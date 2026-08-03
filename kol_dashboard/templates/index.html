@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<meta name="color-scheme" content="dark light" />
+<title>关联决策台 · 风险雷达</title>
+<script>
+  // Deployments live at "/" locally and "/kol/" behind nginx.
+  (function () {
+    var p = location.pathname;
+    window.KOL_BASE = p.indexOf("/kol") === 0
+      ? (p.endsWith("/") ? p : p.replace(/\/?$/, "/"))
+      : "/";
+    try {
+      var t = localStorage.getItem("kol-theme");
+      if (t) document.documentElement.dataset.theme = t;
+    } catch (e) {}
+  })();
+</script>
+<link rel="stylesheet" href="static/style.css?v=7" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='82' font-size='84'%3E📡%3C/text%3E%3C/svg%3E" />
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="brand">
+      <span class="brand-mark">📡</span>
+      <div class="brand-text">
+        <strong>关联决策台</strong>
+        <span class="brand-sub">事件 · 市场 · 持仓</span>
+      </div>
+    </div>
+
+    <nav class="tabs" id="tabs" role="tablist">
+      <button class="tab active" data-view="decision" role="tab" aria-selected="true">
+        关联决策
+      </button>
+      <button class="tab" data-view="macro" role="tab" aria-selected="false">
+        风险雷达
+      </button>
+      <button class="tab" data-view="kol" role="tab" aria-selected="false">
+        KOL 动态
+        <span class="tab-count" id="tab-kol-count"></span>
+      </button>
+    </nav>
+
+    <div class="topbar-actions">
+      <span class="updated" id="last-update" title="上次刷新时间">—</span>
+      <button class="private-mode-btn" id="private-mode-btn" type="button"
+              aria-haspopup="dialog" aria-controls="auth-modal">
+        <span aria-hidden="true">🔒</span><span id="private-mode-label">私人模式</span>
+      </button>
+      <button class="icon-btn support-topbar" data-support-open
+              title="支持服务器运行" aria-label="支持服务器运行">☕</button>
+      <button class="icon-btn" id="theme-btn" title="切换主题" aria-label="切换主题">◐</button>
+      <button class="icon-btn" id="refresh-btn" title="立即刷新" aria-label="立即刷新">↻</button>
+    </div>
+  </div>
+</header>
+
+<!-- ══════════════ 关联决策 ══════════════ -->
+<main class="view active" id="view-decision">
+  <div class="wrap decision-wrap">
+    <section class="decision-hero" id="decision-hero" aria-live="polite">
+      <div class="skeleton skeleton-hero"></div>
+    </section>
+
+    <div class="decision-layout">
+      <section class="decision-panel action-panel" aria-labelledby="action-queue-title">
+        <div class="block-head decision-panel-head">
+          <div>
+            <h2 id="action-queue-title">分级行动队列</h2>
+            <p class="block-sub">先处理风险，再验证分歧；不是自动交易指令</p>
+          </div>
+          <span class="decision-count" id="decision-count">—</span>
+        </div>
+        <div class="action-queue" id="decision-queue">
+          <div class="skeleton skeleton-card"></div>
+          <div class="skeleton skeleton-card"></div>
+        </div>
+      </section>
+
+      <section class="decision-panel matrix-panel" aria-labelledby="impact-matrix-title">
+        <div class="block-head decision-panel-head">
+          <div>
+            <h2 id="impact-matrix-title">主题 × 资产影响矩阵</h2>
+            <p class="block-sub">符号表达方向，颜色仅作辅助；点击单元格查看证据链</p>
+          </div>
+        </div>
+        <div class="impact-matrix-wrap" id="decision-matrix" tabindex="0">
+          <div class="skeleton skeleton-card"></div>
+        </div>
+      </section>
+    </div>
+
+    <section class="decision-panel evidence-panel" id="decision-detail"
+             aria-labelledby="decision-detail-title" aria-live="polite">
+      <div class="empty">
+        <span class="empty-icon">⛓</span>选择行动卡或矩阵单元格查看局部证据链
+      </div>
+    </section>
+
+    <div class="support-slot" data-support-slot></div>
+  </div>
+</main>
+
+<!-- ══════════════ 风险雷达 ══════════════ -->
+<main class="view" id="view-macro">
+  <div class="wrap">
+
+    <section class="hero" id="macro-hero">
+      <div class="skeleton skeleton-hero"></div>
+    </section>
+
+    <section class="block" id="macro-subscores-block" hidden>
+      <div class="block-head">
+        <h2>风险分项</h2>
+        <p class="block-sub">四个维度独立评分，综合分按权重加总</p>
+      </div>
+      <div class="subscore-grid" id="macro-subscores"></div>
+    </section>
+
+    <section class="block" id="macro-market-block" hidden>
+      <div class="block-head">
+        <h2>关键指标</h2>
+        <p class="block-sub">驱动上述评分的原始市场数据</p>
+      </div>
+      <div class="metric-grid" id="macro-metrics"></div>
+    </section>
+
+    <section class="block" id="macro-swans-block" hidden>
+      <div class="block-head">
+        <h2>黑天鹅场景</h2>
+        <p class="block-sub">低概率高冲击事件，按概率排序 · 点击展开对冲方案</p>
+      </div>
+      <div class="scenario-list" id="macro-swans"></div>
+    </section>
+
+    <section class="block" id="macro-rhinos-block" hidden>
+      <div class="block-head">
+        <h2>灰犀牛</h2>
+        <p class="block-sub">高概率、正在逼近、却被市场持续忽视的威胁</p>
+      </div>
+      <div class="scenario-list" id="macro-rhinos"></div>
+    </section>
+
+    <section class="block" id="macro-opps-block" hidden>
+      <div class="block-head">
+        <h2>机会信号</h2>
+        <p class="block-sub">由极端定价触发，无信号时为空属正常</p>
+      </div>
+      <div class="opp-list" id="macro-opps"></div>
+    </section>
+
+    <div class="support-slot" data-support-slot></div>
+
+  </div>
+</main>
+
+<!-- ══════════════ KOL 动态 ══════════════ -->
+<main class="view" id="view-kol">
+  <div class="wrap">
+
+    <section class="statstrip" id="stats">
+      <div class="stat"><span class="stat-num" id="stat-total">–</span><span class="stat-label">动态</span></div>
+      <div class="stat is-high"><span class="stat-num" id="stat-high">–</span><span class="stat-label">高影响</span></div>
+      <div class="stat is-med"><span class="stat-num" id="stat-med">–</span><span class="stat-label">中影响</span></div>
+      <div class="stat"><span class="stat-num" id="stat-kol">–</span><span class="stat-label">活跃 KOL</span></div>
+      <div class="stat"><span class="stat-num" id="stat-market">–</span><span class="stat-label">涉及市场</span></div>
+    </section>
+
+    <section class="filters">
+      <div class="filter-row">
+        <input id="q-input" class="search" type="search"
+               placeholder="搜索标题或摘要…" autocomplete="off" />
+        <div class="chips" id="time-chips" role="group" aria-label="时间窗口">
+          <button data-hours="6" class="chip">6h</button>
+          <button data-hours="24" class="chip active">24h</button>
+          <button data-hours="72" class="chip">3天</button>
+          <button data-hours="168" class="chip">7天</button>
+        </div>
+        <div class="chips" id="time-status-chips" role="group" aria-label="时间可信度">
+          <button data-time-status="verified" class="chip active">可信发布时间</button>
+          <button data-time-status="unverified" class="chip chip-time-warning">时间待核验</button>
+        </div>
+        <span class="time-window-basis" id="time-window-basis">按发布时间筛选</span>
+        <div class="chips" id="impact-chips" role="group" aria-label="影响等级">
+          <button data-impact="" class="chip active">全部</button>
+          <button data-impact="high" class="chip chip-high">高</button>
+          <button data-impact="medium" class="chip chip-med">中</button>
+          <button data-impact="low" class="chip">低</button>
+        </div>
+      </div>
+      <div class="filter-row filter-kols">
+        <div class="chips" id="kol-chips" role="group" aria-label="KOL">
+          <button data-kol="" class="chip active">全部 KOL</button>
+        </div>
+      </div>
+    </section>
+
+    <section id="feed" class="feed">
+      <div class="skeleton skeleton-card"></div>
+      <div class="skeleton skeleton-card"></div>
+      <div class="skeleton skeleton-card"></div>
+    </section>
+
+    <div class="support-slot" data-support-slot></div>
+
+  </div>
+</main>
+
+<footer class="footer">
+  <div class="wrap footer-inner">
+    <span>默认仅显示可信发布时间 · 抓取时间不等于发布时间 · 每 60s 自动刷新</span>
+    <span class="footer-right">
+      <span id="footer-meta"></span>
+      <button type="button" class="footer-support" data-support-open>☕ 支持服务器运行</button>
+    </span>
+  </div>
+</footer>
+
+<button type="button" class="support-fab" id="support-fab" data-support-open
+        aria-label="请我喝杯咖啡，支持服务器运行">
+  <span class="fab-icon" aria-hidden="true">☕</span>
+  <span class="fab-label">请我喝杯咖啡</span>
+</button>
+
+<div class="auth-modal" id="auth-modal" hidden role="dialog" aria-modal="true"
+     aria-labelledby="auth-modal-title">
+  <div class="auth-dialog" role="document">
+    <button type="button" class="support-close" data-auth-close aria-label="关闭">&times;</button>
+    <p class="support-kicker">私人持仓覆盖层</p>
+    <h2 class="support-title" id="auth-modal-title">解锁私人模式</h2>
+    <p class="auth-desc">
+      口令只用于服务端验证。解锁后，具体持仓与个性化影响通过安全 Cookie 临时显示。
+    </p>
+    <form id="auth-form">
+      <label class="auth-label" for="auth-passcode">页面口令</label>
+      <input class="auth-input" id="auth-passcode" name="passcode" type="password"
+             autocomplete="current-password" minlength="1" maxlength="256" required />
+      <p class="auth-error" id="auth-error" role="alert" aria-live="polite"></p>
+      <div class="auth-actions">
+        <button class="auth-submit" type="submit">解锁私人模式</button>
+        <button class="auth-cancel" type="button" data-auth-close>取消</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div class="support-modal" id="support-modal" hidden role="dialog" aria-modal="true"
+     aria-labelledby="support-modal-title">
+  <div class="support-dialog" role="document">
+    <button type="button" class="support-close" data-support-close aria-label="关闭">&times;</button>
+    <p class="support-kicker">随喜支持</p>
+    <h2 class="support-title" id="support-modal-title">请我喝杯咖啡</h2>
+
+    <dl class="support-facts" id="support-facts">
+      <div><dt>24 小时抓取</dt><dd id="fact-events">—</dd></div>
+      <div><dt>追踪 KOL</dt><dd id="fact-kols">—</dd></div>
+      <div><dt>风险快照</dt><dd>每小时</dd></div>
+    </dl>
+
+    <p class="support-desc">
+      这些都跑在一台自费的云服务器上，服务器和数据接口每月都在扣款。
+      你的支持会直接补上这部分，让它继续免费跑下去。多少都好。
+    </p>
+    <div class="support-qr-wrap">
+      <img class="support-qr" src="static/img/donate-qrcode.png" alt="微信赞赏码"
+           width="200" height="200" loading="lazy" />
+    </div>
+    <p class="support-hint">微信扫码，或长按识别</p>
+  </div>
+</div>
+
+<script src="static/app.js?v=7"></script>
+</body>
+</html>
