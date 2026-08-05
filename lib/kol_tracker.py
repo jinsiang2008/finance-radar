@@ -23,6 +23,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone, timedelta
@@ -73,6 +74,8 @@ KOLS = {
         "name_cn": "特朗普",
         "search_terms": ["Trump"],
         "impact": "high",
+        # Primary-source posts, ahead of any news coverage of them.
+        "truth_handle": "realDonaldTrump",
     },
     "musk": {
         "name": "Elon Musk",
@@ -268,6 +271,43 @@ def normalize_published_at(
     return normalized.isoformat()
 
 
+# X labels anything under a day as an offset ("5h") and older posts as a bare
+# date. Only the offset form pins down a time of day.
+_RELATIVE_OFFSET_RE = re.compile(r"^(\d{1,2})\s*([smh])$", re.I)
+_OFFSET_UNITS = {"s": "seconds", "m": "minutes", "h": "hours"}
+_OFFSET_LIMITS = {"s": 59, "m": 59, "h": 23}
+
+
+def resolve_relative_time(
+    value: Any,
+    *,
+    now: datetime | None = None,
+) -> str | None:
+    """Anchor a relative offset label to the moment it was observed.
+
+    The label is floor-rounded, so "6h" means at least six hours but under
+    seven. This resolves to the older edge of that window: the newer edge can
+    land after a post was already observed, which is provably impossible and
+    gets the record quarantined. A bare date such as ``Aug 4`` pins down no
+    time of day at all and stays unresolved.
+    """
+    if not isinstance(value, str):
+        return None
+    match = _RELATIVE_OFFSET_RE.match(value.strip())
+    if not match:
+        return None
+    amount, unit = int(match.group(1)), match.group(2).lower()
+    if amount > _OFFSET_LIMITS[unit]:
+        return None
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None or current.utcoffset() is None:
+        raise ValueError("now must include a timezone")
+    observed = current.astimezone(timezone.utc) - timedelta(
+        **{_OFFSET_UNITS[unit]: amount + 1}
+    )
+    return observed.replace(microsecond=0).isoformat()
+
+
 # ─── Bing News RSS 搜索 ────────────────────────────────
 
 _ITEM_RE = re.compile(r"<item\b[^>]*>(.*?)</item>", re.S | re.I)
@@ -349,6 +389,80 @@ def search_bing_rss(query: str, max_results: int = 5) -> list[dict[str, Any]]:
             })
             if len(results) >= max_results:
                 break
+
+    return results
+
+
+# ─── Truth Social ─────────────────────────────────────
+
+# truthsocial.com puts its own API and RSS behind Cloudflare, which rejects
+# server-side requests outright. This mirror republishes the same posts with
+# their original timestamps and permalinks.
+TRUTH_MIRROR_FEED = "https://trumpstruth.org/feed"
+_CDATA_RE = re.compile(r"^\s*<!\[CDATA\[(.*?)\]\]>\s*$", re.S)
+
+
+def _feed_field(fragment: str, tag: str) -> str:
+    match = re.search(rf"<{tag}\b[^>]*>(.*?)</{tag}>", fragment, re.S | re.I)
+    if not match:
+        return ""
+    return _CDATA_RE.sub(r"\1", match.group(1)).strip()
+
+
+_ANCHOR_RE = re.compile(r"<a\b[^>]*\bhref=[\"']([^\"']+)[\"'][^>]*>.*?</a>", re.S | re.I)
+
+
+def _post_body_text(markup: str) -> str:
+    """Flatten post HTML into readable text.
+
+    Anchors are reduced to their href because Mastodon renders long URLs as
+    several spans, so the visible text alone reassembles into a broken link.
+    Remaining tags become spaces to keep paragraphs from running together.
+    """
+    if not markup:
+        return ""
+    text = _ANCHOR_RE.sub(lambda m: f" {unescape(m.group(1))} ", markup)
+    text = re.sub(r"<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", unescape(text)).strip()
+
+
+def search_truth_social(
+    handle: str,
+    max_results: int = 10,
+    *,
+    feed_url: str = TRUTH_MIRROR_FEED,
+) -> list[dict[str, Any]]:
+    """抓取 Truth Social 帖子（经镜像站，带原始时间与永久链接）。
+
+    只保留有正文的帖子：纯转帖和纯图片帖没有可分析的文本。
+    """
+    xml = http_get(feed_url, headers={"User-Agent": UA}, timeout=15)
+    if not xml:
+        return []
+
+    results: list[dict[str, Any]] = []
+    for fragment in _ITEM_RE.findall(xml):
+        body = _post_body_text(_feed_field(fragment, "description"))
+        if len(body) < 12:
+            continue
+        url = (
+            _feed_field(fragment, "truth:originalUrl")
+            or _feed_field(fragment, "link")
+        )
+        if not url:
+            continue
+        title = body if len(body) <= 90 else body[:90].rstrip() + "…"
+        results.append({
+            "title": title,
+            "snippet": body,
+            "url": url,
+            "source": f"Truth Social @{handle}",
+            "published_at": normalize_published_at(
+                _feed_field(fragment, "pubDate")
+            ),
+        })
+        if len(results) >= max_results:
+            break
 
     return results
 
@@ -510,6 +624,9 @@ _SCRIPTS_DIRS = [
     _HERE,
 ]
 
+X_FETCH_ATTEMPTS = 3
+X_RETRY_BACKOFF_SECONDS = 2
+
 
 def search_x(handle: str, max_results: int = 10) -> list[dict[str, Any]]:
     """抓取 X 账号最新推文。复用 serenity_tracker 的解析逻辑。"""
@@ -524,10 +641,23 @@ def search_x(handle: str, max_results: int = 10) -> list[dict[str, Any]]:
         sys.stderr.write(f"[kol_tracker] x source unavailable: {e}\n")
         return []
 
-    try:
-        tweets = st.parse_tweets(st.fetch_page())
-    except Exception as e:
-        sys.stderr.write(f"[kol_tracker] x fetch failed for @{handle}: {e}\n")
+    # x.com returns intermittent 5xx responses; a couple of retries recovers
+    # the fetch far more often than it fails.
+    tweets = None
+    last_error: Exception | None = None
+    for attempt in range(X_FETCH_ATTEMPTS):
+        try:
+            tweets = st.parse_tweets(st.fetch_page())
+            break
+        except Exception as e:
+            last_error = e
+            if attempt < X_FETCH_ATTEMPTS - 1:
+                time.sleep(X_RETRY_BACKOFF_SECONDS * (attempt + 1))
+    if tweets is None:
+        sys.stderr.write(
+            f"[kol_tracker] x fetch failed for @{handle} after "
+            f"{X_FETCH_ATTEMPTS} attempts: {last_error}\n"
+        )
         return []
 
     results = []
@@ -538,14 +668,20 @@ def search_x(handle: str, max_results: int = 10) -> list[dict[str, Any]]:
         # 推文没有标题，取首句作标题，全文进摘要
         title = text if len(text) <= 90 else text[:90].rstrip() + "…"
         published_at = None
-        for candidate in (
+        candidates = (
             t.get("published_at"),
             t.get("created_at"),
             t.get("date"),
-        ):
+        )
+        for candidate in candidates:
             published_at = normalize_published_at(candidate)
             if published_at:
                 break
+        if not published_at:
+            for candidate in candidates:
+                published_at = resolve_relative_time(candidate)
+                if published_at:
+                    break
         results.append(
             {
                 "title": title,
@@ -564,40 +700,46 @@ def scan_kol(kol_key: str, max_results: int = 5) -> list[dict[str, Any]]:
     if not kol:
         return []
 
+    def annotate(item: dict[str, Any]) -> dict[str, Any]:
+        item["kol_key"] = kol_key
+        item["kol_name"] = kol["name"]
+        item["kol_name_cn"] = kol.get("name_cn", kol["name"])
+        item["impact"] = classify_kol_impact(item, kol)
+        blob = item.get("title", "") + " " + item.get("snippet", "")
+        item["tickers"] = extract_tickers(blob)
+        item["has_market_kw"] = bool(item["tickers"]) or bool(
+            _MARKET_RE.search(blob.lower())
+        )
+        return item
+
     if kol.get("source_type") == "x":
-        items = search_x(kol.get("handle", ""), max_results)
-        for item in items:
-            item["kol_key"] = kol_key
-            item["kol_name"] = kol["name"]
-            item["kol_name_cn"] = kol.get("name_cn", kol["name"])
-            item["impact"] = classify_kol_impact(item, kol)
-            item["tickers"] = extract_tickers(item["snippet"])
-            item["has_market_kw"] = bool(item["tickers"]) or bool(
-                _MARKET_RE.search((item["title"] + " " + item["snippet"]).lower())
-            )
-        return items
+        return [
+            annotate(item)
+            for item in search_x(kol.get("handle", ""), max_results)
+        ]
 
     results = []
     seen = set()
 
-    for term in kol["search_terms"]:
-        items = search_kol(kol_key, term, max_results)
-        for item in items:
+    # Own-platform posts come first: they are the primary source for anything
+    # the news feeds will only report on later. They take at most half the
+    # budget so news coverage is never crowded out entirely.
+    truth_handle = kol.get("truth_handle")
+    if truth_handle:
+        for item in search_truth_social(
+            truth_handle, max(1, max_results // 2)
+        ):
             if item["url"] not in seen:
                 seen.add(item["url"])
-                item["kol_key"] = kol_key
-                item["kol_name"] = kol["name"]
-                item["kol_name_cn"] = kol.get("name_cn", kol["name"])
-                item["impact"] = classify_kol_impact(item, kol)
-                blob = item.get("title", "") + " " + item.get("snippet", "")
-                item["tickers"] = extract_tickers(blob)
-                item["has_market_kw"] = bool(item["tickers"]) or bool(
-                    _MARKET_RE.search(blob.lower())
-                )
-                results.append(item)
+                results.append(annotate(item))
 
+    for term in kol["search_terms"]:
         if len(results) >= max_results:
             break
+        for item in search_kol(kol_key, term, max_results):
+            if item["url"] not in seen:
+                seen.add(item["url"])
+                results.append(annotate(item))
 
     return results[:max_results]
 
