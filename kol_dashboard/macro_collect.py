@@ -75,10 +75,25 @@ def annotate_coverage(report: dict) -> dict:
     return report
 
 
+def _previous_market_data() -> dict | None:
+    """Load the last snapshot's indicators so moves can be detected."""
+    try:
+        db.init()
+        previous = db.latest_macro()
+    except Exception:
+        return None
+    if not isinstance(previous, dict):
+        return None
+    market_data = previous.get("market_data")
+    return market_data if isinstance(market_data, dict) else None
+
+
 def collect(store: bool = True) -> dict:
     import risk_radar  # noqa: E402  — heavy import, only when actually collecting
 
-    report = annotate_coverage(risk_radar.generate_risk_report())
+    report = annotate_coverage(
+        risk_radar.generate_risk_report(_previous_market_data())
+    )
     if store:
         db.init()
         snap_id = db.save_macro_snapshot(report)
@@ -98,6 +113,7 @@ def main() -> int:
         "black_swans": len(report.get("black_swan_scenarios", [])),
         "gray_rhinos": len(report.get("gray_rhinos", [])),
         "opportunities": len(report.get("opportunities", [])),
+        "monitored_events": len(report.get("monitored_events", [])),
     }
     print(json.dumps(summary, ensure_ascii=False))
     return 0

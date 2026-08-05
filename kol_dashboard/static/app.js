@@ -903,13 +903,31 @@
     </div>`;
   }
 
+  // Tradeable symbols and sector themes are rendered as separate rows so a
+  // reader can tell at a glance what is directly actionable.
+  function assetTagRow(item, limit = 10) {
+    const tickers = (item.tickers || []).slice(0, limit);
+    const sectors = (item.sectors || []).slice(0, limit);
+    if (!tickers.length && !sectors.length) return "";
+    const group = (label, values, cls) =>
+      values.length
+        ? `<span class="tag-group">
+            <span class="tag-group-label">${label}</span>
+            ${values.map((v) => `<span class="tag ${cls}">${esc(v)}</span>`).join("")}
+          </span>`
+        : "";
+    return `<div class="tagline tagline-split">
+      ${group("标的", tickers, "ticker")}
+      ${group("板块", sectors, "sector")}
+    </div>`;
+  }
+
   function renderSwans(d) {
     const list = d.black_swan_scenarios || [];
     if (!list.length) return;
     $("#macro-swans").innerHTML = list
       .map((s) => {
         const lvl = PROB_LEVEL[s.probability] || "medium";
-        const affectedAssets = (s.affected_assets || []).slice(0, 12);
         return `<details class="scenario" style="--lvl:${LEVEL_COLOR[lvl]}">
           <summary class="scenario-summary">
             <span class="scenario-chev">▶</span>
@@ -921,20 +939,11 @@
                 ${s.timeframe ? `<span class="tag">${esc(s.timeframe)}</span>` : ""}
               </div>
               <div class="scenario-desc">${esc(s.description)}</div>
+              ${assetTagRow(s)}
             </div>
           </summary>
           <div class="scenario-detail">
             ${detailRow("触发条件", s.trigger)}
-            ${
-              affectedAssets.length
-                ? `<div class="detail-row">
-                    <span class="detail-key">受影响</span>
-                    <span class="detail-val"><span class="tagline">${affectedAssets
-                      .map((p) => `<span class="tag ticker">${esc(p)}</span>`)
-                      .join("")}</span></span>
-                  </div>`
-                : ""
-            }
             ${detailRow("对冲方案", s.hedge, "hedge")}
           </div>
         </details>`;
@@ -954,7 +963,6 @@
     $("#macro-rhinos").innerHTML = sorted
       .map((r) => {
         const lvl = URGENCY_LEVEL[r.urgency] || "medium";
-        const markets = (r.affected_markets || []).slice(0, 10);
         return `<details class="scenario" style="--lvl:${LEVEL_COLOR[lvl]}">
           <summary class="scenario-summary">
             <span class="scenario-chev">▶</span>
@@ -969,26 +977,60 @@
                 }
               </div>
               <div class="scenario-desc">${esc(r.description)}</div>
+              ${assetTagRow(r)}
             </div>
           </summary>
           <div class="scenario-detail">
             ${detailRow("引爆点", r.catalyst)}
-            ${
-              markets.length
-                ? `<div class="detail-row">
-                    <span class="detail-key">相关市场</span>
-                    <span class="detail-val"><span class="tagline">${markets
-                      .map((m) => `<span class="tag">${esc(m)}</span>`)
-                      .join("")}</span></span>
-                  </div>`
-                : ""
-            }
             ${detailRow("市场影响", r.market_impact, "hedge")}
           </div>
         </details>`;
       })
       .join("");
     $("#macro-rhinos-block").hidden = false;
+  }
+
+  const EVENT_KIND_CN = { policy: "政策原文", indicator: "指标异动" };
+  const EVENT_SEVERITY_CN = { high: "高", medium: "中", low: "低" };
+
+  function renderMonitoredEvents(d) {
+    const list = d.monitored_events || [];
+    $("#macro-events").innerHTML = list.length
+      ? list
+          .map((e) => {
+            const lvl = LEVEL_COLOR[e.severity === "high" ? "high" : e.severity === "medium" ? "medium" : "low"];
+            const verified = e.time_status === "verified" && e.published_at;
+            const when = verified
+              ? `<span class="event-time">${esc(fmtTime(e.published_at))}</span>`
+              : `<span class="event-time unverified" title="来源未提供可验证的发布时间">时间待核验</span>`;
+            const move =
+              e.previous_value !== undefined && e.current_value !== undefined
+                ? `<div class="event-move">${esc(String(e.previous_value))} → <strong>${esc(
+                    String(e.current_value)
+                  )}</strong></div>`
+                : "";
+            const title = e.url
+              ? `<a href="${esc(e.url)}" target="_blank" rel="noopener noreferrer">${esc(e.title)}</a>`
+              : esc(e.title);
+            return `<article class="event" style="--lvl:${lvl}">
+              <div class="event-head">
+                <span class="pill event-kind ${esc(e.kind)}">${EVENT_KIND_CN[e.kind] || esc(e.kind)}</span>
+                <span class="tag">影响 ${EVENT_SEVERITY_CN[e.severity] || esc(e.severity)}</span>
+                <span class="event-source">${esc(e.source || "")}</span>
+                ${when}
+              </div>
+              <div class="event-title">${title}</div>
+              ${move}
+              ${e.note ? `<div class="event-note">${esc(e.note)}</div>` : ""}
+              ${assetTagRow(e, 8)}
+            </article>`;
+          })
+          .join("")
+      : `<div class="empty">
+          <span class="empty-icon">🛰</span>近 72 小时内未监控到新的政策事件或指标异动
+          <div class="empty-hint">指标异动需要与上一份快照对比才会出现</div>
+        </div>`;
+    $("#macro-events-block").hidden = false;
   }
 
   function renderOpps(d) {
@@ -1028,6 +1070,7 @@
       renderHero(d);
       renderSubscores(d);
       renderMetrics(d);
+      renderMonitoredEvents(d);
       renderSwans(d);
       renderRhinos(d);
       renderOpps(d);

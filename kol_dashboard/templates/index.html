@@ -18,7 +18,7 @@
     } catch (e) {}
   })();
 </script>
-<link rel="stylesheet" href="static/style.css?v=7" />
+<link rel="stylesheet" href="static/style.css?v=8" />
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='82' font-size='84'%3E📡%3C/text%3E%3C/svg%3E" />
 </head>
 <body>
@@ -130,10 +130,18 @@
       <div class="metric-grid" id="macro-metrics"></div>
     </section>
 
+    <section class="block" id="macro-events-block" hidden>
+      <div class="block-head">
+        <h2>监控到的事件</h2>
+        <p class="block-sub">近 72 小时的政策原文与指标异动，最新在前 · 时间无法核验的会明确标注</p>
+      </div>
+      <div class="event-list" id="macro-events"></div>
+    </section>
+
     <section class="block" id="macro-swans-block" hidden>
       <div class="block-head">
         <h2>黑天鹅场景</h2>
-        <p class="block-sub">低概率高冲击事件，按概率排序 · 点击展开对冲方案</p>
+        <p class="block-sub">低概率高冲击事件，按概率排序 · 标的与板块已分开标注</p>
       </div>
       <div class="scenario-list" id="macro-swans"></div>
     </section>
@@ -141,7 +149,7 @@
     <section class="block" id="macro-rhinos-block" hidden>
       <div class="block-head">
         <h2>灰犀牛</h2>
-        <p class="block-sub">高概率、正在逼近、却被市场持续忽视的威胁</p>
+        <p class="block-sub">高概率、正在逼近、却被市场持续忽视的威胁 · 标的与板块已分开标注</p>
       </div>
       <div class="scenario-list" id="macro-rhinos"></div>
     </section>
@@ -274,6 +282,6 @@
   </div>
 </div>
 
-<script src="static/app.js?v=7"></script>
+<script src="static/app.js?v=8"></script>
 </body>
 </html>

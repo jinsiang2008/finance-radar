@@ -99,6 +99,8 @@ _PUBLIC_MACRO_SCENARIO_FIELDS = (
     "trigger",
     "affected_assets",
     "affected_markets",
+    "tickers",
+    "sectors",
     "hedge",
     "timeframe",
 )
@@ -109,8 +111,26 @@ _PUBLIC_MACRO_RHINO_FIELDS = (
     "visibility",
     "urgency",
     "affected_markets",
+    "tickers",
+    "sectors",
     "catalyst",
     "market_impact",
+)
+_PUBLIC_MACRO_EVENT_FIELDS = (
+    "id",
+    "kind",
+    "title",
+    "url",
+    "source",
+    "published_at",
+    "time_status",
+    "severity",
+    "previous_value",
+    "current_value",
+    "unit",
+    "note",
+    "tickers",
+    "sectors",
 )
 _PUBLIC_MACRO_OPPORTUNITY_FIELDS = (
     "id",
@@ -746,6 +766,10 @@ def project_public_macro(snapshot: Any) -> dict[str, Any]:
     output["opportunities"] = _project_macro_items(
         snapshot.get("opportunities") if trusted else None,
         _PUBLIC_MACRO_OPPORTUNITY_FIELDS,
+    )
+    output["monitored_events"] = _project_macro_items(
+        snapshot.get("monitored_events") if trusted else None,
+        _PUBLIC_MACRO_EVENT_FIELDS,
     )
     return output
 

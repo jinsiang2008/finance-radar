@@ -34,6 +34,56 @@ class PublishedAtParsingTests(unittest.TestCase):
 
         self.assertEqual(items[0]["published_at"], "2026-07-31T10:34:56+00:00")
 
+    def test_bing_rss_requests_date_sorted_english_market_results(self) -> None:
+        """Relevance-ranked defaults returned months-old stories for some KOLs."""
+        captured: dict[str, str] = {}
+
+        def fake_get(url: str, **_kwargs: object) -> str:
+            captured["url"] = url
+            return ""
+
+        with mock.patch.object(kol_tracker, "http_get", side_effect=fake_get):
+            kol_tracker.search_bing_rss("Howard Marks")
+
+        url = captured["url"]
+        self.assertIn("setmkt=en-US", url)
+        self.assertIn("setlang=en-US", url)
+        self.assertIn("sortbydate", url)
+
+    def test_bing_rss_falls_back_to_regex_when_xml_is_malformed(self) -> None:
+        """A single bad character used to drop an entire KOL's feed."""
+        rss = """<?xml version="1.0" encoding="UTF-8"?>
+        <rss version="2.0"><channel>
+          <item>
+            <title>Jensen Huang on AI demand</title>
+            <link>https://example.com/huang</link>
+            <pubDate>Mon, 03 Aug 2026 04:40:00 GMT</pubDate>
+          </item>
+        </channel></rss>""".replace("<channel>", "<channel><bad & tag>")
+
+        with mock.patch.object(kol_tracker, "http_get", return_value=rss):
+            items = kol_tracker.search_bing_rss("Jensen Huang")
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["title"], "Jensen Huang on AI demand")
+        self.assertEqual(items[0]["url"], "https://example.com/huang")
+        self.assertEqual(items[0]["published_at"], "2026-08-03T04:40:00+00:00")
+
+    def test_baidu_results_always_carry_a_published_at_key(self) -> None:
+        """A missing key silently quarantined every Baidu sighting."""
+        html = (
+            '<h3 class="c-title"><a href="https://news.example.cn/a">'
+            "央行发布公告</a></h3>"
+            '<span class="c-color-gray2">2026年08月03日 09:15</span>'
+        )
+
+        with mock.patch.object(kol_tracker, "http_get", return_value=html):
+            items = kol_tracker.search_baidu("央行")
+
+        self.assertTrue(items)
+        for item in items:
+            self.assertIn("published_at", item)
+
     def test_bing_rss_does_not_fabricate_invalid_pubdate(self) -> None:
         rss = """<?xml version="1.0" encoding="UTF-8"?>
         <rss version="2.0"><channel>

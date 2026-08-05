@@ -44,7 +44,10 @@ class FrontendContractTests(unittest.TestCase):
     def test_frontend_does_not_depend_on_legacy_private_macro_fields(self) -> None:
         self.assertNotIn("affected_positions", self.javascript)
         self.assertNotIn("portfolio_impact", self.javascript)
-        self.assertIn("affected_assets", self.javascript)
+        # Scenario exposure now reaches the UI through the public split tags,
+        # which the collector derives from affected_assets/affected_markets.
+        self.assertIn("tickers", self.javascript)
+        self.assertIn("sectors", self.javascript)
         self.assertIn("market_impact", self.javascript)
 
     def test_feed_separates_publication_time_from_collection_time(self) -> None:
@@ -63,6 +66,23 @@ class FrontendContractTests(unittest.TestCase):
             "it.last_seen_at || it.fetched_at",
             self.javascript,
         )
+
+    def test_macro_view_lists_monitored_events_with_time_provenance(self) -> None:
+        self.assertIn('id="macro-events-block"', self.html)
+        self.assertIn('id="macro-events"', self.html)
+        self.assertIn("监控到的事件", self.html)
+        self.assertIn("renderMonitoredEvents", self.javascript)
+        self.assertIn("monitored_events", self.javascript)
+        self.assertIn("时间待核验", self.javascript)
+        self.assertIn(".event-time.unverified", self.css)
+
+    def test_macro_cards_separate_tradeable_symbols_from_sectors(self) -> None:
+        self.assertIn("assetTagRow", self.javascript)
+        self.assertIn("item.tickers", self.javascript)
+        self.assertIn("item.sectors", self.javascript)
+        self.assertIn("tag-group-label", self.javascript)
+        self.assertIn(".tag.sector", self.css)
+        self.assertIn(".tagline-split", self.css)
 
     def test_evidence_and_market_validation_are_visually_separated(self) -> None:
         self.assertIn("机制证据（不是因果证明）", self.javascript)

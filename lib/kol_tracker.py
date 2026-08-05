@@ -270,22 +270,61 @@ def normalize_published_at(
 
 # ─── Bing News RSS 搜索 ────────────────────────────────
 
+_ITEM_RE = re.compile(r"<item\b[^>]*>(.*?)</item>", re.S | re.I)
+
+
+def _tagged_text(fragment: str, tag: str) -> str:
+    match = re.search(rf"<{tag}\b[^>]*>(.*?)</{tag}>", fragment, re.S | re.I)
+    return match.group(1) if match else ""
+
+
+def _parse_bing_items_with_regex(xml: str) -> list[dict[str, Any]]:
+    """Recover items from a feed that is not well-formed XML.
+
+    Bing intermittently emits unescaped markup, which makes the whole
+    document unparseable and would otherwise drop that KOL's entire feed.
+    """
+    recovered: list[dict[str, Any]] = []
+    for fragment in _ITEM_RE.findall(xml):
+        title = strip_html(_tagged_text(fragment, "title"))
+        link = strip_html(_tagged_text(fragment, "link"))
+        if not title or not link:
+            continue
+        recovered.append({
+            "title": title,
+            "url": link,
+            "source": "Bing News",
+            "published_at": normalize_published_at(
+                strip_html(_tagged_text(fragment, "pubDate"))
+            ),
+        })
+    return recovered
+
+
 def search_bing_rss(query: str, max_results: int = 5) -> list[dict[str, Any]]:
-    """使用 Bing News RSS feed 搜索"""
-    results = []
+    """使用 Bing News RSS feed 搜索。
+
+    必须显式指定市场并按时间排序：默认的相关度排序会把几个月前的旧闻排在
+    最前，经过严格时效过滤后前台会长期显示不出新内容。
+    """
     q = urllib.parse.quote(query)
-    url = f"https://www.bing.com/news/search?q={q}&format=rss"
+    url = (
+        f"https://www.bing.com/news/search?q={q}&format=rss"
+        "&setmkt=en-US&setlang=en-US"
+        '&qft=sortbydate%3d"1"'
+    )
 
     html = http_get(url, headers={"User-Agent": UA})
     if not html:
-        return results
+        return []
 
     import xml.etree.ElementTree as ET
     try:
         root = ET.fromstring(html)
     except Exception:
-        return results
+        return _parse_bing_items_with_regex(html)[:max_results]
 
+    results: list[dict[str, Any]] = []
     for item in root.iter():
         tag = item.tag.lower().rsplit("}", 1)[-1]
         if tag != "item":
@@ -316,6 +355,34 @@ def search_bing_rss(query: str, max_results: int = 5) -> list[dict[str, Any]]:
 
 # ─── 百度新闻搜索 ──────────────────────────────────────
 
+_BAIDU_DATE_RE = re.compile(
+    r"(20\d{2})年(\d{1,2})月(\d{1,2})日(?:\s*(\d{1,2}):(\d{2}))?"
+)
+# Baidu renders the timestamp in a sibling node shortly after the headline.
+_BAIDU_DATE_WINDOW = 400
+
+
+def _baidu_published_at(html: str, offset: int) -> str | None:
+    """Read the absolute timestamp Baidu prints next to a headline.
+
+    Baidu reports Beijing time without an offset, and also uses relative
+    labels such as 3小时前 which are deliberately not inferred.
+    """
+    match = _BAIDU_DATE_RE.search(html, offset, offset + _BAIDU_DATE_WINDOW)
+    if not match:
+        return None
+    year, month, day, hour, minute = match.groups()
+    try:
+        stamp = datetime(
+            int(year), int(month), int(day),
+            int(hour or 0), int(minute or 0),
+            tzinfo=CST,
+        )
+    except ValueError:
+        return None
+    return normalize_published_at(stamp.isoformat())
+
+
 def search_baidu(query: str, max_results: int = 5) -> list[dict[str, str]]:
     """百度新闻搜索"""
     results = []
@@ -342,6 +409,7 @@ def search_baidu(query: str, max_results: int = 5) -> list[dict[str, str]]:
             "title": title,
             "url": link,
             "source": "Baidu News",
+            "published_at": _baidu_published_at(html, m.end()),
         })
         if len(results) >= max_results:
             break

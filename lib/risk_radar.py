@@ -26,6 +26,7 @@ import re
 import sys
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from html import unescape
 from typing import Any
 
 # macro_fetcher 与本文件同目录，按相对位置导入以便整个 lib 目录可搬迁
@@ -37,7 +38,10 @@ from macro_fetcher import (
     fetch_usd_cny,
     fetch_gold_oil,
     fetch_fed,
+    fetch_fed_speeches,
+    fetch_fomc,
     fetch_pboc,
+    fetch_pboc_speech,
     fetch_cctv_news,
     http_get,
     CN_TZ,
@@ -604,7 +608,66 @@ def generate_black_swan_scenarios(
             if s["id"] == "bs_us_recession":
                 s["probability"] = "high"
 
-    return scenarios
+    return _attach_asset_tags(scenarios, "affected_assets")
+
+
+# ════════════════════════════════════════════
+# 4b. 标的与板块标签
+# ════════════════════════════════════════════
+
+_PARENS_TICKER_RE = re.compile(r"[（(]\s*([A-Z][A-Z0-9.\-]{0,5})\s*[)）]")
+_BARE_TICKER_RE = re.compile(r"^[A-Z][A-Z0-9.\-]{0,5}$")
+
+
+def split_asset_tags(items: Any) -> dict[str, list[str]]:
+    """Separate tradeable symbols from sector and theme labels.
+
+    The scenario lists mix the two — "NVDA" sits next to "区域银行ETF (KRE)"
+    and "几乎所有资产" — so the UI cannot otherwise tell a reader which tags
+    are directly tradeable.
+    """
+    tickers: list[str] = []
+    sectors: list[str] = []
+    if not isinstance(items, (list, tuple)):
+        return {"tickers": tickers, "sectors": sectors}
+
+    for raw in items:
+        if not isinstance(raw, str):
+            continue
+        text = raw.strip()
+        if not text:
+            continue
+        parenthesized = _PARENS_TICKER_RE.search(text)
+        if parenthesized:
+            symbol = parenthesized.group(1)
+            if symbol not in tickers:
+                tickers.append(symbol)
+            remainder = _PARENS_TICKER_RE.sub("", text).strip()
+            if remainder and remainder not in sectors:
+                sectors.append(remainder)
+            continue
+        if _BARE_TICKER_RE.match(text):
+            if text not in tickers:
+                tickers.append(text)
+            continue
+        if text not in sectors:
+            sectors.append(text)
+
+    return {"tickers": tickers, "sectors": sectors}
+
+
+def _attach_asset_tags(entries: list[dict], *source_fields: str) -> list[dict]:
+    """Add split tags to scenario entries without dropping the original lists."""
+    for entry in entries:
+        combined: list[str] = []
+        for field in source_fields:
+            value = entry.get(field)
+            if isinstance(value, (list, tuple)):
+                combined.extend(value)
+        tags = split_asset_tags(combined)
+        entry["tickers"] = tags["tickers"]
+        entry["sectors"] = tags["sectors"]
+    return entries
 
 
 # ════════════════════════════════════════════
@@ -675,7 +738,322 @@ def identify_gray_rhinos() -> list[dict]:
         "market_impact": "可能压制跨境科技与出口链，并利好部分国产替代方向",
     })
 
-    return rhinos
+    return _attach_asset_tags(rhinos, "affected_markets")
+
+
+# ════════════════════════════════════════════
+# 5b. 监控到的具体事件
+# ════════════════════════════════════════════
+
+# Central banks publish on a weekly-to-monthly cadence, so a tight window
+# would hide the very releases worth monitoring. Recency is conveyed by
+# sorting and by showing each event's age instead of by hiding it.
+POLICY_EVENT_MAX_AGE_HOURS = 14 * 24
+MONITORED_EVENT_LIMIT = 24
+
+# PBoC announcement URLs embed the publication time as YYYYMMDDHHMMSS.
+_URL_TIMESTAMP_RE = re.compile(r"/(\d{14})\d*/")
+
+_POLICY_HIGH_WORDS = (
+    "rate decision", "fomc", "emergency", "sanction", "tariff",
+    "intervention", "downgrade", "default",
+    "降息", "加息", "制裁", "关税", "干预", "降准", "违约", "评级下调",
+)
+_POLICY_MEDIUM_WORDS = (
+    "inflation", "employment", "guidance", "outlook", "speech", "minutes",
+    "通胀", "就业", "讲话", "纪要", "展望", "政策",
+)
+
+# Keyword to tradeable-symbol / sector mapping. Deterministic and explicit:
+# a policy headline never implies a position, only an area to look at.
+_POLICY_TAG_RULES: tuple[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]], ...] = (
+    (("rate", "fomc", "interest", "降息", "加息", "利率", "lpr"),
+     ("TLT", "SPY"), ("美债", "利率敏感板块")),
+    (("inflation", "cpi", "通胀", "物价"),
+     ("TIP", "GLD"), ("通胀受益板块",)),
+    (("tariff", "trade", "关税", "贸易", "出口管制", "sanction", "制裁"),
+     ("SOXL", "FXI"), ("半导体", "跨境贸易链")),
+    (("employment", "payroll", "jobless", "就业", "非农"),
+     ("SPY",), ("消费", "周期股")),
+    (("yuan", "renminbi", "人民币", "汇率", "外汇"),
+     ("CNY=X", "FXI"), ("中概股", "出口链")),
+    (("bank", "liquidity", "银行", "流动性", "存款保险"),
+     ("KRE",), ("区域银行", "信用市场")),
+    (("housing", "real estate", "房地产", "楼市"),
+     ("XHB",), ("地产链",)),
+)
+
+
+def _parse_feed_time(value: Any) -> datetime | None:
+    """Parse a feed timestamp, rejecting anything without a real offset."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    raw = value.strip()
+    try:
+        parsed = datetime.fromisoformat(
+            raw[:-1] + "+00:00" if raw.endswith(("Z", "z")) else raw
+        )
+    except ValueError:
+        try:
+            from email.utils import parsedate_to_datetime
+
+            parsed = parsedate_to_datetime(raw)
+        except (TypeError, ValueError, OverflowError):
+            return None
+    if parsed is None or parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(timezone.utc).replace(microsecond=0)
+
+
+def _url_embedded_time(url: Any) -> datetime | None:
+    """Recover the publication time PBoC encodes in its announcement paths.
+
+    These pages carry no feed timestamp, so without this every Chinese
+    central-bank notice would be quarantined as time-unverifiable.
+    """
+    if not isinstance(url, str):
+        return None
+    match = _URL_TIMESTAMP_RE.search(url)
+    if not match:
+        return None
+    try:
+        stamp = datetime.strptime(match.group(1), "%Y%m%d%H%M%S")
+    except ValueError:
+        return None
+    return stamp.replace(tzinfo=CN_TZ).astimezone(timezone.utc)
+
+
+def _classify_policy_severity(text: str) -> str:
+    blob = text.lower()
+    if any(word in blob for word in _POLICY_HIGH_WORDS):
+        return "high"
+    if any(word in blob for word in _POLICY_MEDIUM_WORDS):
+        return "medium"
+    return "low"
+
+
+def _policy_tags(text: str) -> dict[str, list[str]]:
+    blob = text.lower()
+    tickers: list[str] = []
+    sectors: list[str] = []
+    for keywords, mapped_tickers, mapped_sectors in _POLICY_TAG_RULES:
+        if not any(keyword in blob for keyword in keywords):
+            continue
+        for symbol in mapped_tickers:
+            if symbol not in tickers:
+                tickers.append(symbol)
+        for sector in mapped_sectors:
+            if sector not in sectors:
+                sectors.append(sector)
+    return {"tickers": tickers, "sectors": sectors}
+
+
+def build_policy_events(
+    items: Any,
+    *,
+    now: datetime | None = None,
+    limit: int = MONITORED_EVENT_LIMIT,
+) -> list[dict]:
+    """Turn central-bank and policy feed items into monitored events.
+
+    Undated items are kept but flagged, matching the KOL feed's rule that a
+    missing timestamp is never silently treated as "just published".
+    """
+    current = now or datetime.now(timezone.utc)
+    events: list[dict] = []
+    seen: set[str] = set()
+
+    for item in items if isinstance(items, (list, tuple)) else []:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "").strip()
+        url = unescape(str(item.get("url") or "")).strip()
+        if not title or not url or url in seen:
+            continue
+
+        published = _parse_feed_time(item.get("date") or item.get("published_at"))
+        if published is None:
+            published = _url_embedded_time(url)
+        if published is not None:
+            age_hours = (current - published).total_seconds() / 3600
+            if age_hours > POLICY_EVENT_MAX_AGE_HOURS or age_hours < -0.083:
+                continue
+
+        seen.add(url)
+        tags = _policy_tags(title)
+        events.append({
+            "id": f"pol_{abs(hash(url)) % (10 ** 10):010d}",
+            "kind": "policy",
+            "title": title,
+            "url": url,
+            "source": str(item.get("source") or "").strip() or "未知来源",
+            "published_at": published.isoformat() if published else None,
+            "time_status": "verified" if published else "unknown",
+            "severity": _classify_policy_severity(title),
+            "tickers": tags["tickers"],
+            "sectors": tags["sectors"],
+        })
+        if len(events) >= limit:
+            break
+
+    return events
+
+
+def _numeric(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value):
+        return None
+    return float(value)
+
+
+def detect_indicator_events(
+    current_market: Any,
+    previous_market: Any,
+    *,
+    now: datetime | None = None,
+) -> list[dict]:
+    """Report indicators that moved materially since the previous snapshot.
+
+    Without a previous snapshot there is no move to report, so this abstains
+    rather than presenting a level as if it were an event.
+    """
+    if not isinstance(current_market, dict) or not isinstance(previous_market, dict):
+        return []
+    if not previous_market:
+        return []
+
+    stamp = (now or datetime.now(timezone.utc)).replace(microsecond=0)
+    events: list[dict] = []
+
+    def add(event_id, title, prev, curr, unit, severity, tickers, sectors, note):
+        events.append({
+            "id": event_id,
+            "kind": "indicator",
+            "title": title,
+            "source": "风险雷达指标监控",
+            "published_at": stamp.isoformat(),
+            "time_status": "verified",
+            "severity": severity,
+            "previous_value": prev,
+            "current_value": curr,
+            "unit": unit,
+            "note": note,
+            "tickers": list(tickers),
+            "sectors": list(sectors),
+        })
+
+    vix_now = _numeric((current_market.get("vix") or {}).get("value"))
+    vix_before = _numeric((previous_market.get("vix") or {}).get("value"))
+    if vix_now is not None and vix_before is not None:
+        change = vix_now - vix_before
+        if abs(change) >= 3.0 or (vix_now >= 25 > vix_before):
+            rising = change > 0
+            add(
+                "ind_vix_spike" if rising else "ind_vix_collapse",
+                f"VIX {'跳升' if rising else '快速回落'} {abs(change):.1f} 点"
+                f"（{vix_before:.1f} → {vix_now:.1f}）",
+                vix_before, vix_now, "point",
+                "high" if vix_now >= 25 else "medium",
+                ("VXX", "SPY") if rising else ("SPY",),
+                ("波动率", "美股大盘"),
+                "恐慌指数快速变化通常先于风险资产重定价" if rising
+                else "波动率回落，风险偏好可能修复",
+            )
+
+    hy_now = _numeric((current_market.get("credit_spreads") or {}).get("hy_oas"))
+    hy_before = _numeric((previous_market.get("credit_spreads") or {}).get("hy_oas"))
+    if hy_now is not None and hy_before is not None:
+        change = hy_now - hy_before
+        if abs(change) >= 25:
+            widening = change > 0
+            add(
+                "ind_credit_widening" if widening else "ind_credit_tightening",
+                f"高收益债利差{'走阔' if widening else '收窄'} {abs(change):.0f}bp"
+                f"（{hy_before:.0f} → {hy_now:.0f}bp）",
+                hy_before, hy_now, "basis_points",
+                "high" if widening and hy_now >= 450 else "medium",
+                ("HYG", "KRE"),
+                ("信用市场", "区域银行"),
+                "信用利差是系统性压力最直接的先行指标",
+            )
+
+    curve_now = _numeric((current_market.get("yield_curve") or {}).get("spread_2y10y"))
+    curve_before = _numeric((previous_market.get("yield_curve") or {}).get("spread_2y10y"))
+    if curve_now is not None and curve_before is not None:
+        if (curve_now < 0) != (curve_before < 0):
+            inverting = curve_now < 0
+            add(
+                "ind_curve_inversion" if inverting else "ind_curve_normalization",
+                f"2s10s 收益率曲线{'转为倒挂' if inverting else '结束倒挂'}"
+                f"（{curve_before:+.2f} → {curve_now:+.2f}）",
+                curve_before, curve_now, "percent",
+                "high" if inverting else "medium",
+                ("TLT", "KRE"),
+                ("银行股", "利率敏感板块"),
+                "曲线形态反转历来与衰退预期切换同步",
+            )
+
+    dxy_now = _numeric((current_market.get("dxy") or {}).get("value"))
+    dxy_before = _numeric((previous_market.get("dxy") or {}).get("value"))
+    if dxy_now is not None and dxy_before and dxy_before != 0:
+        change_pct = (dxy_now - dxy_before) / dxy_before * 100
+        if abs(change_pct) >= 1.0:
+            strengthening = change_pct > 0
+            add(
+                "ind_dxy_move",
+                f"美元指数{'走强' if strengthening else '走弱'} {abs(change_pct):.1f}%"
+                f"（{dxy_before:.2f} → {dxy_now:.2f}）",
+                dxy_before, dxy_now, "percent",
+                "medium",
+                ("UUP", "GLD"),
+                ("新兴市场", "大宗商品"),
+                "美元快速变动会重新定价新兴市场与大宗商品",
+            )
+
+    cny_now = _numeric((current_market.get("usd_cny") or {}).get("rate"))
+    cny_before = _numeric((previous_market.get("usd_cny") or {}).get("rate"))
+    if cny_now is not None and cny_before is not None:
+        for threshold in (7.20, 7.30):
+            if (cny_now >= threshold) != (cny_before >= threshold):
+                add(
+                    f"ind_usdcny_{str(threshold).replace('.', '')}",
+                    f"美元/人民币{'升破' if cny_now >= threshold else '回落至'} "
+                    f"{threshold:.2f}（{cny_before:.4f} → {cny_now:.4f}）",
+                    cny_before, cny_now, "rate",
+                    "high" if threshold >= 7.30 else "medium",
+                    ("FXI", "CNY=X"),
+                    ("中概股", "出口链"),
+                    "汇率关键位切换会牵动中概与出口链定价",
+                )
+                break
+
+    return events
+
+
+def assemble_monitored_events(
+    *,
+    policy_events: Any = None,
+    indicator_events: Any = None,
+    limit: int = MONITORED_EVENT_LIMIT,
+) -> list[dict]:
+    """Merge event streams, newest first, with undated records last."""
+    merged: list[dict] = []
+    for group in (indicator_events, policy_events):
+        if isinstance(group, (list, tuple)):
+            merged.extend(item for item in group if isinstance(item, dict))
+
+    def is_dated(event: dict) -> bool:
+        published = event.get("published_at")
+        return isinstance(published, str) and bool(published)
+
+    dated = sorted(
+        (event for event in merged if is_dated(event)),
+        key=lambda event: event["published_at"],
+        reverse=True,
+    )
+    undated = [event for event in merged if not is_dated(event)]
+    return (dated + undated)[:limit]
 
 
 # ════════════════════════════════════════════
@@ -690,8 +1068,12 @@ def _safe_fetch(fn, default=None):
         return default if default is not None else {}
 
 
-def generate_risk_report() -> dict:
-    """生成完整风险雷达报告"""
+def generate_risk_report(previous_market_data: dict | None = None) -> dict:
+    """生成完整风险雷达报告。
+
+    传入上一份快照的 market_data 才能判断指标是否发生异动；缺少历史时只输出
+    政策事件，不把当前水平当成"刚刚发生的事件"。
+    """
     # 采集数据（每个数据源独立超时保护）
     vix_data = _safe_fetch(fetch_vix)
     treasury_data = _safe_fetch(fetch_treasury_yields)
@@ -733,6 +1115,28 @@ def generate_risk_report() -> dict:
     prob_order = {"high": 0, "medium_to_high": 1, "medium": 2, "low_to_medium": 3, "low": 4}
     black_swans.sort(key=lambda x: prob_order.get(x["probability"], 99))
 
+    market_data = {
+        "vix": vix_data,
+        "treasury": treasury_data,
+        "yield_curve": yield_curve,
+        "usd_cny": usd_cny_data,
+        "dxy": dxy_data,
+        "gold_oil": gold_oil_data,
+        "credit_spreads": credit_data,
+    }
+
+    # 具体监控到的事件：政策原文 + 指标异动
+    fomc_items = _safe_fetch(fetch_fomc, default=[])
+    fed_speeches = _safe_fetch(fetch_fed_speeches, default=[])
+    pboc_speech = _safe_fetch(fetch_pboc_speech, default=[])
+    monitored_events = assemble_monitored_events(
+        policy_events=build_policy_events(
+            list(fomc_items) + list(fed_items) + list(fed_speeches)
+            + list(pboc_items) + list(pboc_speech)
+        ),
+        indicator_events=detect_indicator_events(market_data, previous_market_data),
+    )
+
     report = {
         "public_schema_version": 1,
         "timestamp": now_cn(),
@@ -752,15 +1156,8 @@ def generate_risk_report() -> dict:
             "geopolitical": geopolitical,
             "china_risk": china_risk,
         },
-        "market_data": {
-            "vix": vix_data,
-            "treasury": treasury_data,
-            "yield_curve": yield_curve,
-            "usd_cny": usd_cny_data,
-            "dxy": dxy_data,
-            "gold_oil": gold_oil_data,
-            "credit_spreads": credit_data,
-        },
+        "market_data": market_data,
+        "monitored_events": monitored_events,
         "black_swan_scenarios": black_swans,
         "gray_rhinos": gray_rhinos,
         "opportunities": opportunities,

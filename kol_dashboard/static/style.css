@@ -289,6 +289,39 @@ details[open] .scenario-chev { transform: rotate(90deg); }
   font-variant-numeric: tabular-nums;
 }
 .tag.ticker { color: var(--accent); background: var(--accent-soft); border-color: transparent; font-weight: 600; }
+.tag.sector { color: var(--text-2); background: var(--panel-3); border-style: dashed; }
+
+/* Tradeable symbols and sector themes must stay visually distinct. */
+.tagline-split { gap: 10px; margin-top: 8px; align-items: center; }
+.tag-group { display: inline-flex; flex-wrap: wrap; gap: 5px; align-items: center; }
+.tag-group-label {
+  font-size: 10.5px; color: var(--muted); letter-spacing: .04em;
+  padding-right: 2px;
+}
+
+/* ─── Monitored events ────────────────────── */
+.event-list { display: grid; gap: 10px; }
+.event {
+  background: var(--panel); border: 1px solid var(--border);
+  border-left: 3px solid var(--lvl, var(--neutral));
+  border-radius: 12px; padding: 13px 16px;
+}
+.event-head {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+.event-kind.indicator { --lvl: var(--accent); }
+.event-source { font-size: 11.5px; color: var(--muted); }
+.event-time { font-size: 11.5px; color: var(--muted); margin-left: auto; }
+.event-time.unverified { color: var(--med); border-bottom: 1px dotted var(--med); cursor: help; }
+.event-title { font-size: 14px; font-weight: 600; line-height: 1.5; }
+.event-title a { color: inherit; text-decoration: none; }
+.event-title a:hover { text-decoration: underline; }
+.event-move {
+  font-size: 12.5px; color: var(--text-2); margin-top: 5px;
+  font-variant-numeric: tabular-nums;
+}
+.event-note { font-size: 12px; color: var(--muted); margin-top: 5px; line-height: 1.5; }
 
 .pill {
   font-size: 10.5px; font-weight: 660; padding: 2px 8px; border-radius: 20px;
