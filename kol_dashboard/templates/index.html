@@ -18,7 +18,7 @@
     } catch (e) {}
   })();
 </script>
-  <link rel="stylesheet" href="static/style.css?v=12" />
+  <link rel="stylesheet" href="static/style.css?v=13" />
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ccircle cx='50' cy='50' r='42' fill='%230b1720' stroke='%2331d69b' stroke-width='6'/%3E%3Ccircle cx='50' cy='50' r='20' fill='none' stroke='%234ab8d8' stroke-width='5'/%3E%3Cpath d='M50 50L82 24' stroke='%23f4b942' stroke-width='6' stroke-linecap='round'/%3E%3Ccircle cx='50' cy='50' r='7' fill='%23eef4f2'/%3E%3C/svg%3E" />
 </head>
 <body>
@@ -155,10 +155,10 @@
       <div class="metric-grid" id="macro-metrics"></div>
     </section>
 
-    <section class="block" id="macro-events-block" hidden>
+    <section class="block" id="macro-events-block" aria-labelledby="macro-events-title" hidden>
       <div class="block-head">
-        <h2>监控到的事件</h2>
-        <p class="block-sub">近 72 小时的政策原文与指标异动，最新在前 · 时间无法核验的会明确标注</p>
+        <h2 id="macro-events-title">监控到的事件</h2>
+        <p class="block-sub">近 72 小时的政策原文与指标异动，最新在前 · AI 提炼要点，原始标题与证据边界始终保留</p>
       </div>
       <div class="event-list" id="macro-events"></div>
     </section>
@@ -339,6 +339,6 @@
   </div>
 </div>
 
-<script src="static/app.js?v=12"></script>
+<script src="static/app.js?v=13"></script>
 </body>
 </html>

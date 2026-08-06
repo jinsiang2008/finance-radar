@@ -2,11 +2,20 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import unittest
+from pathlib import Path
 from urllib.request import Request
 from unittest import mock
 
 from kol_dashboard import llm_enrichment
+
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import enrichment_collect  # noqa: E402
 
 
 def valid_result(**overrides):
@@ -101,6 +110,277 @@ class EventInputTests(unittest.TestCase):
 
         self.assertEqual(payload["mentioned_tickers"], ["AMD", "NVDA"])
         self.assertEqual(base_hash, equivalent_hash)
+
+
+class MacroEventInputTests(unittest.TestCase):
+    def test_policy_identity_is_stable_and_ignores_feed_tracking_noise(self) -> None:
+        original = {
+            "id": "pol_old-process-specific-id",
+            "kind": "policy",
+            "title": "Federal Reserve policy statement",
+            "url": "HTTPS://FederalReserve.gov/a?utm_source=rss&section=policy#top",
+            "source": "Federal Reserve",
+        }
+        collected_again = {
+            **original,
+            "id": "pol_new-process-specific-id",
+            "title": "Updated feed wording",
+            "url": "https://federalreserve.gov/a?section=policy&utm_medium=feed",
+        }
+
+        self.assertEqual(
+            llm_enrichment.macro_event_key(original),
+            llm_enrichment.macro_event_key(collected_again),
+        )
+        self.assertTrue(
+            llm_enrichment.macro_event_key(original).startswith("policy:")
+        )
+
+    def test_indicator_input_contains_observed_move_and_invalidates_on_change(
+        self,
+    ) -> None:
+        event = {
+            "id": "ind_vix_spike",
+            "kind": "indicator",
+            "title": "VIX 跳升 12 点",
+            "source": "风险雷达指标监控",
+            "previous_value": 15.0,
+            "current_value": 27.0,
+            "unit": "point",
+            "note": "恐慌指数快速变化通常先于风险资产重定价",
+            "tickers": ["SPY", "VXX", "SPY"],
+            "sectors": ["美股大盘", "波动率"],
+            "published_at": "2026-08-03T12:00:00+00:00",
+            "snapshot_id": 10,
+        }
+        next_snapshot = {
+            **event,
+            "published_at": "2026-08-03T13:00:00+00:00",
+            "snapshot_id": 11,
+            "created_at": "2026-08-03T13:00:01+00:00",
+            "ai_status": "ready",
+            "ai_enrichment": {"summary_zh": "旧缓存不得进入输入"},
+        }
+
+        payload, digest = llm_enrichment.build_macro_event_input(event)
+        repeated_payload, repeated_digest = llm_enrichment.build_macro_event_input(
+            next_snapshot
+        )
+        _, changed_digest = llm_enrichment.build_macro_event_input(
+            {**next_snapshot, "current_value": 29.5}
+        )
+        _, changed_note_digest = llm_enrichment.build_macro_event_input(
+            {**next_snapshot, "note": "更新后的规则说明"}
+        )
+        _, changed_severity_digest = llm_enrichment.build_macro_event_input(
+            {**next_snapshot, "severity": "critical"}
+        )
+
+        self.assertEqual(payload, repeated_payload)
+        self.assertEqual(digest, repeated_digest)
+        self.assertNotEqual(digest, changed_digest)
+        self.assertNotEqual(digest, changed_note_digest)
+        self.assertNotEqual(digest, changed_severity_digest)
+        self.assertEqual(len(digest), 64)
+        self.assertEqual(payload["profile"], "macro_monitor")
+        self.assertEqual(payload["event_kind"], "indicator")
+        self.assertEqual(payload["evidence_basis"], "indicator_data")
+        self.assertIn("前值 15.0", payload["snippet"])
+        self.assertIn("当前值 27.0", payload["snippet"])
+        self.assertIn("单位 point", payload["snippet"])
+        self.assertIn(event["note"], payload["snippet"])
+        self.assertEqual(payload["mentioned_tickers"], ["SPY", "VXX"])
+        self.assertEqual(payload["sectors"], ["波动率", "美股大盘"])
+        self.assertNotIn("snapshot_id", payload)
+        self.assertNotIn("published_at", payload)
+        self.assertNotIn("created_at", payload)
+        self.assertNotIn("ai_status", payload)
+        self.assertNotIn("ai_enrichment", payload)
+
+    def test_policy_input_is_explicitly_title_only(self) -> None:
+        payload, _ = llm_enrichment.build_macro_event_input(
+            {
+                "id": "pol_abc",
+                "kind": "policy",
+                "title": "Federal Reserve issues FOMC statement",
+                "url": "https://federalreserve.gov/policy.htm",
+                "source": "Federal Reserve",
+                "published_at": "2026-08-03T09:00:00+00:00",
+            }
+        )
+
+        self.assertEqual(payload["evidence_basis"], "title_only")
+        self.assertEqual(payload["snippet"], "")
+        self.assertNotIn("published_at", payload)
+
+    def test_macro_lists_are_deduplicated_and_order_independent(self) -> None:
+        base = {
+            "id": "ind_cross_asset_move",
+            "kind": "indicator",
+            "title": "跨资产波动",
+            "source": "风险雷达指标监控",
+            "previous_value": 1.0,
+            "current_value": 2.0,
+            "unit": "index",
+            "tickers": ["SPY", "VXX"],
+            "sectors": ["美股大盘", "波动率"],
+        }
+        equivalent = {
+            **base,
+            "tickers": ["VXX", "SPY", "SPY"],
+            "sectors": ["波动率", "美股大盘", "波动率"],
+        }
+
+        payload, digest = llm_enrichment.build_macro_event_input(base)
+        equivalent_payload, equivalent_digest = (
+            llm_enrichment.build_macro_event_input(equivalent)
+        )
+
+        self.assertEqual(payload, equivalent_payload)
+        self.assertEqual(digest, equivalent_digest)
+
+
+class EnrichmentWorkerQuotaTests(unittest.TestCase):
+    @staticmethod
+    def _macro_event(index: int) -> dict:
+        return {
+            "id": f"ind_test_{index}",
+            "kind": "indicator",
+            "title": f"指标事件 {index}",
+            "source": "风险雷达指标监控",
+            "previous_value": 10.0 + index,
+            "current_value": 20.0 + index,
+            "unit": "point",
+            "note": "用于测试独立宏观配额",
+            "severity": "high",
+            "tickers": ["SPY"],
+            "sectors": ["美股大盘"],
+        }
+
+    def test_macro_and_kol_enrichment_have_independent_quotas(self) -> None:
+        macro_events = [self._macro_event(index) for index in range(4)]
+        kol_events = [
+            {"id": index, "title": f"KOL event {index}", "snippet": ""}
+            for index in range(1, 4)
+        ]
+        config = llm_enrichment.DeepSeekConfig(api_key="test-secret")
+
+        with (
+            mock.patch.object(enrichment_collect.db, "init"),
+            mock.patch.object(
+                enrichment_collect.llm_enrichment,
+                "load_config",
+                return_value=config,
+            ),
+            mock.patch.object(
+                enrichment_collect.db,
+                "latest_macro",
+                return_value={"monitored_events": macro_events},
+            ),
+            mock.patch.object(
+                enrichment_collect.db,
+                "query_enrichment_candidates",
+                return_value=kol_events,
+            ),
+            mock.patch.object(
+                enrichment_collect.db,
+                "claim_macro_event_enrichment",
+                side_effect=lambda *args, **kwargs: (f"macro-{args[0]}", 1),
+            ) as claim_macro,
+            mock.patch.object(
+                enrichment_collect.db,
+                "claim_event_enrichment",
+                side_effect=lambda event_id, **kwargs: f"kol-{event_id}",
+            ) as claim_kol,
+            mock.patch.object(
+                enrichment_collect.llm_enrichment,
+                "enrich_event",
+                return_value=valid_result(),
+            ) as enrich,
+            mock.patch.object(
+                enrichment_collect.db,
+                "save_macro_event_enrichment",
+                return_value=True,
+            ) as save_macro,
+            mock.patch.object(
+                enrichment_collect.db,
+                "save_event_enrichment",
+                return_value=True,
+            ) as save_kol,
+        ):
+            counts, stopped = enrichment_collect.run(
+                limit=1,
+                macro_limit=2,
+                max_age_hours=72,
+            )
+
+        self.assertFalse(stopped)
+        self.assertEqual(counts["macro_processed"], 2)
+        self.assertEqual(counts["macro_ready"], 2)
+        self.assertEqual(counts["processed"], 1)
+        self.assertEqual(counts["ready"], 1)
+        self.assertEqual(claim_macro.call_count, 2)
+        self.assertEqual(claim_kol.call_count, 1)
+        self.assertEqual(save_macro.call_count, 2)
+        self.assertEqual(save_kol.call_count, 1)
+        self.assertEqual(enrich.call_count, 3)
+
+    def test_warm_macro_cache_does_not_consume_the_processing_quota(self) -> None:
+        warm = self._macro_event(1)
+        pending = self._macro_event(2)
+        config = llm_enrichment.DeepSeekConfig(api_key="test-secret")
+        pending_key = llm_enrichment.macro_event_key(pending)
+
+        def claim(event_key: str, **kwargs):
+            if event_key == pending_key:
+                return "pending-claim", 1
+            return None
+
+        with (
+            mock.patch.object(enrichment_collect.db, "init"),
+            mock.patch.object(
+                enrichment_collect.llm_enrichment,
+                "load_config",
+                return_value=config,
+            ),
+            mock.patch.object(
+                enrichment_collect.db,
+                "latest_macro",
+                return_value={"monitored_events": [warm, pending]},
+            ),
+            mock.patch.object(
+                enrichment_collect.db,
+                "query_enrichment_candidates",
+                return_value=[],
+            ),
+            mock.patch.object(
+                enrichment_collect.db,
+                "claim_macro_event_enrichment",
+                side_effect=claim,
+            ) as claim_macro,
+            mock.patch.object(
+                enrichment_collect.llm_enrichment,
+                "enrich_event",
+                return_value=valid_result(),
+            ) as enrich,
+            mock.patch.object(
+                enrichment_collect.db,
+                "save_macro_event_enrichment",
+                return_value=True,
+            ) as save_macro,
+        ):
+            counts, stopped = enrichment_collect.run(
+                limit=1,
+                macro_limit=1,
+                max_age_hours=72,
+            )
+
+        self.assertFalse(stopped)
+        self.assertEqual(counts["macro_processed"], 1)
+        self.assertEqual(counts["macro_ready"], 1)
+        self.assertEqual(claim_macro.call_count, 2)
+        self.assertEqual(enrich.call_count, 1)
+        self.assertEqual(save_macro.call_args.args[0], pending_key)
 
 
 class ResultValidationTests(unittest.TestCase):

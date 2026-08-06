@@ -132,6 +132,18 @@ _PUBLIC_MACRO_EVENT_FIELDS = (
     "tickers",
     "sectors",
 )
+_PUBLIC_MACRO_AI_STATUSES = {"pending", "processing", "ready", "retry", "failed"}
+_PUBLIC_MACRO_AI_IMPACTS = {"high", "medium", "low", "none"}
+_PUBLIC_MACRO_AI_DIRECTIONS = {"positive", "negative", "mixed", "unclear"}
+_PUBLIC_MACRO_AI_HORIZONS = {"intraday", "short", "medium", "long"}
+_PUBLIC_MACRO_AI_LANGUAGES = {"zh", "en", "mixed", "other", "unknown"}
+_PUBLIC_MACRO_AI_EVIDENCE = {
+    "title",
+    "title_only",
+    "title_and_snippet",
+    "post_text",
+    "indicator_data",
+}
 _PUBLIC_MACRO_OPPORTUNITY_FIELDS = (
     "id",
     "type",
@@ -638,6 +650,151 @@ def _project_macro_items(value: Any, fields: tuple[str, ...]) -> list[dict[str, 
     return output
 
 
+def _macro_ai_text(value: Any, maximum: int) -> str:
+    if not isinstance(value, str):
+        return ""
+    return _sanitize_public_string(re.sub(r"\s+", " ", value).strip())[:maximum]
+
+
+def _macro_ai_text_list(
+    value: Any,
+    *,
+    maximum_items: int,
+    maximum_length: int,
+) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    output: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        text = _macro_ai_text(item, maximum_length)
+        key = text.casefold()
+        if text and key not in seen:
+            seen.add(key)
+            output.append(text)
+        if len(output) >= maximum_items:
+            break
+    return output
+
+
+def _project_macro_event_ai(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    headline = _macro_ai_text(value.get("headline_zh"), 72)
+    summary = _macro_ai_text(value.get("summary_zh"), 280)
+    why = _macro_ai_text(value.get("why_it_matters_zh"), 220)
+    if not headline or not summary or not why:
+        return None
+
+    impact = str(value.get("impact_level") or "").strip().lower()
+    if impact not in _PUBLIC_MACRO_AI_IMPACTS:
+        impact = "low"
+    language = str(value.get("language") or "unknown").strip().lower()
+    if language not in _PUBLIC_MACRO_AI_LANGUAGES:
+        language = "unknown"
+    evidence = str(value.get("evidence_basis") or "title_only").strip().lower()
+    if evidence not in _PUBLIC_MACRO_AI_EVIDENCE:
+        evidence = "title_only"
+    confidence = _finite_number(value.get("confidence"))
+    confidence = (
+        round(max(0.0, min(1.0, confidence)), 2)
+        if confidence is not None
+        else 0.0
+    )
+
+    assets: list[dict[str, Any]] = []
+    seen_assets: set[str] = set()
+    raw_assets = value.get("assets")
+    if isinstance(raw_assets, list):
+        for raw in raw_assets:
+            if not isinstance(raw, Mapping):
+                continue
+            asset_key = _macro_ai_text(raw.get("asset_key"), 32).upper()
+            if (
+                not re.fullmatch(
+                    r"(?:US|CN|HK|INDEX|ETF|BOND|FX|COMMODITY|CRYPTO):[A-Z0-9.^_-]{1,20}",
+                    asset_key,
+                )
+                or asset_key in seen_assets
+            ):
+                continue
+            direction = str(raw.get("direction") or "unclear").strip().lower()
+            horizon = str(raw.get("horizon") or "short").strip().lower()
+            asset_confidence = _finite_number(raw.get("confidence"))
+            seen_assets.add(asset_key)
+            assets.append(
+                {
+                    "asset_key": asset_key,
+                    "name_zh": _macro_ai_text(raw.get("name_zh"), 30),
+                    "direction": (
+                        direction
+                        if direction in _PUBLIC_MACRO_AI_DIRECTIONS
+                        else "unclear"
+                    ),
+                    "horizon": (
+                        horizon
+                        if horizon in _PUBLIC_MACRO_AI_HORIZONS
+                        else "short"
+                    ),
+                    "reason_zh": _macro_ai_text(raw.get("reason_zh"), 90),
+                    "confidence": round(
+                        max(0.0, min(1.0, asset_confidence or 0.0)), 2
+                    ),
+                }
+            )
+            if len(assets) >= 6:
+                break
+
+    return {
+        "status": "ready",
+        "headline_zh": headline,
+        "summary_zh": summary,
+        "why_it_matters_zh": why,
+        "impact_level": impact,
+        "impact_path": _macro_ai_text_list(
+            value.get("impact_path"), maximum_items=3, maximum_length=150
+        ),
+        "tags": _macro_ai_text_list(
+            value.get("tags"), maximum_items=6, maximum_length=16
+        ),
+        "assets": assets,
+        "cluster_key": _macro_ai_text(value.get("cluster_key"), 96),
+        "language": language,
+        "confidence": confidence,
+        "evidence_basis": evidence,
+        "model": _macro_ai_text(value.get("model"), 80),
+        "generated_at": _macro_ai_text(value.get("generated_at"), 64),
+    }
+
+
+def _project_macro_events(
+    value: Any,
+    enrichment_map: Mapping[str, Any] | None,
+) -> list[dict[str, Any]]:
+    events = _project_macro_items(value, _PUBLIC_MACRO_EVENT_FIELDS)
+    records = enrichment_map if isinstance(enrichment_map, Mapping) else {}
+    for event in events:
+        event_id = str(event.get("id") or "")
+        cache = records.get(event_id)
+        status = (
+            str(cache.get("status") or "pending").strip().lower()
+            if isinstance(cache, Mapping)
+            else "pending"
+        )
+        if status not in _PUBLIC_MACRO_AI_STATUSES:
+            status = "pending"
+        enrichment = (
+            _project_macro_event_ai(cache.get("ai_enrichment"))
+            if status == "ready" and isinstance(cache, Mapping)
+            else None
+        )
+        if status == "ready" and enrichment is None:
+            status = "failed"
+        event["ai_status"] = status
+        event["ai_enrichment"] = enrichment
+    return events
+
+
 def _project_macro_sub_scores(
     value: Any,
     *,
@@ -716,7 +873,10 @@ def _project_macro_market_data(
     return output
 
 
-def project_public_macro(snapshot: Any) -> dict[str, Any]:
+def project_public_macro(
+    snapshot: Any,
+    macro_event_enrichments: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """Project a macro snapshot without legacy portfolio-specific fields."""
     if not isinstance(snapshot, Mapping):
         return {}
@@ -792,9 +952,9 @@ def project_public_macro(snapshot: Any) -> dict[str, Any]:
         snapshot.get("opportunities") if trusted else None,
         _PUBLIC_MACRO_OPPORTUNITY_FIELDS,
     )
-    output["monitored_events"] = _project_macro_items(
+    output["monitored_events"] = _project_macro_events(
         snapshot.get("monitored_events") if trusted else None,
-        _PUBLIC_MACRO_EVENT_FIELDS,
+        macro_event_enrichments,
     )
     return output
 

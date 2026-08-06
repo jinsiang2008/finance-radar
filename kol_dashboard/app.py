@@ -40,6 +40,7 @@ from pydantic import BaseModel, Field
 import auth
 import db
 import decision_service
+import llm_enrichment
 
 BASE = Path(__file__).parent
 app = FastAPI(title="KOL Dashboard + Macro Risk Radar", version="2.0")
@@ -312,7 +313,41 @@ def api_macro() -> JSONResponse:
             {"available": False, "reason": "尚未采集到宏观快照，请运行 macro_collect.py"},
             status_code=200,
         )
-    public_snapshot = decision_service.project_public_macro(snap)
+    expected: list[tuple[str, str, str]] = []
+    monitored_events = snap.get("monitored_events")
+    if isinstance(monitored_events, list):
+        for event in monitored_events[:24]:
+            if not isinstance(event, Mapping):
+                continue
+            event_id = str(event.get("id") or "").strip()
+            if not event_id:
+                continue
+            event_key = llm_enrichment.macro_event_key(event)
+            _, input_hash = llm_enrichment.build_macro_event_input(event)
+            expected.append((event_id, event_key, input_hash))
+
+    cached = db.query_macro_event_enrichments(
+        event_key for _, event_key, _ in expected
+    )
+    matching: dict[str, dict[str, Any]] = {}
+    for event_id, event_key, input_hash in expected:
+        value = cached.get(event_key)
+        if not isinstance(value, Mapping):
+            continue
+        # A cache entry is evidence-bound: stale output never follows a title
+        # or indicator value after the underlying monitored event changes.
+        if (
+            value.get("input_hash") != input_hash
+            or value.get("prompt_version")
+            != llm_enrichment.MACRO_PROMPT_VERSION
+        ):
+            continue
+        matching[event_id] = dict(value)
+
+    public_snapshot = decision_service.project_public_macro(
+        snap,
+        macro_event_enrichments=matching,
+    )
     public_snapshot["available"] = True
     return JSONResponse(public_snapshot)
 

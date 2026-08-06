@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import sys
 import unittest
 from datetime import datetime, timezone
@@ -252,6 +253,40 @@ class AssetTagTests(unittest.TestCase):
 
 
 class MonitoredEventTests(unittest.TestCase):
+    def test_policy_event_id_is_a_stable_sha256_key(self) -> None:
+        url = (
+            "https://federalreserve.gov/newsevents/pressreleases/"
+            "test.htm?section=policy&amp;view=full"
+        )
+        normalized_url = url.replace("&amp;", "&")
+
+        first = risk_radar.build_policy_events(
+            [
+                {
+                    "title": "Federal Reserve policy statement",
+                    "url": url,
+                    "source": "Federal Reserve",
+                    "date": "Mon, 03 Aug 2026 09:00:00 GMT",
+                }
+            ],
+            now=NOW,
+        )[0]
+        repeated = risk_radar.build_policy_events(
+            [
+                {
+                    "title": "A revised feed title must not change identity",
+                    "url": url,
+                    "source": "Federal Reserve",
+                    "date": "Mon, 03 Aug 2026 09:00:00 GMT",
+                }
+            ],
+            now=NOW,
+        )[0]
+
+        digest = hashlib.sha256(normalized_url.encode("utf-8")).hexdigest()
+        self.assertEqual(first["id"], repeated["id"])
+        self.assertEqual(first["id"], f"pol_{digest[:12]}")
+
     def test_policy_events_normalize_time_and_flag_unverified(self) -> None:
         events = risk_radar.build_policy_events(
             [

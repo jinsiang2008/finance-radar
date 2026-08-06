@@ -69,6 +69,7 @@ class FrontendContractTests(unittest.TestCase):
     def test_macro_view_lists_monitored_events_with_time_provenance(self) -> None:
         self.assertIn('id="macro-events-block"', self.html)
         self.assertIn('id="macro-events"', self.html)
+        self.assertIn('aria-labelledby="macro-events-title"', self.html)
         self.assertIn("监控到的事件", self.html)
         self.assertIn("renderMonitoredEvents", self.javascript)
         self.assertIn("monitored_events", self.javascript)
@@ -97,8 +98,55 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn('stale ? "数据延迟" : ""', self.javascript)
         self.assertIn('"高收益债利差"', self.javascript)
         self.assertIn("cs.hy_oas", self.javascript)
-        self.assertIn('static/app.js?v=12', self.html)
+        self.assertIn('static/app.js?v=13', self.html)
+        self.assertIn('static/style.css?v=13', self.html)
         self.assertIn(".metric.is-stale", self.css)
+
+    def test_macro_events_render_compact_ai_digest_and_bounded_highlights(self) -> None:
+        self.assertIn("function renderMacroAiDigest(list)", self.javascript)
+        self.assertIn('class="macro-ai-digest"', self.javascript)
+        self.assertIn("AI 态势摘录", self.javascript)
+        self.assertIn('role="status" aria-live="polite"', self.javascript)
+        self.assertIn("statusCounts.ready", self.javascript)
+        self.assertIn(".slice(0, 3)", self.javascript)
+        self.assertIn("高影响", self.javascript)
+        self.assertIn("中影响", self.javascript)
+        self.assertIn("待生成", self.javascript)
+        self.assertIn("待重试", self.javascript)
+        self.assertIn("不可用", self.javascript)
+        self.assertIn(".macro-ai-digest", self.css)
+        self.assertIn(".macro-ai-points", self.css)
+
+    def test_macro_event_cards_use_ai_copy_and_native_disclosure(self) -> None:
+        for field in (
+            "ai_status",
+            "ai_enrichment",
+            "headline_zh",
+            "summary_zh",
+            "why_it_matters_zh",
+            "impact_path",
+            "tags",
+            "assets",
+            "evidence_basis",
+            "confidence",
+            "model",
+            "generated_at",
+        ):
+            self.assertIn(field, self.javascript)
+        self.assertIn("function macroEventCopy(event)", self.javascript)
+        self.assertIn("function renderMacroEventInsight(event, copy)", self.javascript)
+        self.assertIn('aria-labelledby="${titleId}"', self.javascript)
+        self.assertIn('<details class="event-insight">', self.javascript)
+        self.assertIn("展开完整解读", self.javascript)
+        self.assertIn("为何重要", self.javascript)
+        self.assertIn("传导路径", self.javascript)
+        self.assertIn("可能受影响的资产", self.javascript)
+        self.assertIn("原始标题", self.javascript)
+        self.assertIn("仅标题证据", self.javascript)
+        self.assertIn("AI 解读暂不可用", self.javascript)
+        self.assertIn("AI 解读将在稍后重试", self.javascript)
+        self.assertIn(".event-insight > summary:focus-visible", self.css)
+        self.assertIn("min-height: 44px", self.css)
 
     def test_macro_coverage_distinguishes_stale_and_unavailable_sources(self) -> None:
         self.assertIn("source?.data_status", self.javascript)

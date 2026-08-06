@@ -20,6 +20,7 @@ Risk Radar — 黑天鹅/灰犀牛预警与系统性风险扫描
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import math
@@ -1061,7 +1062,10 @@ def build_policy_events(
         seen.add(url)
         tags = _policy_tags(title)
         events.append({
-            "id": f"pol_{abs(hash(url)) % (10 ** 10):010d}",
+            # Python's built-in hash is salted per process, so it cannot be
+            # used as a durable cache identity.  The URL is already the feed
+            # dedup key; a short SHA-256 prefix is stable across collectors.
+            "id": f"pol_{hashlib.sha256(url.encode('utf-8')).hexdigest()[:12]}",
             "kind": "policy",
             "title": title,
             "url": url,

@@ -15,10 +15,12 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 
 PROMPT_VERSION = "event-intelligence-v1"
+MACRO_PROMPT_VERSION = "macro-monitor-intelligence-v1"
 SCHEMA_VERSION = 1
 DEFAULT_MODEL = "deepseek-v4-flash"
 DEEPSEEK_ENDPOINT = "https://api.deepseek.com/chat/completions"
@@ -106,6 +108,134 @@ def build_event_input(event: Mapping[str, Any]) -> tuple[dict[str, Any], str]:
             event.get("kol_name_cn") or event.get("kol_name"), 80
         ),
         "mentioned_tickers": mentioned,
+        "evidence_basis": evidence_basis,
+    }
+    stable = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(stable.encode("utf-8")).hexdigest()
+    return payload, digest
+
+
+_IDENTITY_TRACKING_PARAMS = {
+    "ref",
+    "from",
+    "src",
+    "spm",
+    "utm_campaign",
+    "utm_content",
+    "utm_medium",
+    "utm_source",
+    "utm_term",
+}
+
+
+def _normalized_source_url(value: Any) -> str:
+    raw = _clean_source_text(value, 2_000)
+    if not raw:
+        return ""
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return raw
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return raw
+    query = [
+        (key, item)
+        for key, item in parse_qsl(parsed.query, keep_blank_values=False)
+        if key.lower() not in _IDENTITY_TRACKING_PARAMS
+    ]
+    return urlunsplit(
+        (
+            parsed.scheme.lower(),
+            parsed.netloc.lower(),
+            parsed.path or "/",
+            urlencode(sorted(query)),
+            "",
+        )
+    )
+
+
+def _clean_macro_values(value: Any, *, maximum_items: int = 12) -> list[str]:
+    if isinstance(value, str):
+        raw_values = value.split(",")
+    elif isinstance(value, (list, tuple, set)):
+        raw_values = value
+    else:
+        raw_values = []
+    output: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_values:
+        text = _clean_source_text(raw, 40)
+        key = text.casefold()
+        if text and key not in seen:
+            seen.add(key)
+            output.append(text)
+        if len(output) >= maximum_items:
+            break
+    return sorted(output, key=str.casefold)
+
+
+def macro_event_key(event: Mapping[str, Any]) -> str:
+    """Return a stable, opaque identity for one monitored macro event."""
+    kind = _clean_source_text(event.get("kind"), 24).lower() or "unknown"
+    if kind == "policy":
+        identity = _normalized_source_url(event.get("url"))
+    else:
+        identity = _clean_source_text(event.get("id"), 160)
+    if not identity:
+        identity = "\x1f".join(
+            (
+                _clean_source_text(event.get("source"), 120),
+                _clean_source_text(event.get("title"), 700),
+            )
+        )
+    digest = hashlib.sha256(f"{kind}\x1f{identity}".encode("utf-8")).hexdigest()
+    return f"{kind}:{digest[:24]}"
+
+
+def build_macro_event_input(event: Mapping[str, Any]) -> tuple[dict[str, Any], str]:
+    """Build the bounded evidence packet used for macro-event enrichment.
+
+    Snapshot timestamps are intentionally excluded so an unchanged monitored
+    event reuses its cache.  Indicator values remain in the packet and
+    therefore invalidate the result whenever the observed move changes.
+    """
+    kind = _clean_source_text(event.get("kind"), 24).lower() or "unknown"
+    note = _clean_source_text(event.get("note"), 700)
+    snippet = ""
+    evidence_basis = "title_only"
+    if kind == "indicator":
+        value_parts: list[str] = []
+        if event.get("previous_value") is not None:
+            value_parts.append(
+                f"前值 {_clean_source_text(event.get('previous_value'), 80)}"
+            )
+        if event.get("current_value") is not None:
+            value_parts.append(
+                f"当前值 {_clean_source_text(event.get('current_value'), 80)}"
+            )
+        unit = _clean_source_text(event.get("unit"), 40)
+        if unit:
+            value_parts.append(f"单位 {unit}")
+        sections: list[str] = []
+        if value_parts:
+            sections.append("监控数值：" + "，".join(value_parts))
+        if note:
+            sections.append("规则说明：" + note)
+        snippet = "；".join(sections)
+        evidence_basis = "indicator_data" if snippet else "title_only"
+    elif note:
+        snippet = note
+        evidence_basis = "title_and_snippet"
+
+    payload = {
+        "profile": "macro_monitor",
+        "event_kind": kind,
+        "title": _clean_source_text(event.get("title"), 700),
+        "snippet": snippet,
+        "source": _clean_source_text(event.get("source"), 120),
+        "rule_severity": _clean_source_text(event.get("severity"), 24).lower(),
+        "mentioned_tickers": _clean_macro_values(event.get("tickers")),
+        "sectors": _clean_macro_values(event.get("sectors")),
         "evidence_basis": evidence_basis,
     }
     stable = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))

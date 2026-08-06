@@ -23,8 +23,8 @@ import portfolio  # noqa: E402
 import app as dashboard_app  # noqa: E402
 
 
-def api_enrichment_result() -> dict:
-    return {
+def api_enrichment_result(**overrides) -> dict:
+    result = {
         "headline_zh": "人工智能需求推动英伟达信号升温",
         "summary_zh": "公开来源显示人工智能需求仍受关注，但订单与收入影响仍需等待公司披露确认。",
         "why_it_matters_zh": "该信号可能通过算力需求影响美国半导体股票及相关供应链。",
@@ -46,6 +46,8 @@ def api_enrichment_result() -> dict:
         "confidence": 0.77,
         "schema_version": 1,
     }
+    result.update(overrides)
+    return result
 
 
 class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
@@ -646,6 +648,226 @@ class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
             }
         )
         self.assertEqual(dashboard_app._macro_coverage(), 0.5)
+
+    async def test_macro_api_exposes_only_current_whitelisted_ai_analysis(
+        self,
+    ) -> None:
+        ready_event = {
+            "id": "ind_ready",
+            "kind": "indicator",
+            "title": "VIX 跳升 12 点",
+            "source": "风险雷达指标监控",
+            "published_at": "2026-08-06T04:00:00+00:00",
+            "time_status": "verified",
+            "severity": "high",
+            "previous_value": 15.0,
+            "current_value": 27.0,
+            "unit": "point",
+            "note": "恐慌指数快速变化通常先于风险资产重定价",
+            "tickers": ["VXX", "SPY"],
+            "sectors": ["波动率", "美股大盘"],
+        }
+        stale_original = {
+            **ready_event,
+            "id": "ind_stale",
+            "title": "OFR FSI 上升",
+            "previous_value": 1.0,
+            "current_value": 2.5,
+            "unit": "index",
+        }
+        stale_current = {**stale_original, "current_value": 4.0}
+        retry_event = {
+            "id": "pol_retry",
+            "kind": "policy",
+            "title": "Federal Reserve issues a policy statement",
+            "url": "https://federalreserve.gov/policy/retry.htm",
+            "source": "Federal Reserve",
+            "published_at": "2026-08-06T03:00:00+00:00",
+            "time_status": "verified",
+            "severity": "medium",
+            "tickers": ["SPY"],
+            "sectors": ["美股大盘"],
+        }
+        pending_event = {
+            **retry_event,
+            "id": "pol_pending",
+            "title": "PBOC issues an open-market notice",
+            "url": "https://pbc.gov.cn/policy/pending.htm",
+            "source": "中国人民银行",
+            "ai_status": "ready",
+            "ai_enrichment": {
+                "headline_zh": "PRIVATE-INJECTED-SNAPSHOT-AI",
+                "summary_zh": "不能信任快照中自带的 AI 字段",
+            },
+        }
+
+        def claim_params(event: dict) -> tuple[dict, str]:
+            event_input, input_hash = llm_enrichment.build_macro_event_input(event)
+            params = {
+                "event_key": llm_enrichment.macro_event_key(event),
+                "input_hash": input_hash,
+                "prompt_version": llm_enrichment.MACRO_PROMPT_VERSION,
+                "model": llm_enrichment.DEFAULT_MODEL,
+                "evidence_basis": event_input["evidence_basis"],
+            }
+            claimed = db.claim_macro_event_enrichment(**params)
+            self.assertIsNotNone(claimed)
+            assert claimed is not None
+            return params, claimed[0]
+
+        ready_params, ready_token = claim_params(ready_event)
+        self.assertTrue(
+            db.save_macro_event_enrichment(
+                **ready_params,
+                claim_token=ready_token,
+                result=api_enrichment_result(),
+            )
+        )
+        with db.conn() as connection:
+            connection.execute(
+                "UPDATE macro_event_enrichments "
+                "SET assets_json=?, claim_token=?, error_code=? "
+                "WHERE event_key=?",
+                (
+                    json.dumps(
+                        [
+                            {
+                                "asset_key": "US:NVDA",
+                                "name_zh": "英伟达",
+                                "direction": "positive",
+                                "horizon": "medium",
+                                "reason_zh": "波动率变化可能影响风险偏好。",
+                                "confidence": 0.8,
+                                "account": "PRIVATE-ASSET-ACCOUNT",
+                                "quantity": 999,
+                            },
+                            {
+                                "asset_key": "THEME:NOT-TRADEABLE",
+                                "name_zh": "不得公开",
+                                "direction": "positive",
+                                "horizon": "medium",
+                                "reason_zh": "无效资产键",
+                                "confidence": 1,
+                            },
+                        ],
+                        ensure_ascii=False,
+                    ),
+                    "PRIVATE-CLAIM-TOKEN",
+                    "PRIVATE-READY-ERROR",
+                    ready_params["event_key"],
+                ),
+            )
+
+        stale_params, stale_token = claim_params(stale_original)
+        self.assertTrue(
+            db.save_macro_event_enrichment(
+                **stale_params,
+                claim_token=stale_token,
+                result=api_enrichment_result(
+                    headline_zh="不得跟随新指标值展示的旧结论"
+                ),
+            )
+        )
+
+        retry_params, retry_token = claim_params(retry_event)
+        self.assertTrue(
+            db.fail_macro_event_enrichment(
+                retry_params["event_key"],
+                input_hash=retry_params["input_hash"],
+                prompt_version=retry_params["prompt_version"],
+                model=retry_params["model"],
+                claim_token=retry_token,
+                error_code="Bearer-private-provider-detail",
+                retry_after_seconds=900,
+            )
+        )
+
+        db.save_macro_snapshot(
+            {
+                "public_schema_version": 1,
+                "timestamp": "2026-08-06T04:00:00+00:00",
+                "composite_risk": {"score": 65, "level": "high"},
+                "monitored_events": [
+                    ready_event,
+                    stale_current,
+                    retry_event,
+                    pending_event,
+                ],
+                "market_data": {},
+                "sub_scores": {},
+                "black_swan_scenarios": [],
+                "gray_rhinos": [],
+                "opportunities": [],
+            }
+        )
+
+        response = await self.client.get("/api/macro")
+
+        self.assertEqual(response.status_code, 200)
+        events = {
+            item["id"]: item for item in response.json()["monitored_events"]
+        }
+        ready = events["ind_ready"]
+        self.assertEqual(ready["severity"], "high")
+        self.assertEqual(ready["ai_status"], "ready")
+        enrichment = ready["ai_enrichment"]
+        self.assertEqual(
+            set(enrichment),
+            {
+                "status",
+                "headline_zh",
+                "summary_zh",
+                "why_it_matters_zh",
+                "impact_level",
+                "impact_path",
+                "tags",
+                "assets",
+                "cluster_key",
+                "language",
+                "confidence",
+                "evidence_basis",
+                "model",
+                "generated_at",
+            },
+        )
+        self.assertEqual(enrichment["headline_zh"], api_enrichment_result()["headline_zh"])
+        self.assertEqual(len(enrichment["assets"]), 1)
+        self.assertEqual(
+            set(enrichment["assets"][0]),
+            {
+                "asset_key",
+                "name_zh",
+                "direction",
+                "horizon",
+                "reason_zh",
+                "confidence",
+            },
+        )
+
+        self.assertEqual(events["ind_stale"]["ai_status"], "pending")
+        self.assertIsNone(events["ind_stale"]["ai_enrichment"])
+        self.assertEqual(events["pol_retry"]["ai_status"], "retry")
+        self.assertIsNone(events["pol_retry"]["ai_enrichment"])
+        self.assertEqual(events["pol_pending"]["ai_status"], "pending")
+        self.assertIsNone(events["pol_pending"]["ai_enrichment"])
+
+        encoded = response.text.lower()
+        for forbidden in (
+            "input_hash",
+            "prompt_version",
+            "attempt_count",
+            "next_attempt_at",
+            "claim_token",
+            "error_code",
+            "raw_response",
+            "private-asset-account",
+            "private-claim-token",
+            "private-ready-error",
+            "bearer-private-provider-detail",
+            "private-injected-snapshot-ai",
+            "quantity",
+        ):
+            self.assertNotIn(forbidden, encoded)
 
     async def test_legacy_macro_portfolio_fields_never_reach_public_apis(
         self,

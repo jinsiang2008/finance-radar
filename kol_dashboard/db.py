@@ -11,6 +11,12 @@ Schema:
                     impact_path_json, tags_json, assets_json, cluster_key,
                     language, confidence, evidence_basis, model, generated_at)
 
+  macro_event_enrichments(event_key PRIMARY KEY, input_hash, prompt_version,
+                          status, headline_zh, summary_zh, why_it_matters_zh,
+                          impact_level, impact_path_json, tags_json,
+                          assets_json, cluster_key, language, confidence,
+                          evidence_basis, model, generated_at)
+
   event_sightings(event_id, kol_key, kol_name, kol_name_cn, source, source_url,
                   published_at, first_seen_at, last_seen_at, source_count)
 
@@ -958,6 +964,45 @@ def init() -> None:
             "ON event_enrichments(cluster_key) WHERE status='ready'"
         )
 
+        # Risk-radar events live inside immutable macro snapshot JSON rather
+        # than the canonical KOL events table, so their replaceable AI cache
+        # uses a stable opaque event key and deliberately has no foreign key.
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS macro_event_enrichments (
+              event_key TEXT PRIMARY KEY,
+              input_hash TEXT NOT NULL,
+              prompt_version TEXT NOT NULL,
+              status TEXT NOT NULL
+                CHECK(status IN ('pending', 'processing', 'ready', 'retry', 'failed')),
+              headline_zh TEXT NOT NULL DEFAULT '',
+              summary_zh TEXT NOT NULL DEFAULT '',
+              why_it_matters_zh TEXT NOT NULL DEFAULT '',
+              impact_level TEXT NOT NULL DEFAULT 'unknown'
+                CHECK(impact_level IN ('high', 'medium', 'low', 'none', 'unknown')),
+              impact_path_json TEXT NOT NULL DEFAULT '[]',
+              tags_json TEXT NOT NULL DEFAULT '[]',
+              assets_json TEXT NOT NULL DEFAULT '[]',
+              cluster_key TEXT NOT NULL DEFAULT '',
+              language TEXT NOT NULL DEFAULT 'unknown',
+              confidence REAL
+                CHECK(confidence IS NULL OR (confidence >= 0 AND confidence <= 1)),
+              evidence_basis TEXT NOT NULL DEFAULT 'title_only',
+              model TEXT NOT NULL DEFAULT '',
+              generated_at TEXT,
+              updated_at TEXT NOT NULL,
+              attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+              next_attempt_at TEXT,
+              error_code TEXT NOT NULL DEFAULT '',
+              claim_token TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_macro_event_enrichment_status "
+            "ON macro_event_enrichments(status, next_attempt_at, updated_at)"
+        )
+
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS relations (
@@ -1727,6 +1772,290 @@ def fail_event_enrichment(
                 next_attempt,
                 safe_code or "unknown",
                 int(event_id),
+                input_hash,
+                prompt_version,
+                model,
+                claim_token,
+            ),
+        )
+    return cur.rowcount == 1
+
+
+# ─── Macro monitored-event intelligence cache ─────────
+
+def _macro_enrichment_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    item = dict(row)
+    status = str(item.get("status") or "pending")
+    output: dict[str, Any] = {
+        "event_key": str(item.get("event_key") or ""),
+        "input_hash": str(item.get("input_hash") or ""),
+        "prompt_version": str(item.get("prompt_version") or ""),
+        "status": status,
+        "model": str(item.get("model") or ""),
+        "attempt_count": int(item.get("attempt_count") or 0),
+        "updated_at": item.get("updated_at"),
+        "next_attempt_at": item.get("next_attempt_at"),
+        "ai_enrichment": None,
+    }
+    if status != "ready":
+        return output
+
+    def decode_list(key: str) -> list[Any]:
+        raw = item.get(key, "[]") or "[]"
+        try:
+            value = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            return []
+        return value if isinstance(value, list) else []
+
+    output["ai_enrichment"] = {
+        "status": "ready",
+        "headline_zh": item.get("headline_zh") or "",
+        "summary_zh": item.get("summary_zh") or "",
+        "why_it_matters_zh": item.get("why_it_matters_zh") or "",
+        "impact_level": item.get("impact_level") or "unknown",
+        "impact_path": decode_list("impact_path_json"),
+        "tags": decode_list("tags_json"),
+        "assets": decode_list("assets_json"),
+        "cluster_key": item.get("cluster_key") or "",
+        "language": item.get("language") or "unknown",
+        "confidence": item.get("confidence"),
+        "evidence_basis": item.get("evidence_basis") or "title_only",
+        "model": item.get("model") or "",
+        "generated_at": item.get("generated_at"),
+    }
+    return output
+
+
+def query_macro_event_enrichments(
+    event_keys: Iterable[str],
+) -> dict[str, dict[str, Any]]:
+    """Load a bounded set of macro-event cache rows in one query."""
+    keys: list[str] = []
+    seen: set[str] = set()
+    for value in event_keys:
+        key = str(value or "").strip()[:160]
+        if key and key not in seen:
+            seen.add(key)
+            keys.append(key)
+        if len(keys) >= 100:
+            break
+    if not keys:
+        return {}
+    placeholders = ",".join("?" for _ in keys)
+    with conn() as c:
+        rows = c.execute(
+            f"""
+            SELECT event_key, input_hash, prompt_version, status,
+                   headline_zh, summary_zh, why_it_matters_zh, impact_level,
+                   impact_path_json, tags_json, assets_json, cluster_key,
+                   language, confidence, evidence_basis, model, generated_at,
+                   updated_at, attempt_count, next_attempt_at
+            FROM macro_event_enrichments
+            WHERE event_key IN ({placeholders})
+            """,
+            keys,
+        ).fetchall()
+    decoded = (_macro_enrichment_row(row) for row in rows)
+    return {
+        item["event_key"]: item
+        for item in decoded
+        if isinstance(item, dict) and item.get("event_key")
+    }
+
+
+def get_macro_event_enrichment(
+    event_key: str,
+    *,
+    input_hash: str | None = None,
+    prompt_version: str | None = None,
+    model: str | None = None,
+) -> dict[str, Any] | None:
+    """Return one cache row, optionally requiring an exact cache identity."""
+    item = query_macro_event_enrichments([event_key]).get(str(event_key or ""))
+    if item is None:
+        return None
+    for field, expected in (
+        ("input_hash", input_hash),
+        ("prompt_version", prompt_version),
+        ("model", model),
+    ):
+        if expected is not None and item.get(field) != expected:
+            return None
+    return item
+
+
+def claim_macro_event_enrichment(
+    event_key: str,
+    *,
+    input_hash: str,
+    prompt_version: str,
+    model: str,
+    evidence_basis: str,
+    now: datetime | None = None,
+    processing_lease_seconds: int = 20 * 60,
+) -> tuple[str, int] | None:
+    """Atomically claim one current macro-event cache and return its attempt."""
+    safe_key = str(event_key or "").strip()[:160]
+    if not safe_key:
+        raise ValueError("event_key is required")
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    now_iso = current.replace(microsecond=0).isoformat()
+    with conn(immediate=True) as c:
+        row = c.execute(
+            "SELECT input_hash, prompt_version, status, model, updated_at, "
+            "next_attempt_at, attempt_count FROM macro_event_enrichments "
+            "WHERE event_key=?",
+            (safe_key,),
+        ).fetchone()
+        same_cache = bool(
+            row
+            and row["input_hash"] == input_hash
+            and row["prompt_version"] == prompt_version
+            and row["model"] == model
+        )
+        if same_cache and row["status"] in {"ready", "failed"}:
+            return None
+        if same_cache and row["status"] == "retry":
+            retry_at = _parse_utc_datetime(row["next_attempt_at"])
+            if retry_at is not None and retry_at > current:
+                return None
+        if same_cache and row["status"] == "processing":
+            updated = _parse_utc_datetime(row["updated_at"])
+            if updated is not None and (
+                current - updated
+            ).total_seconds() < max(60, int(processing_lease_seconds)):
+                return None
+
+        attempts = int(row["attempt_count"] or 0) + 1 if same_cache else 1
+        claim_token = secrets.token_urlsafe(24)
+        c.execute(
+            """
+            INSERT INTO macro_event_enrichments (
+              event_key, input_hash, prompt_version, status, headline_zh,
+              summary_zh, why_it_matters_zh, impact_level,
+              impact_path_json, tags_json, assets_json, cluster_key, language,
+              confidence, evidence_basis, model, generated_at, updated_at,
+              attempt_count, next_attempt_at, error_code, claim_token
+            ) VALUES (?, ?, ?, 'processing', '', '', '', 'unknown',
+                      '[]', '[]', '[]', '', 'unknown', NULL, ?, ?, NULL, ?, ?, NULL, '', ?)
+            ON CONFLICT(event_key) DO UPDATE SET
+              input_hash=excluded.input_hash,
+              prompt_version=excluded.prompt_version,
+              status='processing',
+              headline_zh='', summary_zh='', why_it_matters_zh='',
+              impact_level='unknown', impact_path_json='[]', tags_json='[]',
+              assets_json='[]', cluster_key='', language='unknown',
+              confidence=NULL, evidence_basis=excluded.evidence_basis,
+              model=excluded.model, generated_at=NULL,
+              updated_at=excluded.updated_at,
+              attempt_count=excluded.attempt_count,
+              next_attempt_at=NULL, error_code='',
+              claim_token=excluded.claim_token
+            """,
+            (
+                safe_key,
+                input_hash,
+                prompt_version,
+                evidence_basis,
+                model,
+                now_iso,
+                attempts,
+                claim_token,
+            ),
+        )
+    return claim_token, attempts
+
+
+def save_macro_event_enrichment(
+    event_key: str,
+    *,
+    input_hash: str,
+    prompt_version: str,
+    model: str,
+    claim_token: str,
+    evidence_basis: str,
+    result: dict[str, Any],
+    generated_at: str | None = None,
+) -> bool:
+    """Store validated macro-event output only for the active claim."""
+    completed = generated_at or _now_iso()
+    with conn(immediate=True) as c:
+        cur = c.execute(
+            """
+            UPDATE macro_event_enrichments
+            SET status='ready', headline_zh=?, summary_zh=?,
+                why_it_matters_zh=?, impact_level=?, impact_path_json=?,
+                tags_json=?, assets_json=?, cluster_key=?, language=?,
+                confidence=?, evidence_basis=?, model=?, generated_at=?,
+                updated_at=?, next_attempt_at=NULL, error_code='', claim_token=''
+            WHERE event_key=? AND input_hash=? AND prompt_version=?
+              AND model=? AND claim_token=? AND status='processing'
+            """,
+            (
+                result["headline_zh"],
+                result["summary_zh"],
+                result["why_it_matters_zh"],
+                result["impact_level"],
+                json.dumps(result["impact_path"], ensure_ascii=False),
+                json.dumps(result["tags"], ensure_ascii=False),
+                json.dumps(result["assets"], ensure_ascii=False),
+                result["cluster_key"],
+                result["language"],
+                result["confidence"],
+                evidence_basis,
+                model,
+                completed,
+                completed,
+                str(event_key or "").strip()[:160],
+                input_hash,
+                prompt_version,
+                model,
+                claim_token,
+            ),
+        )
+    return cur.rowcount == 1
+
+
+def fail_macro_event_enrichment(
+    event_key: str,
+    *,
+    input_hash: str,
+    prompt_version: str,
+    model: str,
+    claim_token: str,
+    error_code: str,
+    retry_after_seconds: int | None,
+    now: datetime | None = None,
+) -> bool:
+    """Record a bounded macro-event error category without provider text."""
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    updated = current.replace(microsecond=0).isoformat()
+    status = "failed"
+    next_attempt = None
+    if retry_after_seconds is not None:
+        status = "retry"
+        next_attempt = (
+            current + timedelta(seconds=max(60, int(retry_after_seconds)))
+        ).replace(microsecond=0).isoformat()
+    safe_code = re.sub(r"[^a-z0-9_:-]", "", str(error_code).lower())[:48]
+    with conn(immediate=True) as c:
+        cur = c.execute(
+            """
+            UPDATE macro_event_enrichments
+            SET status=?, updated_at=?, next_attempt_at=?, error_code=?,
+                claim_token=''
+            WHERE event_key=? AND input_hash=? AND prompt_version=?
+              AND model=? AND claim_token=? AND status='processing'
+            """,
+            (
+                status,
+                updated,
+                next_attempt,
+                safe_code or "unknown",
+                str(event_key or "").strip()[:160],
                 input_hash,
                 prompt_version,
                 model,

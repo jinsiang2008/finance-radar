@@ -1507,11 +1507,194 @@
   const EVENT_KIND_CN = { policy: "政策原文", indicator: "指标异动" };
   const EVENT_SEVERITY_CN = { high: "高", medium: "中", low: "低" };
 
+  function macroEventCopy(event) {
+    const enrichment = eventEnrichment(event);
+    const originalTitle = String(event?.title || "").trim() || "未命名事件";
+    const fallbackSummary = String(event?.note || event?.snippet || "").trim();
+    const status = String(event?.ai_status || "pending").toLowerCase();
+    return {
+      enrichment,
+      originalTitle,
+      headline:
+        String(enrichment?.headline_zh || "").trim() || originalTitle,
+      summary:
+        String(enrichment?.summary_zh || "").trim() ||
+        fallbackSummary ||
+        (status === "failed"
+          ? "AI 解读暂不可用，请结合原始标题与来源人工核对。"
+          : status === "retry"
+            ? "AI 解读将在稍后重试，当前仅展示采集到的原始信息。"
+            : "AI 解读正在生成，当前仅展示采集到的原始信息。"),
+    };
+  }
+
+  function macroEventImpact(event) {
+    const enrichment = eventEnrichment(event);
+    const aiImpact = String(enrichment?.impact_level || "").toLowerCase();
+    return ["high", "medium", "low", "none"].includes(aiImpact)
+      ? aiImpact
+      : String(event?.severity || "low").toLowerCase();
+  }
+
+  function renderMacroAiDigest(list) {
+    const events = Array.isArray(list) ? list : [];
+    const statusCounts = events.reduce(
+      (counts, event) => {
+        const status = String(event?.ai_status || "pending").toLowerCase();
+        if (status === "ready" && eventEnrichment(event)) counts.ready += 1;
+        else if (status === "failed") counts.failed += 1;
+        else if (status === "retry") counts.retry += 1;
+        else counts.pending += 1;
+        return counts;
+      },
+      { ready: 0, pending: 0, retry: 0, failed: 0 }
+    );
+    const impactRank = { high: 0, medium: 1 };
+    const highlights = events
+      .filter((event) => {
+        const impact = macroEventImpact(event);
+        return Boolean(eventEnrichment(event)) && (impact === "high" || impact === "medium");
+      })
+      .sort((a, b) => impactRank[macroEventImpact(a)] - impactRank[macroEventImpact(b)])
+      .slice(0, 3);
+    const limitedCount = events.filter((event) =>
+      isTitleOnlyEvidence(eventEnrichment(event))
+    ).length;
+    const statusParts = [
+      statusCounts.pending ? `待生成 ${statusCounts.pending}` : "",
+      statusCounts.retry ? `待重试 ${statusCounts.retry}` : "",
+      statusCounts.failed ? `不可用 ${statusCounts.failed}` : "",
+      limitedCount ? `仅标题证据 ${limitedCount}` : "",
+    ].filter(Boolean);
+    const highlightHTML = highlights.length
+      ? `<ol class="macro-ai-points">
+          ${highlights
+            .map((event, index) => {
+              const copy = macroEventCopy(event);
+              const impact = macroEventImpact(event);
+              return `<li>
+                <span class="macro-ai-index" aria-hidden="true">${String(index + 1).padStart(2, "0")}</span>
+                <div>
+                  <div class="macro-ai-point-head">
+                    <span class="macro-ai-impact is-${esc(impact)}">${impact === "high" ? "高影响" : "中影响"}</span>
+                    ${isTitleOnlyEvidence(copy.enrichment) ? `<span class="macro-ai-evidence">仅标题证据</span>` : ""}
+                  </div>
+                  <strong>${esc(copy.headline)}</strong>
+                  <p>${esc(copy.summary)}</p>
+                </div>
+              </li>`;
+            })
+            .join("")}
+        </ol>`
+      : `<p class="macro-ai-empty">${
+          statusCounts.ready
+            ? "已完成的解读中，暂无高或中影响要点。"
+            : "AI 正在生成首批解读；事件原始信息仍可继续查看。"
+        }</p>`;
+    return `<section class="macro-ai-digest" role="status" aria-live="polite" aria-atomic="true" aria-labelledby="macro-ai-digest-title">
+      <div class="macro-ai-digest-head">
+        <div>
+          <span class="macro-ai-eyebrow">72H / AI 研判</span>
+          <h3 id="macro-ai-digest-title">AI 态势摘录</h3>
+        </div>
+        <div class="macro-ai-readiness">
+          <strong>${statusCounts.ready}<span> / ${events.length}</span></strong>
+          <small>已解读</small>
+        </div>
+      </div>
+      ${highlightHTML}
+      ${statusParts.length ? `<p class="macro-ai-status">${esc(statusParts.join(" · "))}</p>` : ""}
+    </section>`;
+  }
+
+  function renderMacroAiAssets(event, enrichment) {
+    const assets = (Array.isArray(enrichment?.assets) ? enrichment.assets : []).filter(
+      (asset) => String(asset?.asset_key || "").trim()
+    );
+    if (!assets.length) {
+      const ruleAssets = assetTagRow(event, 8);
+      return ruleAssets || `<p class="event-insight-empty">尚未识别到可交易资产，不能据此判断事件没有市场影响。</p>`;
+    }
+    return `<ul class="event-ai-assets">
+      ${assets
+        .slice(0, 8)
+        .map((asset) => {
+          const key = String(asset?.asset_key || "").trim();
+          if (!key) return "";
+          const direction = String(asset?.direction || "unclear").toLowerCase();
+          const horizon = String(asset?.horizon || "short").toLowerCase();
+          return `<li data-direction="${esc(direction)}">
+            <div class="event-ai-asset-head">
+              <strong>${esc(asset?.name_zh || assetLabel(key))}</strong>
+              <code>${esc(key)}</code>
+              <span>${esc(DIRECTION_CN[direction] || direction)}</span>
+            </div>
+            ${asset?.reason_zh ? `<p>${esc(asset.reason_zh)}</p>` : ""}
+            <small>${esc(HORIZON_CN[horizon] || horizon)}${
+              confidenceLabel(asset?.confidence)
+                ? ` · ${esc(confidenceLabel(asset.confidence))}`
+                : ""
+            }</small>
+          </li>`;
+        })
+        .filter(Boolean)
+        .join("")}
+    </ul>`;
+  }
+
+  function renderMacroEventInsight(event, copy) {
+    const enrichment = copy.enrichment;
+    if (!enrichment) return "";
+    const paths = Array.isArray(enrichment.impact_path)
+      ? enrichment.impact_path.filter(Boolean).slice(0, 3)
+      : [];
+    const tags = Array.isArray(enrichment.tags)
+      ? enrichment.tags.filter(Boolean).slice(0, 8)
+      : [];
+    const meta = [
+      confidenceLabel(enrichment.confidence),
+      enrichment.model ? `模型 ${enrichment.model}` : "",
+      enrichment.generated_at ? `生成 ${fmtTime(enrichment.generated_at)}` : "",
+    ].filter(Boolean);
+    return `<details class="event-insight">
+      <summary>
+        <span>展开完整解读</span>
+        <span class="event-insight-summary-meta">为何重要 · 传导路径 · 资产</span>
+      </summary>
+      <div class="event-insight-body">
+        <section>
+          <h4>为何重要</h4>
+          <p>${esc(enrichment.why_it_matters_zh || "当前证据不足以形成进一步判断。")}</p>
+        </section>
+        <section>
+          <h4>传导路径</h4>
+          ${
+            paths.length
+              ? `<ol class="event-impact-path">${paths.map((path) => `<li>${esc(path)}</li>`).join("")}</ol>`
+              : `<p class="event-insight-empty">尚未形成可复核的传导路径。</p>`
+          }
+        </section>
+        <section>
+          <h4>可能受影响的资产</h4>
+          ${renderMacroAiAssets(event, enrichment)}
+        </section>
+        ${
+          tags.length
+            ? `<section><h4>标签</h4><div class="event-ai-tags">${tags
+                .map((tag) => `<span class="tag">${esc(tag)}</span>`)
+                .join("")}</div></section>`
+            : ""
+        }
+        ${meta.length ? `<p class="event-ai-meta">${esc(meta.join(" · "))}</p>` : ""}
+      </div>
+    </details>`;
+  }
+
   function renderMonitoredEvents(d) {
-    const list = d.monitored_events || [];
+    const list = Array.isArray(d.monitored_events) ? d.monitored_events : [];
     $("#macro-events").innerHTML = list.length
-      ? list
-          .map((e) => {
+      ? renderMacroAiDigest(list) + list
+          .map((e, index) => {
             const lvl = LEVEL_COLOR[e.severity === "high" ? "high" : e.severity === "medium" ? "medium" : "low"];
             const verified = e.time_status === "verified" && e.published_at;
             const when = verified
@@ -1524,20 +1707,32 @@
                   )}</strong></div>`
                 : "";
             const externalUrl = safeExternalUrl(e.url);
-            const title = externalUrl
-              ? `<a href="${esc(externalUrl)}" target="_blank" rel="noopener noreferrer">${esc(e.title)}</a>`
-              : esc(e.title);
-            return `<article class="event" style="--lvl:${lvl}">
+            const copy = macroEventCopy(e);
+            const titleId = `macro-event-title-${index}`;
+            const ready = Boolean(copy.enrichment);
+            const primaryTitle = !ready && externalUrl
+              ? `<a href="${esc(externalUrl)}" target="_blank" rel="noopener noreferrer">${esc(copy.headline)}</a>`
+              : esc(copy.headline);
+            const originalTitle = ready
+              ? `<p class="event-original"><span>原始标题</span>${
+                  externalUrl
+                    ? `<a href="${esc(externalUrl)}" target="_blank" rel="noopener noreferrer" aria-label="打开原始事件，新窗口">${esc(copy.originalTitle)} ↗</a>`
+                    : `<span>${esc(copy.originalTitle)}</span>`
+                }</p>`
+              : "";
+            return `<article class="event" style="--lvl:${lvl}" aria-labelledby="${titleId}">
               <div class="event-head">
                 <span class="pill event-kind ${esc(e.kind)}">${EVENT_KIND_CN[e.kind] || esc(e.kind)}</span>
                 <span class="tag">影响 ${EVENT_SEVERITY_CN[e.severity] || esc(e.severity)}</span>
+                ${aiStateHTML(e)}
                 <span class="event-source">${esc(e.source || "")}</span>
                 ${when}
               </div>
-              <div class="event-title">${title}</div>
+              <h3 class="event-title" id="${titleId}">${primaryTitle}</h3>
+              <p class="event-summary ${ready ? "" : "is-degraded"}">${esc(copy.summary)}</p>
+              ${originalTitle}
               ${move}
-              ${e.note ? `<div class="event-note">${esc(e.note)}</div>` : ""}
-              ${assetTagRow(e, 8)}
+              ${renderMacroEventInsight(e, copy)}
             </article>`;
           })
           .join("")

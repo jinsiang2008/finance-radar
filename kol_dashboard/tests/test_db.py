@@ -78,6 +78,25 @@ class DatabaseTests(unittest.TestCase):
             ).fetchone()
         self.assertEqual(row["published_at"], published_at)
 
+    def test_macro_event_enrichment_cache_uses_an_independent_text_key(self) -> None:
+        with db.conn() as connection:
+            columns = {
+                row["name"]: dict(row)
+                for row in connection.execute(
+                    "PRAGMA table_info(macro_event_enrichments)"
+                ).fetchall()
+            }
+            foreign_keys = connection.execute(
+                "PRAGMA foreign_key_list(macro_event_enrichments)"
+            ).fetchall()
+
+        self.assertEqual(columns["event_key"]["type"], "TEXT")
+        self.assertEqual(columns["event_key"]["pk"], 1)
+        self.assertIn("input_hash", columns)
+        self.assertIn("prompt_version", columns)
+        self.assertIn("claim_token", columns)
+        self.assertEqual(foreign_keys, [])
+
     def test_merge_fills_missing_published_at_then_preserves_it(self) -> None:
         reliable = "2026-07-31T10:34:56+00:00"
         later_claim = "2026-08-01T10:34:56+00:00"
@@ -700,6 +719,139 @@ class DatabaseTests(unittest.TestCase):
             now=now + timedelta(minutes=80),
         )
         self.assertIsInstance(recovered_token, str)
+
+    def test_macro_enrichment_claim_is_cache_aware_and_token_scoped(self) -> None:
+        now = datetime(2026, 8, 6, 6, 0, tzinfo=timezone.utc)
+        event_key = "indicator:0123456789abcdef01234567"
+        base = {
+            "event_key": event_key,
+            "input_hash": "a" * 64,
+            "prompt_version": llm_enrichment.MACRO_PROMPT_VERSION,
+            "model": llm_enrichment.DEFAULT_MODEL,
+            "evidence_basis": "indicator_data",
+        }
+
+        first = db.claim_macro_event_enrichment(**base, now=now)
+        self.assertIsInstance(first, tuple)
+        assert first is not None
+        first_token, first_attempt = first
+        self.assertEqual(first_attempt, 1)
+        self.assertIsNone(
+            db.claim_macro_event_enrichment(
+                **base,
+                now=now + timedelta(minutes=1),
+            )
+        )
+
+        changed = {**base, "input_hash": "b" * 64}
+        replacement = db.claim_macro_event_enrichment(
+            **changed,
+            now=now + timedelta(minutes=1),
+        )
+        self.assertIsInstance(replacement, tuple)
+        assert replacement is not None
+        replacement_token, replacement_attempt = replacement
+        self.assertEqual(replacement_attempt, 1)
+        self.assertNotEqual(first_token, replacement_token)
+
+        self.assertFalse(
+            db.save_macro_event_enrichment(
+                **base,
+                claim_token=first_token,
+                result=ready_enrichment(headline_zh="旧 worker 结果"),
+            )
+        )
+        self.assertFalse(
+            db.fail_macro_event_enrichment(
+                event_key,
+                input_hash=base["input_hash"],
+                prompt_version=base["prompt_version"],
+                model=base["model"],
+                claim_token=first_token,
+                error_code="provider secret must not overwrite",
+                retry_after_seconds=60,
+                now=now + timedelta(minutes=2),
+            )
+        )
+        self.assertTrue(
+            db.save_macro_event_enrichment(
+                **changed,
+                claim_token=replacement_token,
+                result=ready_enrichment(headline_zh="当前指标解读"),
+                generated_at=(now + timedelta(minutes=2)).isoformat(),
+            )
+        )
+
+        exact = db.get_macro_event_enrichment(
+            event_key,
+            input_hash=changed["input_hash"],
+            prompt_version=changed["prompt_version"],
+            model=changed["model"],
+        )
+        self.assertIsNotNone(exact)
+        assert exact is not None
+        self.assertEqual(exact["status"], "ready")
+        self.assertEqual(
+            exact["ai_enrichment"]["headline_zh"],
+            "当前指标解读",
+        )
+        self.assertIsNone(
+            db.get_macro_event_enrichment(
+                event_key,
+                input_hash=base["input_hash"],
+                prompt_version=changed["prompt_version"],
+                model=changed["model"],
+            )
+        )
+        self.assertIsNone(
+            db.claim_macro_event_enrichment(
+                **changed,
+                now=now + timedelta(minutes=3),
+            )
+        )
+
+    def test_macro_enrichment_prompt_or_model_change_invalidates_ready_cache(
+        self,
+    ) -> None:
+        now = datetime(2026, 8, 6, 7, 0, tzinfo=timezone.utc)
+        event_key = "policy:0123456789abcdef01234567"
+        base = {
+            "event_key": event_key,
+            "input_hash": "c" * 64,
+            "prompt_version": llm_enrichment.MACRO_PROMPT_VERSION,
+            "model": llm_enrichment.DEFAULT_MODEL,
+            "evidence_basis": "title_only",
+        }
+        claimed = db.claim_macro_event_enrichment(**base, now=now)
+        assert claimed is not None
+        self.assertTrue(
+            db.save_macro_event_enrichment(
+                **base,
+                claim_token=claimed[0],
+                result=ready_enrichment(),
+                generated_at=now.isoformat(),
+            )
+        )
+
+        new_prompt = db.claim_macro_event_enrichment(
+            **{**base, "prompt_version": "macro-monitor-intelligence-v2"},
+            now=now + timedelta(seconds=1),
+        )
+        self.assertIsNotNone(new_prompt)
+        assert new_prompt is not None
+        self.assertEqual(new_prompt[1], 1)
+
+        new_model = db.claim_macro_event_enrichment(
+            **{
+                **base,
+                "prompt_version": "macro-monitor-intelligence-v2",
+                "model": "deepseek-v4-pro",
+            },
+            now=now + timedelta(seconds=2),
+        )
+        self.assertIsNotNone(new_model)
+        assert new_model is not None
+        self.assertEqual(new_model[1], 1)
 
     def test_stale_claim_cannot_save_or_fail_a_new_owner(self) -> None:
         now = datetime(2026, 8, 6, 4, 0, tzinfo=timezone.utc)
