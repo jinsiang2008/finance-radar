@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
 <meta name="color-scheme" content="dark light" />
-<title>关联决策台 · 风险雷达</title>
+<title>全球风险雷达 · 宏观与 KOL 情报</title>
 <script>
   // Deployments live at "/" locally and "/kol/" behind nginx.
   (function () {
@@ -18,36 +18,45 @@
     } catch (e) {}
   })();
 </script>
-<link rel="stylesheet" href="static/style.css?v=8" />
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='82' font-size='84'%3E📡%3C/text%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="static/style.css?v=11" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ccircle cx='50' cy='50' r='42' fill='%230b1720' stroke='%2331d69b' stroke-width='6'/%3E%3Ccircle cx='50' cy='50' r='20' fill='none' stroke='%234ab8d8' stroke-width='5'/%3E%3Cpath d='M50 50L82 24' stroke='%23f4b942' stroke-width='6' stroke-linecap='round'/%3E%3Ccircle cx='50' cy='50' r='7' fill='%23eef4f2'/%3E%3C/svg%3E" />
 </head>
 <body>
 
 <header class="topbar">
   <div class="topbar-inner">
-    <div class="brand">
-      <span class="brand-mark">📡</span>
+    <a class="brand" href="#decision" aria-label="返回今日态势">
+      <span class="brand-mark" aria-hidden="true"></span>
       <div class="brand-text">
-        <strong>关联决策台</strong>
-        <span class="brand-sub">事件 · 市场 · 持仓</span>
+        <strong>全球风险雷达</strong>
+        <span class="brand-sub">MACRO INTELLIGENCE</span>
       </div>
-    </div>
+    </a>
 
-    <nav class="tabs" id="tabs" role="tablist">
-      <button class="tab active" data-view="decision" role="tab" aria-selected="true">
-        关联决策
+    <nav class="tabs" id="tabs" role="tablist" aria-label="主要视图">
+      <button class="tab active" id="tab-decision" data-view="decision" role="tab"
+              aria-selected="true" aria-controls="view-decision" tabindex="0">
+        今日态势
       </button>
-      <button class="tab" data-view="macro" role="tab" aria-selected="false">
-        风险雷达
+      <button class="tab" id="tab-macro" data-view="macro" role="tab"
+              aria-selected="false" aria-controls="view-macro" tabindex="-1">
+        风险图谱
       </button>
-      <button class="tab" data-view="kol" role="tab" aria-selected="false">
-        KOL 动态
+      <button class="tab" id="tab-kol" data-view="kol" role="tab"
+              aria-selected="false" aria-controls="view-kol" tabindex="-1">
+        KOL 信号
         <span class="tab-count" id="tab-kol-count"></span>
       </button>
     </nav>
 
     <div class="topbar-actions">
-      <span class="updated" id="last-update" title="上次刷新时间">—</span>
+      <span class="system-status is-unknown" id="system-status" title="正在确认最新宏观快照">
+        <span class="status-dot" aria-hidden="true"></span>
+        <span id="system-status-label">状态待确认</span>
+      </span>
+      <span class="updated" title="浏览器页面上次刷新时间">
+        <span class="updated-label">页面刷新</span><time id="last-update">—</time>
+      </span>
       <button class="private-mode-btn" id="private-mode-btn" type="button"
               aria-haspopup="dialog" aria-controls="auth-modal">
         <span aria-hidden="true">🔒</span><span id="private-mode-label">私人模式</span>
@@ -60,8 +69,8 @@
   </div>
 </header>
 
-<!-- ══════════════ 关联决策 ══════════════ -->
-<main class="view active" id="view-decision">
+<!-- ══════════════ 今日态势 ══════════════ -->
+<main class="view active" id="view-decision" role="tabpanel" aria-labelledby="tab-decision">
   <div class="wrap decision-wrap">
     <section class="decision-hero" id="decision-hero" aria-live="polite">
       <div class="skeleton skeleton-hero"></div>
@@ -71,8 +80,9 @@
       <section class="decision-panel action-panel" aria-labelledby="action-queue-title">
         <div class="block-head decision-panel-head">
           <div>
-            <h2 id="action-queue-title">分级行动队列</h2>
-            <p class="block-sub">先处理风险，再验证分歧；不是自动交易指令</p>
+            <p class="section-kicker">PRIORITY SIGNALS</p>
+            <h2 id="action-queue-title">重点信号</h2>
+            <p class="block-sub">按关注优先级排序；点击查看传导路径与证据</p>
           </div>
           <span class="decision-count" id="decision-count">—</span>
         </div>
@@ -85,8 +95,12 @@
       <section class="decision-panel matrix-panel" aria-labelledby="impact-matrix-title">
         <div class="block-head decision-panel-head">
           <div>
-            <h2 id="impact-matrix-title">主题 × 资产影响矩阵</h2>
-            <p class="block-sub">符号表达方向，颜色仅作辅助；点击单元格查看证据链</p>
+            <p class="section-kicker">EXPOSURE MAP</p>
+            <h2 id="impact-matrix-title">主题 × 资产暴露</h2>
+            <p class="block-sub">条件性方向，不是交易结论；点击单元格核验证据</p>
+          </div>
+          <div class="matrix-legend" aria-label="方向图例">
+            <span class="is-up">▲ 正向</span><span class="is-down">▼ 负向</span><span class="is-conflict">◆ 分歧</span>
           </div>
         </div>
         <div class="impact-matrix-wrap" id="decision-matrix" tabindex="0">
@@ -98,7 +112,7 @@
     <section class="decision-panel evidence-panel" id="decision-detail"
              aria-labelledby="decision-detail-title" aria-live="polite">
       <div class="empty">
-        <span class="empty-icon">⛓</span>选择行动卡或矩阵单元格查看局部证据链
+        <span class="empty-icon">⛓</span>选择重点信号或资产单元格，查看局部证据链
       </div>
     </section>
 
@@ -107,11 +121,22 @@
 </main>
 
 <!-- ══════════════ 风险雷达 ══════════════ -->
-<main class="view" id="view-macro">
+<main class="view" id="view-macro" role="tabpanel" aria-labelledby="tab-macro">
   <div class="wrap">
 
     <section class="hero" id="macro-hero">
       <div class="skeleton skeleton-hero"></div>
+    </section>
+
+    <section class="block trend-block" id="macro-trend-block" hidden>
+      <div class="block-head block-head-row">
+        <div>
+          <p class="section-kicker">RISK TRAJECTORY</p>
+          <h2>风险轨迹</h2>
+          <p class="block-sub">最近 72 份小时快照；变化表示关注优先级变化，不等于事件发生概率</p>
+        </div>
+      </div>
+      <div class="macro-trend" id="macro-trend" aria-live="polite"></div>
     </section>
 
     <section class="block" id="macro-subscores-block" hidden>
@@ -140,16 +165,16 @@
 
     <section class="block" id="macro-swans-block" hidden>
       <div class="block-head">
-        <h2>黑天鹅场景</h2>
-        <p class="block-sub">低概率高冲击事件，按概率排序 · 标的与板块已分开标注</p>
+        <h2>突发冲击监测</h2>
+        <p class="block-sub">异常形成中的低频高冲击场景；信号强度不等于发生概率</p>
       </div>
       <div class="scenario-list" id="macro-swans"></div>
     </section>
 
     <section class="block" id="macro-rhinos-block" hidden>
       <div class="block-head">
-        <h2>灰犀牛</h2>
-        <p class="block-sub">高概率、正在逼近、却被市场持续忽视的威胁 · 标的与板块已分开标注</p>
+        <h2>已知风险推进</h2>
+        <p class="block-sub">高可见度、正在逼近却可能未被充分定价的风险</p>
       </div>
       <div class="scenario-list" id="macro-rhinos"></div>
     </section>
@@ -168,45 +193,59 @@
 </main>
 
 <!-- ══════════════ KOL 动态 ══════════════ -->
-<main class="view" id="view-kol">
+<main class="view" id="view-kol" role="tabpanel" aria-labelledby="tab-kol">
   <div class="wrap">
 
+    <header class="kol-intro">
+      <div>
+        <p class="section-kicker">SOURCE INTELLIGENCE</p>
+        <h1>KOL 信号流</h1>
+      </div>
+      <p>按发布时间、影响和独立来源降噪；转载不会增加确认度。</p>
+    </header>
+
     <section class="statstrip" id="stats">
-      <div class="stat"><span class="stat-num" id="stat-total">–</span><span class="stat-label">动态</span></div>
+      <div class="stat"><span class="stat-num" id="stat-total">–</span><span class="stat-label">窗口内动态</span></div>
       <div class="stat is-high"><span class="stat-num" id="stat-high">–</span><span class="stat-label">高影响</span></div>
       <div class="stat is-med"><span class="stat-num" id="stat-med">–</span><span class="stat-label">中影响</span></div>
       <div class="stat"><span class="stat-num" id="stat-kol">–</span><span class="stat-label">活跃 KOL</span></div>
-      <div class="stat"><span class="stat-num" id="stat-market">–</span><span class="stat-label">涉及市场</span></div>
+      <div class="stat"><span class="stat-num" id="stat-market">–</span><span class="stat-label">含市场关键词</span></div>
     </section>
 
     <section class="filters">
       <div class="filter-row">
+        <label class="sr-only" for="q-input">搜索 KOL 动态</label>
         <input id="q-input" class="search" type="search"
-               placeholder="搜索标题或摘要…" autocomplete="off" />
+               placeholder="搜索观点、事件或资产…" autocomplete="off" />
+        <span class="filter-label" aria-hidden="true">时间</span>
         <div class="chips" id="time-chips" role="group" aria-label="时间窗口">
-          <button data-hours="6" class="chip">6h</button>
-          <button data-hours="24" class="chip active">24h</button>
-          <button data-hours="72" class="chip">3天</button>
-          <button data-hours="168" class="chip">7天</button>
+          <button data-hours="6" class="chip" aria-pressed="false">6h</button>
+          <button data-hours="24" class="chip active" aria-pressed="true">24h</button>
+          <button data-hours="72" class="chip" aria-pressed="false">3天</button>
+          <button data-hours="168" class="chip" aria-pressed="false">7天</button>
         </div>
         <div class="chips" id="time-status-chips" role="group" aria-label="时间可信度">
-          <button data-time-status="verified" class="chip active">可信发布时间</button>
-          <button data-time-status="unverified" class="chip chip-time-warning">时间待核验</button>
+          <button data-time-status="verified" class="chip active" aria-pressed="true">可信时间</button>
+          <button data-time-status="unverified" class="chip chip-time-warning" aria-pressed="false">待核验</button>
         </div>
         <span class="time-window-basis" id="time-window-basis">按发布时间筛选</span>
+        <span class="filter-label" aria-hidden="true">影响</span>
         <div class="chips" id="impact-chips" role="group" aria-label="影响等级">
-          <button data-impact="" class="chip active">全部</button>
-          <button data-impact="high" class="chip chip-high">高</button>
-          <button data-impact="medium" class="chip chip-med">中</button>
-          <button data-impact="low" class="chip">低</button>
+          <button data-impact="" class="chip active" aria-pressed="true">全部</button>
+          <button data-impact="high" class="chip chip-high" aria-pressed="false">高</button>
+          <button data-impact="medium" class="chip chip-med" aria-pressed="false">中</button>
+          <button data-impact="low" class="chip" aria-pressed="false">低</button>
         </div>
       </div>
       <div class="filter-row filter-kols">
+        <span class="filter-label" aria-hidden="true">来源</span>
         <div class="chips" id="kol-chips" role="group" aria-label="KOL">
-          <button data-kol="" class="chip active">全部 KOL</button>
+          <button data-kol="" class="chip active" aria-pressed="true">全部 KOL</button>
         </div>
       </div>
     </section>
+
+    <p class="feed-status" id="feed-status" aria-live="polite">正在加载信号流…</p>
 
     <section id="feed" class="feed">
       <div class="skeleton skeleton-card"></div>
@@ -221,8 +260,9 @@
 
 <footer class="footer">
   <div class="wrap footer-inner">
-    <span>默认仅显示可信发布时间 · 抓取时间不等于发布时间 · 每 60s 自动刷新</span>
+    <span>研究辅助 · 风险分值不等于事件概率 · 条件性方向不构成投资建议</span>
     <span class="footer-right">
+      <span>KOL 约 30 分钟采集 · 宏观/决策每小时计算 · 页面每 5 分钟检查更新</span>
       <span id="footer-meta"></span>
       <button type="button" class="footer-support" data-support-open>☕ 支持服务器运行</button>
     </span>
@@ -282,6 +322,6 @@
   </div>
 </div>
 
-<script src="static/app.js?v=8"></script>
+<script src="static/app.js?v=11"></script>
 </body>
 </html>

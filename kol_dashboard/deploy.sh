@@ -54,7 +54,10 @@ cp "$LOCAL_DIR"/{app.py,auth.py,db.py,decision_collect.py,decision_service.py,ma
 cp -R "$LOCAL_DIR"/templates "$LOCAL_DIR"/static "$WORK/pkg/"
 cp "$LIB_DIR"/{kol_tracker.py,macro_fetcher.py,risk_radar.py} "$WORK/pkg/lib/"
 cp "$LIB_DIR/serenity_tracker.py" "$WORK/pkg/lib/"
-tar czf "$WORK/app.tgz" --exclude='__pycache__' --exclude='*.pyc' -C "$WORK/pkg" .
+# macOS tar otherwise serializes extended attributes as AppleDouble `._*`
+# files, which Linux compileall mistakes for Python source files.
+COPYFILE_DISABLE=1 tar czf "$WORK/app.tgz" \
+  --exclude='__pycache__' --exclude='*.pyc' -C "$WORK/pkg" .
 
 echo "→ 创建远端私有暂存区"
 "$VPS" run "install -d -m 700 '$REMOTE_STAGE'"

@@ -598,6 +598,110 @@ class PublicDecisionTests(unittest.TestCase):
             "公开对冲说明",
         )
 
+    def test_public_macro_projects_ofr_stress_and_coverage_metadata(self) -> None:
+        projected = decision_service.project_public_macro(
+            {
+                "public_schema_version": 1,
+                "market_data": {
+                    "financial_stress": {
+                        "ofr_fsi": 1.25,
+                        "credit": 0.8,
+                        "funding": 0.4,
+                        "volatility": 1.1,
+                        "equity_valuation": -0.2,
+                        "safe_assets": 0.3,
+                        "observed_at": "2026-08-04",
+                        "data_status": "ok",
+                        "status": "elevated",
+                        "source": "Office of Financial Research",
+                        "source_url": (
+                            "https://www.financialresearch.gov/"
+                            "financial-stress-index/"
+                        ),
+                        "unit": "index",
+                        "stale": False,
+                        "note": "Official daily observation",
+                        "account": "must-never-be-public",
+                    },
+                    "credit_spreads": {
+                        "hy_oas": 420.0,
+                        "unit": "basis_points",
+                    },
+                },
+                "data_coverage": {
+                    "available": 1,
+                    "total": 6,
+                    "pct": 17,
+                    "sources": [
+                        {
+                            "key": "financial_stress",
+                            "label": "全球金融压力（OFR FSI）",
+                            "available": True,
+                            "status": "elevated",
+                            "data_status": "ok",
+                            "observed_at": "2026-08-04",
+                            "source_url": (
+                                "https://www.financialresearch.gov/"
+                                "financial-stress-index/"
+                            ),
+                            "stale": False,
+                            "note": "Official daily observation",
+                            "portfolio": "must-never-be-public",
+                        }
+                    ],
+                },
+            }
+        )
+
+        self.assertEqual(
+            projected["market_data"]["financial_stress"],
+            {
+                "ofr_fsi": 1.25,
+                "credit": 0.8,
+                "funding": 0.4,
+                "volatility": 1.1,
+                "equity_valuation": -0.2,
+                "safe_assets": 0.3,
+                "observed_at": "2026-08-04",
+                "data_status": "ok",
+                "status": "elevated",
+                "source": "Office of Financial Research",
+                "source_url": (
+                    "https://www.financialresearch.gov/financial-stress-index/"
+                ),
+                "unit": "index",
+                "stale": False,
+                "note": "Official daily observation",
+            },
+        )
+        self.assertEqual(
+            projected["market_data"]["credit_spreads"],
+            {"hy_oas": 420.0, "unit": "basis_points"},
+        )
+        self.assertEqual(
+            projected["data_coverage"]["sources"],
+            [
+                {
+                    "key": "financial_stress",
+                    "label": "全球金融压力（OFR FSI）",
+                    "available": True,
+                    "status": "elevated",
+                    "data_status": "ok",
+                    "observed_at": "2026-08-04",
+                    "source_url": (
+                        "https://www.financialresearch.gov/"
+                        "financial-stress-index/"
+                    ),
+                    "stale": False,
+                    "note": "Official daily observation",
+                }
+            ],
+        )
+        self.assertNotIn(
+            "must-never-be-public",
+            json.dumps(projected, ensure_ascii=False),
+        )
+
 
 class SourceIngestionTests(unittest.TestCase):
     def setUp(self) -> None:
