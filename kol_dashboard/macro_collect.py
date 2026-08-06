@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 _HERE = Path(__file__).parent
@@ -32,14 +33,40 @@ for _cand in (
 
 import db  # noqa: E402
 
+
+def _has_metric(payload: object, field: str) -> bool:
+    """Return whether a source supplied a usable metric value."""
+    return (
+        isinstance(payload, Mapping)
+        and payload.get(field) is not None
+        and payload.get("data_status") != "unavailable"
+    )
+
+
+def _financial_stress_available(market_data: Mapping) -> bool:
+    """Prefer OFR FSI while accepting stored snapshots from the OAS era."""
+    return _has_metric(market_data.get("financial_stress"), "ofr_fsi") or _has_metric(
+        market_data.get("credit_spreads"), "hy_oas"
+    )
+
+
+def _gold_oil_available(market_data: Mapping) -> bool:
+    payload = market_data.get("gold_oil")
+    return (
+        isinstance(payload, Mapping)
+        and _has_metric(payload.get("gold"), "price")
+        and _has_metric(payload.get("oil"), "price")
+    )
+
+
 # Which market_data fields must be present for a sub-score to be trustworthy.
 _SOURCE_CHECKS = {
     "vix": lambda md: md.get("vix", {}).get("value") is not None,
     "treasury": lambda md: md.get("treasury", {}).get("10Y") is not None,
     "usd_cny": lambda md: md.get("usd_cny", {}).get("rate") is not None,
-    "gold_oil": lambda md: md.get("gold_oil", {}).get("gold", {}).get("price") is not None,
+    "gold_oil": _gold_oil_available,
     "dxy": lambda md: md.get("dxy", {}).get("value") is not None,
-    "credit_spreads": lambda md: md.get("credit_spreads", {}).get("hy_oas") is not None,
+    "financial_stress": _financial_stress_available,
 }
 
 _SOURCE_LABELS = {
@@ -48,13 +75,40 @@ _SOURCE_LABELS = {
     "usd_cny": "美元/人民币",
     "gold_oil": "黄金 / 原油",
     "dxy": "美元指数 DXY",
-    "credit_spreads": "信用利差 (HY/IG OAS)",
+    "financial_stress": "全球金融压力（OFR FSI）",
 }
+
+_COVERAGE_SOURCE_FIELDS = (
+    "status",
+    "data_status",
+    "observed_at",
+    "source_url",
+    "stale",
+    "is_stale",
+    "note",
+)
+
+
+def _coverage_source_payload(market_data: Mapping, key: str) -> Mapping:
+    """Choose the payload whose metadata describes the coverage decision."""
+    if key != "financial_stress":
+        payload = market_data.get(key)
+        return payload if isinstance(payload, Mapping) else {}
+
+    current = market_data.get("financial_stress")
+    if _has_metric(current, "ofr_fsi"):
+        return current
+    legacy = market_data.get("credit_spreads")
+    if _has_metric(legacy, "hy_oas"):
+        return legacy
+    return current if isinstance(current, Mapping) else {}
 
 
 def annotate_coverage(report: dict) -> dict:
     """Mark which data sources came back, so the UI never implies false confidence."""
     md = report.get("market_data", {})
+    if not isinstance(md, Mapping):
+        md = {}
     sources = []
     ok = 0
     for key, check in _SOURCE_CHECKS.items():
@@ -63,9 +117,16 @@ def annotate_coverage(report: dict) -> dict:
         except Exception:
             available = False
         ok += available
-        sources.append(
-            {"key": key, "label": _SOURCE_LABELS[key], "available": available}
+        source = {"key": key, "label": _SOURCE_LABELS[key], "available": available}
+        payload = _coverage_source_payload(md, key)
+        source.update(
+            {
+                field: payload[field]
+                for field in _COVERAGE_SOURCE_FIELDS
+                if field in payload
+            }
         )
+        sources.append(source)
     report["data_coverage"] = {
         "available": ok,
         "total": len(_SOURCE_CHECKS),

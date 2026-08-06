@@ -17,27 +17,87 @@ import risk_radar  # noqa: E402
 NOW = datetime(2026, 8, 3, 12, 0, tzinfo=timezone.utc)
 
 
-class CreditSpreadTests(unittest.TestCase):
-    def test_fred_oas_percent_values_are_normalized_to_basis_points(self) -> None:
-        responses = iter(
-            [
-                "DATE,BAMLH0A0HYM2\n2026-08-01,5.50\n",
-                "DATE,BAMLC0A0CM\n2026-08-01,1.20\n",
-            ]
+class FinancialStressTests(unittest.TestCase):
+    HEADER = (
+        "Date,OFR FSI,Credit,Equity valuation,Safe assets,Funding,Volatility,"
+        "United States,Other advanced economies,Emerging markets\n"
+    )
+
+    def test_official_ofr_csv_uses_last_complete_finite_row(self) -> None:
+        payload = self.HEADER + (
+            "2026-08-01,1.25,0.30,-0.10,0.20,0.40,0.45,1.0,0.1,0.15\n"
+            "2026-08-03,6.25,1.10,0.80,0.70,1.20,2.45,4.0,1.0,1.25\n"
         )
 
-        with mock.patch.object(
-            risk_radar,
-            "http_get",
-            side_effect=lambda *args, **kwargs: next(responses),
-        ):
-            result = risk_radar.fetch_credit_spreads()
+        with mock.patch.object(risk_radar, "http_get", return_value=payload) as get:
+            result = risk_radar.fetch_financial_stress()
 
-        self.assertEqual(result["hy_oas"], 550.0)
-        self.assertEqual(result["ig_oas"], 120.0)
-        self.assertEqual(result["spread_diff"], 430.0)
-        self.assertEqual(result["unit"], "basis_points")
+        get.assert_called_once()
+        self.assertEqual(get.call_args.args[0], risk_radar.OFR_FSI_CSV_URL)
+        self.assertEqual(result["ofr_fsi"], 6.25)
+        self.assertEqual(result["credit"], 1.10)
+        self.assertEqual(result["funding"], 1.20)
+        self.assertEqual(result["volatility"], 2.45)
+        self.assertEqual(result["equity_valuation"], 0.80)
+        self.assertEqual(result["safe_assets"], 0.70)
+        self.assertEqual(result["observed_at"], "2026-08-03")
+        self.assertEqual(result["source"], "U.S. Treasury OFR")
+        self.assertEqual(result["source_url"], risk_radar.OFR_FSI_SOURCE_URL)
+        self.assertEqual(result["unit"], "index")
         self.assertEqual(result["status"], "critical")
+        self.assertEqual(result["data_status"], "ok")
+
+    def test_malformed_trailing_rows_do_not_replace_last_complete_row(self) -> None:
+        payload = self.HEADER + (
+            "2026-08-01,3.25,0.8,0.4,0.3,0.7,1.05,2.0,0.5,0.75\n"
+            "2026-08-02,7.0,1.0,,0.5,1.0,2.0,4.0,1.0,2.0\n"
+            "2026-08-03,nan,1.0,0.5,0.5,1.0,2.0,4.0,1.0,2.0\n"
+        )
+
+        with mock.patch.object(risk_radar, "http_get", return_value=payload):
+            result = risk_radar.fetch_financial_stress()
+
+        self.assertEqual(result["observed_at"], "2026-08-01")
+        self.assertEqual(result["ofr_fsi"], 3.25)
+        self.assertEqual(result["status"], "elevated")
+        self.assertEqual(result["data_status"], "ok")
+
+    def test_empty_response_is_explicitly_unavailable(self) -> None:
+        with mock.patch.object(risk_radar, "http_get", return_value=""):
+            result = risk_radar.fetch_financial_stress()
+
+        for field in (
+            "ofr_fsi",
+            "credit",
+            "funding",
+            "volatility",
+            "equity_valuation",
+            "safe_assets",
+            "observed_at",
+        ):
+            self.assertIsNone(result[field])
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["data_status"], "unavailable")
+
+    def test_ofr_scoring_uses_controlled_weight_increments(self) -> None:
+        financial_stress = {"ofr_fsi": 6.0, "data_status": "ok"}
+        recession = risk_radar.score_recession_risk(
+            {"value": 15.0},
+            {"spread_2y10y": 0.5},
+            financial_stress,
+        )
+        stress = risk_radar.score_market_stress(
+            {"value": 15.0},
+            {"value": 100.0, "change_pct": 0.1},
+            financial_stress,
+        )
+
+        self.assertEqual(recession["score"], 55)
+        self.assertEqual(stress["score"], 35)
+        self.assertIn("OFR FSI > 5 → 系统性金融压力极高", recession["signals"])
+        self.assertIn("OFR FSI > 5 → 系统性金融压力极高", stress["signals"])
+        self.assertEqual(recession["data_status"], "ok")
+        self.assertEqual(stress["data_status"], "ok")
 
     def test_credit_stress_scoring_uses_basis_point_thresholds(self) -> None:
         recession = risk_radar.score_recession_risk(
@@ -53,6 +113,110 @@ class CreditSpreadTests(unittest.TestCase):
 
         self.assertIn("高收益债利差飙升", recession["signals"])
         self.assertIn("信用利差显著扩大", stress["signals"])
+
+    def test_missing_financial_stress_never_implies_normal_or_ample(self) -> None:
+        recession = risk_radar.score_recession_risk(
+            {"value": 15.0},
+            {"spread_2y10y": 0.5},
+            {},
+        )
+        stress = risk_radar.score_market_stress(
+            {"value": 15.0},
+            {"value": 100.0},
+            {},
+        )
+
+        for score in (recession, stress):
+            self.assertEqual(score["data_status"], "partial")
+            self.assertIn("financial_stress", score["missing_inputs"])
+            self.assertIn("数据不完整", score["interpretation"])
+            self.assertIn("OFR 金融压力", score["interpretation"])
+        self.assertNotIn("宏观环境正常", recession["interpretation"])
+        self.assertNotIn("流动性充裕", stress["interpretation"])
+
+    def test_recent_complete_ofr_point_can_be_reused_but_is_marked_stale(self) -> None:
+        previous = {
+            "financial_stress": {
+                "ofr_fsi": -1.5,
+                "credit": -0.5,
+                "funding": -0.2,
+                "volatility": -0.3,
+                "equity_valuation": -0.1,
+                "safe_assets": -0.4,
+                "observed_at": "2026-08-01",
+                "unit": "index",
+                "data_status": "ok",
+            }
+        }
+
+        result = risk_radar._reuse_recent_financial_stress(
+            risk_radar._empty_financial_stress(),
+            previous,
+            now=NOW,
+        )
+
+        self.assertEqual(result["ofr_fsi"], -1.5)
+        self.assertEqual(result["data_status"], "stale")
+        self.assertTrue(result["stale"])
+        self.assertEqual(result["status"], "low")
+
+    def test_expired_ofr_point_is_not_reused(self) -> None:
+        previous = {
+            "financial_stress": {
+                "ofr_fsi": -1.5,
+                "credit": -0.5,
+                "funding": -0.2,
+                "volatility": -0.3,
+                "equity_valuation": -0.1,
+                "safe_assets": -0.4,
+                "observed_at": "2026-07-20",
+                "data_status": "ok",
+            }
+        }
+
+        result = risk_radar._reuse_recent_financial_stress(
+            risk_radar._empty_financial_stress(),
+            previous,
+            now=NOW,
+        )
+
+        self.assertIsNone(result["ofr_fsi"])
+        self.assertEqual(result["data_status"], "unavailable")
+
+    def test_new_reports_publish_ofr_instead_of_legacy_oas(self) -> None:
+        financial_stress = {
+            "ofr_fsi": 1.0,
+            "credit": 0.2,
+            "funding": 0.2,
+            "volatility": 0.2,
+            "equity_valuation": 0.2,
+            "safe_assets": 0.2,
+            "observed_at": "2026-08-03",
+            "source": "U.S. Treasury OFR",
+            "source_url": risk_radar.OFR_FSI_SOURCE_URL,
+            "unit": "index",
+            "status": "normal",
+            "data_status": "ok",
+        }
+        payloads = {
+            risk_radar.fetch_vix: {"value": 15.0},
+            risk_radar.fetch_treasury_yields: {"2Y": 4.0, "10Y": 4.5},
+            risk_radar.fetch_usd_cny: {"rate": 7.0},
+            risk_radar.fetch_gold_oil: {},
+            risk_radar.fetch_dxy: {"value": 100.0, "change_pct": 0.0},
+            risk_radar.fetch_financial_stress: financial_stress,
+            risk_radar.fetch_yield_curve_analysis: {"spread_2y10y": 0.5},
+        }
+
+        def fake_safe_fetch(fn, default=None):
+            return payloads.get(fn, default if default is not None else {})
+
+        with mock.patch.object(risk_radar, "_safe_fetch", side_effect=fake_safe_fetch):
+            report = risk_radar.generate_risk_report()
+
+        self.assertEqual(report["market_data"]["financial_stress"], financial_stress)
+        self.assertNotIn("credit_spreads", report["market_data"])
+        self.assertNotIn("US high yield bond spread today", report["search_queries"])
 
 
 class AssetTagTests(unittest.TestCase):
@@ -193,6 +357,32 @@ class MonitoredEventTests(unittest.TestCase):
         self.assertEqual(spike["previous_value"], 15.0)
         self.assertEqual(spike["current_value"], 27.0)
         self.assertTrue(spike["tickers"] or spike["sectors"])
+
+    def test_ofr_fsi_material_change_creates_an_indicator_event(self) -> None:
+        previous = {
+            "financial_stress": {"ofr_fsi": 1.25, "data_status": "ok"},
+        }
+        current = {
+            "financial_stress": {"ofr_fsi": 3.10, "data_status": "ok"},
+        }
+
+        events = risk_radar.detect_indicator_events(current, previous, now=NOW)
+
+        event = next(e for e in events if e["id"] == "ind_ofr_fsi_rise")
+        self.assertEqual(event["source"], "U.S. Treasury OFR")
+        self.assertEqual(event["previous_value"], 1.25)
+        self.assertEqual(event["current_value"], 3.10)
+        self.assertEqual(event["unit"], "index")
+        self.assertEqual(event["severity"], "high")
+        self.assertIn("OFR FSI 上升", event["title"])
+
+    def test_legacy_credit_event_remains_available_for_old_snapshots(self) -> None:
+        previous = {"credit_spreads": {"hy_oas": 300.0}}
+        current = {"credit_spreads": {"hy_oas": 340.0}}
+
+        events = risk_radar.detect_indicator_events(current, previous, now=NOW)
+
+        self.assertIn("ind_credit_widening", [event["id"] for event in events])
 
     def test_indicator_events_need_a_previous_snapshot(self) -> None:
         current = {"vix": {"value": 40.0}}

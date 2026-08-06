@@ -157,6 +157,7 @@ _PUBLIC_MACRO_MARKET_KEYS = (
     "usd_cny",
     "dxy",
     "gold_oil",
+    "financial_stress",
     "credit_spreads",
 )
 _PUBLIC_MACRO_MARKET_SCALARS = (
@@ -167,6 +168,7 @@ _PUBLIC_MACRO_MARKET_SCALARS = (
     "change_pct",
     "status",
     "source",
+    "source_url",
     "timestamp",
     "observed_at",
     "spread_2y10y",
@@ -176,8 +178,31 @@ _PUBLIC_MACRO_MARKET_SCALARS = (
     "30Y",
     "hy_oas",
     "ig_oas",
+    "ofr_fsi",
+    "credit",
+    "funding",
+    "volatility",
+    "equity_valuation",
+    "safe_assets",
+    "data_status",
+    "stale",
+    "is_stale",
+    "note",
     "symbol",
     "unit",
+)
+
+_PUBLIC_MACRO_COVERAGE_SOURCE_FIELDS = (
+    "key",
+    "label",
+    "available",
+    "status",
+    "data_status",
+    "observed_at",
+    "source_url",
+    "stale",
+    "is_stale",
+    "note",
 )
 _PRIVATE_MACRO_RELATION_FIELDS = {
     "affected_positions",
@@ -739,7 +764,7 @@ def project_public_macro(snapshot: Any) -> dict[str, Any]:
             [
                 {
                     field: _public_sanitize(source[field])
-                    for field in ("key", "label", "available")
+                    for field in _PUBLIC_MACRO_COVERAGE_SOURCE_FIELDS
                     if field in source and _is_public_scalar(source[field])
                 }
                 for source in sources

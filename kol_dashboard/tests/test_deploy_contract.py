@@ -28,6 +28,9 @@ class DeploymentContractTests(unittest.TestCase):
         ):
             self.assertIn(filename, self.deploy)
 
+    def test_deploy_bundle_omits_macos_appledouble_metadata(self) -> None:
+        self.assertIn("COPYFILE_DISABLE=1 tar czf", self.deploy)
+
     def test_systemd_uses_root_only_environment_file(self) -> None:
         self.assertIn("EnvironmentFile=-/etc/kol-dashboard.env", self.deploy)
         self.assertIn("chmod 600 /etc/kol-dashboard.env", self.deploy)

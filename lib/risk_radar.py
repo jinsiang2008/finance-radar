@@ -19,13 +19,14 @@ Risk Radar — 黑天鹅/灰犀牛预警与系统性风险扫描
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import math
 import os
 import re
 import sys
-import urllib.request
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from html import unescape
 from typing import Any
 
@@ -53,6 +54,19 @@ UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
 TIMEOUT = 15
+OFR_FSI_CSV_URL = "https://www.financialresearch.gov/financial-stress-index/data/fsi.csv"
+OFR_FSI_SOURCE_URL = "https://www.financialresearch.gov/financial-stress-index/"
+OFR_FSI_SOURCE = "U.S. Treasury OFR"
+OFR_FSI_FALLBACK_MAX_AGE_DAYS = 10
+
+_OFR_FSI_COLUMNS = {
+    "ofr_fsi": "ofr fsi",
+    "credit": "credit",
+    "funding": "funding",
+    "volatility": "volatility",
+    "equity_valuation": "equity valuation",
+    "safe_assets": "safe assets",
+}
 
 # ════════════════════════════════════════════
 # 1. 核心风险指标采集
@@ -118,63 +132,102 @@ def fetch_dxy() -> dict[str, Any]:
     return result
 
 
-def fetch_credit_spreads() -> dict[str, Any]:
-    """信用利差 — 尝试从 FRED 获取（HY OAS, IG OAS）"""
-    result = {
-        "hy_oas": None,
-        "ig_oas": None,
-        "unit": "basis_points",
+def _financial_stress_status(value: float | None) -> str:
+    """Classify OFR FSI levels without treating a missing value as calm."""
+    if value is None:
+        return "unknown"
+    if value > 5:
+        return "critical"
+    if value > 2:
+        return "elevated"
+    if value > 0:
+        return "normal"
+    return "low"
+
+
+def _empty_financial_stress() -> dict[str, Any]:
+    return {
+        "ofr_fsi": None,
+        "credit": None,
+        "funding": None,
+        "volatility": None,
+        "equity_valuation": None,
+        "safe_assets": None,
+        "observed_at": None,
+        "source": OFR_FSI_SOURCE,
+        "source_url": OFR_FSI_SOURCE_URL,
+        "unit": "index",
         "status": "unknown",
+        "data_status": "unavailable",
     }
+
+
+def fetch_financial_stress() -> dict[str, Any]:
+    """Fetch the official OFR Financial Stress Index category decomposition.
+
+    OFR occasionally publishes a partial final row while its daily file is being
+    refreshed.  Walk the file in order and retain the last row whose date and all
+    six index values are complete and finite, rather than blindly trusting the
+    final physical line.
+    """
+    result = _empty_financial_stress()
+
     try:
-        # 尝试 BAML HY OAS (FRED: BAMLH0A0HYM2)
-        hy = http_get(
-            "https://fred.stlouisfed.org/graph/fredgraph.csv?bgcolor=%23e1e9f0&chart_type=line&"
-            "drp=0&fo=open%20sans&graph_bgcolor=%23ffffff&height=450&mode=fred&recession_bars=on&"
-            "txtcolor=%23444444&ts=12&tts=12&width=1168&nt=0&thu=0&trc=0&show_legend=yes&"
-            "show_axis_titles=yes&show_tooltip=yes&id=BAMLH0A0HYM2&scale=left&cosd=2025-01-01&"
-            "coed=2026-12-31&line_color=%234572a7&link_values=false&line_style=solid&"
-            "mark_type=none&mw=3&lw=2&ost=-99999&oet=99999&mma=0&fml=a&fq=Daily&fam=avg&"
-            "fgst=lin&fgsnd=2020-02-01&line_index=1&transformation=lin&vintage_date=TODAY",
-            timeout=10,
+        raw = http_get(
+            OFR_FSI_CSV_URL,
+            headers={"Accept": "text/csv,*/*;q=0.8"},
+            timeout=TIMEOUT,
         )
-        lines = hy.strip().split("\n")
-        if len(lines) >= 2:
-            last_line = lines[-1].strip()
-            parts = last_line.split(",")
-            if len(parts) >= 2 and parts[1]:
-                result["hy_oas"] = round(float(parts[1]) * 100, 2)
+        if not isinstance(raw, str) or not raw.strip():
+            return result
 
-        # 尝试 IG OAS (FRED: BAMLC0A0CM)
-        ig = http_get(
-            "https://fred.stlouisfed.org/graph/fredgraph.csv?bgcolor=%23e1e9f0&chart_type=line&"
-            "drp=0&fo=open%20sans&graph_bgcolor=%23ffffff&height=450&mode=fred&recession_bars=on&"
-            "txtcolor=%23444444&ts=12&tts=12&width=1168&nt=0&thu=0&trc=0&show_legend=yes&"
-            "show_axis_titles=yes&show_tooltip=yes&id=BAMLC0A0CM&scale=left&cosd=2025-01-01&"
-            "coed=2026-12-31&line_color=%234572a7&link_values=false&line_style=solid&"
-            "mark_type=none&mw=3&lw=2&ost=-99999&oet=99999&mma=0&fml=a&fq=Daily&fam=avg&"
-            "fgst=lin&fgsnd=2020-02-01&line_index=1&transformation=lin&vintage_date=TODAY",
-            timeout=10,
-        )
-        lines = ig.strip().split("\n")
-        if len(lines) >= 2:
-            last_line = lines[-1].strip()
-            parts = last_line.split(",")
-            if len(parts) >= 2 and parts[1]:
-                result["ig_oas"] = round(float(parts[1]) * 100, 2)
+        latest: tuple[str, dict[str, float]] | None = None
+        reader = csv.DictReader(io.StringIO(raw.lstrip("\ufeff")))
+        for row in reader:
+            if not isinstance(row, dict):
+                continue
+            normalized = {
+                str(key).strip().lower(): value
+                for key, value in row.items()
+                if key is not None
+            }
+            observed_raw = normalized.get("date")
+            if not isinstance(observed_raw, str):
+                continue
+            observed_at = observed_raw.strip()
+            try:
+                datetime.strptime(observed_at, "%Y-%m-%d")
+            except ValueError:
+                continue
 
-        if result["hy_oas"] and result["ig_oas"]:
-            result["spread_diff"] = round(result["hy_oas"] - result["ig_oas"], 2)
-            if result["hy_oas"] > 500:
-                result["status"] = "critical"  # HY > 500bp → 信用恐慌
-            elif result["hy_oas"] > 350:
-                result["status"] = "elevated"
-            elif result["hy_oas"] > 200:
-                result["status"] = "normal"
-            else:
-                result["status"] = "low"
+            values: dict[str, float] = {}
+            valid = True
+            for output_key, csv_key in _OFR_FSI_COLUMNS.items():
+                raw_value = normalized.get(csv_key)
+                if not isinstance(raw_value, str) or not raw_value.strip():
+                    valid = False
+                    break
+                try:
+                    value = float(raw_value.strip())
+                except ValueError:
+                    valid = False
+                    break
+                if not math.isfinite(value):
+                    valid = False
+                    break
+                values[output_key] = value
+            if valid:
+                latest = observed_at, values
+
+        if latest is None:
+            return result
+        observed_at, values = latest
+        result.update(values)
+        result["observed_at"] = observed_at
+        result["status"] = _financial_stress_status(values["ofr_fsi"])
+        result["data_status"] = "ok"
     except Exception:
-        pass
+        return result
     return result
 
 
@@ -213,14 +266,62 @@ def fetch_yield_curve_analysis() -> dict[str, Any]:
 # 2. 风险场景评分
 # ════════════════════════════════════════════
 
-def score_recession_risk(vix_data: dict, yield_curve: dict, credit_data: dict) -> dict:
+
+def _stress_measure(
+    financial_stress_data: Any,
+    legacy_credit_data: Any = None,
+) -> tuple[str | None, float | None]:
+    """Read OFR FSI first, with HY OAS accepted only for stored old snapshots."""
+    candidates = (financial_stress_data, legacy_credit_data)
+    for payload in candidates:
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("data_status") == "unavailable":
+            continue
+        ofr_fsi = _numeric(payload.get("ofr_fsi"))
+        if ofr_fsi is not None:
+            return "ofr_fsi", ofr_fsi
+        hy_oas = _numeric(payload.get("hy_oas"))
+        if hy_oas is not None:
+            return "legacy_hy_oas", hy_oas
+    return None, None
+
+
+def _score_completeness(inputs: dict[str, float | None]) -> tuple[str, list[str]]:
+    missing = [name for name, value in inputs.items() if value is None]
+    if not missing:
+        return "ok", []
+    if len(missing) == len(inputs):
+        return "unavailable", missing
+    return "partial", missing
+
+
+_SCORE_INPUT_LABELS = {
+    "vix": "VIX",
+    "yield_curve": "收益率曲线",
+    "dxy": "美元指数 DXY",
+    "financial_stress": "OFR 金融压力",
+}
+
+
+def _missing_input_text(missing_inputs: list[str]) -> str:
+    return "、".join(_SCORE_INPUT_LABELS.get(key, key) for key in missing_inputs)
+
+
+def score_recession_risk(
+    vix_data: dict,
+    yield_curve: dict,
+    financial_stress_data: dict | None = None,
+    *,
+    credit_data: dict | None = None,
+) -> dict:
     """衰退风险评估 (0-100)"""
     score = 30  # 基准分
     signals = []
 
     # VIX 信号
-    vix_val = vix_data.get("value")
-    if vix_val:
+    vix_val = _numeric(vix_data.get("value")) if isinstance(vix_data, dict) else None
+    if vix_val is not None:
         if vix_val > 35:
             score += 30
             signals.append("VIX极度恐慌")
@@ -232,7 +333,11 @@ def score_recession_risk(vix_data: dict, yield_curve: dict, credit_data: dict) -
             signals.append("VIX偏高")
 
     # 收益率曲线信号
-    spread = yield_curve.get("spread_2y10y")
+    spread = (
+        _numeric(yield_curve.get("spread_2y10y"))
+        if isinstance(yield_curve, dict)
+        else None
+    )
     if spread is not None:
         if spread < -0.4:
             score += 25
@@ -244,41 +349,77 @@ def score_recession_risk(vix_data: dict, yield_curve: dict, credit_data: dict) -
             score += 5
             signals.append("收益率曲线平坦化")
 
-    # 信用利差信号
-    hy_oas = credit_data.get("hy_oas")
-    if hy_oas:
-        if hy_oas > 500:
+    # 新快照使用 OFR FSI；旧快照仍可按原 HY OAS 口径重算。
+    stress_kind, stress_value = _stress_measure(financial_stress_data, credit_data)
+    if stress_kind == "ofr_fsi" and stress_value is not None:
+        if stress_value > 5:
+            score += 25
+            signals.append("OFR FSI > 5 → 系统性金融压力极高")
+        elif stress_value > 2:
+            score += 15
+            signals.append("OFR FSI > 2 → 金融压力显著高于历史均值")
+        elif stress_value > 0:
+            score += 5
+            signals.append("OFR FSI 高于历史均值")
+    elif stress_kind == "legacy_hy_oas" and stress_value is not None:
+        if stress_value > 500:
             score += 25
             signals.append("高收益债利差飙升")
-        elif hy_oas > 350:
+        elif stress_value > 350:
             score += 15
             signals.append("高收益债利差扩大")
-        elif hy_oas > 200:
+        elif stress_value > 200:
             score += 5
 
     score = min(score, 100)
     level = "critical" if score >= 75 else "high" if score >= 55 else "medium" if score >= 40 else "low"
+    data_status, missing_inputs = _score_completeness({
+        "vix": vix_val,
+        "yield_curve": spread,
+        "financial_stress": stress_value,
+    })
+    base_interpretation = {
+        "critical": "🚨 衰退风险极高 — 多项指标同时触发预警",
+        "high": "⚠️ 衰退风险偏高 — 需密切关注",
+        "medium": "📌 衰退风险中等 — 部分指标发出预警",
+        "low": "🟢 衰退风险较低 — 宏观环境正常",
+    }.get(level, "")
+    if missing_inputs:
+        missing_text = _missing_input_text(missing_inputs)
+        qualifier = (
+            f"数据不完整（缺少 {missing_text}），当前分数仅反映可用指标，"
+            "不足以确认宏观环境处于低风险状态"
+        )
+        interpretation = (
+            f"⚪ {qualifier}" if level == "low"
+            else f"{base_interpretation}；{qualifier}"
+        )
+    else:
+        interpretation = base_interpretation
 
     return {
         "score": score,
         "level": level,
         "signals": signals,
-        "interpretation": {
-            "critical": "🚨 衰退风险极高 — 多项指标同时触发预警",
-            "high": "⚠️ 衰退风险偏高 — 需密切关注",
-            "medium": "📌 衰退风险中等 — 部分指标发出预警",
-            "low": "🟢 衰退风险较低 — 宏观环境正常",
-        }.get(level, ""),
+        "data_status": data_status,
+        "missing_inputs": missing_inputs,
+        "interpretation": interpretation,
     }
 
 
-def score_market_stress(vix_data: dict, dxy_data: dict, credit_data: dict) -> dict:
+def score_market_stress(
+    vix_data: dict,
+    dxy_data: dict,
+    financial_stress_data: dict | None = None,
+    *,
+    credit_data: dict | None = None,
+) -> dict:
     """市场压力/流动性风险评估 (0-100)"""
     score = 20
     signals = []
 
-    vix_val = vix_data.get("value")
-    if vix_val:
+    vix_val = _numeric(vix_data.get("value")) if isinstance(vix_data, dict) else None
+    if vix_val is not None:
         if vix_val > 35:
             score += 25
             signals.append("VIX > 35 → 市场极度恐慌")
@@ -288,37 +429,75 @@ def score_market_stress(vix_data: dict, dxy_data: dict, credit_data: dict) -> di
         elif vix_val > 20:
             score += 5
 
-    dxy_val = dxy_data.get("value")
-    dxy_chg = dxy_data.get("change_pct")
-    if dxy_val:
+    dxy_val = _numeric(dxy_data.get("value")) if isinstance(dxy_data, dict) else None
+    dxy_chg = (
+        _numeric(dxy_data.get("change_pct"))
+        if isinstance(dxy_data, dict)
+        else None
+    )
+    if dxy_val is not None:
         if dxy_val > 108:
             score += 20
             signals.append("美元指数 > 108 → 新兴市场压力")
         elif dxy_val > 105:
             score += 10
             signals.append("美元指数偏高")
-        if dxy_chg and abs(dxy_chg) > 1:
+        if dxy_chg is not None and abs(dxy_chg) > 1:
             score += 10
             signals.append(f"美元单日波动 {dxy_chg:+.2f}%")
 
-    hy_oas = credit_data.get("hy_oas")
-    if hy_oas and hy_oas > 400:
+    stress_kind, stress_value = _stress_measure(financial_stress_data, credit_data)
+    if stress_kind == "ofr_fsi" and stress_value is not None:
+        if stress_value > 5:
+            score += 15
+            signals.append("OFR FSI > 5 → 系统性金融压力极高")
+        elif stress_value > 2:
+            score += 10
+            signals.append("OFR FSI > 2 → 金融压力显著高于历史均值")
+        elif stress_value > 0:
+            score += 5
+            signals.append("OFR FSI 高于历史均值")
+    elif (
+        stress_kind == "legacy_hy_oas"
+        and stress_value is not None
+        and stress_value > 400
+    ):
         score += 15
         signals.append("信用利差显著扩大")
 
     score = min(score, 100)
     level = "critical" if score >= 70 else "high" if score >= 50 else "medium" if score >= 35 else "low"
+    data_status, missing_inputs = _score_completeness({
+        "vix": vix_val,
+        "dxy": dxy_val,
+        "financial_stress": stress_value,
+    })
+    base_interpretation = {
+        "critical": "🚨 市场压力极大 — 流动性紧缩风险",
+        "high": "⚠️ 市场压力偏高 — 警惕流动性拐点",
+        "medium": "📌 市场压力中等 — 正常波动范围",
+        "low": "🟢 市场压力较低 — 流动性充裕",
+    }.get(level, "")
+    if missing_inputs:
+        missing_text = _missing_input_text(missing_inputs)
+        qualifier = (
+            f"数据不完整（缺少 {missing_text}），当前分数仅反映可用指标，"
+            "不足以确认流动性处于宽松状态"
+        )
+        interpretation = (
+            f"⚪ {qualifier}" if level == "low"
+            else f"{base_interpretation}；{qualifier}"
+        )
+    else:
+        interpretation = base_interpretation
 
     return {
         "score": score,
         "level": level,
         "signals": signals,
-        "interpretation": {
-            "critical": "🚨 市场压力极大 — 流动性紧缩风险",
-            "high": "⚠️ 市场压力偏高 — 警惕流动性拐点",
-            "medium": "📌 市场压力中等 — 正常波动范围",
-            "low": "🟢 市场压力较低 — 流动性充裕",
-        }.get(level, ""),
+        "data_status": data_status,
+        "missing_inputs": missing_inputs,
+        "interpretation": interpretation,
     }
 
 
@@ -926,12 +1105,23 @@ def detect_indicator_events(
     stamp = (now or datetime.now(timezone.utc)).replace(microsecond=0)
     events: list[dict] = []
 
-    def add(event_id, title, prev, curr, unit, severity, tickers, sectors, note):
+    def add(
+        event_id,
+        title,
+        prev,
+        curr,
+        unit,
+        severity,
+        tickers,
+        sectors,
+        note,
+        source="风险雷达指标监控",
+    ):
         events.append({
             "id": event_id,
             "kind": "indicator",
             "title": title,
-            "source": "风险雷达指标监控",
+            "source": source,
             "published_at": stamp.isoformat(),
             "time_status": "verified",
             "severity": severity,
@@ -961,6 +1151,43 @@ def detect_indicator_events(
                 else "波动率回落，风险偏好可能修复",
             )
 
+    current_financial_stress = current_market.get("financial_stress") or {}
+    previous_financial_stress = previous_market.get("financial_stress") or {}
+    ofr_now = (
+        _numeric(current_financial_stress.get("ofr_fsi"))
+        if isinstance(current_financial_stress, dict)
+        and current_financial_stress.get("data_status") != "unavailable"
+        else None
+    )
+    ofr_before = (
+        _numeric(previous_financial_stress.get("ofr_fsi"))
+        if isinstance(previous_financial_stress, dict)
+        and previous_financial_stress.get("data_status") != "unavailable"
+        else None
+    )
+    if ofr_now is not None and ofr_before is not None:
+        change = ofr_now - ofr_before
+        crossed_level = any(
+            (ofr_now > threshold) != (ofr_before > threshold)
+            for threshold in (0.0, 2.0, 5.0)
+        )
+        if change != 0 and (abs(change) >= 1.0 or crossed_level):
+            rising = change > 0
+            add(
+                "ind_ofr_fsi_rise" if rising else "ind_ofr_fsi_fall",
+                f"OFR FSI {'上升' if rising else '回落'} {abs(change):.2f} 点"
+                f"（{ofr_before:.2f} → {ofr_now:.2f}）",
+                ofr_before,
+                ofr_now,
+                "index",
+                "high" if rising and ofr_now > 2 else "medium",
+                ("HYG", "KRE", "SPY"),
+                ("信用市场", "融资流动性", "系统性金融压力"),
+                "OFR FSI 是相对历史均值衡量全球金融市场压力的综合指标",
+                source=OFR_FSI_SOURCE,
+            )
+
+    # Backward compatibility for comparisons between snapshots from the OAS era.
     hy_now = _numeric((current_market.get("credit_spreads") or {}).get("hy_oas"))
     hy_before = _numeric((previous_market.get("credit_spreads") or {}).get("hy_oas"))
     if hy_now is not None and hy_before is not None:
@@ -1068,6 +1295,63 @@ def _safe_fetch(fn, default=None):
         return default if default is not None else {}
 
 
+def _reuse_recent_financial_stress(
+    current: Any,
+    previous_market_data: Any,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Reuse one complete recent OFR point when today's download is unavailable."""
+    if isinstance(current, dict) and _stress_measure(current)[0] == "ofr_fsi":
+        return current
+    fallback = (
+        current
+        if isinstance(current, dict) and current
+        else _empty_financial_stress()
+    )
+    if not isinstance(previous_market_data, dict):
+        return fallback
+    previous = previous_market_data.get("financial_stress")
+    if not isinstance(previous, dict) or previous.get("data_status") == "unavailable":
+        return fallback
+
+    observed_raw = previous.get("observed_at")
+    if not isinstance(observed_raw, str):
+        return fallback
+    try:
+        observed_date = datetime.strptime(observed_raw.strip(), "%Y-%m-%d").date()
+    except ValueError:
+        return fallback
+    current_time = now or datetime.now(timezone.utc)
+    age_days = (current_time.date() - observed_date).days
+    if age_days < 0 or age_days > OFR_FSI_FALLBACK_MAX_AGE_DAYS:
+        return fallback
+
+    values = {
+        key: _numeric(previous.get(key))
+        for key in _OFR_FSI_COLUMNS
+    }
+    if any(value is None for value in values.values()):
+        return fallback
+
+    reused = {
+        **values,
+        "observed_at": observed_date.isoformat(),
+        "source": OFR_FSI_SOURCE,
+        "source_url": OFR_FSI_SOURCE_URL,
+        "unit": "index",
+        "status": _financial_stress_status(values["ofr_fsi"]),
+        "data_status": "stale",
+        "stale": True,
+        "is_stale": True,
+        "note": (
+            "OFR download unavailable; reused the most recent complete point "
+            f"({age_days} days old)"
+        ),
+    }
+    return reused
+
+
 def generate_risk_report(previous_market_data: dict | None = None) -> dict:
     """生成完整风险雷达报告。
 
@@ -1080,15 +1364,18 @@ def generate_risk_report(previous_market_data: dict | None = None) -> dict:
     usd_cny_data = _safe_fetch(fetch_usd_cny)
     gold_oil_data = _safe_fetch(fetch_gold_oil)
     dxy_data = _safe_fetch(fetch_dxy)
-    credit_data = _safe_fetch(fetch_credit_spreads)
+    financial_stress_data = _reuse_recent_financial_stress(
+        _safe_fetch(fetch_financial_stress),
+        previous_market_data,
+    )
     yield_curve = _safe_fetch(fetch_yield_curve_analysis)
     fed_items = _safe_fetch(fetch_fed, default=[])
     pboc_items = _safe_fetch(fetch_pboc, default=[])
     cctv_items = _safe_fetch(fetch_cctv_news, default=[])
 
     # 评分
-    recession = score_recession_risk(vix_data, yield_curve, credit_data)
-    market_stress = score_market_stress(vix_data, dxy_data, credit_data)
+    recession = score_recession_risk(vix_data, yield_curve, financial_stress_data)
+    market_stress = score_market_stress(vix_data, dxy_data, financial_stress_data)
     geopolitical = score_geopolitical_risk(fed_items, pboc_items, cctv_items)
     china_risk = score_china_risk(usd_cny_data, pboc_items)
 
@@ -1105,6 +1392,19 @@ def generate_risk_report(previous_market_data: dict | None = None) -> dict:
         "medium" if composite_score >= 40 else
         "low"
     )
+    composite_missing_inputs = list(dict.fromkeys(
+        recession.get("missing_inputs", [])
+        + market_stress.get("missing_inputs", [])
+    ))
+    composite_data_status = "partial" if composite_missing_inputs else "ok"
+    composite_label = {
+        "critical": "🚨 综合风险极高 — 系统性风险警报",
+        "high": "⚠️ 综合风险偏高 — 需警惕",
+        "medium": "📌 综合风险中等 — 正常关注",
+        "low": "🟢 综合风险较低 — 环境良好",
+    }.get(composite_level, "")
+    if composite_level == "low" and composite_missing_inputs:
+        composite_label = "⚪ 综合分仅反映可用指标 — 数据不完整，不足以确认低风险环境"
 
     # 机会与场景
     opportunities = identify_opportunities(vix_data, gold_oil_data, yield_curve, usd_cny_data)
@@ -1122,7 +1422,7 @@ def generate_risk_report(previous_market_data: dict | None = None) -> dict:
         "usd_cny": usd_cny_data,
         "dxy": dxy_data,
         "gold_oil": gold_oil_data,
-        "credit_spreads": credit_data,
+        "financial_stress": financial_stress_data,
     }
 
     # 具体监控到的事件：政策原文 + 指标异动
@@ -1143,12 +1443,9 @@ def generate_risk_report(previous_market_data: dict | None = None) -> dict:
         "composite_risk": {
             "score": composite_score,
             "level": composite_level,
-            "label": {
-                "critical": "🚨 综合风险极高 — 系统性风险警报",
-                "high": "⚠️ 综合风险偏高 — 需警惕",
-                "medium": "📌 综合风险中等 — 正常关注",
-                "low": "🟢 综合风险较低 — 环境良好",
-            }.get(composite_level, ""),
+            "data_status": composite_data_status,
+            "missing_inputs": composite_missing_inputs,
+            "label": composite_label,
         },
         "sub_scores": {
             "recession": recession,
@@ -1164,7 +1461,6 @@ def generate_risk_report(previous_market_data: dict | None = None) -> dict:
         "search_queries": [
             "Fear and Greed Index today",
             "S&P 500 PE ratio forward 2026",
-            "US high yield bond spread today",
             "Global PMI manufacturing June 2026",
             "Bitcoin fear and greed index",
             "US initial jobless claims latest",

@@ -19,7 +19,15 @@
     logoutPending: false,
     decisionData: null,
     selectedDecisionKey: "",
+    decisionQueueExpanded: false,
+    matrixExpanded: false,
     decisionRequestGeneration: 0,
+    macroData: null,
+    macroHistory: [],
+    stats: null,
+    feedLoadedCount: 0,
+    feedHighPriority: false,
+    feedRegularCapped: false,
   };
 
   // ─── Helpers ──────────────────────────────
@@ -92,12 +100,71 @@
     ai_semiconductors: "AI 与半导体",
     monetary_policy: "货币政策",
     recession_growth: "衰退与增长",
+    inflation: "通胀与物价",
+    geopolitics_trade: "地缘与贸易",
+    crypto: "加密资产",
+    financial_system: "金融系统",
+    china_markets: "中国市场",
+    market_risk: "市场风险",
     inflation_rates: "通胀与利率",
     geopolitical_risk: "地缘政治",
     china_macro: "中国宏观",
     crypto_regulation: "加密与监管",
     market_stress: "市场压力",
     general_market: "综合市场",
+    general: "综合市场",
+  };
+  const ASSET_CN = {
+    "US:SPY": "标普 500 ETF",
+    "US:QQQ": "纳指 100 ETF",
+    "US:NVDA": "英伟达",
+    "US:AVGO": "博通",
+    "US:AMD": "超威半导体",
+    "US:TSM": "台积电",
+    "US:SOXL": "三倍做多半导体 ETF",
+    "US:TSLA": "特斯拉",
+    "US:AAPL": "苹果",
+    "US:MSFT": "微软",
+    "US:META": "Meta",
+    "US:GOOGL": "谷歌",
+    "US:AMZN": "亚马逊",
+    "US:BABA": "阿里巴巴",
+    "US:TLT": "长期美国国债 ETF",
+    "BOND:UST_LONG": "长期美国国债",
+    "BOND:UST_INTERMEDIATE": "中期美国国债",
+    "COMMODITY:GOLD": "黄金",
+    "COMMODITY:OIL": "原油",
+    "CRYPTO:BTC": "比特币",
+    "CRYPTO:ETH": "以太坊",
+    "CRYPTO:DOGE": "狗狗币",
+    "FX:JPY": "日元",
+    "FX:CNY": "人民币",
+    "FX:USD/CNY": "美元兑人民币",
+    "FX:DXY": "美元指数",
+    "INDEX:HSI": "恒生指数",
+    "INDEX:CSI300": "沪深 300",
+    "INDEX:NIKKEI": "日经 225",
+    "INDEX:VIX": "VIX 恐慌指数",
+    "THEME:AI": "人工智能主题",
+    "THEME:SEMICONDUCTOR": "半导体主题",
+    "THEME:CHINA_EQUITY": "中国股票主题",
+    "THEME:CRYPTO": "加密资产主题",
+    "THEME:EMERGING_MARKETS": "新兴市场主题",
+    "THEME:FINANCIALS": "金融板块",
+    "THEME:GLOBAL_RISK_ASSETS": "全球风险资产",
+  };
+  const ASSET_TICKER = {
+    "BOND:UST_LONG": "TLT",
+    "BOND:UST_INTERMEDIATE": "IEF",
+    "COMMODITY:GOLD": "GOLD",
+    "COMMODITY:OIL": "WTI",
+    "FX:USD/CNY": "USD/CNY",
+    "INDEX:NIKKEI": "NIKKEI",
+    "THEME:SEMICONDUCTOR": "SEMICONDUCTOR",
+    "THEME:CHINA_EQUITY": "CHINA EQUITY",
+    "THEME:EMERGING_MARKETS": "EM",
+    "THEME:FINANCIALS": "FINANCIALS",
+    "THEME:GLOBAL_RISK_ASSETS": "GLOBAL RISK",
   };
   const ACTION_CN = {
     reduce_or_hedge: { label: "减仓 / 对冲", icon: "▼", color: "var(--high)" },
@@ -114,6 +181,33 @@
   // Strip leading emoji that the backend bakes into labels; the UI adds its own.
   const stripEmoji = (s) =>
     String(s ?? "").replace(/^[\s\p{Extended_Pictographic}\uFE0F]+/u, "").trim();
+
+  function safeExternalUrl(value) {
+    const raw = String(value || "").trim();
+    if (!raw) return "";
+    try {
+      const parsed = new URL(raw, window.location.href);
+      return parsed.protocol === "http:" || parsed.protocol === "https:"
+        ? parsed.href
+        : "";
+    } catch (error) {
+      return "";
+    }
+  }
+
+  function assetTicker(key) {
+    const value = String(key || "").trim();
+    if (!value) return "未知";
+    if (ASSET_TICKER[value]) return ASSET_TICKER[value];
+    const separator = value.indexOf(":");
+    return separator >= 0 ? value.slice(separator + 1) : value;
+  }
+
+  function assetLabel(key) {
+    const value = String(key || "").trim();
+    const ticker = assetTicker(value);
+    return ASSET_CN[value] ? `${ASSET_CN[value]} · ${ticker}` : ticker;
+  }
 
   function fmtTime(iso) {
     if (!iso) return "";
@@ -214,8 +308,153 @@
     return CLASS_CN[card.classification] || CLASS_CN.conflict;
   }
 
+  function shortText(value, limit = 52) {
+    const text = String(value || "").trim();
+    return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
+  }
+
+  function fmtAbsoluteTime(value) {
+    const date = new Date(String(value || ""));
+    if (Number.isNaN(date.getTime())) return String(value || "时间未知");
+    return new Intl.DateTimeFormat("zh-CN", {
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    }).format(date);
+  }
+
+  function setSystemStatus(kind, label, title) {
+    const host = $("#system-status");
+    const text = $("#system-status-label");
+    if (!host || !text) return;
+    host.classList.remove("is-unknown", "is-ok", "is-warn", "is-error");
+    host.classList.add(`is-${kind}`);
+    text.textContent = label;
+    host.title = title;
+  }
+
+  function updateMacroStatus(snapshot) {
+    if (!snapshot?.available) {
+      setSystemStatus(
+        "warn",
+        "等待快照",
+        snapshot?.reason || "尚未采集到宏观快照"
+      );
+      return;
+    }
+
+    const createdAt = snapshot.created_at || snapshot.timestamp;
+    const createdDate = new Date(String(createdAt || ""));
+    if (Number.isNaN(createdDate.getTime())) {
+      setSystemStatus("warn", "时间待核验", "宏观快照未提供可核验的生成时间");
+      return;
+    }
+
+    const ageMs = Date.now() - createdDate.getTime();
+    const coverage = snapshot.data_coverage;
+    const coverageText =
+      typeof coverage?.available === "number" &&
+      typeof coverage?.total === "number" &&
+      coverage.total > 0
+        ? ` · 数据源 ${coverage.available}/${coverage.total}`
+        : "";
+    const title = `宏观快照 ${fmtAbsoluteTime(createdAt)}${coverageText}`;
+    if (ageMs < -5 * 60_000 || ageMs > 150 * 60_000) {
+      setSystemStatus("warn", "快照延迟", title);
+      return;
+    }
+    setSystemStatus("ok", "快照正常", title);
+  }
+
+  function normalizedMacroTrend(items) {
+    return (Array.isArray(items) ? items : [])
+      .map((item, index) => {
+        const score =
+          typeof item?.composite_score === "number"
+            ? item.composite_score
+            : Number.NaN;
+        const time = String(item?.created_at || "");
+        const epoch = new Date(time).getTime();
+        return {
+          score,
+          time,
+          epoch: Number.isFinite(epoch) ? epoch : index,
+          hasTime: Number.isFinite(epoch),
+          level: item?.composite_level || "unknown",
+        };
+      })
+      .filter((item) => Number.isFinite(item.score))
+      .sort((a, b) => a.epoch - b.epoch);
+  }
+
+  function macroTrendSummary(items = state.macroHistory) {
+    const points = normalizedMacroTrend(items);
+    if (!points.length) return { points, current: null, anchor: null, delta: null };
+    const current = points[points.length - 1];
+    let anchor = points[0];
+    if (points.length > 1 && current.hasTime) {
+      const target = current.epoch - 24 * 60 * 60 * 1000;
+      anchor = points.reduce((closest, point) =>
+        Math.abs(point.epoch - target) < Math.abs(closest.epoch - target)
+          ? point
+          : closest
+      );
+    } else if (points.length > 1) {
+      anchor = points[Math.max(0, points.length - 25)];
+    }
+    return {
+      points,
+      current,
+      anchor: points.length > 1 ? anchor : null,
+      delta: points.length > 1 ? current.score - anchor.score : null,
+    };
+  }
+
+  function trendDirection(delta) {
+    if (!Number.isFinite(delta) || Math.abs(delta) < 0.5) return "持平";
+    return delta > 0 ? "上涨" : "回落";
+  }
+
+  function sparklineSVG(points, className = "trend-svg", width = 560, height = 132) {
+    if (!points.length) return "";
+    const padX = 8;
+    const padY = 10;
+    const scores = points.map((point) => point.score);
+    const low = Math.min(...scores);
+    const high = Math.max(...scores);
+    const span = Math.max(1, high - low);
+    const coords = points.map((point, index) => {
+      const x =
+        points.length === 1
+          ? width / 2
+          : padX + (index / (points.length - 1)) * (width - padX * 2);
+      const y = padY + ((high - point.score) / span) * (height - padY * 2);
+      return { x, y };
+    });
+    const line = coords.map((point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`).join(" ");
+    const area = [
+      `${coords[0].x.toFixed(1)},${height - padY}`,
+      line,
+      `${coords[coords.length - 1].x.toFixed(1)},${height - padY}`,
+    ].join(" ");
+    const latest = coords[coords.length - 1];
+    return `<svg class="${esc(className)}" viewBox="0 0 ${width} ${height}"
+      role="img" aria-label="关注优先级最近 ${points.length} 份快照走势" preserveAspectRatio="none">
+      <line class="trend-axis" x1="${padX}" y1="${height - padY}" x2="${
+        width - padX
+      }" y2="${height - padY}"></line>
+      <polygon class="trend-area" points="${area}"></polygon>
+      <polyline class="trend-line" points="${line}" fill="none"></polyline>
+      <circle class="trend-dot" cx="${latest.x.toFixed(1)}" cy="${latest.y.toFixed(
+        1
+      )}" r="3.5"></circle>
+    </svg>`;
+  }
+
   function renderDecisionHero(data) {
-    const cards = data.decisions || [];
+    const cards = orderedDecisions(data.decisions || []);
     const counts = cards.reduce(
       (acc, card) => {
         acc[card.classification] = (acc[card.classification] || 0) + 1;
@@ -241,11 +480,31 @@
       .filter(Boolean)
       .sort();
     const latest = sortedTimes[sortedTimes.length - 1];
-    const headline = counts.risk
-      ? `优先核验 ${counts.risk} 项风险，避免把相关性当成因果`
-      : counts.opportunity
-        ? `发现 ${counts.opportunity} 项机会，先等市场样本确认`
-        : "当前以观察和补充证据为主";
+    const lead = cards[0];
+    const macro = state.macroData?.available === false ? null : state.macroData;
+    const composite = macro?.composite_risk || {};
+    const riskScore = typeof composite.score === "number" && isFinite(composite.score)
+      ? composite.score
+      : null;
+    const riskLevel = composite.level || "unknown";
+    const trend = macroTrendSummary();
+    const delta = trend.delta;
+    const direction = trendDirection(delta);
+    const directionLabel = Number.isFinite(delta) ? direction : "暂无可比";
+    const deltaText = Number.isFinite(delta)
+      ? `${delta > 0 ? "+" : ""}${delta.toFixed(0)} 分`
+      : "历史积累中";
+    const freshnessTime = macro?.created_at || macro?.timestamp || latest;
+    const freshness = freshnessTime ? fmtTime(freshnessTime) : "等待首份快照";
+    const narrative = Number.isFinite(delta)
+      ? `综合风险关注优先级较约 24 小时前${direction === "持平" ? "基本持平" : `${direction} ${Math.abs(delta).toFixed(0)} 分`}。${
+          lead
+            ? `当前先核验“${shortText(lead.trigger || topicName(lead.topic_key), 34)}”及其资产传导。`
+            : "当前没有进入重点队列的资产信号。"
+        }`
+      : lead
+        ? "历史快照仍在积累，先按当前重点信号核验证据链与市场确认。"
+        : "历史快照仍在积累，当前以观察和补充证据为主。";
     const snapshot = data.portfolio_snapshot;
     const privateSummary = state.authenticated
       ? `<div class="private-summary">
@@ -268,26 +527,68 @@
           <span>公共模式不加载持仓；解锁后才显示直接敞口与杠杆风险。</span>
         </div>`;
 
+    const leadAction = lead ? actionInfo(lead) : ACTION_CN.observe;
+    const leadIsActionable = Boolean(
+      lead && ["reduce_or_hedge", "scale_in"].includes(lead.action_stage)
+    );
+    const transmission = lead
+      ? `<div class="transmission-ribbon" aria-label="首要信号传导路径">
+          <span class="transmission-node" title="${esc(lead.trigger || "待补充触发条件")}">
+            <small>信号</small><strong>${esc(shortText(lead.trigger || leadAction.label, 38))}</strong>
+          </span>
+          <span class="transmission-arrow" aria-hidden="true">→</span>
+          <span class="transmission-node" title="${esc(lead.topic_key || "")}">
+            <small>主题</small><strong>${esc(topicName(lead.topic_key))}</strong>
+          </span>
+          <span class="transmission-arrow" aria-hidden="true">→</span>
+          <span class="transmission-node" title="${esc(lead.asset_key || "")}">
+            <small>资产</small><strong>${esc(assetLabel(lead.asset_key))}</strong>
+          </span>
+        </div>`
+      : `<div class="transmission-ribbon is-empty">等待形成可核验的信号 → 主题 → 资产传导</div>`;
+
     $("#decision-hero").innerHTML = `
-      <div class="decision-summary">
-        <div>
-          <p class="decision-kicker">Today’s decision queue</p>
-          <h1 class="decision-title">${esc(headline)}</h1>
-          <p class="decision-lead">
-            机制关系与统计伴随分开展示。完整样本不足、方向冲突或数据过期时，系统会保持观察 / 验证。
-          </p>
-          <div class="decision-meta">
-            <span>数据截至 ${esc(latest ? fmtTime(latest) : "暂无")}</span>
-            <span>·</span><span>宏观覆盖 ${coverage}%</span>
-            <span>·</span><span>所有结论需人工复核</span>
+      <div class="situation-brief">
+        <section class="brief-risk" style="--lvl:${LEVEL_COLOR[riskLevel] || LEVEL_COLOR.unknown}">
+          <p class="brief-eyebrow">10 秒态势简报 · 关注优先级</p>
+          <div class="brief-score-line">
+            <strong class="brief-score">${riskScore === null ? "—" : esc(riskScore)}</strong>
+            <span>/ 100</span>
+            <span class="brief-level">综合风险 ${esc(LEVEL_CN[riskLevel] || riskLevel)}</span>
           </div>
-        </div>
-        <div class="decision-summary-stats">
-          <div class="decision-summary-stat risk"><strong>${counts.risk}</strong><span>▼ 风险</span></div>
-          <div class="decision-summary-stat opportunity"><strong>${counts.opportunity}</strong><span>▲ 机会</span></div>
-          <div class="decision-summary-stat conflict"><strong>${counts.conflict}</strong><span>◆ 分歧</span></div>
-          <div class="decision-summary-stat"><strong>${actionable}</strong><span>可进入分级行动</span></div>
-        </div>
+          <div class="brief-delta">约 24 小时 ${esc(deltaText)} · ${esc(directionLabel)}</div>
+          <div class="brief-sparkline">${
+            trend.points.length
+              ? sparklineSVG(trend.points, "brief-sparkline-svg", 260, 58)
+              : '<span class="empty-hint">等待历史快照</span>'
+          }</div>
+          <div class="brief-freshness">数据新鲜度：${esc(freshness)}</div>
+          <p class="brief-narrative">${esc(narrative)}</p>
+        </section>
+        <section class="brief-lead">
+          <p class="brief-kicker">当前首要传导 · ${
+            leadIsActionable ? "已进入分级行动" : "待验证影响假设"
+          }</p>
+          <h1 class="brief-title">${
+            lead
+              ? `${leadAction.icon} ${esc(
+                  leadIsActionable ? leadAction.label : "待验证影响假设"
+                )} · ${esc(assetLabel(lead.asset_key))}`
+              : "等待重点信号"
+          }</h1>
+          ${transmission}
+          <div class="brief-statline">
+            <span>风险 ${counts.risk}</span><span>机会 ${counts.opportunity}</span>
+            <span>分歧 ${counts.conflict}</span><span>${
+              actionable ? `已确认行动 ${actionable}` : "本轮无已确认行动"
+            }</span>
+            <span>宏观覆盖 ${coverage}%</span>
+          </div>
+          <p class="brief-policy">${esc(
+            data.evidence_policy ||
+              "机制关系与统计伴随分开展示；数据不足、方向冲突或过期时保持观察 / 验证，所有结论需人工复核。"
+          )}</p>
+        </section>
       </div>
       ${privateSummary}`;
   }
@@ -311,7 +612,8 @@
       </div>`;
       return;
     }
-    $("#decision-queue").innerHTML = cards
+    const visibleCards = state.decisionQueueExpanded ? cards : cards.slice(0, 10);
+    const cardHTML = visibleCards
       .map((card) => {
         const action = actionInfo(card);
         const key = decisionKey(card);
@@ -325,7 +627,9 @@
           style="--decision-color:${action.color}">
           <div class="decision-card-top">
             <span class="decision-action">${action.icon} ${action.label}</span>
-            <span class="decision-asset">${esc(card.asset_key)}</span>
+            <span class="decision-asset" title="${esc(card.asset_key)}">${esc(
+              assetLabel(card.asset_key)
+            )}</span>
             <span class="decision-card-score">${Math.round((card.total_score || 0) * 100)} 分</span>
           </div>
           <div class="decision-topic">${esc(topicName(card.topic_key))}</div>
@@ -343,6 +647,14 @@
         </button>`;
       })
       .join("");
+    const moreHTML =
+      cards.length > 10
+        ? `<button class="decision-more" id="decision-show-all" type="button"
+            aria-expanded="${state.decisionQueueExpanded}">
+            ${state.decisionQueueExpanded ? "收起到重点信号" : `查看全部 ${cards.length} 条`}
+          </button>`
+        : "";
+    $("#decision-queue").innerHTML = cardHTML + moreHTML;
   }
 
   function renderDecisionMatrix(data) {
@@ -355,23 +667,39 @@
       </div>`;
       return;
     }
+    const assetScores = (data.decisions || []).reduce((scores, card) => {
+      const key = String(card.asset_key || "");
+      scores[key] = Math.max(scores[key] || 0, Number(card.total_score) || 0);
+      return scores;
+    }, {});
+    const orderedColumns = columns
+      .slice()
+      .sort((a, b) => (assetScores[b] || 0) - (assetScores[a] || 0));
+    const visibleColumns = state.matrixExpanded
+      ? orderedColumns
+      : orderedColumns.slice(0, 8);
     $("#decision-matrix").innerHTML = `<table class="impact-matrix">
-      <thead><tr><th scope="col">主题</th>${columns
-        .map((asset) => `<th scope="col">${esc(asset)}</th>`)
+      <thead><tr><th scope="col">主题</th>${visibleColumns
+        .map(
+          (asset) =>
+            `<th scope="col" title="${esc(asset)}">${esc(assetLabel(asset))}</th>`
+        )
         .join("")}</tr></thead>
       <tbody>${rows
         .map(
           (row) => `<tr>
             <th scope="row">${esc(topicName(row.topic_key))}</th>
-            ${(row.cells || [])
-              .map((cell, index) => {
+            ${visibleColumns
+              .map((asset) => {
+                const index = columns.indexOf(asset);
+                const cell = (row.cells || [])[index];
                 if (!cell) return '<td class="matrix-empty">·</td>';
                 const info = CLASS_CN[cell.classification] || CLASS_CN.conflict;
-                const key = `${row.topic_key}::${columns[index]}`;
+                const key = `${row.topic_key}::${asset}`;
                 return `<td><button type="button" class="matrix-cell ${
                   key === state.selectedDecisionKey ? "is-selected" : ""
                 }" data-decision-key="${esc(key)}" style="--cell-color:${info.color}"
-                  aria-label="${esc(topicName(row.topic_key))} ${esc(columns[index])} ${
+                  aria-label="${esc(topicName(row.topic_key))} ${esc(assetLabel(asset))} ${
                     info.label
                   }">
                   <span class="matrix-symbol">${info.icon}</span>
@@ -382,7 +710,14 @@
           </tr>`
         )
         .join("")}</tbody>
-    </table>`;
+    </table>${
+        columns.length > 8
+          ? `<button class="matrix-more" id="matrix-show-all" type="button"
+              aria-expanded="${state.matrixExpanded}">
+              ${state.matrixExpanded ? "收起到重点资产" : `查看全部 ${columns.length} 个资产`}
+            </button>`
+          : ""
+      }`;
   }
 
   function distinctEvidence(card) {
@@ -422,7 +757,9 @@
       '<span class="chain-arrow" aria-hidden="true">→</span>',
       `<div class="chain-node"><small>主题</small><strong>${esc(topicName(card.topic_key))}</strong></div>`,
       '<span class="chain-arrow" aria-hidden="true">→</span>',
-      `<div class="chain-node"><small>资产</small><strong>${esc(card.asset_key)}</strong></div>`,
+      `<div class="chain-node" title="${esc(card.asset_key)}"><small>资产</small><strong>${esc(
+        assetLabel(card.asset_key)
+      )}</strong></div>`,
     ];
     if (positions.length) {
       chain.push(
@@ -474,7 +811,9 @@
             <tbody>${positions
               .map(
                 (position) => `<tr>
-                  <td>${esc(position.account)}</td><td>${esc(position.asset_key)}</td>
+                  <td>${esc(position.account)}</td><td title="${esc(position.asset_key)}">${esc(
+                    assetLabel(position.asset_key)
+                  )}</td>
                   <td>${esc(position.quantity)}</td><td>${esc(position.avg_cost ?? "—")} ${esc(
                     position.currency || ""
                   )}</td><td>${esc(position.as_of || "—")}</td>
@@ -512,9 +851,9 @@
             }</span>
             <span class="pill" style="--lvl:${kind.color}">${kind.icon} ${kind.label}</span>
           </div>
-          <h2 class="evidence-title" id="decision-detail-title">${esc(card.asset_key)} · ${esc(
-            topicName(card.topic_key)
-          )}</h2>
+          <h2 class="evidence-title" id="decision-detail-title" title="${esc(
+            card.asset_key
+          )}">${esc(assetLabel(card.asset_key))} · ${esc(topicName(card.topic_key))}</h2>
           <div class="evidence-subtitle">数据截至 ${esc(
             card.data_as_of ? fmtTime(card.data_as_of) : "未知"
           )} · 期限 ${esc(card.horizon || "未知")} · ${card.source_count || 0} 个独立来源</div>
@@ -730,22 +1069,55 @@
     const score = typeof cr.score === "number" ? cr.score : 0;
     const cov = d.data_coverage;
 
-    const covPills = cov
-      ? cov.sources
-          .map(
-            (s) =>
-              `<span class="cov-pill ${s.available ? "ok" : "off"}">${
-                s.available ? "●" : "○"
-              } ${esc(s.label)}</span>`
-          )
-          .join("")
-      : "";
+    const coverageSources = Array.isArray(cov?.sources)
+      ? cov.sources.map((source) => {
+          const dataStatus = String(source?.data_status || "").toLowerCase();
+          const sourceStatus = String(source?.status || "").toLowerCase();
+          const unavailable =
+            !source?.available ||
+            dataStatus === "unavailable" ||
+            sourceStatus === "unavailable";
+          const stale =
+            !unavailable &&
+            (source?.stale === true ||
+              source?.is_stale === true ||
+              dataStatus === "stale" ||
+              dataStatus === "delayed" ||
+              sourceStatus === "stale" ||
+              sourceStatus === "delayed");
+          return {
+            source,
+            state: unavailable ? "off" : stale ? "stale" : "ok",
+            symbol: unavailable ? "○" : stale ? "◐" : "●",
+            statusLabel: unavailable ? "不可用" : stale ? "数据延迟" : "",
+          };
+        })
+      : [];
 
-    const covWarn =
-      cov && cov.available < cov.total
-        ? `<div class="cov-warn">${cov.total - cov.available} 个数据源当前不可用，
-           相关分项以基线分计算，综合分可能偏低。</div>`
-        : "";
+    const covPills = coverageSources
+      .map(
+        ({ source, state, symbol, statusLabel }) =>
+          `<span class="cov-pill ${state}">${symbol} ${esc(source.label)}${
+            statusLabel ? ` · ${statusLabel}` : ""
+          }</span>`
+      )
+      .join("");
+
+    const coverageWarnings = [];
+    if (cov && cov.available < cov.total) {
+      coverageWarnings.push(
+        `${cov.total - cov.available} 个数据源当前不可用，相关分项以基线分计算，综合分可能偏低。`
+      );
+    }
+    const staleCount = coverageSources.filter(
+      ({ state: sourceState }) => sourceState === "stale"
+    ).length;
+    if (staleCount) {
+      coverageWarnings.push(`${staleCount} 个数据源延迟，当前值仅供参考。`);
+    }
+    const covWarn = coverageWarnings.length
+      ? `<div class="cov-warn">${coverageWarnings.join(" ")}</div>`
+      : "";
 
     $("#macro-hero").innerHTML = `
       <div style="--lvl:${LEVEL_COLOR[level]}">
@@ -769,6 +1141,74 @@
         </div>
       </div>`;
     $("#macro-hero").style.setProperty("--lvl", LEVEL_COLOR[level]);
+  }
+
+  function renderMacroTrend(items) {
+    const host = $("#macro-trend");
+    const block = $("#macro-trend-block");
+    if (!host || !block) return;
+    let sourceItems = Array.isArray(items) ? items : [];
+    const currentRisk = state.macroData?.composite_risk || {};
+    if (
+      !normalizedMacroTrend(sourceItems).length &&
+      typeof currentRisk.score === "number" &&
+      isFinite(currentRisk.score)
+    ) {
+      sourceItems = [
+        {
+          composite_score: currentRisk.score,
+          composite_level: currentRisk.level,
+          created_at: state.macroData?.created_at || state.macroData?.timestamp || "",
+        },
+      ];
+    }
+    const trend = macroTrendSummary(sourceItems);
+    if (!trend.points.length) {
+      host.innerHTML = `<div class="empty">
+        <span class="empty-icon">⌁</span>历史快照仍在积累
+        <div class="empty-hint">至少需要两份快照才能比较约 24 小时变化</div>
+      </div>`;
+      block.hidden = false;
+      return;
+    }
+
+    const direction = trendDirection(trend.delta);
+    const deltaClass =
+      direction === "上涨" ? "up" : direction === "回落" ? "down" : "flat";
+    const deltaValue = Number.isFinite(trend.delta)
+      ? `${trend.delta > 0 ? "+" : ""}${trend.delta.toFixed(0)} 分`
+      : "样本不足";
+    const narrative = !Number.isFinite(trend.delta)
+      ? "历史样本不足，暂不能计算约 24 小时变化。"
+      : direction === "上涨"
+        ? `关注优先级约 24 小时上涨 ${Math.abs(trend.delta).toFixed(0)} 分，新增信号需要优先核验。`
+        : direction === "回落"
+          ? `关注优先级约 24 小时回落 ${Math.abs(trend.delta).toFixed(0)} 分，压力有所缓和，但仍需检查分项与证据。`
+          : "关注优先级与约 24 小时前基本持平，暂未出现明显级别切换。";
+    const first = trend.points[0];
+    const last = trend.current;
+    host.innerHTML = `<div class="trend-card" style="--lvl:${
+      LEVEL_COLOR[last.level] || LEVEL_COLOR.unknown
+    }">
+      <div class="trend-summary">
+        <div class="trend-current">
+          <span>当前关注分</span>
+          <strong class="trend-value">${esc(last.score)}</strong>
+          <small>/ 100</small>
+        </div>
+        <div class="trend-delta ${deltaClass}">
+          <strong>约 24 小时 ${esc(deltaValue)}</strong>
+          <span>${esc(narrative)}</span>
+        </div>
+      </div>
+      <div class="trend-chart">${sparklineSVG(trend.points, "trend-svg")}</div>
+      <div class="trend-range">
+        <time datetime="${esc(first.time)}">起 ${esc(fmtAbsoluteTime(first.time))}</time>
+        <span>${trend.points.length} 份快照</span>
+        <time datetime="${esc(last.time)}">止 ${esc(fmtAbsoluteTime(last.time))}</time>
+      </div>
+    </div>`;
+    block.hidden = false;
   }
 
   const SUBSCORE_NAMES = {
@@ -826,6 +1266,58 @@
     return `<span class="${cls}">${pct > 0 ? "+" : ""}${pct.toFixed(2)}%</span>`;
   };
 
+  const signedMetric = (value, digits = 2) =>
+    typeof value === "number" && isFinite(value)
+      ? `${value >= 0 ? "+" : ""}${value.toFixed(digits)}`
+      : "—";
+
+  function fmtMonthDay(value) {
+    const raw = String(value || "").trim();
+    const isoDate = raw.match(/^\d{4}-(\d{2})-(\d{2})/);
+    if (isoDate) return `${isoDate[1]}-${isoDate[2]}`;
+    const date = new Date(raw);
+    if (Number.isNaN(date.getTime())) return "—";
+    return `${String(date.getMonth() + 1).padStart(2, "0")}-${String(
+      date.getDate()
+    ).padStart(2, "0")}`;
+  }
+
+  function financialStressMetric(stress) {
+    const fsi =
+      typeof stress?.ofr_fsi === "number" && isFinite(stress.ofr_fsi)
+        ? stress.ofr_fsi
+        : null;
+    const dataStatus = String(stress?.data_status || "").toLowerCase();
+    const stale =
+      stress?.stale === true ||
+      stress?.is_stale === true ||
+      dataStatus === "stale" ||
+      dataStatus === "delayed";
+    const statusLabel =
+      {
+        critical: "压力极高",
+        elevated: "压力偏高",
+        normal: "高于长期均值",
+        low: "低于长期均值",
+      }[String(stress?.status || "").toLowerCase()] || "";
+    const sub = [
+      statusLabel,
+      `信用 ${signedMetric(stress?.credit)}`,
+      `融资 ${signedMetric(stress?.funding)}`,
+      `截至 ${fmtMonthDay(stress?.observed_at)}`,
+      "OFR FSI",
+      stale ? "数据延迟" : "",
+    ]
+      .filter(Boolean)
+      .join(" · ");
+    return metricCard(
+      "全球金融压力",
+      fsi === null ? null : signedMetric(fsi),
+      sub,
+      stale ? "is-stale" : ""
+    );
+  }
+
   function renderMetrics(d) {
     const md = d.market_data || {};
     const vix = md.vix || {};
@@ -835,6 +1327,14 @@
     const go = md.gold_oil || {};
     const dxy = md.dxy || {};
     const cs = md.credit_spreads || {};
+    const hasFinancialStress = Object.prototype.hasOwnProperty.call(
+      md,
+      "financial_stress"
+    );
+    const financialStress =
+      md.financial_stress && typeof md.financial_stress === "object"
+        ? md.financial_stress
+        : {};
 
     const YC_CN = {
       deep_inverted: "深度倒挂 · 衰退信号",
@@ -884,11 +1384,13 @@
         go.oil ? chgHTML(go.oil.change_pct) : ""
       ),
       metricCard("美元指数 DXY", num(dxy.value), dxy.value ? chgHTML(dxy.change_pct) : ""),
-      metricCard(
-        "高收益债利差",
-        num(cs.hy_oas) ? `${num(cs.hy_oas)}bp` : null,
-        cs.ig_oas ? `IG ${num(cs.ig_oas)}bp` : ""
-      ),
+      hasFinancialStress
+        ? financialStressMetric(financialStress)
+        : metricCard(
+            "高收益债利差",
+            num(cs.hy_oas) ? `${num(cs.hy_oas)}bp` : null,
+            cs.ig_oas ? `IG ${num(cs.ig_oas)}bp` : ""
+          ),
     ];
 
     $("#macro-metrics").innerHTML = cards.join("");
@@ -1009,8 +1511,9 @@
                     String(e.current_value)
                   )}</strong></div>`
                 : "";
-            const title = e.url
-              ? `<a href="${esc(e.url)}" target="_blank" rel="noopener noreferrer">${esc(e.title)}</a>`
+            const externalUrl = safeExternalUrl(e.url);
+            const title = externalUrl
+              ? `<a href="${esc(externalUrl)}" target="_blank" rel="noopener noreferrer">${esc(e.title)}</a>`
               : esc(e.title);
             return `<article class="event" style="--lvl:${lvl}">
               <div class="event-head">
@@ -1057,27 +1560,49 @@
   }
 
   async function loadMacro() {
-    const url = api("api/macro");
-    try {
-      const d = await fetchJSON(url);
-      if (!d.available) {
-        $("#macro-hero").innerHTML = `<div class="empty">
-          <span class="empty-icon">📡</span>${esc(d.reason || "暂无宏观快照")}
-          <div class="empty-hint">首次采集约需 45 秒</div>
-        </div>`;
-        return;
-      }
-      renderHero(d);
-      renderSubscores(d);
-      renderMetrics(d);
-      renderMonitoredEvents(d);
-      renderSwans(d);
-      renderRhinos(d);
-      renderOpps(d);
-      renderSupportCard("macro");
-    } catch (e) {
-      $("#macro-hero").innerHTML = errorHTML(e, url);
-    }
+    const currentUrl = api("api/macro");
+    const historyUrl = api("api/macro/history?limit=72");
+    const currentRequest = fetchJSON(currentUrl)
+      .then((d) => {
+        state.macroData = d;
+        updateMacroStatus(d);
+        if (!d.available) {
+          $("#macro-hero").innerHTML = `<div class="empty">
+            <span class="empty-icon">📡</span>${esc(d.reason || "暂无宏观快照")}
+            <div class="empty-hint">首次采集约需 45 秒</div>
+          </div>`;
+        } else {
+          renderHero(d);
+          renderSubscores(d);
+          renderMetrics(d);
+          renderMonitoredEvents(d);
+          renderSwans(d);
+          renderRhinos(d);
+          renderOpps(d);
+          renderSupportCard("macro");
+        }
+        renderMacroTrend(state.macroHistory);
+        if (state.decisionData) renderDecisionHero(state.decisionData);
+      })
+      .catch((error) => {
+        setSystemStatus(
+          "error",
+          "快照异常",
+          `最新宏观快照加载失败：${error.message || error}`
+        );
+        $("#macro-hero").innerHTML = errorHTML(error, currentUrl);
+      });
+    const historyRequest = fetchJSON(historyUrl)
+      .then((payload) => {
+        state.macroHistory = Array.isArray(payload?.items) ? payload.items : [];
+        renderMacroTrend(state.macroHistory);
+        if (state.decisionData) renderDecisionHero(state.decisionData);
+      })
+      .catch((error) => {
+        console.warn("macro history", error);
+        renderMacroTrend(state.macroHistory);
+      });
+    await Promise.allSettled([currentRequest, historyRequest]);
   }
 
   // ─── KOL view ─────────────────────────────
@@ -1085,12 +1610,14 @@
   async function loadStats() {
     try {
       const s = await fetchJSON(api(`api/stats?hours=${state.hours}`), 8000);
+      state.stats = s;
       $("#stat-total").textContent = s.total;
       $("#stat-high").textContent = s.high;
       $("#stat-med").textContent = s.medium;
       $("#stat-kol").textContent = s.active_kols;
       $("#stat-market").textContent = s.with_market_kw;
       $("#tab-kol-count").textContent = s.high > 0 ? s.high : "";
+      updateFeedStatus();
     } catch (e) {
       console.warn("stats", e);
     }
@@ -1105,6 +1632,7 @@
         const b = document.createElement("button");
         b.className = "chip";
         b.dataset.kol = k.kol_key;
+        b.setAttribute("aria-pressed", String(k.kol_key === state.kol));
         const label = esc(k.kol_name_cn || k.kol_name || k.kol_key);
         const badge = k.total_24h > 0 ? `<span class="chip-badge">${k.total_24h}</span>` : "";
         b.innerHTML = label + badge;
@@ -1116,6 +1644,49 @@
     } catch (e) {
       console.warn("kols", e);
     }
+  }
+
+  function sourceKind(source) {
+    const value = String(source || "").trim();
+    if (/^(?:truth social\b|x\s*@|twitter\s*@|serenity\b)/i.test(value)) {
+      return { key: "is-direct", label: "本人动态" };
+    }
+    if (/(?:bing|baidu|google)\s+news|百度新闻|媒体|news\b/i.test(value)) {
+      return { key: "is-media", label: "媒体提及" };
+    }
+    return { key: "is-unverified", label: "来源待核验" };
+  }
+
+  function eventIdentity(item) {
+    return String(item?.canonical_url || item?.url || item?.title || "")
+      .trim()
+      .toLowerCase();
+  }
+
+  function mergePriorityEvents(priorityItems, regularItems) {
+    const seen = new Set();
+    return [...priorityItems, ...regularItems].filter((item) => {
+      const key = eventIdentity(item);
+      if (key && seen.has(key)) return false;
+      if (key) seen.add(key);
+      return true;
+    });
+  }
+
+  function updateFeedStatus() {
+    const host = $("#feed-status");
+    if (!host) return;
+    const parts = [`已加载 ${state.feedLoadedCount} 条`];
+    if (typeof state.stats?.total === "number") {
+      parts.push(`当前窗口采集记录 ${state.stats.total} 条`);
+    }
+    const filtered = Boolean(
+      state.impact || state.kol || state.q || state.timeStatus !== "verified"
+    );
+    if (filtered) parts.push("筛选后");
+    if (state.feedHighPriority) parts.push("高影响已优先");
+    if (state.feedRegularCapped) parts.push("普通流仅展示前150条");
+    host.textContent = parts.join(" · ");
   }
 
   function renderEvents(items) {
@@ -1143,6 +1714,7 @@
     $("#feed").innerHTML = items
       .map((it) => {
         const body = bodyOf(it);
+        const sourceNature = sourceKind(it.source);
         const lvl = LVL[it.impact] || "transparent";
         const pillLvl = LEVEL_COLOR[it.impact] || "var(--neutral)";
         const tickers = (it.tickers || [])
@@ -1167,6 +1739,12 @@
             : timeStatus === "future"
               ? `发布时间异常 · 抓取 ${fmtTime(collectedAt)}`
               : `发布时间未知 · 抓取 ${fmtTime(collectedAt)}`;
+        const externalUrl = safeExternalUrl(it.canonical_url || it.url);
+        const headline = externalUrl
+          ? `<a href="${esc(externalUrl)}" target="_blank" rel="noopener noreferrer">${esc(
+              body.headline
+            )}</a>`
+          : esc(body.headline);
         return `<article class="card" style="--lvl:${lvl}">
           <div class="card-head">
             <span class="card-kol">${esc(it.kol_name_cn || it.kol_name)}</span>
@@ -1176,14 +1754,13 @@
                 : ""
             }
             <span class="card-src">${esc(it.source || "")}</span>
+            <span class="source-kind ${sourceNature.key}">${sourceNature.label}</span>
             <span class="card-time ${
               timeStatus === "verified" ? "" : "is-unverified"
             }" title="${esc(timeTitle)}">${esc(eventTime)}</span>
           </div>
           <div class="card-title${body.snippet ? "" : " card-title-body"}">
-            <a href="${esc(it.canonical_url || it.url)}" target="_blank" rel="noopener noreferrer">${esc(
-              body.headline
-            )}</a>
+            ${headline}
           </div>
           ${body.snippet ? `<div class="card-snippet">${esc(body.snippet)}</div>` : ""}
           ${
@@ -1207,10 +1784,42 @@
     p.set("limit", "150");
     const url = api(`api/events?${p}`);
     try {
-      const d = await fetchJSON(url);
-      renderEvents(d.items || []);
+      let regularData;
+      let priorityItems = [];
+      let highPriorityLoaded = false;
+      if (state.impact) {
+        regularData = await fetchJSON(url);
+      } else {
+        const highParams = new URLSearchParams(p);
+        highParams.set("impact", "high");
+        highParams.set("limit", "50");
+        const highUrl = api(`api/events?${highParams}`);
+        const [regularResult, highResult] = await Promise.allSettled([
+          fetchJSON(url),
+          fetchJSON(highUrl),
+        ]);
+        if (regularResult.status === "rejected") throw regularResult.reason;
+        regularData = regularResult.value;
+        if (highResult.status === "fulfilled") {
+          priorityItems = highResult.value?.items || [];
+          highPriorityLoaded = true;
+        } else {
+          console.warn("high impact feed", highResult.reason);
+        }
+      }
+      const regularItems = regularData?.items || [];
+      const items = highPriorityLoaded
+        ? mergePriorityEvents(priorityItems, regularItems)
+        : regularItems;
+      state.feedLoadedCount = items.length;
+      state.feedHighPriority = highPriorityLoaded;
+      state.feedRegularCapped = regularItems.length >= 150;
+      renderEvents(items);
+      updateFeedStatus();
     } catch (e) {
       $("#feed").innerHTML = errorHTML(e, url);
+      const host = $("#feed-status");
+      if (host) host.textContent = "动态加载失败";
     }
   }
 
@@ -1223,7 +1832,6 @@
   const SNOOZE_DAYS = 30;
   const NUDGE_KEY = "kol-support-nudged";
   const NUDGE_DELAY = 25_000;
-
   const supportSnoozed = () => {
     try {
       return Number(localStorage.getItem(SNOOZE_KEY) || 0) > Date.now();
@@ -1280,11 +1888,11 @@
     m.hidden = false;
     m.querySelector(".support-close").focus();
     document.body.style.overflow = "hidden";
-    // They found it on their own; no need to wave later.
+    // Once opened intentionally, this session no longer needs a visual nudge.
     try {
       sessionStorage.setItem(NUDGE_KEY, "1");
     } catch (e) {}
-    $("#support-fab").classList.remove("attention");
+    $("#support-fab")?.classList.remove("attention");
   }
 
   function closeSupport() {
@@ -1292,9 +1900,7 @@
     document.body.style.overflow = "";
   }
 
-  // Nudge the button once, and only after the visitor shows they're actually
-  // reading (scrolled + stuck around). Fires at most once per session, never
-  // while the modal is open or after the card was snoozed.
+  // Nudge once after the visitor has spent time reading and has scrolled.
   function scheduleNudge() {
     try {
       if (sessionStorage.getItem(NUDGE_KEY)) return;
@@ -1335,12 +1941,17 @@
   // ─── Wiring ───────────────────────────────
 
   function setActive(nodes, node) {
-    nodes.forEach((n) => n.classList.remove("active"));
+    nodes.forEach((n) => {
+      n.classList.remove("active");
+      n.setAttribute("aria-pressed", "false");
+    });
     node.classList.add("active");
+    node.setAttribute("aria-pressed", "true");
   }
 
   function bindChips(sel, dataKey, stateKey, onChange) {
     $$(sel).forEach((btn) => {
+      btn.setAttribute("aria-pressed", String(btn.classList.contains("active")));
       if (btn.__bound) return;
       btn.__bound = true;
       btn.addEventListener("click", () => {
@@ -1368,6 +1979,7 @@
       const on = t.dataset.view === view;
       t.classList.toggle("active", on);
       t.setAttribute("aria-selected", String(on));
+      t.tabIndex = on ? 0 : -1;
     });
     $$(".view").forEach((node) =>
       node.classList.toggle("active", node.id === `view-${view}`)
@@ -1380,17 +1992,33 @@
   async function refreshAll() {
     const btn = $("#refresh-btn");
     btn.classList.add("spinning");
-    await Promise.all([
-      loadDecisions(),
-      loadMacro(),
-      loadStats(),
-      loadKols(),
-      loadEvents(),
-    ]);
+    try {
+      await Promise.all([
+        loadDecisions(),
+        loadMacro(),
+        loadStats(),
+        loadKols(),
+        loadEvents(),
+      ]);
+      updateRefreshTime();
+    } finally {
+      btn.classList.remove("spinning");
+    }
+  }
+
+  function updateRefreshTime() {
     const t = new Date();
     const pad = (n) => String(n).padStart(2, "0");
     $("#last-update").textContent = `${pad(t.getHours())}:${pad(t.getMinutes())}`;
-    btn.classList.remove("spinning");
+  }
+
+  async function refreshCurrentView() {
+    const tasks = [loadDecisions(), loadMacro()];
+    if (state.view === "kol") {
+      tasks.push(loadStats(), loadKols(), loadEvents());
+    }
+    await Promise.all(tasks);
+    updateRefreshTime();
   }
 
   document.addEventListener("DOMContentLoaded", () => {
@@ -1412,6 +2040,20 @@
     bindSupport();
 
     $("#view-decision").addEventListener("click", (event) => {
+      const more = event.target.closest("#decision-show-all");
+      if (more) {
+        state.decisionQueueExpanded = !state.decisionQueueExpanded;
+        renderDecisionQueue(state.decisionData || { decisions: [] });
+        requestAnimationFrame(() => $("#decision-show-all")?.focus());
+        return;
+      }
+      const matrixMore = event.target.closest("#matrix-show-all");
+      if (matrixMore) {
+        state.matrixExpanded = !state.matrixExpanded;
+        renderDecisionMatrix(state.decisionData || { decisions: [], impact_matrix: {} });
+        requestAnimationFrame(() => $("#matrix-show-all")?.focus());
+        return;
+      }
       const target = event.target.closest("[data-decision-key]");
       if (target) selectDecision(target.dataset.decisionKey, { focusDetail: true });
     });
@@ -1431,12 +2073,30 @@
       if (event.key === "Escape" && !$("#auth-modal").hidden) closeAuth();
     });
 
-    $$("#tabs .tab").forEach((t) =>
-      t.addEventListener("click", () => switchView(t.dataset.view))
-    );
+    const tabs = $$("#tabs .tab");
+    tabs.forEach((tab) => {
+      tab.addEventListener("click", () => switchView(tab.dataset.view));
+      tab.addEventListener("keydown", (event) => {
+        let index = tabs.indexOf(tab);
+        if (event.key === "ArrowRight") index = (index + 1) % tabs.length;
+        else if (event.key === "ArrowLeft") index = (index - 1 + tabs.length) % tabs.length;
+        else if (event.key === "Home") index = 0;
+        else if (event.key === "End") index = tabs.length - 1;
+        else return;
+        event.preventDefault();
+        const next = tabs[index];
+        switchView(next.dataset.view);
+        next.focus();
+      });
+    });
     if (location.hash === "#kol") switchView("kol");
     else if (location.hash === "#macro") switchView("macro");
     else switchView("decision");
+
+    $(".brand")?.addEventListener("click", (event) => {
+      event.preventDefault();
+      switchView("decision");
+    });
 
     $("#refresh-btn").addEventListener("click", refreshAll);
 
@@ -1460,6 +2120,6 @@
 
     loadAuthStatus().then(refreshAll);
     loadSupportFacts();
-    setInterval(refreshAll, 60_000);
+    setInterval(refreshCurrentView, 300_000);
   });
 })();
