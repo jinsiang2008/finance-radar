@@ -833,8 +833,9 @@ class DatabaseTests(unittest.TestCase):
             )
         )
 
+        next_prompt_version = f"{llm_enrichment.MACRO_PROMPT_VERSION}-next"
         new_prompt = db.claim_macro_event_enrichment(
-            **{**base, "prompt_version": "macro-monitor-intelligence-v2"},
+            **{**base, "prompt_version": next_prompt_version},
             now=now + timedelta(seconds=1),
         )
         self.assertIsNotNone(new_prompt)
@@ -844,7 +845,7 @@ class DatabaseTests(unittest.TestCase):
         new_model = db.claim_macro_event_enrichment(
             **{
                 **base,
-                "prompt_version": "macro-monitor-intelligence-v2",
+                "prompt_version": next_prompt_version,
                 "model": "deepseek-v4-pro",
             },
             now=now + timedelta(seconds=2),

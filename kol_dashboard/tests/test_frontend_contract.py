@@ -98,8 +98,8 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn('stale ? "数据延迟" : ""', self.javascript)
         self.assertIn('"高收益债利差"', self.javascript)
         self.assertIn("cs.hy_oas", self.javascript)
-        self.assertIn('static/app.js?v=13', self.html)
-        self.assertIn('static/style.css?v=13', self.html)
+        self.assertIn('static/app.js?v=14', self.html)
+        self.assertIn('static/style.css?v=14', self.html)
         self.assertIn(".metric.is-stale", self.css)
 
     def test_macro_events_render_compact_ai_digest_and_bounded_highlights(self) -> None:
@@ -114,8 +114,18 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn("待生成", self.javascript)
         self.assertIn("待重试", self.javascript)
         self.assertIn("不可用", self.javascript)
+        self.assertIn("function macroAiImpactEligible(event)", self.javascript)
+        self.assertIn("function hasSubstantiveMacroEvidence(enrichment)", self.javascript)
+        self.assertIn("confidence >= 0.65", self.javascript)
+        self.assertIn("低置信待核验", self.javascript)
+        self.assertIn("正文或指标", self.javascript)
+        self.assertIn("qualifiedCount", self.javascript)
+        self.assertIn("可用于研判", self.javascript)
+        self.assertIn("处理完成", self.javascript)
+        self.assertNotIn("<small>已解读</small>", self.javascript)
         self.assertIn(".macro-ai-digest", self.css)
         self.assertIn(".macro-ai-points", self.css)
+        self.assertIn(".macro-ai-readiness-item", self.css)
 
     def test_macro_event_cards_use_ai_copy_and_native_disclosure(self) -> None:
         for field in (
@@ -131,9 +141,22 @@ class FrontendContractTests(unittest.TestCase):
             "confidence",
             "model",
             "generated_at",
+            "category",
+            "content_status",
+            "content_excerpt",
+            "content_source_url",
+            "evidence_sections",
+            "official_body",
         ):
             self.assertIn(field, self.javascript)
         self.assertIn("function macroEventCopy(event)", self.javascript)
+        self.assertIn(
+            "const enrichment = macroAiImpactEligible(event) ? rawEnrichment : null;",
+            self.javascript,
+        )
+        self.assertIn("compactMacroSourceText(event.content_excerpt)", self.javascript)
+        self.assertIn("function macroAiStateHTML(event)", self.javascript)
+        self.assertIn("主标题、摘要和完整研判未采用", self.javascript)
         self.assertIn("function renderMacroEventInsight(event, copy)", self.javascript)
         self.assertIn('aria-labelledby="${titleId}"', self.javascript)
         self.assertIn('<details class="event-insight">', self.javascript)
@@ -143,9 +166,24 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn("可能受影响的资产", self.javascript)
         self.assertIn("原始标题", self.javascript)
         self.assertIn("仅标题证据", self.javascript)
+        self.assertIn("事件类别重要度", self.javascript)
+        self.assertIn("AI 核验影响", self.javascript)
+        self.assertIn("官方正文已读取", self.javascript)
+        self.assertIn("系统尚未读取正文", self.javascript)
+        self.assertIn("来源暂不支持正文抓取", self.javascript)
+        self.assertIn("正文抓取暂不可用，系统将重试", self.javascript)
+        self.assertIn("function renderOfficialEvidence(event)", self.javascript)
+        self.assertIn('<details class="event-source-evidence">', self.javascript)
+        self.assertIn("展开官方正文摘录", self.javascript)
+        self.assertIn("不公开原始 HTML", self.javascript)
         self.assertIn("AI 解读暂不可用", self.javascript)
         self.assertIn("AI 解读将在稍后重试", self.javascript)
         self.assertIn(".event-insight > summary:focus-visible", self.css)
+        self.assertIn(".event-source-evidence > summary:focus-visible", self.css)
+        self.assertIn(".content-evidence-status.is-ready", self.css)
+        self.assertIn(".content-evidence-status.is-missing", self.css)
+        self.assertIn(".content-evidence-status.is-unsupported", self.css)
+        self.assertIn(".content-evidence-status.is-unavailable", self.css)
         self.assertIn("min-height: 44px", self.css)
 
     def test_macro_coverage_distinguishes_stale_and_unavailable_sources(self) -> None:

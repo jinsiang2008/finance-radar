@@ -13,7 +13,9 @@ import re
 from collections import Counter, defaultdict
 from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
+from html import unescape
 from typing import Any, Iterable, Mapping
+from urllib.parse import urlsplit
 
 try:
     from kol_dashboard import relation_engine
@@ -132,6 +134,30 @@ _PUBLIC_MACRO_EVENT_FIELDS = (
     "tickers",
     "sectors",
 )
+_PUBLIC_MACRO_EVENT_CATEGORIES = {
+    "fomc_statement",
+    "fomc_minutes",
+    "fed_press_release",
+    "fed_speech",
+    "pboc_announcement",
+    "policy_update",
+}
+_PUBLIC_MACRO_CONTENT_STATUSES = {"ready", "unavailable", "unsupported"}
+_PUBLIC_MACRO_CONTENT_HOSTS = {
+    "federalreserve.gov",
+    "www.federalreserve.gov",
+    "pbc.gov.cn",
+    "www.pbc.gov.cn",
+}
+_PUBLIC_FED_ARTICLE_PATH = re.compile(
+    r"^/newsevents/(?:pressreleases|speech)/[a-z0-9._~-]+\.htm$",
+    re.IGNORECASE,
+)
+_PUBLIC_PBOC_ARTICLE_PATH = re.compile(
+    r"^/zhengcehuobisi/(?:[0-9]+/)+index\.html$",
+    re.IGNORECASE,
+)
+_PUBLIC_MACRO_EVIDENCE_SECTION_KINDS = {"paragraph", "table_row"}
 _PUBLIC_MACRO_AI_STATUSES = {"pending", "processing", "ready", "retry", "failed"}
 _PUBLIC_MACRO_AI_IMPACTS = {"high", "medium", "low", "none"}
 _PUBLIC_MACRO_AI_DIRECTIONS = {"positive", "negative", "mixed", "unclear"}
@@ -143,6 +169,7 @@ _PUBLIC_MACRO_AI_EVIDENCE = {
     "title_and_snippet",
     "post_text",
     "indicator_data",
+    "official_body",
 }
 _PUBLIC_MACRO_OPPORTUNITY_FIELDS = (
     "id",
@@ -677,6 +704,110 @@ def _macro_ai_text_list(
     return output
 
 
+def _macro_event_plain_text(value: Any, maximum: int) -> str:
+    """Return bounded plain text; never pass source HTML through the public API."""
+    if not isinstance(value, str):
+        return ""
+    text = unescape(value)
+    text = re.sub(
+        r"<(?:script|style)\b[^>]*>.*?</(?:script|style)\s*>",
+        " ",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    text = re.sub(r"<[^>]*>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return _sanitize_public_string(text)[:maximum]
+
+
+def _public_macro_content_identity(value: Any) -> tuple[str, str] | None:
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    try:
+        parsed = urlsplit(candidate)
+        port = parsed.port
+    except (TypeError, ValueError):
+        return None
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if (
+        parsed.scheme.lower() != "https"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or parsed.fragment
+        or host not in _PUBLIC_MACRO_CONTENT_HOSTS
+    ):
+        return None
+    if host.endswith("federalreserve.gov"):
+        return (
+            ("fed", parsed.path)
+            if _PUBLIC_FED_ARTICLE_PATH.fullmatch(parsed.path)
+            else None
+        )
+    return (
+        ("pboc", parsed.path)
+        if _PUBLIC_PBOC_ARTICLE_PATH.fullmatch(parsed.path)
+        else None
+    )
+
+
+def _public_macro_content_url(value: Any) -> str:
+    if _public_macro_content_identity(value) is None:
+        return ""
+    return _sanitize_public_string(str(value).strip())[:2048]
+
+
+def _project_macro_evidence_sections(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    output: list[dict[str, str]] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        kind = str(item.get("kind") or "").strip().lower()
+        text = _macro_event_plain_text(item.get("text"), 700)
+        if kind not in _PUBLIC_MACRO_EVIDENCE_SECTION_KINDS or not text:
+            continue
+        output.append({"kind": kind, "text": text})
+        if len(output) >= 8:
+            break
+    return output
+
+
+def _project_macro_event_content(
+    source: Mapping[str, Any],
+    event: dict[str, Any],
+) -> None:
+    category = str(source.get("category") or "").strip().lower()
+    if category in _PUBLIC_MACRO_EVENT_CATEGORIES:
+        event["category"] = category
+
+    status = str(source.get("content_status") or "").strip().lower()
+    if status not in _PUBLIC_MACRO_CONTENT_STATUSES:
+        return
+    excerpt = _macro_event_plain_text(source.get("content_excerpt"), 4000)
+    source_url = _public_macro_content_url(source.get("content_source_url"))
+    event_identity = _public_macro_content_identity(source.get("url"))
+    source_identity = _public_macro_content_identity(source_url)
+    if status == "ready" and (
+        not excerpt
+        or not source_url
+        or event_identity is None
+        or event_identity != source_identity
+    ):
+        status = "unavailable"
+    event["content_status"] = status
+    if status != "ready":
+        return
+
+    event["content_excerpt"] = excerpt
+    event["content_source_url"] = source_url
+    sections = _project_macro_evidence_sections(source.get("evidence_sections"))
+    if sections:
+        event["evidence_sections"] = sections
+
+
 def _project_macro_event_ai(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, Mapping):
         return None
@@ -771,7 +902,17 @@ def _project_macro_events(
     value: Any,
     enrichment_map: Mapping[str, Any] | None,
 ) -> list[dict[str, Any]]:
-    events = _project_macro_items(value, _PUBLIC_MACRO_EVENT_FIELDS)
+    raw_events = value if isinstance(value, list) else []
+    events: list[dict[str, Any]] = []
+    for source in raw_events:
+        if not isinstance(source, Mapping):
+            continue
+        projected = _project_macro_items([source], _PUBLIC_MACRO_EVENT_FIELDS)
+        if not projected:
+            continue
+        event = projected[0]
+        _project_macro_event_content(source, event)
+        events.append(event)
     records = enrichment_map if isinstance(enrichment_map, Mapping) else {}
     for event in events:
         event_id = str(event.get("id") or "")

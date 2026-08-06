@@ -598,6 +598,171 @@ class PublicDecisionTests(unittest.TestCase):
             "公开对冲说明",
         )
 
+    def test_public_macro_projects_sanitized_official_body_evidence(self) -> None:
+        projected = decision_service.project_public_macro(
+            {
+                "public_schema_version": 1,
+                "monitored_events": [
+                    {
+                        "id": "fomc-statement",
+                        "kind": "policy",
+                        "title": "Federal Reserve issues FOMC statement",
+                        "url": "https://www.federalreserve.gov/newsevents/pressreleases/monetary20260801a.htm",
+                        "source": "Federal Reserve",
+                        "severity": "high",
+                        "category": "fomc_statement",
+                        "content_status": "ready",
+                        "content_excerpt": (
+                            "<p>The Committee maintained the target range.</p>"
+                            "<script>raw-provider-response</script>"
+                        ),
+                        "content_source_url": (
+                            "https://www.federalreserve.gov/newsevents/"
+                            "pressreleases/monetary20260801a.htm"
+                        ),
+                        "evidence_sections": [
+                            {
+                                "kind": "paragraph",
+                                "text": "<strong>Voting</strong> was 9 to 3.",
+                            },
+                            {
+                                "kind": "table_row",
+                                "text": "Target range | 3.50%-3.75%",
+                                "raw_html": "<tr>must-never-be-public</tr>",
+                            },
+                            {"kind": "raw_html", "text": "private-html"},
+                        ],
+                        "content_html": "<main>must-never-be-public</main>",
+                        "raw_response": "provider-private",
+                    }
+                ],
+            },
+            {
+                "fomc-statement": {
+                    "status": "ready",
+                    "ai_enrichment": {
+                        "headline_zh": "美联储维持目标利率区间",
+                        "summary_zh": "委员会维持目标区间不变。",
+                        "why_it_matters_zh": "政策路径会影响利率敏感资产。",
+                        "impact_level": "high",
+                        "confidence": 0.82,
+                        "evidence_basis": "official_body",
+                    },
+                }
+            },
+        )
+
+        event = projected["monitored_events"][0]
+        self.assertEqual(event["category"], "fomc_statement")
+        self.assertEqual(event["content_status"], "ready")
+        self.assertEqual(
+            event["content_excerpt"],
+            "The Committee maintained the target range.",
+        )
+        self.assertEqual(
+            event["content_source_url"],
+            "https://www.federalreserve.gov/newsevents/pressreleases/monetary20260801a.htm",
+        )
+        self.assertEqual(
+            event["evidence_sections"],
+            [
+                {"kind": "paragraph", "text": "Voting was 9 to 3."},
+                {
+                    "kind": "table_row",
+                    "text": "Target range | 3.50%-3.75%",
+                },
+            ],
+        )
+        self.assertEqual(
+            event["ai_enrichment"]["evidence_basis"],
+            "official_body",
+        )
+        encoded = json.dumps(event, ensure_ascii=False)
+        self.assertNotIn("<", encoded)
+        self.assertNotIn("raw-provider-response", encoded)
+        self.assertNotIn("must-never-be-public", encoded)
+        self.assertNotIn("provider-private", encoded)
+
+    def test_public_macro_never_exposes_nonready_body_payload(self) -> None:
+        projected = decision_service.project_public_macro(
+            {
+                "public_schema_version": 1,
+                "monitored_events": [
+                    {
+                        "id": "unsupported-source",
+                        "kind": "policy",
+                        "title": "Policy update",
+                        "category": "policy_update",
+                        "content_status": "unsupported",
+                        "content_excerpt": "must-never-be-public",
+                        "content_source_url": "https://evil.example/policy",
+                        "evidence_sections": [
+                            {"kind": "paragraph", "text": "private section"}
+                        ],
+                    },
+                    {
+                        "id": "empty-body",
+                        "kind": "policy",
+                        "title": "Empty body",
+                        "content_status": "ready",
+                        "content_excerpt": "   ",
+                    },
+                    {
+                        "id": "forged-ready-body",
+                        "kind": "policy",
+                        "title": "Forged body",
+                        "content_status": "ready",
+                        "content_excerpt": "Untrusted body text",
+                        "content_source_url": "https://evil.example/policy",
+                    },
+                    {
+                        "id": "wrong-official-path",
+                        "kind": "policy",
+                        "title": "Wrong official path",
+                        "url": "https://www.federalreserve.gov/not-an-article",
+                        "content_status": "ready",
+                        "content_excerpt": "Must not be trusted by host alone",
+                        "content_source_url": (
+                            "https://www.federalreserve.gov:4444/not-an-article"
+                        ),
+                    },
+                    {
+                        "id": "mismatched-official-article",
+                        "kind": "policy",
+                        "title": "Mismatched official article",
+                        "url": (
+                            "https://www.federalreserve.gov/newsevents/"
+                            "pressreleases/monetary20260801a.htm"
+                        ),
+                        "content_status": "ready",
+                        "content_excerpt": "Body belongs to another release",
+                        "content_source_url": (
+                            "https://www.federalreserve.gov/newsevents/"
+                            "pressreleases/monetary20260701a.htm"
+                        ),
+                    },
+                ],
+            }
+        )
+
+        unsupported, empty, forged, wrong_path, mismatch = projected[
+            "monitored_events"
+        ]
+        self.assertEqual(unsupported["content_status"], "unsupported")
+        self.assertNotIn("content_excerpt", unsupported)
+        self.assertNotIn("content_source_url", unsupported)
+        self.assertNotIn("evidence_sections", unsupported)
+        self.assertEqual(empty["content_status"], "unavailable")
+        self.assertNotIn("content_excerpt", empty)
+        self.assertEqual(forged["content_status"], "unavailable")
+        self.assertNotIn("content_excerpt", forged)
+        self.assertNotIn("content_source_url", forged)
+        self.assertEqual(wrong_path["content_status"], "unavailable")
+        self.assertNotIn("content_excerpt", wrong_path)
+        self.assertNotIn("content_source_url", wrong_path)
+        self.assertEqual(mismatch["content_status"], "unavailable")
+        self.assertNotIn("content_excerpt", mismatch)
+
     def test_public_macro_projects_ofr_stress_and_coverage_metadata(self) -> None:
         projected = decision_service.project_public_macro(
             {

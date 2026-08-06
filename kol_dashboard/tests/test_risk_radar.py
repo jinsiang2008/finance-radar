@@ -253,6 +253,158 @@ class AssetTagTests(unittest.TestCase):
 
 
 class MonitoredEventTests(unittest.TestCase):
+    def test_policy_events_fetch_official_body_once_after_deduplication(self) -> None:
+        url = (
+            "https://www.federalreserve.gov/newsevents/pressreleases/"
+            "monetary20260803a.htm"
+        )
+        calls: list[str] = []
+
+        def fetch_content(candidate: str) -> dict:
+            calls.append(candidate)
+            return {
+                "content_status": "ready",
+                "content_excerpt": (
+                    "Inflation remains elevated. The Committee voted 9-3 to "
+                    "maintain the target range at 3-1/2 to 3-3/4 percent."
+                ),
+                "content_source_url": candidate,
+                "evidence_sections": [
+                    {
+                        "kind": "paragraph",
+                        "text": "The Committee voted 9-3 to maintain rates.",
+                    }
+                ],
+            }
+
+        events = risk_radar.build_policy_events(
+            [
+                {
+                    "title": "Federal Reserve publishes an update",
+                    "url": url,
+                    "source": "Federal Reserve",
+                    "date": "Mon, 03 Aug 2026 09:00:00 GMT",
+                    "category": "fomc_statement",
+                },
+                {
+                    "title": "Duplicate title",
+                    "url": url,
+                    "source": "Federal Reserve",
+                    "date": "Mon, 03 Aug 2026 09:00:00 GMT",
+                },
+            ],
+            now=NOW,
+            content_fetcher=fetch_content,
+        )
+
+        self.assertEqual(calls, [url])
+        self.assertEqual(len(events), 1)
+        event = events[0]
+        self.assertEqual(event["category"], "fomc_statement")
+        self.assertEqual(event["content_status"], "ready")
+        self.assertIn("9-3", event["content_excerpt"])
+        self.assertEqual(event["severity"], "medium")
+        self.assertIn("TIP", event["tickers"])
+
+    def test_policy_content_failure_is_explicit_not_claimed_as_undisclosed(self) -> None:
+        url = (
+            "https://www.federalreserve.gov/newsevents/pressreleases/"
+            "monetary20260803a.htm"
+        )
+
+        def fail(_: str) -> dict:
+            raise TimeoutError("network timeout")
+
+        event = risk_radar.build_policy_events(
+            [
+                {
+                    "title": "FOMC statement",
+                    "url": url,
+                    "source": "FOMC",
+                    "date": "Mon, 03 Aug 2026 09:00:00 GMT",
+                }
+            ],
+            now=NOW,
+            content_fetcher=fail,
+        )[0]
+
+        self.assertEqual(event["content_status"], "unavailable")
+        self.assertNotIn("content_excerpt", event)
+        self.assertNotIn("content_source_url", event)
+
+    def test_policy_event_rejects_body_from_another_official_article(self) -> None:
+        url = (
+            "https://www.federalreserve.gov/newsevents/pressreleases/"
+            "monetary20260803a.htm"
+        )
+
+        event = risk_radar.build_policy_events(
+            [
+                {
+                    "title": "FOMC statement",
+                    "url": url,
+                    "source": "FOMC",
+                    "date": "Mon, 03 Aug 2026 09:00:00 GMT",
+                }
+            ],
+            now=NOW,
+            content_fetcher=lambda _: {
+                "content_status": "ready",
+                "content_excerpt": "The Committee voted to maintain the target range.",
+                "content_source_url": (
+                    "https://www.federalreserve.gov/newsevents/pressreleases/"
+                    "monetary20260701a.htm"
+                ),
+            },
+        )[0]
+
+        self.assertEqual(event["content_status"], "unavailable")
+        self.assertNotIn("content_excerpt", event)
+
+    def test_feed_snippet_survives_event_normalization(self) -> None:
+        event = risk_radar.build_policy_events(
+            [
+                {
+                    "title": "Policy update",
+                    "url": "https://example.com/policy",
+                    "source": "Newswire",
+                    "date": "Mon, 03 Aug 2026 09:00:00 GMT",
+                    "snippet": "Employment growth slowed and guidance changed.",
+                }
+            ],
+            now=NOW,
+        )[0]
+
+        self.assertEqual(
+            event["snippet"],
+            "Employment growth slowed and guidance changed.",
+        )
+        self.assertEqual(event["content_status"], "unsupported")
+        self.assertEqual(event["severity"], "medium")
+
+    def test_policy_limit_is_applied_after_cross_source_time_sorting(self) -> None:
+        events = risk_radar.build_policy_events(
+            [
+                {
+                    "title": "Older Fed update",
+                    "url": "https://example.com/fed-old",
+                    "source": "Federal Reserve",
+                    "date": "Mon, 03 Aug 2026 08:00:00 GMT",
+                },
+                {
+                    "title": "Newer PBoC update",
+                    "url": "https://example.com/pboc-new",
+                    "source": "中国人民银行",
+                    "date": "Mon, 03 Aug 2026 11:00:00 GMT",
+                },
+            ],
+            now=NOW,
+            limit=1,
+        )
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["title"], "Newer PBoC update")
+
     def test_policy_event_id_is_a_stable_sha256_key(self) -> None:
         url = (
             "https://federalreserve.gov/newsevents/pressreleases/"

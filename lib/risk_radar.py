@@ -29,7 +29,7 @@ import re
 import sys
 from datetime import datetime, timezone
 from html import unescape
-from typing import Any
+from typing import Any, Callable
 
 # macro_fetcher 与本文件同目录，按相对位置导入以便整个 lib 目录可搬迁
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -45,7 +45,10 @@ from macro_fetcher import (
     fetch_pboc,
     fetch_pboc_speech,
     fetch_cctv_news,
+    fetch_official_policy_content,
     http_get,
+    is_supported_official_policy_url,
+    same_official_policy_article,
     CN_TZ,
     now_cn,
 )
@@ -944,6 +947,16 @@ _POLICY_MEDIUM_WORDS = (
     "通胀", "就业", "讲话", "纪要", "展望", "政策",
 )
 
+_POLICY_CATEGORIES = {
+    "fomc_statement",
+    "fomc_minutes",
+    "fed_press_release",
+    "fed_speech",
+    "pboc_announcement",
+    "policy_update",
+}
+_POLICY_CONTENT_STATUSES = {"ready", "unavailable", "unsupported"}
+
 # Keyword to tradeable-symbol / sector mapping. Deterministic and explicit:
 # a policy headline never implies a position, only an area to look at.
 _POLICY_TAG_RULES: tuple[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]], ...] = (
@@ -1028,11 +1041,102 @@ def _policy_tags(text: str) -> dict[str, list[str]]:
     return {"tickers": tickers, "sectors": sectors}
 
 
+def _policy_category(item: dict[str, Any], title: str, url: str) -> str:
+    supplied = str(item.get("category") or "").strip().lower()
+    if supplied in _POLICY_CATEGORIES:
+        return supplied
+    source = str(item.get("source") or "").strip()
+    blob = f"{title} {source} {url}".casefold()
+    if "pbc.gov.cn" in blob or "中国人民银行" in source:
+        return "pboc_announcement" if "pbc.gov.cn" in url.casefold() else "policy_update"
+    if "speech" in source.casefold() or "/newsevents/speech/" in url.casefold():
+        return "fed_speech"
+    if ("minutes" in blob or "纪要" in blob) and (
+        "fomc" in blob
+        or "federal open market committee" in blob
+        or "fomc" in source.casefold()
+    ):
+        return "fomc_minutes"
+    if "fomc" in blob and ("statement" in blob or "声明" in blob):
+        return "fomc_statement"
+    if "federal reserve" in source.casefold() or "fomc" in source.casefold():
+        return "fed_press_release"
+    return "policy_update"
+
+
+def _bounded_policy_text(value: Any, maximum: int) -> str:
+    if not isinstance(value, str):
+        return ""
+    text = unescape(value)
+    text = re.sub(
+        r"<(?:script|style)\b[^>]*>.*?</(?:script|style)\s*>",
+        " ",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    text = re.sub(r"<[^>]*>", " ", text)
+    return re.sub(r"\s+", " ", text).strip()[:maximum]
+
+
+def _normalized_policy_content(
+    item: dict[str, Any],
+    url: str,
+    content_fetcher: Callable[[str], dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """Return only the bounded evidence fields trusted by downstream layers."""
+    candidate: Any = item
+    item_status = str(item.get("content_status") or "").strip().lower()
+    if item_status != "ready" and content_fetcher is not None:
+        try:
+            candidate = content_fetcher(url)
+        except Exception:
+            candidate = {}
+    if not isinstance(candidate, dict):
+        candidate = {}
+
+    status = str(candidate.get("content_status") or "").strip().lower()
+    if status not in _POLICY_CONTENT_STATUSES:
+        status = "unavailable" if is_supported_official_policy_url(url) else "unsupported"
+
+    source_url = unescape(str(candidate.get("content_source_url") or url)).strip()
+    excerpt = _bounded_policy_text(candidate.get("content_excerpt"), 4_000)
+    if status == "ready" and (
+        not excerpt
+        or not is_supported_official_policy_url(source_url)
+        or not same_official_policy_article(url, source_url)
+    ):
+        status = "unavailable" if is_supported_official_policy_url(url) else "unsupported"
+
+    result: dict[str, Any] = {"content_status": status}
+    if status != "ready":
+        return result
+
+    result["content_excerpt"] = excerpt
+    result["content_source_url"] = source_url
+    sections: list[dict[str, str]] = []
+    raw_sections = candidate.get("evidence_sections")
+    if isinstance(raw_sections, list):
+        for raw_section in raw_sections:
+            if not isinstance(raw_section, dict):
+                continue
+            kind = str(raw_section.get("kind") or "").strip().lower()
+            text = _bounded_policy_text(raw_section.get("text"), 700)
+            if kind not in {"paragraph", "table_row"} or not text:
+                continue
+            sections.append({"kind": kind, "text": text})
+            if len(sections) >= 8:
+                break
+    if sections:
+        result["evidence_sections"] = sections
+    return result
+
+
 def build_policy_events(
     items: Any,
     *,
     now: datetime | None = None,
     limit: int = MONITORED_EVENT_LIMIT,
+    content_fetcher: Callable[[str], dict[str, Any]] | None = None,
 ) -> list[dict]:
     """Turn central-bank and policy feed items into monitored events.
 
@@ -1043,9 +1147,23 @@ def build_policy_events(
     events: list[dict] = []
     seen: set[str] = set()
 
-    for item in items if isinstance(items, (list, tuple)) else []:
-        if not isinstance(item, dict):
-            continue
+    raw_items = [
+        item
+        for item in (items if isinstance(items, (list, tuple)) else [])
+        if isinstance(item, dict)
+    ]
+
+    def candidate_time(item: dict[str, Any]) -> datetime:
+        parsed = _parse_feed_time(item.get("date") or item.get("published_at"))
+        if parsed is None:
+            parsed = _url_embedded_time(item.get("url"))
+        return parsed or datetime.min.replace(tzinfo=timezone.utc)
+
+    # Merge all institutions chronologically before applying the public limit;
+    # otherwise a busy Fed feed can crowd newer PBoC events out of the report.
+    ordered_items = sorted(raw_items, key=candidate_time, reverse=True)
+
+    for item in ordered_items:
         title = str(item.get("title") or "").strip()
         url = unescape(str(item.get("url") or "")).strip()
         if not title or not url or url in seen:
@@ -1060,8 +1178,16 @@ def build_policy_events(
                 continue
 
         seen.add(url)
-        tags = _policy_tags(title)
-        events.append({
+        category = _policy_category(item, title, url)
+        snippet = _bounded_policy_text(item.get("snippet"), 2_200)
+        content = _normalized_policy_content(item, url, content_fetcher)
+        analysis_text = " ".join(
+            part
+            for part in (title, snippet, str(content.get("content_excerpt") or ""))
+            if part
+        )
+        tags = _policy_tags(analysis_text)
+        event = {
             # Python's built-in hash is salted per process, so it cannot be
             # used as a durable cache identity.  The URL is already the feed
             # dedup key; a short SHA-256 prefix is stable across collectors.
@@ -1072,10 +1198,15 @@ def build_policy_events(
             "source": str(item.get("source") or "").strip() or "未知来源",
             "published_at": published.isoformat() if published else None,
             "time_status": "verified" if published else "unknown",
-            "severity": _classify_policy_severity(title),
+            "severity": _classify_policy_severity(analysis_text),
+            "category": category,
             "tickers": tags["tickers"],
             "sectors": tags["sectors"],
-        })
+            **content,
+        }
+        if snippet:
+            event["snippet"] = snippet
+        events.append(event)
         if len(events) >= limit:
             break
 
@@ -1436,7 +1567,8 @@ def generate_risk_report(previous_market_data: dict | None = None) -> dict:
     monitored_events = assemble_monitored_events(
         policy_events=build_policy_events(
             list(fomc_items) + list(fed_items) + list(fed_speeches)
-            + list(pboc_items) + list(pboc_speech)
+            + list(pboc_items) + list(pboc_speech),
+            content_fetcher=fetch_official_policy_content,
         ),
         indicator_events=detect_indicator_events(market_data, previous_market_data),
     )

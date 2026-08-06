@@ -1506,34 +1506,169 @@
 
   const EVENT_KIND_CN = { policy: "政策原文", indicator: "指标异动" };
   const EVENT_SEVERITY_CN = { high: "高", medium: "中", low: "低" };
+  const EVENT_CATEGORY_CN = {
+    fomc_statement: "FOMC 声明",
+    fomc_minutes: "FOMC 纪要",
+    fed_press_release: "美联储公告",
+    fed_speech: "美联储讲话",
+    pboc_announcement: "人民银行公告",
+    policy_update: "政策更新",
+  };
+
+  function compactMacroSourceText(value, maximum = 360) {
+    const text = String(value || "").replace(/\s+/g, " ").trim();
+    return text.length > maximum ? `${text.slice(0, maximum).trim()}…` : text;
+  }
 
   function macroEventCopy(event) {
-    const enrichment = eventEnrichment(event);
+    const rawEnrichment = eventEnrichment(event);
+    const enrichment = macroAiImpactEligible(event) ? rawEnrichment : null;
     const originalTitle = String(event?.title || "").trim() || "未命名事件";
-    const fallbackSummary = String(event?.note || event?.snippet || "").trim();
+    const officialSummary = hasOfficialBodyEvidence(event)
+      ? compactMacroSourceText(event.content_excerpt)
+      : "";
+    const fallbackSummary =
+      officialSummary ||
+      compactMacroSourceText(event?.note || event?.snippet || "");
     const status = String(event?.ai_status || "pending").toLowerCase();
+    const contentStatus = String(event?.content_status || "").toLowerCase();
+    const sourceUnavailableCopy =
+      contentStatus === "unsupported"
+        ? "当前仅展示原始标题；来源暂不支持正文抓取。"
+        : contentStatus === "unavailable"
+          ? "当前仅展示原始标题；正文抓取暂不可用，系统将重试。"
+          : "";
     return {
       enrichment,
+      rawEnrichment,
       originalTitle,
       headline:
         String(enrichment?.headline_zh || "").trim() || originalTitle,
       summary:
         String(enrichment?.summary_zh || "").trim() ||
         fallbackSummary ||
+        sourceUnavailableCopy ||
         (status === "failed"
           ? "AI 解读暂不可用，请结合原始标题与来源人工核对。"
           : status === "retry"
             ? "AI 解读将在稍后重试，当前仅展示采集到的原始信息。"
-            : "AI 解读正在生成，当前仅展示采集到的原始信息。"),
+            : rawEnrichment
+              ? "AI 提示的证据或置信度不足，主内容未采用；请回到原始来源核验。"
+              : "AI 解读正在生成，当前仅展示采集到的原始信息。"),
     };
   }
 
+  function hasSubstantiveMacroEvidence(enrichment) {
+    return ["official_body", "indicator_data", "title_and_snippet", "post_text"].includes(
+      String(enrichment?.evidence_basis || "").toLowerCase()
+    );
+  }
+
+  function macroAiImpactEligible(event) {
+    const enrichment = eventEnrichment(event);
+    if (!enrichment || !hasSubstantiveMacroEvidence(enrichment)) return false;
+    const confidence = Number(enrichment.confidence);
+    return Number.isFinite(confidence) && confidence >= 0.65;
+  }
+
   function macroEventImpact(event) {
+    if (!macroAiImpactEligible(event)) return "";
     const enrichment = eventEnrichment(event);
     const aiImpact = String(enrichment?.impact_level || "").toLowerCase();
     return ["high", "medium", "low", "none"].includes(aiImpact)
       ? aiImpact
-      : String(event?.severity || "low").toLowerCase();
+      : "";
+  }
+
+  function macroAiImpactBadge(event) {
+    const impact = macroEventImpact(event);
+    if (!impact) {
+      const enrichment = eventEnrichment(event);
+      const reason = enrichment && !hasSubstantiveMacroEvidence(enrichment)
+        ? "AI 没有正文或指标证据，不能覆盖事件类别重要度"
+        : enrichment
+          ? "AI 置信度低于 65%，不能覆盖事件类别重要度"
+          : "AI 核验尚未就绪";
+      return `<span class="tag event-ai-impact is-unverified" title="${esc(reason)}">AI 核验影响 待核验</span>`;
+    }
+    const label = { high: "高", medium: "中", low: "低", none: "低相关" }[impact];
+    return `<span class="tag event-ai-impact is-${esc(impact)}">AI 核验影响 ${esc(label)}</span>`;
+  }
+
+  function macroAiStateHTML(event) {
+    const enrichment = eventEnrichment(event);
+    if (enrichment && !macroAiImpactEligible(event)) {
+      const label = isTitleOnlyEvidence(enrichment)
+        ? "仅标题证据 · 待核验"
+        : "低置信 AI · 待核验";
+      return `<span class="ai-state is-limited" title="主标题、摘要和完整研判未采用此 AI 结果">${label}</span>`;
+    }
+    if (enrichment) {
+      return `<span class="ai-state is-ready">AI 研判可用</span>`;
+    }
+    return aiStateHTML(event);
+  }
+
+  function hasOfficialBodyEvidence(event) {
+    return (
+      String(event?.content_status || "").toLowerCase() === "ready" &&
+      Boolean(String(event?.content_excerpt || "").trim())
+    );
+  }
+
+  function macroContentEvidenceStatus(event) {
+    if (String(event?.kind || "").toLowerCase() === "indicator") {
+      return `<span class="content-evidence-status is-indicator">指标数据证据</span>`;
+    }
+    if (hasOfficialBodyEvidence(event)) {
+      return `<span class="content-evidence-status is-ready">官方正文已读取</span>`;
+    }
+    const contentStatus = String(event?.content_status || "").toLowerCase();
+    if (contentStatus === "unsupported") {
+      return `<span class="content-evidence-status is-missing is-unsupported">来源暂不支持正文抓取</span>`;
+    }
+    if (contentStatus === "unavailable") {
+      return `<span class="content-evidence-status is-missing is-unavailable">正文抓取暂不可用，系统将重试</span>`;
+    }
+    return `<span class="content-evidence-status is-missing">系统尚未读取正文</span>`;
+  }
+
+  function renderOfficialEvidence(event) {
+    if (!hasOfficialBodyEvidence(event)) return "";
+    const excerpt = String(event.content_excerpt || "").trim();
+    const sections = (Array.isArray(event.evidence_sections)
+      ? event.evidence_sections
+      : []
+    )
+      .filter((section) =>
+        ["paragraph", "table_row"].includes(String(section?.kind || "")) &&
+        String(section?.text || "").trim()
+      )
+      .slice(0, 8);
+    const sourceUrl = safeExternalUrl(event.content_source_url || event.url);
+    const evidenceHTML = sections.length
+      ? `<div class="event-evidence-sections">${sections
+          .map((section) => {
+            const kind = String(section.kind);
+            return `<p class="event-evidence-section is-${esc(kind)}">${esc(section.text)}</p>`;
+          })
+          .join("")}</div>`
+      : `<blockquote>${esc(excerpt)}</blockquote>`;
+    return `<details class="event-source-evidence">
+      <summary>
+        <span>展开官方正文摘录</span>
+        <span class="event-source-evidence-meta">${sections.length ? `${sections.length} 条证据片段` : "正文证据"}</span>
+      </summary>
+      <div class="event-source-evidence-body">
+        ${evidenceHTML}
+        <p class="event-source-evidence-note">系统仅展示清洗后的官方正文摘录，不公开原始 HTML。</p>
+        ${
+          sourceUrl
+            ? `<a href="${esc(sourceUrl)}" target="_blank" rel="noopener noreferrer">核对官方原文 ↗</a>`
+            : ""
+        }
+      </div>
+    </details>`;
   }
 
   function renderMacroAiDigest(list) {
@@ -1550,21 +1685,34 @@
       { ready: 0, pending: 0, retry: 0, failed: 0 }
     );
     const impactRank = { high: 0, medium: 1 };
+    const qualifiedCount = events.filter((event) =>
+      macroAiImpactEligible(event)
+    ).length;
     const highlights = events
       .filter((event) => {
         const impact = macroEventImpact(event);
-        return Boolean(eventEnrichment(event)) && (impact === "high" || impact === "medium");
+        return macroAiImpactEligible(event) && (impact === "high" || impact === "medium");
       })
       .sort((a, b) => impactRank[macroEventImpact(a)] - impactRank[macroEventImpact(b)])
       .slice(0, 3);
     const limitedCount = events.filter((event) =>
       isTitleOnlyEvidence(eventEnrichment(event))
     ).length;
+    const lowConfidenceCount = events.filter((event) => {
+      const enrichment = eventEnrichment(event);
+      const confidence = Number(enrichment?.confidence);
+      return (
+        enrichment &&
+        hasSubstantiveMacroEvidence(enrichment) &&
+        (!Number.isFinite(confidence) || confidence < 0.65)
+      );
+    }).length;
     const statusParts = [
       statusCounts.pending ? `待生成 ${statusCounts.pending}` : "",
       statusCounts.retry ? `待重试 ${statusCounts.retry}` : "",
       statusCounts.failed ? `不可用 ${statusCounts.failed}` : "",
       limitedCount ? `仅标题证据 ${limitedCount}` : "",
+      lowConfidenceCount ? `低置信待核验 ${lowConfidenceCount}` : "",
     ].filter(Boolean);
     const highlightHTML = highlights.length
       ? `<ol class="macro-ai-points">
@@ -1577,7 +1725,7 @@
                 <div>
                   <div class="macro-ai-point-head">
                     <span class="macro-ai-impact is-${esc(impact)}">${impact === "high" ? "高影响" : "中影响"}</span>
-                    ${isTitleOnlyEvidence(copy.enrichment) ? `<span class="macro-ai-evidence">仅标题证据</span>` : ""}
+                    <span class="macro-ai-evidence">${copy.enrichment?.evidence_basis === "official_body" ? "官方正文" : "非标题证据"}</span>
                   </div>
                   <strong>${esc(copy.headline)}</strong>
                   <p>${esc(copy.summary)}</p>
@@ -1588,7 +1736,7 @@
         </ol>`
       : `<p class="macro-ai-empty">${
           statusCounts.ready
-            ? "已完成的解读中，暂无高或中影响要点。"
+            ? "暂无基于正文或指标、且置信度不低于 65% 的高或中影响要点。"
             : "AI 正在生成首批解读；事件原始信息仍可继续查看。"
         }</p>`;
     return `<section class="macro-ai-digest" role="status" aria-live="polite" aria-atomic="true" aria-labelledby="macro-ai-digest-title">
@@ -1597,9 +1745,15 @@
           <span class="macro-ai-eyebrow">72H / AI 研判</span>
           <h3 id="macro-ai-digest-title">AI 态势摘录</h3>
         </div>
-        <div class="macro-ai-readiness">
-          <strong>${statusCounts.ready}<span> / ${events.length}</span></strong>
-          <small>已解读</small>
+        <div class="macro-ai-readiness" aria-label="AI 处理与证据资格">
+          <div class="macro-ai-readiness-item is-qualified">
+            <strong>${qualifiedCount}<span> / ${events.length}</span></strong>
+            <small>可用于研判</small>
+          </div>
+          <div class="macro-ai-readiness-item">
+            <strong>${statusCounts.ready}</strong>
+            <small>处理完成</small>
+          </div>
         </div>
       </div>
       ${highlightHTML}
@@ -1720,11 +1874,15 @@
                     : `<span>${esc(copy.originalTitle)}</span>`
                 }</p>`
               : "";
+            const category = String(e.category || "").toLowerCase();
             return `<article class="event" style="--lvl:${lvl}" aria-labelledby="${titleId}">
               <div class="event-head">
                 <span class="pill event-kind ${esc(e.kind)}">${EVENT_KIND_CN[e.kind] || esc(e.kind)}</span>
-                <span class="tag">影响 ${EVENT_SEVERITY_CN[e.severity] || esc(e.severity)}</span>
-                ${aiStateHTML(e)}
+                ${category && EVENT_CATEGORY_CN[category] ? `<span class="tag event-category">${esc(EVENT_CATEGORY_CN[category])}</span>` : ""}
+                <span class="tag event-category-impact">事件类别重要度 ${EVENT_SEVERITY_CN[e.severity] || esc(e.severity)}</span>
+                ${macroAiImpactBadge(e)}
+                ${macroContentEvidenceStatus(e)}
+                ${macroAiStateHTML(e)}
                 <span class="event-source">${esc(e.source || "")}</span>
                 ${when}
               </div>
@@ -1732,6 +1890,7 @@
               <p class="event-summary ${ready ? "" : "is-degraded"}">${esc(copy.summary)}</p>
               ${originalTitle}
               ${move}
+              ${renderOfficialEvidence(e)}
               ${renderMacroEventInsight(e, copy)}
             </article>`;
           })

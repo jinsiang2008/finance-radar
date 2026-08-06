@@ -869,6 +869,102 @@ class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.assertNotIn(forbidden, encoded)
 
+    async def test_macro_api_publishes_official_body_with_evidence_bound_ai(
+        self,
+    ) -> None:
+        source_url = (
+            "https://www.federalreserve.gov/newsevents/pressreleases/"
+            "monetary20260729a.htm"
+        )
+        event = {
+            "id": "pol_fomc_official_body",
+            "kind": "policy",
+            "title": "Federal Reserve issues FOMC statement",
+            "url": source_url,
+            "source": "FOMC",
+            "published_at": "2026-07-29T18:00:00+00:00",
+            "time_status": "verified",
+            "severity": "high",
+            "category": "fomc_statement",
+            "content_status": "ready",
+            "content_excerpt": (
+                "The Committee decided to maintain the target range at "
+                "3-1/2 to 3-3/4 percent. <b>The vote was 9-3.</b>"
+            ),
+            "content_source_url": source_url,
+            "evidence_sections": [
+                {
+                    "kind": "paragraph",
+                    "text": "The vote was 9-3; three members preferred a 25 basis point increase.",
+                }
+            ],
+            "tickers": ["TLT", "SPY"],
+            "sectors": ["美债", "利率敏感板块"],
+            "raw_html": "PRIVATE-RAW-ARTICLE",
+        }
+        event_input, input_hash = llm_enrichment.build_macro_event_input(event)
+        event_key = llm_enrichment.macro_event_key(event)
+        claimed = db.claim_macro_event_enrichment(
+            event_key,
+            input_hash=input_hash,
+            prompt_version=llm_enrichment.MACRO_PROMPT_VERSION,
+            model=llm_enrichment.DEFAULT_MODEL,
+            evidence_basis=event_input["evidence_basis"],
+        )
+        self.assertIsNotNone(claimed)
+        assert claimed is not None
+        self.assertTrue(
+            db.save_macro_event_enrichment(
+                event_key,
+                input_hash=input_hash,
+                prompt_version=llm_enrichment.MACRO_PROMPT_VERSION,
+                model=llm_enrichment.DEFAULT_MODEL,
+                claim_token=claimed[0],
+                evidence_basis=event_input["evidence_basis"],
+                result=api_enrichment_result(
+                    headline_zh="美联储以9比3维持利率区间不变",
+                    summary_zh=(
+                        "FOMC以9比3决定维持3.5%至3.75%的目标区间，"
+                        "三名委员倾向加息25个基点。"
+                    ),
+                    why_it_matters_zh="分歧偏鹰，可能推高美债收益率并压制高估值股票。",
+                    confidence=0.86,
+                ),
+            )
+        )
+        db.save_macro_snapshot(
+            {
+                "public_schema_version": 1,
+                "timestamp": "2026-07-29T18:05:00+00:00",
+                "composite_risk": {"score": 55, "level": "high"},
+                "monitored_events": [event],
+                "market_data": {},
+                "sub_scores": {},
+                "black_swan_scenarios": [],
+                "gray_rhinos": [],
+                "opportunities": [],
+            }
+        )
+
+        response = await self.client.get("/api/macro")
+
+        self.assertEqual(response.status_code, 200)
+        public_event = response.json()["monitored_events"][0]
+        self.assertEqual(public_event["category"], "fomc_statement")
+        self.assertEqual(public_event["content_status"], "ready")
+        self.assertIn("3-1/2 to 3-3/4", public_event["content_excerpt"])
+        self.assertNotIn("<b>", public_event["content_excerpt"])
+        self.assertEqual(public_event["content_source_url"], source_url)
+        self.assertEqual(
+            public_event["evidence_sections"][0]["kind"], "paragraph"
+        )
+        self.assertEqual(public_event["ai_status"], "ready")
+        self.assertEqual(
+            public_event["ai_enrichment"]["evidence_basis"], "official_body"
+        )
+        self.assertIn("9比3", public_event["ai_enrichment"]["summary_zh"])
+        self.assertNotIn("private-raw-article", response.text.lower())
+
     async def test_legacy_macro_portfolio_fields_never_reach_public_apis(
         self,
     ) -> None:
