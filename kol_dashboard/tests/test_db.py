@@ -8,7 +8,34 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
-from kol_dashboard import db, relation_engine
+from kol_dashboard import db, llm_enrichment, relation_engine
+
+
+def ready_enrichment(**overrides):
+    result = {
+        "headline_zh": "英伟达发布新一代人工智能平台",
+        "summary_zh": "英伟达发布新的人工智能平台，但具体产品参数仍需核对原始来源。",
+        "why_it_matters_zh": "若客户采用增加，可能影响美国半导体板块与相关供应链。",
+        "impact_level": "high",
+        "impact_path": ["产品发布 → 算力需求 → 半导体股票"],
+        "tags": ["人工智能", "半导体"],
+        "assets": [
+            {
+                "asset_key": "US:NVDA",
+                "name_zh": "英伟达",
+                "direction": "positive",
+                "horizon": "medium",
+                "reason_zh": "采用增加可能改善收入预期。",
+                "confidence": 0.74,
+            }
+        ],
+        "cluster_key": "nvidia-launches-ai-platform",
+        "language": "en",
+        "confidence": 0.72,
+        "schema_version": 1,
+    }
+    result.update(overrides)
+    return result
 
 
 class DatabaseTests(unittest.TestCase):
@@ -558,6 +585,520 @@ class DatabaseTests(unittest.TestCase):
                 "SELECT published_at FROM event_sightings"
             ).fetchone()
         self.assertEqual(row["published_at"], reliable)
+
+    def test_enrichment_claim_cache_input_change_and_retry_backoff(self) -> None:
+        now = datetime(2026, 8, 6, 4, 0, tzinfo=timezone.utc)
+        db.insert_events(
+            [self.event(published_at=(now - timedelta(hours=1)).isoformat())]
+        )
+        with db.conn() as connection:
+            event_id = connection.execute("SELECT id FROM events").fetchone()["id"]
+
+        claim = {
+            "event_id": event_id,
+            "input_hash": "a" * 64,
+            "prompt_version": llm_enrichment.PROMPT_VERSION,
+            "model": llm_enrichment.DEFAULT_MODEL,
+            "evidence_basis": "title_and_snippet",
+        }
+        first_token = db.claim_event_enrichment(**claim, now=now)
+        self.assertIsInstance(first_token, str)
+        self.assertIsNone(
+            db.claim_event_enrichment(
+                **claim,
+                now=now + timedelta(minutes=1),
+            )
+        )
+        self.assertTrue(
+            db.save_event_enrichment(
+                event_id,
+                input_hash=claim["input_hash"],
+                prompt_version=claim["prompt_version"],
+                model=claim["model"],
+                claim_token=first_token,
+                evidence_basis=claim["evidence_basis"],
+                result=ready_enrichment(),
+                generated_at=(now + timedelta(minutes=2)).isoformat(),
+            )
+        )
+        self.assertIsNone(
+            db.claim_event_enrichment(
+                **claim,
+                now=now + timedelta(minutes=3),
+            )
+        )
+
+        changed_claim = {**claim, "input_hash": "b" * 64}
+        changed_token = db.claim_event_enrichment(
+            **changed_claim,
+            now=now + timedelta(minutes=3),
+        )
+        self.assertIsInstance(changed_token, str)
+        rate_limit = llm_enrichment._response_error(429)
+        self.assertTrue(
+            db.fail_event_enrichment(
+                event_id,
+                input_hash=changed_claim["input_hash"],
+                prompt_version=changed_claim["prompt_version"],
+                model=changed_claim["model"],
+                claim_token=changed_token,
+                error_code=rate_limit.code,
+                retry_after_seconds=rate_limit.retry_after_seconds,
+                now=now + timedelta(minutes=3),
+            )
+        )
+        self.assertIsNone(
+            db.claim_event_enrichment(
+                **changed_claim,
+                now=now + timedelta(minutes=17),
+            )
+        )
+        retry_token = db.claim_event_enrichment(
+            **changed_claim,
+            now=now + timedelta(minutes=19),
+        )
+        self.assertIsInstance(retry_token, str)
+
+        authentication = llm_enrichment._response_error(401)
+        self.assertTrue(
+            db.fail_event_enrichment(
+                event_id,
+                input_hash=changed_claim["input_hash"],
+                prompt_version=changed_claim["prompt_version"],
+                model=changed_claim["model"],
+                claim_token=retry_token,
+                error_code=authentication.code,
+                retry_after_seconds=authentication.retry_after_seconds,
+                now=now + timedelta(minutes=19),
+            )
+        )
+        self.assertIsNone(
+            db.claim_event_enrichment(
+                **changed_claim,
+                now=now + timedelta(minutes=60),
+            )
+        )
+        with db.conn() as connection:
+            persisted = dict(
+                connection.execute(
+                    "SELECT * FROM event_enrichments WHERE event_id=?",
+                    (event_id,),
+                ).fetchone()
+            )
+        serialized = json.dumps(persisted, sort_keys=True)
+        self.assertEqual(persisted["status"], "retry")
+        self.assertEqual(persisted["error_code"], "authentication")
+        self.assertEqual(persisted["attempt_count"], 2)
+        self.assertEqual(persisted["claim_token"], "")
+        self.assertNotIn("Authorization", serialized)
+        self.assertNotIn("Bearer", serialized)
+        self.assertNotIn("deepseek-secret", serialized)
+
+        # Authentication errors become retryable after configuration is fixed.
+        recovered_token = db.claim_event_enrichment(
+            **changed_claim,
+            now=now + timedelta(minutes=80),
+        )
+        self.assertIsInstance(recovered_token, str)
+
+    def test_stale_claim_cannot_save_or_fail_a_new_owner(self) -> None:
+        now = datetime(2026, 8, 6, 4, 0, tzinfo=timezone.utc)
+        db.insert_events(
+            [self.event(published_at=(now - timedelta(hours=1)).isoformat())]
+        )
+        with db.conn() as connection:
+            event_id = connection.execute("SELECT id FROM events").fetchone()["id"]
+        base_claim = {
+            "event_id": event_id,
+            "input_hash": "a" * 64,
+            "prompt_version": llm_enrichment.PROMPT_VERSION,
+            "evidence_basis": "title_and_snippet",
+        }
+        old_token = db.claim_event_enrichment(
+            **base_claim,
+            model="deepseek-v4-flash",
+            now=now,
+        )
+        new_token = db.claim_event_enrichment(
+            **base_claim,
+            model="deepseek-v4-pro",
+            now=now + timedelta(seconds=1),
+        )
+        self.assertIsInstance(old_token, str)
+        self.assertIsInstance(new_token, str)
+        self.assertNotEqual(old_token, new_token)
+
+        self.assertFalse(
+            db.save_event_enrichment(
+                **base_claim,
+                model="deepseek-v4-flash",
+                claim_token=old_token,
+                result=ready_enrichment(headline_zh="旧 worker 的结果"),
+            )
+        )
+        self.assertFalse(
+            db.fail_event_enrichment(
+                event_id,
+                input_hash=base_claim["input_hash"],
+                prompt_version=base_claim["prompt_version"],
+                model="deepseek-v4-flash",
+                claim_token=old_token,
+                error_code="provider_unavailable",
+                retry_after_seconds=1200,
+                now=now + timedelta(seconds=2),
+            )
+        )
+        self.assertFalse(
+            db.save_event_enrichment(
+                **base_claim,
+                model="deepseek-v4-flash",
+                claim_token=new_token,
+                result=ready_enrichment(headline_zh="错误模型的结果"),
+            )
+        )
+        self.assertTrue(
+            db.save_event_enrichment(
+                **base_claim,
+                model="deepseek-v4-pro",
+                claim_token=new_token,
+                result=ready_enrichment(headline_zh="新 owner 的结果"),
+                generated_at=(now + timedelta(seconds=3)).isoformat(),
+            )
+        )
+        with db.conn() as connection:
+            row = connection.execute(
+                "SELECT status, model, headline_zh, claim_token "
+                "FROM event_enrichments WHERE event_id=?",
+                (event_id,),
+            ).fetchone()
+        self.assertEqual(row["status"], "ready")
+        self.assertEqual(row["model"], "deepseek-v4-pro")
+        self.assertEqual(row["headline_zh"], "新 owner 的结果")
+        self.assertEqual(row["claim_token"], "")
+
+    def test_candidate_pool_skips_live_backoff_without_starving_ready_rows(self) -> None:
+        now = datetime(2026, 8, 6, 4, 0, tzinfo=timezone.utc)
+        titles = (
+            "Unclaimed enrichment candidate",
+            "Ready enrichment candidate",
+            "Future retry enrichment candidate",
+            "Live processing enrichment candidate",
+            "Failed enrichment candidate",
+        )
+        for index, title in enumerate(titles):
+            db.insert_events(
+                [
+                    self.event(
+                        title=title,
+                        url=f"https://example.com/enrichment-{index}",
+                        published_at=(now - timedelta(hours=1)).isoformat(),
+                    )
+                ]
+            )
+        with db.conn() as connection:
+            event_ids = {
+                row["title"]: row["id"]
+                for row in connection.execute("SELECT id, title FROM events")
+            }
+
+        def claim(title: str) -> tuple[dict[str, object], str]:
+            params: dict[str, object] = {
+                "event_id": event_ids[title],
+                "input_hash": str(event_ids[title]).zfill(64),
+                "prompt_version": llm_enrichment.PROMPT_VERSION,
+                "model": llm_enrichment.DEFAULT_MODEL,
+                "evidence_basis": "title_only",
+            }
+            token = db.claim_event_enrichment(**params, now=now)
+            self.assertIsInstance(token, str)
+            return params, token
+
+        ready_claim, ready_token = claim("Ready enrichment candidate")
+        self.assertTrue(
+            db.save_event_enrichment(
+                **ready_claim,
+                claim_token=ready_token,
+                result=ready_enrichment(),
+                generated_at=now.isoformat(),
+            )
+        )
+        retry_claim, retry_token = claim("Future retry enrichment candidate")
+        self.assertTrue(
+            db.fail_event_enrichment(
+                retry_claim["event_id"],
+                input_hash=retry_claim["input_hash"],
+                prompt_version=retry_claim["prompt_version"],
+                model=retry_claim["model"],
+                claim_token=retry_token,
+                error_code="rate_limit",
+                retry_after_seconds=3600,
+                now=now,
+            )
+        )
+        claim("Live processing enrichment candidate")
+        failed_claim, failed_token = claim("Failed enrichment candidate")
+        self.assertTrue(
+            db.fail_event_enrichment(
+                failed_claim["event_id"],
+                input_hash=failed_claim["input_hash"],
+                prompt_version=failed_claim["prompt_version"],
+                model=failed_claim["model"],
+                claim_token=failed_token,
+                error_code="invalid_output",
+                retry_after_seconds=None,
+                now=now,
+            )
+        )
+
+        first_page = db.query_enrichment_candidates(now=now, limit=2)
+        due_later = db.query_enrichment_candidates(
+            now=now + timedelta(hours=2),
+            limit=10,
+        )
+
+        self.assertEqual(
+            [row["title"] for row in first_page],
+            ["Unclaimed enrichment candidate", "Ready enrichment candidate"],
+        )
+        self.assertEqual(
+            {row["title"] for row in due_later},
+            set(titles),
+        )
+        self.assertEqual(due_later[-1]["title"], "Failed enrichment candidate")
+
+    def test_ready_enrichment_is_nested_in_event_queries_and_searchable(self) -> None:
+        now = datetime(2026, 8, 6, 5, 0, tzinfo=timezone.utc)
+        db.insert_events(
+            [self.event(published_at=(now - timedelta(hours=1)).isoformat())]
+        )
+        candidate = db.query_enrichment_candidates(now=now)[0]
+        event_input, input_hash = llm_enrichment.build_event_input(candidate)
+        claim = {
+            "event_id": candidate["id"],
+            "input_hash": input_hash,
+            "prompt_version": llm_enrichment.PROMPT_VERSION,
+            "model": llm_enrichment.DEFAULT_MODEL,
+            "evidence_basis": event_input["evidence_basis"],
+        }
+
+        claim_token = db.claim_event_enrichment(**claim, now=now)
+        self.assertIsInstance(claim_token, str)
+        self.assertTrue(
+            db.save_event_enrichment(
+                **claim,
+                claim_token=claim_token,
+                result=ready_enrichment(),
+                generated_at=now.isoformat(),
+            )
+        )
+
+        deterministic_items = db.query_events(hours=24, now=now)
+        public_items = db.query_events(hours=24, now=now, use_ai_impact=True)
+        searched = db.query_events(q="人工智能", hours=24, now=now)
+        rule_high = db.query_events(impact="high", hours=24, now=now)
+        ai_high = db.query_events(
+            impact="high",
+            hours=24,
+            now=now,
+            use_ai_impact=True,
+        )
+
+        self.assertEqual(len(deterministic_items), 1)
+        deterministic = deterministic_items[0]
+        public = public_items[0]
+        self.assertEqual(deterministic["rule_impact"], "medium")
+        self.assertEqual(deterministic["impact"], "medium")
+        self.assertEqual(public["impact"], "high")
+        self.assertEqual(public["ai_status"], "ready")
+        self.assertEqual(public["ai_enrichment"]["status"], "ready")
+        self.assertEqual(public["ai_enrichment"]["tags"], ["人工智能", "半导体"])
+        self.assertEqual(
+            public["ai_enrichment"]["assets"][0]["asset_key"],
+            "US:NVDA",
+        )
+        self.assertEqual(public["ai_enrichment"]["model"], "deepseek-v4-flash")
+        self.assertNotIn("ai_summary_zh", public)
+        self.assertNotIn("ai_tags_json", public)
+        self.assertEqual([row["id"] for row in searched], [candidate["id"]])
+        self.assertEqual(rule_high, [])
+        self.assertEqual([row["id"] for row in ai_high], [candidate["id"]])
+
+    def test_ai_none_only_downgrades_confident_medium_rule_impact(self) -> None:
+        now = datetime(2026, 8, 6, 5, 30, tzinfo=timezone.utc)
+        cases = (
+            ("Rule high stays high", "high", 0.99),
+            ("Low confidence medium stays medium", "medium", 0.64),
+            ("Confident medium becomes low", "medium", 0.65),
+        )
+        for index, (title, impact, _confidence) in enumerate(cases):
+            db.insert_events(
+                [
+                    self.event(
+                        title=title,
+                        url=f"https://example.com/ai-none-{index}",
+                        impact=impact,
+                        published_at=(now - timedelta(hours=1)).isoformat(),
+                    )
+                ]
+            )
+        with db.conn() as connection:
+            event_ids = {
+                row["title"]: row["id"]
+                for row in connection.execute("SELECT id, title FROM events")
+            }
+
+        for title, _impact, confidence in cases:
+            event_id = event_ids[title]
+            claim = {
+                "event_id": event_id,
+                "input_hash": str(event_id).zfill(64),
+                "prompt_version": llm_enrichment.PROMPT_VERSION,
+                "model": llm_enrichment.DEFAULT_MODEL,
+                "evidence_basis": "title_only",
+            }
+            claim_token = db.claim_event_enrichment(**claim, now=now)
+            self.assertIsInstance(claim_token, str)
+            self.assertTrue(
+                db.save_event_enrichment(
+                    **claim,
+                    claim_token=claim_token,
+                    result=ready_enrichment(
+                        impact_level="none",
+                        confidence=confidence,
+                        cluster_key=f"ai-none-{event_id}",
+                    ),
+                    generated_at=now.isoformat(),
+                )
+            )
+
+        deterministic = {
+            row["title"]: row
+            for row in db.query_events(hours=24, now=now)
+        }
+        public = {
+            row["title"]: row
+            for row in db.query_events(
+                hours=24,
+                now=now,
+                use_ai_impact=True,
+            )
+        }
+
+        self.assertEqual(deterministic["Rule high stays high"]["impact"], "high")
+        self.assertEqual(public["Rule high stays high"]["impact"], "high")
+        self.assertEqual(
+            public["Low confidence medium stays medium"]["impact"],
+            "medium",
+        )
+        self.assertEqual(public["Confident medium becomes low"]["impact"], "low")
+        self.assertEqual(
+            public["Confident medium becomes low"]["ai_enrichment"]["impact_level"],
+            "none",
+        )
+        self.assertEqual(
+            {
+                row["title"]
+                for row in db.query_events(
+                    impact="low",
+                    hours=24,
+                    now=now,
+                    use_ai_impact=True,
+                )
+            },
+            {"Confident medium becomes low"},
+        )
+        high_detail = db.get_event_detail(event_ids["Rule high stays high"])
+        low_detail = db.get_event_detail(event_ids["Confident medium becomes low"])
+        self.assertIsNotNone(high_detail)
+        self.assertIsNotNone(low_detail)
+        assert high_detail is not None
+        assert low_detail is not None
+        self.assertEqual(high_detail["event"]["impact"], "high")
+        self.assertEqual(low_detail["event"]["impact"], "low")
+
+    def test_event_detail_includes_every_sighting_and_related_cluster(self) -> None:
+        now = datetime(2026, 8, 6, 6, 0, tzinfo=timezone.utc)
+        db.insert_events(
+            [
+                self.event(
+                    title="NVIDIA launches enterprise AI platform",
+                    url="https://example.com/nvidia-enterprise-platform",
+                    published_at=(now - timedelta(hours=2)).isoformat(),
+                )
+            ]
+        )
+        db.insert_events(
+            [
+                self.event(
+                    title="NVIDIA launches enterprise AI platform",
+                    url="https://x.com/elonmusk/status/123",
+                    source="X @elonmusk",
+                    kol_key="musk",
+                    kol_name="Elon Musk",
+                    kol_name_cn="马斯克",
+                    published_at=(now - timedelta(hours=1)).isoformat(),
+                )
+            ]
+        )
+        db.insert_events(
+            [
+                self.event(
+                    title="Partners adopt NVIDIA platform worldwide",
+                    url="https://example.com/nvidia-partners",
+                    source="Reuters",
+                    kol_key="analyst",
+                    kol_name="Analyst",
+                    kol_name_cn="分析师",
+                    published_at=(now - timedelta(minutes=30)).isoformat(),
+                )
+            ]
+        )
+        candidates = db.query_enrichment_candidates(now=now)
+        ids_by_title = {item["title"]: item["id"] for item in candidates}
+        first_id = ids_by_title["NVIDIA launches enterprise AI platform"]
+        related_id = ids_by_title["Partners adopt NVIDIA platform worldwide"]
+
+        for candidate in candidates:
+            event_input, input_hash = llm_enrichment.build_event_input(candidate)
+            claim = {
+                "event_id": candidate["id"],
+                "input_hash": input_hash,
+                "prompt_version": llm_enrichment.PROMPT_VERSION,
+                "model": llm_enrichment.DEFAULT_MODEL,
+                "evidence_basis": event_input["evidence_basis"],
+            }
+            claim_token = db.claim_event_enrichment(**claim, now=now)
+            self.assertIsInstance(claim_token, str)
+            self.assertTrue(
+                db.save_event_enrichment(
+                    **claim,
+                    claim_token=claim_token,
+                    result=ready_enrichment(
+                        headline_zh=f"事件 {candidate['id']}",
+                        cluster_key="nvidia-enterprise-ai-platform",
+                    ),
+                    generated_at=now.isoformat(),
+                )
+            )
+
+        detail = db.get_event_detail(first_id)
+
+        self.assertIsNotNone(detail)
+        assert detail is not None
+        self.assertEqual(detail["event"]["id"], first_id)
+        self.assertEqual(detail["event"]["ai_status"], "ready")
+        self.assertEqual(len(detail["sightings"]), 2)
+        self.assertEqual(detail["sightings"][0]["kol_key"], "musk")
+        self.assertEqual(
+            {sighting["source_url"] for sighting in detail["sightings"]},
+            {
+                "https://example.com/nvidia-enterprise-platform",
+                "https://x.com/elonmusk/status/123",
+            },
+        )
+        self.assertEqual([item["id"] for item in detail["related"]], [related_id])
+        self.assertEqual(detail["related"][0]["headline_zh"], f"事件 {related_id}")
+        self.assertIsNone(db.get_event_detail(999_999))
 
     def test_replace_relations_is_idempotent_and_updates_payload(self) -> None:
         edge = {

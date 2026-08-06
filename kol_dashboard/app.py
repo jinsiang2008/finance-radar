@@ -6,6 +6,7 @@ Routes:
   GET  /api/stats           — headline counters
   GET  /api/kols            — per-KOL summary
   GET  /api/events          — filtered event list
+  GET  /api/events/{id}     — event intelligence, evidence and related stories
   GET  /api/macro           — latest macro risk snapshot
   GET  /api/macro/history   — composite risk score over time
   GET  /api/decisions       — public risk/opportunity decision cards
@@ -31,7 +32,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Path as ApiPath, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -230,10 +231,78 @@ def api_events(
         time_status=time_status,
         limit=limit,
         offset=offset,
+        use_ai_impact=True,
     )
     for it in items:
         it["tickers"] = [t for t in (it.get("tickers") or "").split(",") if t]
     return {"items": items, "count": len(items)}
+
+
+@app.get("/api/events/{event_id:int}")
+def api_event_detail(
+    event_id: int = ApiPath(ge=1, le=9_223_372_036_854_775_807),
+    kol: Optional[str] = Query(None, max_length=120),
+    source_url: Optional[str] = Query(None, max_length=2048),
+) -> JSONResponse:
+    detail = db.get_event_detail(event_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="event_not_found")
+    event = detail["event"]
+    event["tickers"] = [
+        ticker for ticker in (event.get("tickers") or "").split(",") if ticker
+    ]
+    if kol or source_url:
+        selected_sighting = next(
+            (
+                sighting
+                for sighting in detail["sightings"]
+                if (
+                    not kol
+                    or str(sighting.get("kol_key") or "") == kol
+                )
+                and (
+                    not source_url
+                    or str(sighting.get("source_url") or "") == source_url
+                )
+            ),
+            None,
+        )
+        if selected_sighting:
+            for field in (
+                "source_url",
+                "source",
+                "kol_key",
+                "kol_name",
+                "kol_name_cn",
+                "published_at",
+                "time_status",
+                "first_seen_at",
+                "last_seen_at",
+                "source_count",
+            ):
+                event[field] = selected_sighting.get(field)
+    relations = decision_service.project_public_relations(
+        db.query_relations(
+            source_type="event",
+            source_id=str(event_id),
+            limit=100,
+        )
+    )
+    reactions = decision_service.project_public_reactions(
+        db.query_market_reactions(
+            source_type="event",
+            source_id=str(event_id),
+            limit=100,
+        )
+    )
+    return JSONResponse(
+        {
+            **detail,
+            "relations": relations,
+            "market_reactions": reactions,
+        },
+        headers=_PUBLIC_CACHE_HEADERS,
+    )
 
 @app.get("/api/macro")
 def api_macro() -> JSONResponse:

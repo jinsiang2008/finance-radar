@@ -24,6 +24,8 @@ class DeploymentContractTests(unittest.TestCase):
             "portfolio.py",
             "relation_engine.py",
             "macro_collect.py",
+            "llm_enrichment.py",
+            "enrichment_collect.py",
             "collect.sh",
         ):
             self.assertIn(filename, self.deploy)
@@ -53,6 +55,73 @@ class DeploymentContractTests(unittest.TestCase):
         self.assertIn("kol-collect-decision.timer", self.deploy)
         self.assertIn("python3 -c 'import db; db.init()'", self.deploy)
         self.assertIn("KOL_DB_WRITE_REQUIRED=1", self.collect)
+
+    def test_enrichment_has_an_isolated_secret_file_and_hardened_timer(self) -> None:
+        self.assertIn('enrich)', self.collect)
+        self.assertIn('enrichment_collect.py")', self.collect)
+        self.assertIn("kol-collect-enrich.timer", self.deploy)
+        self.assertIn(
+            'cat > "$REMOTE_STAGE/kol-collect-enrich.timer"',
+            self.deploy,
+        )
+        self.assertIn('if [[ "$job" == "enrich" ]]; then', self.deploy)
+        self.assertIn(
+            'EXTRA_ENVIRONMENT="EnvironmentFile=-/etc/kol-dashboard/deepseek.env"',
+            self.deploy,
+        )
+        self.assertEqual(
+            self.deploy.count(
+                "EnvironmentFile=-/etc/kol-dashboard/deepseek.env"
+            ),
+            1,
+        )
+        self.assertIn('EXTRA_HARDENING="LimitCORE=0"', self.deploy)
+        self.assertNotIn("DEEPSEEK_API_KEY=", self.deploy)
+        self.assertNotIn("DEEPSEEK_API_KEY=", self.collect)
+        # The externally provisioned root-only file must never be created,
+        # copied, rewritten or bundled by this deployment script.
+        self.assertNotIn("put-secret deepseek", self.deploy)
+        self.assertNotIn("deepseek.env\" <<", self.deploy)
+
+    def test_existing_deepseek_secret_file_must_be_root_only(self) -> None:
+        self.assertIn(
+            "stat -c '%U:%G:%a' /etc/kol-dashboard/deepseek.env",
+            self.deploy,
+        )
+        self.assertIn(
+            '"$DEEPSEEK_SECRET_STAT" == "root:root:600"',
+            self.deploy,
+        )
+        self.assertNotIn("source /etc/kol-dashboard/deepseek.env", self.deploy)
+        self.assertNotIn("cat /etc/kol-dashboard/deepseek.env", self.deploy)
+        self.assertNotIn("chmod 600 /etc/kol-dashboard/deepseek.env", self.deploy)
+        self.assertNotIn("chown root:root /etc/kol-dashboard/deepseek.env", self.deploy)
+
+    def test_rollback_restores_original_unit_enablement_and_activity(self) -> None:
+        self.assertIn("record_unit_state()", self.deploy)
+        self.assertIn("prepare_unit_state_rollback()", self.deploy)
+        self.assertIn("restore_unit_states()", self.deploy)
+        self.assertIn('> "$ROLLBACK_DIR/config/$unit.state"', self.deploy)
+        self.assertIn('systemctl disable -q "$unit"', self.deploy)
+        self.assertIn('systemctl enable -q "$unit"', self.deploy)
+        self.assertIn('systemctl start "$unit"', self.deploy)
+        self.assertIn(
+            "prepare_unit_state_rollback || rollback_failed=1",
+            self.deploy,
+        )
+        self.assertIn("restore_unit_states || rollback_failed=1", self.deploy)
+        self.assertNotIn("start_available_units", self.deploy)
+
+    def test_all_worker_logs_are_precreated_private(self) -> None:
+        self.assertIn(
+            "for log_file in out.log err.log collect.log collect.err.log",
+            self.deploy,
+        )
+        self.assertIn("-m 600 /dev/null", self.deploy)
+        self.assertIn(
+            'chmod 600 "/var/log/kol-dashboard/$log_file"',
+            self.deploy,
+        )
 
     def test_auth_rotation_requires_explicit_flag_and_secure_rewrite(self) -> None:
         self.assertIn("if [[ $CONFIGURE_AUTH == 1 ]]; then", self.deploy)
@@ -100,6 +169,7 @@ class DeploymentContractTests(unittest.TestCase):
             "kol-collect-kol.service",
             "kol-collect-macro.service",
             "kol-collect-decision.service",
+            "kol-collect-enrich.service",
         ):
             self.assertIn(unit, self.deploy)
         self.assertIn("PRAGMA wal_checkpoint(TRUNCATE)", self.deploy)

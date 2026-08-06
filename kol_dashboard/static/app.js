@@ -25,9 +25,21 @@
     macroData: null,
     macroHistory: [],
     stats: null,
+    feedItems: [],
+    expandedClusters: new Set(),
     feedLoadedCount: 0,
+    feedVisibleCount: 0,
+    feedClusteredCount: 0,
     feedHighPriority: false,
     feedRegularCapped: false,
+    feedRequestGeneration: 0,
+    drawerEventId: null,
+    drawerKol: "",
+    drawerSourceUrl: "",
+    drawerRequestGeneration: 0,
+    drawerReturnFocus: null,
+    drawerPreviousOverflow: "",
+    drawerInertNodes: [],
   };
 
   // ─── Helpers ──────────────────────────────
@@ -1617,7 +1629,7 @@
       $("#stat-kol").textContent = s.active_kols;
       $("#stat-market").textContent = s.with_market_kw;
       $("#tab-kol-count").textContent = s.high > 0 ? s.high : "";
-      updateFeedStatus();
+      if ($("#feed")?.getAttribute("aria-busy") !== "true") updateFeedStatus();
     } catch (e) {
       console.warn("stats", e);
     }
@@ -1658,9 +1670,28 @@
   }
 
   function eventIdentity(item) {
-    return String(item?.canonical_url || item?.url || item?.title || "")
+    return String(
+      item?.canonical_url ||
+        item?.source_url ||
+        item?.url ||
+        item?.id ||
+        item?.title ||
+        ""
+    )
       .trim()
       .toLowerCase();
+  }
+
+  function eventExternalUrl(item, preferSighting = false) {
+    const sightingFirst = preferSighting || Boolean(state.kol);
+    const candidates = sightingFirst
+      ? [item?.source_url, item?.canonical_url, item?.url]
+      : [item?.canonical_url, item?.url, item?.source_url];
+    for (const candidate of candidates) {
+      const safe = safeExternalUrl(candidate);
+      if (safe) return safe;
+    }
+    return "";
   }
 
   function mergePriorityEvents(priorityItems, regularItems) {
@@ -1676,7 +1707,14 @@
   function updateFeedStatus() {
     const host = $("#feed-status");
     if (!host) return;
-    const parts = [`已加载 ${state.feedLoadedCount} 条`];
+    const parts = [
+      state.feedClusteredCount > 0
+        ? `已加载 ${state.feedLoadedCount} 条，按事件折叠为 ${state.feedVisibleCount} 张卡片`
+        : `已加载 ${state.feedLoadedCount} 条`,
+    ];
+    if (state.feedClusteredCount > 0) {
+      parts.push(`已折叠 ${state.feedClusteredCount} 条同簇报道，可逐簇展开`);
+    }
     if (typeof state.stats?.total === "number") {
       parts.push(`当前窗口采集记录 ${state.stats.total} 条`);
     }
@@ -1689,8 +1727,134 @@
     host.textContent = parts.join(" · ");
   }
 
+  function eventBody(item) {
+    const title = String(item?.title || "").trim();
+    const snippet = String(item?.snippet || "").trim();
+    const stem = title.replace(/[…\.]+$/, "").trim();
+    if (snippet && stem && snippet.startsWith(stem)) {
+      return { headline: snippet, snippet: "" };
+    }
+    return { headline: title, snippet };
+  }
+
+  function eventEnrichment(item) {
+    return item?.ai_status === "ready" && item?.ai_enrichment
+      ? item.ai_enrichment
+      : null;
+  }
+
+  function isTitleOnlyEvidence(enrichment) {
+    return ["title", "title_only"].includes(
+      String(enrichment?.evidence_basis || "").toLowerCase()
+    );
+  }
+
+  function aiStateHTML(item) {
+    const enrichment = eventEnrichment(item);
+    if (enrichment && isTitleOnlyEvidence(enrichment)) {
+      return `<span class="ai-state is-limited" title="AI 只获得标题，未读取正文">仅标题证据</span>`;
+    }
+    const status = String(item?.ai_status || "pending").toLowerCase();
+    if (status === "failed") {
+      return `<span class="ai-state is-failed">AI 解读暂不可用</span>`;
+    }
+    if (!enrichment) {
+      const label = {
+        processing: "AI 解读生成中",
+        retry: "AI 解读等待重试",
+        pending: "AI 解读待就绪",
+      }[status] || "AI 解读待就绪";
+      return `<span class="ai-state is-pending">${label}</span>`;
+    }
+    return `<span class="ai-state is-ready">AI 研判</span>`;
+  }
+
+  function eventCopy(item) {
+    const original = eventBody(item);
+    const enrichment = eventEnrichment(item);
+    const status = String(item?.ai_status || "pending").toLowerCase();
+    if (enrichment) {
+      return {
+        headline:
+          String(enrichment.headline_zh || "").trim() ||
+          original.headline ||
+          "未命名事件",
+        summary:
+          String(enrichment.summary_zh || "").trim() ||
+          original.snippet ||
+          "中文摘要暂不可用，请核对原文。",
+        original,
+        enrichment,
+      };
+    }
+    return {
+      headline: original.headline || "未命名事件",
+      summary:
+        original.snippet ||
+        (status === "failed"
+          ? "AI 解读暂不可用；请先核对原文与来源。"
+          : "AI 解读尚未就绪；请先核对原文与来源。"),
+      original,
+      enrichment: null,
+    };
+  }
+
+  function foldEventClusters(items) {
+    const folded = [];
+    const byCluster = new Map();
+    items.forEach((item) => {
+      const enrichment = eventEnrichment(item);
+      const timeStatus = String(
+        item?.time_status || (item?.published_at ? "verified" : "unknown")
+      );
+      const clusterKey =
+        timeStatus === "verified"
+          ? String(enrichment?.cluster_key || "").trim()
+          : "";
+      if (!clusterKey) {
+        folded.push({ primary: item, relatedItems: [], relatedCount: 0 });
+        return;
+      }
+      const existing = byCluster.get(clusterKey);
+      if (existing) {
+        existing.relatedItems.push(item);
+        existing.relatedCount = existing.relatedItems.length;
+        return;
+      }
+      const group = {
+        primary: item,
+        relatedItems: [],
+        relatedCount: 0,
+        clusterKey,
+        isExpanded: false,
+      };
+      byCluster.set(clusterKey, group);
+      folded.push(group);
+    });
+
+    const groups = [];
+    let hiddenCount = 0;
+    folded.forEach((group) => {
+      group.isExpanded = Boolean(
+        group.clusterKey && state.expandedClusters.has(group.clusterKey)
+      );
+      groups.push(group);
+      if (group.isExpanded) {
+        group.relatedItems.forEach((item) => {
+          groups.push({ primary: item, relatedItems: [], relatedCount: 0 });
+        });
+      } else {
+        hiddenCount += group.relatedCount;
+      }
+    });
+    return { groups, hiddenCount };
+  }
+
   function renderEvents(items) {
+    state.feedItems = Array.isArray(items) ? items : [];
     if (!items.length) {
+      state.feedVisibleCount = 0;
+      state.feedClusteredCount = 0;
       $("#feed").innerHTML = `<div class="empty">
         <span class="empty-icon">📭</span>当前筛选条件下没有动态
         <div class="empty-hint">试试放宽时间窗口或影响等级</div>
@@ -1698,32 +1862,48 @@
       return;
     }
     const LVL = { high: "var(--high)", medium: "var(--med)" };
-    const LBL = { high: "高影响", medium: "中影响", low: "低影响" };
-
-    // X posts carry the same text as both title and snippet; show it once.
-    const bodyOf = (it) => {
-      const title = String(it.title || "");
-      const snippet = String(it.snippet || "");
-      const stem = title.replace(/[…\.]+$/, "").trim();
-      if (snippet && stem && snippet.startsWith(stem)) {
-        return { headline: snippet, snippet: "" };
-      }
-      return { headline: title, snippet };
+    const LBL = {
+      high: "高影响",
+      medium: "中影响",
+      low: "低影响",
+      none: "低相关",
     };
+    const clusterResult = foldEventClusters(items);
+    const groups = clusterResult.groups;
+    state.feedVisibleCount = groups.length;
+    state.feedClusteredCount = clusterResult.hiddenCount;
 
-    $("#feed").innerHTML = items
-      .map((it) => {
-        const body = bodyOf(it);
+    $("#feed").innerHTML = groups
+      .map((group) => {
+        const it = group.primary;
+        const copy = eventCopy(it);
         const sourceNature = sourceKind(it.source);
         const lvl = LVL[it.impact] || "transparent";
         const pillLvl = LEVEL_COLOR[it.impact] || "var(--neutral)";
-        const tickers = (it.tickers || [])
-          .map((t) => `<span class="tag ticker">$${esc(t)}</span>`)
+        const aiAssets = (copy.enrichment?.assets || [])
+          .map((asset) => asset?.asset_key)
+          .filter(Boolean);
+        const assetKeys = Array.from(
+          new Set(aiAssets.length ? aiAssets : it.tickers || [])
+        ).slice(0, 6);
+        const tickers = assetKeys
+          .map((key) => {
+            const raw = String(key || "");
+            const label = raw.includes(":") ? assetTicker(raw) : `$${raw}`;
+            return `<span class="tag ticker">${esc(label)}</span>`;
+          })
           .join("");
         const heat =
           it.source_count > 1
-            ? `<span class="heat">🔗 ${it.source_count} 个独立来源</span>`
+            ? `<span class="heat">🔗 ${it.source_count} 条来源链接</span>`
             : "";
+        const related = group.relatedCount
+          ? `<button type="button" class="cluster-count"
+               data-cluster-toggle="${esc(group.clusterKey)}"
+               aria-expanded="${group.isExpanded ? "true" : "false"}">
+               ${group.isExpanded ? "收起" : "展开"} ${group.relatedCount} 条同簇相关报道
+             </button>`
+          : "";
         const collectedAt = it.first_seen_at || it.fetched_at;
         const timeStatus =
           it.time_status || (it.published_at ? "verified" : "unknown");
@@ -1737,44 +1917,584 @@
           timeStatus === "verified" && it.published_at
             ? `发布 ${fmtTime(it.published_at)}`
             : timeStatus === "future"
-              ? `发布时间异常 · 抓取 ${fmtTime(collectedAt)}`
-              : `发布时间未知 · 抓取 ${fmtTime(collectedAt)}`;
-        const externalUrl = safeExternalUrl(it.canonical_url || it.url);
-        const headline = externalUrl
-          ? `<a href="${esc(externalUrl)}" target="_blank" rel="noopener noreferrer">${esc(
-              body.headline
-            )}</a>`
-          : esc(body.headline);
-        return `<article class="card" style="--lvl:${lvl}">
+              ? collectedAt
+                ? `发布时间异常 · 抓取 ${fmtTime(collectedAt)}`
+                : "发布时间异常 · 抓取时间未知"
+              : collectedAt
+                ? `发布时间未知 · 抓取 ${fmtTime(collectedAt)}`
+                : "发布时间与抓取时间均未知";
+        const externalUrl = eventExternalUrl(it, Boolean(state.kol));
+        const titleId = `event-card-title-${esc(it.id)}`;
+        const original =
+          copy.enrichment && copy.original.headline
+            ? `<p class="card-original"><span>原文</span>${esc(copy.original.headline)}</p>`
+            : "";
+        return `<article class="card" style="--lvl:${lvl}" aria-labelledby="${titleId}">
           <div class="card-head">
             <span class="card-kol">${esc(it.kol_name_cn || it.kol_name)}</span>
             ${
               it.impact !== "low"
-                ? `<span class="pill" style="--lvl:${pillLvl}">${LBL[it.impact]}</span>`
+                ? `<span class="pill" style="--lvl:${pillLvl}">${
+                    LBL[it.impact] || "影响待评估"
+                  }</span>`
                 : ""
             }
+            ${aiStateHTML(it)}
             <span class="card-src">${esc(it.source || "")}</span>
             <span class="source-kind ${sourceNature.key}">${sourceNature.label}</span>
             <span class="card-time ${
               timeStatus === "verified" ? "" : "is-unverified"
             }" title="${esc(timeTitle)}">${esc(eventTime)}</span>
           </div>
-          <div class="card-title${body.snippet ? "" : " card-title-body"}">
-            ${headline}
-          </div>
-          ${body.snippet ? `<div class="card-snippet">${esc(body.snippet)}</div>` : ""}
+          <h2 class="card-title" id="${titleId}">${esc(copy.headline)}</h2>
+          <p class="card-snippet">${esc(copy.summary)}</p>
+          ${original}
           ${
-            tickers || heat
-              ? `<div class="card-foot">${tickers}${heat}</div>`
+            tickers || heat || related
+              ? `<div class="card-foot">${tickers}${heat}${related}</div>`
               : ""
           }
+          <div class="card-actions">
+            <button type="button" class="card-evidence-btn" data-event-detail="${esc(
+              it.id
+            )}" data-event-kol="${esc(it.source_url ? it.kol_key || "" : "")}"
+                    data-event-source-url="${esc(it.source_url || "")}"
+                    aria-haspopup="dialog" aria-controls="intel-drawer"
+                    aria-label="查看${esc(shortText(copy.headline, 36))}的证据链">
+              查看证据链
+            </button>
+            ${
+              externalUrl
+                ? `<a class="card-original-link" href="${esc(
+                    externalUrl
+                  )}" target="_blank" rel="noopener noreferrer"
+                     aria-label="打开${esc(shortText(copy.original.headline || copy.headline, 36))}原文，新窗口">原文 ↗</a>`
+                : `<span class="card-link-unavailable">原文链接不可用</span>`
+            }
+          </div>
         </article>`;
       })
       .join("");
     renderSupportCard("kol");
   }
 
+  const DIRECTION_CN = {
+    positive: "正向",
+    negative: "负向",
+    mixed: "双向",
+    unclear: "待核验",
+    neutral: "中性",
+  };
+  const HORIZON_CN = {
+    intraday: "日内",
+    short: "短期",
+    medium: "中期",
+    long: "长期",
+  };
+
+  function confidenceLabel(value) {
+    if (value === null || value === undefined || value === "") return "";
+    const number = Number(value);
+    return Number.isFinite(number) ? `置信 ${Math.round(number * 100)}%` : "";
+  }
+
+  function intelSection(index, title, content, extraClass = "") {
+    return `<section class="intel-section ${extraClass}" aria-labelledby="intel-section-${index}">
+      <div class="intel-spine-index" aria-hidden="true">${String(index).padStart(2, "0")}</div>
+      <div class="intel-section-content">
+        <h3 id="intel-section-${index}">${esc(title)}</h3>
+        ${content}
+      </div>
+    </section>`;
+  }
+
+  function marketReactionHTML(reaction) {
+    if (!reaction) return "";
+    const abnormal =
+      typeof reaction.abnormal_return === "number"
+        ? `异常收益 ${pct(reaction.abnormal_return)}`
+        : "";
+    const confirmation =
+      reaction.direction_confirmed === true
+        ? "方向已确认"
+        : reaction.direction_confirmed === false
+          ? "方向未确认"
+          : reaction.status === "complete"
+            ? "方向不明确"
+            : "样本尚不完整";
+    const windowLabel = reaction.window ? String(reaction.window).toUpperCase() : "";
+    return `<div class="market-check ${
+      reaction.direction_confirmed === true ? "is-confirmed" : ""
+    }">
+      <span>市场核验</span>
+      <strong>${esc(confirmation)}</strong>
+      ${windowLabel ? `<span>${esc(windowLabel)}</span>` : ""}
+      ${abnormal ? `<span>${esc(abnormal)}</span>` : ""}
+      ${
+        typeof reaction.sample_count === "number"
+          ? `<span>${reaction.sample_count} 个样本</span>`
+          : ""
+      }
+    </div>`;
+  }
+
+  function renderIntelAssets(event, enrichment, relations, reactions) {
+    const aiAssets = Array.isArray(enrichment?.assets) ? enrichment.assets : [];
+    const reactionMap = new Map();
+    (Array.isArray(reactions) ? reactions : []).forEach((reaction) => {
+      const key = String(reaction?.asset_key || "");
+      if (key && !reactionMap.has(key)) reactionMap.set(key, reaction);
+    });
+
+    const assetCards = aiAssets
+      .map((asset) => {
+        const key = String(asset?.asset_key || "");
+        if (!key) return "";
+        const direction = String(asset.direction || "unclear").toLowerCase();
+        const horizon = String(asset.horizon || "short").toLowerCase();
+        return `<article class="intel-asset" data-direction="${esc(direction)}">
+          <div class="intel-asset-head">
+            <div>
+              <strong>${esc(asset.name_zh || assetLabel(key))}</strong>
+              <code>${esc(key)}</code>
+            </div>
+            <span class="direction-badge">${esc(DIRECTION_CN[direction] || direction)}</span>
+          </div>
+          <p>${esc(asset.reason_zh || "暂无补充理由，请核对传导路径。")}</p>
+          <div class="intel-asset-meta">
+            <span>${esc(HORIZON_CN[horizon] || horizon)}</span>
+            ${
+              confidenceLabel(asset.confidence)
+                ? `<span>${esc(confidenceLabel(asset.confidence))}</span>`
+                : ""
+            }
+          </div>
+          ${marketReactionHTML(reactionMap.get(key))}
+        </article>`;
+      })
+      .filter(Boolean)
+      .join("");
+
+    const relationRows = (Array.isArray(relations) ? relations : [])
+      .map((relation) => {
+        const key = String(relation?.asset_key || "");
+        if (!key) return "";
+        const direction = String(relation.direction || "unclear").toLowerCase();
+        const horizon = String(relation.horizon || "short").toLowerCase();
+        return `<article class="mechanism-row">
+          <div class="mechanism-row-head">
+            <strong>${esc(assetLabel(key))}</strong>
+            <code>${esc(key)}</code>
+            <span>${esc(DIRECTION_CN[direction] || direction)}</span>
+            <span>${esc(HORIZON_CN[horizon] || horizon)}</span>
+          </div>
+          <p>${esc(relation.rationale || "规则识别到关联，具体机制仍需人工复核。")}</p>
+          ${marketReactionHTML(reactionMap.get(key))}
+        </article>`;
+      })
+      .filter(Boolean)
+      .join("");
+
+    const fallbackTickers = (event?.tickers || [])
+      .map((ticker) => {
+        const raw = String(ticker || "");
+        const label = raw.includes(":") ? assetTicker(raw) : `$${raw}`;
+        return `<span class="tag ticker">${esc(label)}</span>`;
+      })
+      .join("");
+    if (!assetCards && !relationRows && !fallbackTickers) {
+      return `<p class="intel-degraded">尚未识别到可交易资产；这不代表事件没有影响，只表示当前证据不足。</p>`;
+    }
+    return `${assetCards ? `<div class="intel-assets">${assetCards}</div>` : ""}
+      ${
+        fallbackTickers && !assetCards
+          ? `<div class="intel-fallback-assets"><span>规则标的</span>${fallbackTickers}</div>`
+          : ""
+      }
+      ${
+        relationRows
+          ? `<div class="mechanism-block">
+              <h4>规则机制与市场核验</h4>
+              <p class="mechanism-note">规则关联用于发现线索；市场相关不等于因果。</p>
+              ${relationRows}
+            </div>`
+          : ""
+      }`;
+  }
+
+  function renderIntelSources(event, sightings) {
+    const originalTitle = String(event?.title || "").trim() || "原文标题不可用";
+    const originalSnippet = String(event?.snippet || "").trim();
+    const originalUrl = eventExternalUrl(event, Boolean(event?.source_url));
+    const sourceItems = Array.isArray(sightings) ? sightings : [];
+    const sources = sourceItems.length
+      ? sourceItems
+          .map((sighting) => {
+            const url = eventExternalUrl(sighting, true);
+            const sourceLabel = String(
+              sighting.kol_name_cn ||
+                sighting.kol_name ||
+                sighting.source ||
+                "未知来源"
+            );
+            const timeStatus = String(sighting.time_status || "unknown");
+            const sourceNature = sourceKind(sighting.source);
+            const when =
+              timeStatus === "verified" && sighting.published_at
+                ? `发布 ${fmtTime(sighting.published_at)}`
+                : sighting.first_seen_at
+                  ? `抓取 ${fmtTime(sighting.first_seen_at)}`
+                  : "时间待核验";
+            return `<li class="source-record">
+              <div>
+                <strong>${esc(sourceLabel)}</strong>
+                <span>${esc(sighting.source || "来源待核验")}</span>
+              </div>
+              <div class="source-record-meta">
+                <span class="source-kind ${sourceNature.key}">${sourceNature.label}</span>
+                <span class="${timeStatus === "verified" ? "" : "is-unverified"}">${esc(
+                  when
+                )}</span>
+                ${
+                  sighting.source_count > 1
+                    ? `<span>采集 ${sighting.source_count} 次</span>`
+                    : ""
+                }
+              </div>
+              ${
+                url
+                  ? `<a class="drawer-source-link" href="${esc(
+                      url
+                    )}" target="_blank" rel="noopener noreferrer"
+                       aria-label="核对${esc(shortText(sourceLabel, 32))}来源，新窗口">核对来源 ↗</a>`
+                  : `<span class="source-link-missing">链接不可用</span>`
+              }
+            </li>`;
+          })
+          .join("")
+      : `<li class="source-record is-empty"><span>暂无独立来源记录，请直接核对原文。</span></li>`;
+
+    return `<article class="original-document">
+        <p class="original-document-label">抓取原文</p>
+        <h4>${esc(originalTitle)}</h4>
+        ${
+          originalSnippet && originalSnippet !== originalTitle
+            ? `<p>${esc(originalSnippet)}</p>`
+            : ""
+        }
+        ${
+          originalUrl
+            ? `<a class="drawer-primary-link" href="${esc(
+                originalUrl
+              )}" target="_blank" rel="noopener noreferrer"
+                 aria-label="打开当前事件原文，新窗口">打开原文 ↗</a>`
+            : `<span class="source-link-missing">原文链接不可用</span>`
+        }
+      </article>
+      <div class="source-ledger">
+        <h4>来源记录</h4>
+        <ul>${sources}</ul>
+      </div>`;
+  }
+
+  function renderIntelRelated(related) {
+    if (!Array.isArray(related) || !related.length) {
+      return `<p class="intel-degraded">当前未发现同一事件簇的其他报道。</p>`;
+    }
+    return `<ul class="related-ledger">${related
+      .map((item) => {
+        const headline = String(item.headline_zh || item.title || "未命名报道").trim();
+        const original = String(item.title || "").trim();
+        const url = eventExternalUrl(item);
+        return `<li>
+          <div class="related-copy">
+            <strong>${esc(headline)}</strong>
+            ${original && original !== headline ? `<span>原文：${esc(original)}</span>` : ""}
+            <small>${esc(item.kol_name_cn || item.source || "未知来源")}${
+              item.published_at ? ` · ${esc(fmtTime(item.published_at))}` : ""
+            }</small>
+          </div>
+          ${
+            url
+              ? `<a class="drawer-source-link" href="${esc(
+                  url
+                )}" target="_blank" rel="noopener noreferrer"
+                   aria-label="查看${esc(shortText(headline, 32))}报道，新窗口">查看报道 ↗</a>`
+              : `<span class="source-link-missing">链接不可用</span>`
+          }
+        </li>`;
+      })
+      .join("")}</ul>`;
+  }
+
+  function renderIntelDetail(payload) {
+    const event = payload?.event || {};
+    const enrichment = eventEnrichment(event);
+    const copy = eventCopy(event);
+    const relations = Array.isArray(payload?.relations) ? payload.relations : [];
+    const reactions = Array.isArray(payload?.market_reactions)
+      ? payload.market_reactions
+      : [];
+    const impact = String(enrichment?.impact_level || event.impact || "unknown");
+    const impactLabel = {
+      high: "高影响",
+      medium: "中影响",
+      low: "低影响",
+      none: "低相关",
+      unknown: "影响待评估",
+    }[impact] || "影响待评估";
+    const status = String(event.ai_status || "pending").toLowerCase();
+    const caveat =
+      enrichment && isTitleOnlyEvidence(enrichment)
+        ? `<div class="evidence-limit" role="note">
+            <strong>仅标题证据</strong>
+            <span>AI 未读取正文；摘要与影响均为条件性释义，必须回到原文核验。</span>
+          </div>`
+        : "";
+    const conclusion = `<div class="intel-conclusion-meta">
+        <span class="impact-badge is-${esc(impact)}">${esc(impactLabel)}</span>
+        ${aiStateHTML(event)}
+        ${
+          enrichment && confidenceLabel(enrichment.confidence)
+            ? `<span>${esc(confidenceLabel(enrichment.confidence))}</span>`
+            : ""
+        }
+      </div>
+      <h2 class="intel-headline">${esc(copy.headline)}</h2>
+      <p class="intel-summary">${esc(copy.summary)}</p>
+      ${caveat}`;
+
+    const why = enrichment?.why_it_matters_zh
+      ? `<p class="intel-prose">${esc(enrichment.why_it_matters_zh)}</p>`
+      : `<p class="intel-degraded">${
+          status === "failed"
+            ? "AI 解读暂不可用。先核对原文、来源和下方规则关联，避免从标题直接外推。"
+            : "AI 解读尚未就绪。先核对原文、来源和下方规则关联，避免从标题直接外推。"
+        }</p>`;
+
+    const paths = Array.isArray(enrichment?.impact_path)
+      ? enrichment.impact_path.filter(Boolean)
+      : [];
+    const pathHTML = paths.length
+      ? `<ol class="impact-path-list">${paths
+          .map((path) => `<li>${esc(path)}</li>`)
+          .join("")}</ol>`
+      : `<p class="intel-degraded">暂无 AI 传导路径；可先核对资产规则关联与来源证据。</p>`;
+
+    const topicTags = Array.from(
+      new Set([
+        ...((enrichment?.tags || []).filter(Boolean)),
+        ...relations.map((relation) => topicName(relation.topic_key)).filter(Boolean),
+      ])
+    );
+    const tagHTML = topicTags.length
+      ? `<div class="intel-tags">${topicTags
+          .map((tag) => `<span>${esc(tag)}</span>`)
+          .join("")}</div>`
+      : `<p class="intel-degraded">暂无主题标签。</p>`;
+    const auditParts = enrichment
+      ? [
+          enrichment.language ? `语言 ${enrichment.language}` : "",
+          enrichment.model ? `模型 ${enrichment.model}` : "",
+          enrichment.generated_at ? `生成 ${fmtAbsoluteTime(enrichment.generated_at)}` : "",
+        ].filter(Boolean)
+      : [];
+    const auditHTML = auditParts.length
+      ? `<p class="intel-audit">${auditParts.map(esc).join(" · ")}</p>`
+      : "";
+
+    $("#intel-drawer-body").innerHTML = [
+      intelSection(1, "结论", conclusion, "intel-conclusion"),
+      intelSection(2, "为何重要", why),
+      intelSection(3, "影响路径", pathHTML),
+      intelSection(
+        4,
+        "资产",
+        renderIntelAssets(event, enrichment, relations, reactions)
+      ),
+      intelSection(5, "标签", tagHTML + auditHTML),
+      intelSection(6, "原文 / 来源", renderIntelSources(event, payload?.sightings)),
+      intelSection(7, "关联报道", renderIntelRelated(payload?.related)),
+    ].join("");
+  }
+
+  function setDrawerBusy(busy, announcement) {
+    const drawer = $("#intel-drawer");
+    if (drawer) drawer.setAttribute("aria-busy", String(Boolean(busy)));
+    const live = $("#intel-drawer-live");
+    if (live) live.textContent = announcement || "";
+  }
+
+  async function loadIntelDetail(eventId) {
+    const generation = ++state.drawerRequestGeneration;
+    const params = new URLSearchParams();
+    if (state.drawerKol) params.set("kol", state.drawerKol);
+    if (state.drawerSourceUrl) params.set("source_url", state.drawerSourceUrl);
+    const query = params.toString();
+    const url = `${api(`api/events/${encodeURIComponent(eventId)}`)}${
+      query ? `?${query}` : ""
+    }`;
+    setDrawerBusy(true, "正在加载事件证据链");
+    $("#intel-drawer-body").innerHTML = `<div class="intel-drawer-loading" role="presentation">
+      <div class="skeleton skeleton-card"></div>
+      <div class="skeleton skeleton-card"></div>
+      <p>正在组装结论、来源与关联报道…</p>
+    </div>`;
+    try {
+      const payload = await fetchJSON(url, 15000);
+      if (
+        generation !== state.drawerRequestGeneration ||
+        $("#intel-drawer-shell").hidden
+      ) {
+        return;
+      }
+      renderIntelDetail(payload);
+      setDrawerBusy(false, "事件证据链已加载");
+    } catch (error) {
+      if (
+        generation !== state.drawerRequestGeneration ||
+        $("#intel-drawer-shell").hidden
+      ) {
+        return;
+      }
+      const message = /abort/i.test(error?.name || error?.message || "")
+        ? "证据链请求超时"
+        : `证据链加载失败：${error?.message || error}`;
+      $("#intel-drawer-body").innerHTML = `<div class="intel-drawer-error" role="alert">
+        <span aria-hidden="true">⚠</span>
+        <h2>${esc(message)}</h2>
+        <p>卡片中的原文链接仍可独立打开，也可以重新请求详情。</p>
+        <button type="button" data-event-retry="${esc(eventId)}">重新加载证据链</button>
+      </div>`;
+      setDrawerBusy(false, message);
+    }
+  }
+
+  function openIntelDrawer(eventId, trigger) {
+    const shell = $("#intel-drawer-shell");
+    const wasClosed = shell.hidden;
+    state.drawerEventId = eventId;
+    state.drawerKol = String(trigger?.dataset?.eventKol || "");
+    state.drawerSourceUrl = String(trigger?.dataset?.eventSourceUrl || "");
+    if (wasClosed) {
+      state.drawerReturnFocus = trigger || document.activeElement;
+      state.drawerPreviousOverflow = document.body.style.overflow;
+      state.drawerInertNodes = Array.from(document.body.children).filter(
+        (node) => node !== shell && !node.inert
+      );
+      state.drawerInertNodes.forEach((node) => (node.inert = true));
+      document.body.classList.add("intel-drawer-open");
+      document.body.style.overflow = "hidden";
+      shell.hidden = false;
+      requestAnimationFrame(() => {
+        $("#intel-drawer .intel-drawer-close")?.focus({ preventScroll: true });
+      });
+    }
+    loadIntelDetail(eventId);
+  }
+
+  function closeIntelDrawer() {
+    const shell = $("#intel-drawer-shell");
+    if (!shell || shell.hidden) return;
+    state.drawerRequestGeneration += 1;
+    shell.hidden = true;
+    setDrawerBusy(false, "");
+    document.body.classList.remove("intel-drawer-open");
+    document.body.style.overflow = state.drawerPreviousOverflow;
+    state.drawerInertNodes.forEach((node) => (node.inert = false));
+    state.drawerInertNodes = [];
+    const returnFocus = state.drawerReturnFocus;
+    const closedEventId = state.drawerEventId;
+    state.drawerReturnFocus = null;
+    state.drawerEventId = null;
+    state.drawerKol = "";
+    state.drawerSourceUrl = "";
+    const focusTarget = returnFocus?.isConnected
+      ? returnFocus
+      : document.querySelector(`[data-event-detail="${Number(closedEventId)}"]`) ||
+        $("#tab-kol");
+    if (focusTarget) {
+      requestAnimationFrame(() => focusTarget.focus({ preventScroll: true }));
+    }
+  }
+
+  function drawerFocusableElements() {
+    return $$(
+      "#intel-drawer a[href], #intel-drawer button:not([disabled]), " +
+        "#intel-drawer input:not([disabled]), #intel-drawer [tabindex]:not([tabindex='-1'])"
+    ).filter((element) => !element.hidden && element.offsetParent !== null);
+  }
+
+  function bindIntelDrawer() {
+    $("#feed").addEventListener("click", (event) => {
+      const clusterToggle = event.target.closest("[data-cluster-toggle]");
+      if (clusterToggle) {
+        const clusterKey = String(clusterToggle.dataset.clusterToggle || "");
+        if (!clusterKey) return;
+        if (state.expandedClusters.has(clusterKey)) {
+          state.expandedClusters.delete(clusterKey);
+        } else {
+          state.expandedClusters.add(clusterKey);
+        }
+        renderEvents(state.feedItems);
+        updateFeedStatus();
+        requestAnimationFrame(() => {
+          $$('[data-cluster-toggle]').find(
+            (button) => button.dataset.clusterToggle === clusterKey
+          )?.focus({ preventScroll: true });
+        });
+        return;
+      }
+      const trigger = event.target.closest("[data-event-detail]");
+      if (!trigger) return;
+      const eventId = Number(trigger.dataset.eventDetail);
+      if (!Number.isInteger(eventId) || eventId < 1) return;
+      openIntelDrawer(eventId, trigger);
+    });
+    $("#intel-drawer-shell").addEventListener("click", (event) => {
+      if (event.target.closest("[data-intel-close]") || event.target.matches("[data-intel-backdrop]")) {
+        closeIntelDrawer();
+        return;
+      }
+      const retry = event.target.closest("[data-event-retry]");
+      if (retry) loadIntelDetail(retry.dataset.eventRetry);
+    });
+    document.addEventListener("keydown", (event) => {
+      const shell = $("#intel-drawer-shell");
+      if (!shell || shell.hidden) return;
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeIntelDrawer();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = drawerFocusableElements();
+      if (!focusable.length) {
+        event.preventDefault();
+        $("#intel-drawer").focus();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && (document.activeElement === first || !$("#intel-drawer").contains(document.activeElement))) {
+        event.preventDefault();
+        last.focus();
+      } else if (
+        !event.shiftKey &&
+        (document.activeElement === last ||
+          !$("#intel-drawer").contains(document.activeElement))
+      ) {
+        event.preventDefault();
+        first.focus();
+      }
+    });
+  }
+
   async function loadEvents() {
+    const generation = ++state.feedRequestGeneration;
+    const feed = $("#feed");
+    feed.setAttribute("aria-busy", "true");
+    $("#feed-status").textContent = "正在更新信号流…";
     const p = new URLSearchParams();
     if (state.hours) p.set("hours", state.hours);
     if (state.impact) p.set("impact", state.impact);
@@ -1811,15 +2531,21 @@
       const items = highPriorityLoaded
         ? mergePriorityEvents(priorityItems, regularItems)
         : regularItems;
+      if (generation !== state.feedRequestGeneration) return;
       state.feedLoadedCount = items.length;
       state.feedHighPriority = highPriorityLoaded;
       state.feedRegularCapped = regularItems.length >= 150;
       renderEvents(items);
       updateFeedStatus();
     } catch (e) {
+      if (generation !== state.feedRequestGeneration) return;
       $("#feed").innerHTML = errorHTML(e, url);
       const host = $("#feed-status");
       if (host) host.textContent = "动态加载失败";
+    } finally {
+      if (generation === state.feedRequestGeneration) {
+        feed.setAttribute("aria-busy", "false");
+      }
     }
   }
 
@@ -2038,6 +2764,7 @@
     bindChips("#impact-chips button", "impact", "impact", loadEvents);
     bindKolChips();
     bindSupport();
+    bindIntelDrawer();
 
     $("#view-decision").addEventListener("click", (event) => {
       const more = event.target.closest("#decision-show-all");

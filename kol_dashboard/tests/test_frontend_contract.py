@@ -97,7 +97,7 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn('stale ? "数据延迟" : ""', self.javascript)
         self.assertIn('"高收益债利差"', self.javascript)
         self.assertIn("cs.hy_oas", self.javascript)
-        self.assertIn('static/app.js?v=11', self.html)
+        self.assertIn('static/app.js?v=12', self.html)
         self.assertIn(".metric.is-stale", self.css)
 
     def test_macro_coverage_distinguishes_stale_and_unavailable_sources(self) -> None:
@@ -246,6 +246,84 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn("本人动态", self.javascript)
         self.assertIn("媒体提及", self.javascript)
         self.assertIn('class="source-kind ${sourceNature.key}"', self.javascript)
+
+    def test_feed_prefers_bounded_ai_fields_and_opens_evidence_drawer(self) -> None:
+        for field in (
+            "ai_enrichment",
+            "headline_zh",
+            "summary_zh",
+            "why_it_matters_zh",
+            "impact_path",
+            "tags",
+            "assets",
+            "cluster_key",
+            "evidence_basis",
+        ):
+            self.assertIn(field, self.javascript)
+        self.assertIn("function eventEnrichment(item)", self.javascript)
+        self.assertIn("function foldEventClusters(items)", self.javascript)
+        self.assertIn('data-event-detail="${esc(', self.javascript)
+        self.assertIn("查看证据链", self.javascript)
+        self.assertIn("AI 解读生成中", self.javascript)
+        self.assertIn("AI 解读暂不可用", self.javascript)
+        self.assertIn("仅标题证据", self.javascript)
+        self.assertIn("同簇相关报道", self.javascript)
+        self.assertIn("function renderIntelAssets", self.javascript)
+        self.assertIn("function renderIntelSources", self.javascript)
+        self.assertIn("function renderIntelRelated", self.javascript)
+        self.assertIn("规则关联用于发现线索；市场相关不等于因果", self.javascript)
+
+    def test_event_clusters_keep_unverified_items_separate_and_expand_in_place(
+        self,
+    ) -> None:
+        fold_start = self.javascript.index("function foldEventClusters(items)")
+        fold_end = self.javascript.index("function renderEvents(items)", fold_start)
+        fold_contract = self.javascript[fold_start:fold_end]
+
+        self.assertIn("timeStatus", fold_contract)
+        self.assertIn('timeStatus === "verified"', fold_contract)
+        self.assertLess(
+            fold_contract.index('timeStatus === "verified"'),
+            fold_contract.index("cluster_key"),
+        )
+        self.assertIn("relatedItems", fold_contract)
+        self.assertIn("expandedClusters", self.javascript)
+        self.assertIn("data-cluster-toggle", self.javascript)
+        self.assertIn('aria-expanded="${group.isExpanded', self.javascript)
+        self.assertIn("state.expandedClusters.add(clusterKey)", self.javascript)
+        self.assertIn("state.expandedClusters.delete(clusterKey)", self.javascript)
+
+    def test_event_detail_request_preserves_selected_kol_sighting(self) -> None:
+        self.assertIn("drawerKol", self.javascript)
+        self.assertIn("drawerSourceUrl", self.javascript)
+        self.assertIn("data-event-kol", self.javascript)
+        self.assertIn("data-event-source-url", self.javascript)
+        self.assertIn('params.set("kol", state.drawerKol)', self.javascript)
+        self.assertIn(
+            'params.set("source_url", state.drawerSourceUrl)',
+            self.javascript,
+        )
+        self.assertIn("trigger?.dataset?.eventKol", self.javascript)
+        self.assertIn("trigger?.dataset?.eventSourceUrl", self.javascript)
+        self.assertIn('query ? `?${query}` : ""', self.javascript)
+
+    def test_event_intelligence_drawer_is_accessible_and_mobile_safe(self) -> None:
+        self.assertIn('id="intel-drawer-shell" hidden', self.html)
+        self.assertIn('id="intel-drawer" role="dialog" aria-modal="true"', self.html)
+        self.assertIn('aria-labelledby="intel-drawer-title"', self.html)
+        self.assertIn('id="intel-drawer-live" role="status" aria-live="polite"', self.html)
+        self.assertIn("function openIntelDrawer", self.javascript)
+        self.assertIn("function closeIntelDrawer", self.javascript)
+        self.assertIn("function bindIntelDrawer", self.javascript)
+        self.assertIn("bindIntelDrawer();", self.javascript)
+        self.assertIn('api(`api/events/${encodeURIComponent(eventId)}`)', self.javascript)
+        self.assertIn('event.key === "Escape"', self.javascript)
+        self.assertIn('event.key !== "Tab"', self.javascript)
+        self.assertIn("node.inert = true", self.javascript)
+        self.assertIn("node.inert = false", self.javascript)
+        self.assertIn("drawerReturnFocus", self.javascript)
+        self.assertIn(".intel-drawer", self.css)
+        self.assertIn("height: 100dvh", self.css)
 
 
 if __name__ == "__main__":

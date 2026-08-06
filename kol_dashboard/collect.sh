@@ -3,6 +3,7 @@
 #   collect.sh kol     — scan every KOL into the events table
 #   collect.sh macro   — store one macro risk snapshot
 #   collect.sh decision — refresh relations, market checks, and portfolio
+#   collect.sh enrich  — add cached Chinese intelligence with DeepSeek
 #
 # Both are idempotent; the DB dedups repeat sightings.
 
@@ -76,8 +77,12 @@ case "${1:-kol}" in
     OUT=$(run_capture python3 "$DIR/decision_collect.py" all)
     echo "[$(stamp)] decision: $OUT" >> "$LOG_DIR/collect.log"
     ;;
+  enrich)
+    OUT=$(run_capture python3 "$DIR/enrichment_collect.py")
+    echo "[$(stamp)] enrich: $OUT" >> "$LOG_DIR/collect.log"
+    ;;
   *)
-    echo "usage: collect.sh {kol|macro|decision}" >&2
+    echo "usage: collect.sh {kol|macro|decision|enrich}" >&2
     exit 2
     ;;
 esac

@@ -18,7 +18,7 @@
     } catch (e) {}
   })();
 </script>
-  <link rel="stylesheet" href="static/style.css?v=11" />
+  <link rel="stylesheet" href="static/style.css?v=12" />
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ccircle cx='50' cy='50' r='42' fill='%230b1720' stroke='%2331d69b' stroke-width='6'/%3E%3Ccircle cx='50' cy='50' r='20' fill='none' stroke='%234ab8d8' stroke-width='5'/%3E%3Cpath d='M50 50L82 24' stroke='%23f4b942' stroke-width='6' stroke-linecap='round'/%3E%3Ccircle cx='50' cy='50' r='7' fill='%23eef4f2'/%3E%3C/svg%3E" />
 </head>
 <body>
@@ -245,9 +245,9 @@
       </div>
     </section>
 
-    <p class="feed-status" id="feed-status" aria-live="polite">正在加载信号流…</p>
+    <p class="feed-status" id="feed-status" role="status" aria-live="polite">正在加载信号流…</p>
 
-    <section id="feed" class="feed">
+    <section id="feed" class="feed" aria-busy="true" aria-labelledby="feed-status">
       <div class="skeleton skeleton-card"></div>
       <div class="skeleton skeleton-card"></div>
       <div class="skeleton skeleton-card"></div>
@@ -274,6 +274,23 @@
   <span class="fab-icon" aria-hidden="true">☕</span>
   <span class="fab-label">请我喝杯咖啡</span>
 </button>
+
+<div class="intel-drawer-shell" id="intel-drawer-shell" hidden>
+  <div class="intel-drawer-backdrop" data-intel-backdrop aria-hidden="true"></div>
+  <aside class="intel-drawer" id="intel-drawer" role="dialog" aria-modal="true"
+         aria-labelledby="intel-drawer-title" aria-busy="false" tabindex="-1">
+    <header class="intel-drawer-head">
+      <div>
+        <p class="section-kicker">EVIDENCE SPINE</p>
+        <p class="intel-drawer-label" id="intel-drawer-title">事件证据链</p>
+      </div>
+      <button type="button" class="intel-drawer-close" data-intel-close
+              aria-label="关闭事件证据链">&times;</button>
+    </header>
+    <p class="sr-only" id="intel-drawer-live" role="status" aria-live="polite"></p>
+    <div class="intel-drawer-body" id="intel-drawer-body"></div>
+  </aside>
+</div>
 
 <div class="auth-modal" id="auth-modal" hidden role="dialog" aria-modal="true"
      aria-labelledby="auth-modal-title">
@@ -322,6 +339,6 @@
   </div>
 </div>
 
-<script src="static/app.js?v=11"></script>
+<script src="static/app.js?v=12"></script>
 </body>
 </html>

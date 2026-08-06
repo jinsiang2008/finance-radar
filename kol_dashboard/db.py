@@ -6,6 +6,11 @@ Schema:
          kol_key, kol_name, kol_name_cn,
          impact, has_market_kw, source_count, fetched_at, last_seen_at, published_at)
 
+  event_enrichments(event_id PRIMARY KEY, input_hash, prompt_version, status,
+                    headline_zh, summary_zh, why_it_matters_zh, impact_level,
+                    impact_path_json, tags_json, assets_json, cluster_key,
+                    language, confidence, evidence_basis, model, generated_at)
+
   event_sightings(event_id, kol_key, kol_name, kol_name_cn, source, source_url,
                   published_at, first_seen_at, last_seen_at, source_count)
 
@@ -29,6 +34,7 @@ import json
 import math
 import os
 import re
+import secrets
 import sqlite3
 import time
 import unicodedata
@@ -903,6 +909,55 @@ def init() -> None:
             "kol_key, published_at_status, published_at_epoch DESC)"
         )
 
+        # LLM output is an auxiliary, replaceable cache.  The canonical event,
+        # original evidence and deterministic relation graph remain untouched.
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS event_enrichments (
+              event_id INTEGER PRIMARY KEY
+                REFERENCES events(id) ON DELETE CASCADE,
+              input_hash TEXT NOT NULL,
+              prompt_version TEXT NOT NULL,
+              status TEXT NOT NULL
+                CHECK(status IN ('pending', 'processing', 'ready', 'retry', 'failed')),
+              headline_zh TEXT NOT NULL DEFAULT '',
+              summary_zh TEXT NOT NULL DEFAULT '',
+              why_it_matters_zh TEXT NOT NULL DEFAULT '',
+              impact_level TEXT NOT NULL DEFAULT 'unknown'
+                CHECK(impact_level IN ('high', 'medium', 'low', 'none', 'unknown')),
+              impact_path_json TEXT NOT NULL DEFAULT '[]',
+              tags_json TEXT NOT NULL DEFAULT '[]',
+              assets_json TEXT NOT NULL DEFAULT '[]',
+              cluster_key TEXT NOT NULL DEFAULT '',
+              language TEXT NOT NULL DEFAULT 'unknown',
+              confidence REAL
+                CHECK(confidence IS NULL OR (confidence >= 0 AND confidence <= 1)),
+              evidence_basis TEXT NOT NULL DEFAULT 'title',
+              model TEXT NOT NULL DEFAULT '',
+              generated_at TEXT,
+              updated_at TEXT NOT NULL,
+              attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+              next_attempt_at TEXT,
+              error_code TEXT NOT NULL DEFAULT '',
+              claim_token TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        enrichment_columns = _columns(c, "event_enrichments")
+        if "claim_token" not in enrichment_columns:
+            c.execute(
+                "ALTER TABLE event_enrichments ADD COLUMN claim_token TEXT "
+                "NOT NULL DEFAULT ''"
+            )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_enrichment_status "
+            "ON event_enrichments(status, next_attempt_at, updated_at)"
+        )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_enrichment_cluster "
+            "ON event_enrichments(cluster_key) WHERE status='ready'"
+        )
+
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS relations (
@@ -1423,6 +1478,262 @@ def insert_events(items: Iterable[dict[str, Any]]) -> tuple[int, int]:
                 _upsert_sighting(c, event_id, it, now)
                 inserted += 1
     return inserted, merged
+
+
+# ─── Event intelligence cache ─────────────────────────
+
+def query_enrichment_candidates(
+    *,
+    max_age_hours: int = 72,
+    limit: int = 500,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Return recent events and their cache metadata for the LLM worker.
+
+    Selection intentionally includes ready rows: the worker owns the stable
+    input hash and prompt version, so it can invalidate a cache when a merged
+    event later acquires a fuller title or when the output contract changes.
+    """
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    if current.tzinfo is None:
+        raise ValueError("now must include a timezone")
+    cutoff = int(current.timestamp()) - max(1, int(max_age_hours)) * 3600
+    safe_limit = max(1, min(int(limit), 5_000))
+    with conn() as c:
+        rows = c.execute(
+            """
+            SELECT e.id, e.title, e.snippet, e.source, e.url, e.canonical_url,
+                   e.kol_name, e.kol_name_cn, e.impact, e.has_market_kw,
+                   e.tickers, e.source_count, e.fetched_at, e.published_at,
+                   e.published_at_status,
+                   ai.input_hash AS ai_input_hash,
+                   ai.prompt_version AS ai_prompt_version,
+                   ai.status AS ai_status,
+                   ai.model AS ai_model,
+                   ai.updated_at AS ai_updated_at,
+                   ai.next_attempt_at AS ai_next_attempt_at,
+                   ai.attempt_count AS ai_attempt_count
+            FROM events e
+            LEFT JOIN event_enrichments ai ON ai.event_id=e.id
+            WHERE (
+                (e.published_at_status='verified' AND e.published_at_epoch >= ?)
+                OR (
+                    e.published_at_status IN ('unknown', 'future')
+                    AND CAST(strftime('%s', e.fetched_at) AS INTEGER) >= ?
+                )
+            ) AND (
+                ai.event_id IS NULL
+                OR ai.status='ready'
+                OR (
+                    ai.status='retry'
+                    AND (ai.next_attempt_at IS NULL OR ai.next_attempt_at <= ?)
+                )
+                OR (
+                    ai.status='processing'
+                    AND ai.updated_at <= ?
+                )
+                OR ai.status='failed'
+            )
+            ORDER BY
+              CASE
+                WHEN ai.event_id IS NULL THEN 0
+                WHEN ai.status IN ('retry', 'processing') THEN 1
+                WHEN ai.status='ready' THEN 2
+                ELSE 3
+              END,
+              CASE e.impact WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
+              e.has_market_kw DESC,
+              COALESCE(e.published_at_epoch,
+                CAST(strftime('%s', e.fetched_at) AS INTEGER)) DESC,
+              e.id DESC
+            LIMIT ?
+            """,
+            (
+                cutoff,
+                cutoff,
+                current.replace(microsecond=0).isoformat(),
+                (current - timedelta(minutes=20)).replace(microsecond=0).isoformat(),
+                safe_limit,
+            ),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def claim_event_enrichment(
+    event_id: int,
+    *,
+    input_hash: str,
+    prompt_version: str,
+    model: str,
+    evidence_basis: str,
+    now: datetime | None = None,
+    processing_lease_seconds: int = 20 * 60,
+) -> str | None:
+    """Atomically claim an event unless its cache is fresh or lease is live."""
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    now_iso = current.replace(microsecond=0).isoformat()
+    with conn(immediate=True) as c:
+        row = c.execute(
+            "SELECT input_hash, prompt_version, status, model, updated_at, "
+            "next_attempt_at, attempt_count FROM event_enrichments "
+            "WHERE event_id=?",
+            (int(event_id),),
+        ).fetchone()
+        same_cache = bool(
+            row
+            and row["input_hash"] == input_hash
+            and row["prompt_version"] == prompt_version
+            and row["model"] == model
+        )
+        if same_cache and row["status"] == "ready":
+            return None
+        if same_cache and row["status"] == "failed":
+            return None
+        if same_cache and row["status"] == "retry":
+            retry_at = _parse_utc_datetime(row["next_attempt_at"])
+            if retry_at is not None and retry_at > current:
+                return None
+        if same_cache and row["status"] == "processing":
+            updated = _parse_utc_datetime(row["updated_at"])
+            if updated is not None and (
+                current - updated
+            ).total_seconds() < max(60, int(processing_lease_seconds)):
+                return None
+
+        attempts = int(row["attempt_count"] or 0) + 1 if same_cache else 1
+        claim_token = secrets.token_urlsafe(24)
+        c.execute(
+            """
+            INSERT INTO event_enrichments (
+              event_id, input_hash, prompt_version, status, headline_zh,
+              summary_zh, why_it_matters_zh, impact_level,
+              impact_path_json, tags_json, assets_json, cluster_key, language,
+              confidence, evidence_basis, model, generated_at, updated_at,
+              attempt_count, next_attempt_at, error_code, claim_token
+            ) VALUES (?, ?, ?, 'processing', '', '', '', 'unknown',
+                      '[]', '[]', '[]', '', 'unknown', NULL, ?, ?, NULL, ?, ?, NULL, '', ?)
+            ON CONFLICT(event_id) DO UPDATE SET
+              input_hash=excluded.input_hash,
+              prompt_version=excluded.prompt_version,
+              status='processing',
+              headline_zh='', summary_zh='', why_it_matters_zh='',
+              impact_level='unknown', impact_path_json='[]', tags_json='[]',
+              assets_json='[]', cluster_key='', language='unknown',
+              confidence=NULL, evidence_basis=excluded.evidence_basis,
+              model=excluded.model, generated_at=NULL,
+              updated_at=excluded.updated_at,
+              attempt_count=excluded.attempt_count,
+              next_attempt_at=NULL, error_code='',
+              claim_token=excluded.claim_token
+            """,
+            (
+                int(event_id),
+                input_hash,
+                prompt_version,
+                evidence_basis,
+                model,
+                now_iso,
+                attempts,
+                claim_token,
+            ),
+        )
+    return claim_token
+
+
+def save_event_enrichment(
+    event_id: int,
+    *,
+    input_hash: str,
+    prompt_version: str,
+    model: str,
+    claim_token: str,
+    evidence_basis: str,
+    result: dict[str, Any],
+    generated_at: str | None = None,
+) -> bool:
+    """Store a validated result only if it still owns the active claim."""
+    completed = generated_at or _now_iso()
+    with conn(immediate=True) as c:
+        cur = c.execute(
+            """
+            UPDATE event_enrichments
+            SET status='ready', headline_zh=?, summary_zh=?,
+                why_it_matters_zh=?, impact_level=?, impact_path_json=?,
+                tags_json=?, assets_json=?, cluster_key=?, language=?,
+                confidence=?, evidence_basis=?, model=?, generated_at=?,
+                updated_at=?, next_attempt_at=NULL, error_code='', claim_token=''
+            WHERE event_id=? AND input_hash=? AND prompt_version=?
+              AND model=? AND claim_token=? AND status='processing'
+            """,
+            (
+                result["headline_zh"],
+                result["summary_zh"],
+                result["why_it_matters_zh"],
+                result["impact_level"],
+                json.dumps(result["impact_path"], ensure_ascii=False),
+                json.dumps(result["tags"], ensure_ascii=False),
+                json.dumps(result["assets"], ensure_ascii=False),
+                result["cluster_key"],
+                result["language"],
+                result["confidence"],
+                evidence_basis,
+                model,
+                completed,
+                completed,
+                int(event_id),
+                input_hash,
+                prompt_version,
+                model,
+                claim_token,
+            ),
+        )
+    return cur.rowcount == 1
+
+
+def fail_event_enrichment(
+    event_id: int,
+    *,
+    input_hash: str,
+    prompt_version: str,
+    model: str,
+    claim_token: str,
+    error_code: str,
+    retry_after_seconds: int | None,
+    now: datetime | None = None,
+) -> bool:
+    """Record only a bounded error category; never persist provider text."""
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    updated = current.replace(microsecond=0).isoformat()
+    next_attempt = None
+    status = "failed"
+    if retry_after_seconds is not None:
+        status = "retry"
+        next_attempt = (
+            current + timedelta(seconds=max(60, int(retry_after_seconds)))
+        ).replace(microsecond=0).isoformat()
+    safe_code = re.sub(r"[^a-z0-9_:-]", "", str(error_code).lower())[:48]
+    with conn(immediate=True) as c:
+        cur = c.execute(
+            """
+            UPDATE event_enrichments
+            SET status=?, updated_at=?, next_attempt_at=?, error_code=?,
+                claim_token=''
+            WHERE event_id=? AND input_hash=? AND prompt_version=?
+              AND model=? AND claim_token=? AND status='processing'
+            """,
+            (
+                status,
+                updated,
+                next_attempt,
+                safe_code or "unknown",
+                int(event_id),
+                input_hash,
+                prompt_version,
+                model,
+                claim_token,
+            ),
+        )
+    return cur.rowcount == 1
 
 
 def save_macro_snapshot(report: dict[str, Any]) -> int:
@@ -2234,6 +2545,78 @@ def query_market_validation_relations(
 
 # ─── Reads ─────────────────────────────────────────────
 
+_EVENT_AI_SELECT = (
+    "ai.status AS ai_status, ai.headline_zh AS ai_headline_zh, "
+    "ai.summary_zh AS ai_summary_zh, "
+    "ai.why_it_matters_zh AS ai_why_it_matters_zh, "
+    "ai.impact_level AS ai_impact_level, "
+    "ai.impact_path_json AS ai_impact_path_json, "
+    "ai.tags_json AS ai_tags_json, ai.assets_json AS ai_assets_json, "
+    "ai.cluster_key AS ai_cluster_key, ai.language AS ai_language, "
+    "ai.confidence AS ai_confidence, "
+    "ai.evidence_basis AS ai_evidence_basis, ai.model AS ai_model, "
+    "ai.generated_at AS ai_generated_at"
+)
+
+# The public score combines deterministic rules with the model assessment.
+# Rules retain veto power over high-risk events, while the model may promote a
+# signal or demote a medium rule hit only when it has enough evidence.  A
+# title-only enrichment is capped below this confidence threshold upstream.
+_PUBLIC_IMPACT_SQL = (
+    "CASE "
+    "WHEN e.impact='high' THEN 'high' "
+    "WHEN ai.status='ready' AND ai.impact_level='high' "
+    "AND ai.confidence>=0.65 THEN 'high' "
+    "WHEN e.impact='medium' AND ai.status='ready' "
+    "AND ai.impact_level='none' AND ai.confidence>=0.65 THEN 'low' "
+    "WHEN e.impact='medium' THEN 'medium' "
+    "WHEN ai.status='ready' AND ai.impact_level='medium' "
+    "AND ai.confidence>=0.65 THEN 'medium' "
+    "ELSE 'low' END"
+)
+
+
+def _event_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    item = dict(row)
+    status = str(item.pop("ai_status", "") or "")
+    if status != "ready":
+        item["ai_enrichment"] = None
+        item["ai_status"] = status or "pending"
+        for key in tuple(item):
+            if key.startswith("ai_") and key not in {"ai_status", "ai_enrichment"}:
+                item.pop(key, None)
+        return item
+
+    def decode_list(key: str) -> list[Any]:
+        raw = item.pop(key, "[]") or "[]"
+        try:
+            value = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            return []
+        return value if isinstance(value, list) else []
+
+    enrichment = {
+        "status": "ready",
+        "headline_zh": item.pop("ai_headline_zh", "") or "",
+        "summary_zh": item.pop("ai_summary_zh", "") or "",
+        "why_it_matters_zh": item.pop("ai_why_it_matters_zh", "") or "",
+        "impact_level": item.pop("ai_impact_level", "unknown") or "unknown",
+        "impact_path": decode_list("ai_impact_path_json"),
+        "tags": decode_list("ai_tags_json"),
+        "assets": decode_list("ai_assets_json"),
+        "cluster_key": item.pop("ai_cluster_key", "") or "",
+        "language": item.pop("ai_language", "unknown") or "unknown",
+        "confidence": item.pop("ai_confidence", None),
+        "evidence_basis": item.pop("ai_evidence_basis", "title") or "title",
+        "model": item.pop("ai_model", "") or "",
+        "generated_at": item.pop("ai_generated_at", None),
+    }
+    item["ai_status"] = "ready"
+    item["ai_enrichment"] = enrichment
+    return item
+
 def query_events(
     *,
     kol: str | None = None,
@@ -2244,6 +2627,7 @@ def query_events(
     limit: int = 100,
     offset: int = 0,
     now: datetime | None = None,
+    use_ai_impact: bool = False,
 ) -> list[dict[str, Any]]:
     if time_status not in {"verified", "unverified"}:
         raise ValueError("time_status must be 'verified' or 'unverified'")
@@ -2257,22 +2641,28 @@ def query_events(
     now_epoch = int(current.timestamp())
     where: list[str] = []
     params: list[Any] = []
+    effective_impact_sql = "e.impact"
+    if use_ai_impact:
+        effective_impact_sql = _PUBLIC_IMPACT_SQL
     select_sql = (
         "e.id, e.url, e.canonical_url, e.title, e.snippet, e.source, "
-        "e.kol_key, e.kol_name, e.kol_name_cn, e.impact, e.has_market_kw, "
+        "e.kol_key, e.kol_name, e.kol_name_cn, e.impact AS rule_impact, "
+        f"{effective_impact_sql} AS impact, e.has_market_kw, "
         "e.tickers, e.source_count, e.fetched_at, "
         "e.fetched_at AS first_seen_at, e.last_seen_at, e.published_at, "
-        "e.published_at_status AS time_status, e.published_at_epoch"
+        "e.published_at_status AS time_status, e.published_at_epoch, "
+        f"{_EVENT_AI_SELECT}"
     )
-    from_sql = "events e"
+    from_sql = "events e LEFT JOIN event_enrichments ai ON ai.event_id=e.id"
     if kol:
         select_sql = (
             "e.id, e.url, e.canonical_url, e.title, e.snippet, m.source, "
-            "m.kol_key, m.kol_name, m.kol_name_cn, e.impact, e.has_market_kw, "
+            "m.kol_key, m.kol_name, m.kol_name_cn, e.impact AS rule_impact, "
+            f"{effective_impact_sql} AS impact, e.has_market_kw, "
             "e.tickers, e.source_count, e.fetched_at, m.first_seen_at, "
             "m.last_seen_at, m.published_at, "
             "m.published_at_status AS time_status, m.published_at_epoch, "
-            "m.source_url"
+            f"m.source_url, {_EVENT_AI_SELECT}"
         )
         sighting_status = (
             "s.published_at_status='verified'"
@@ -2289,7 +2679,8 @@ def query_events(
             "SELECT s.id FROM event_sightings s "
             f"WHERE s.event_id=e.id AND s.kol_key=? AND {sighting_status} "
             f"ORDER BY {sighting_order}, s.last_seen_at DESC, "
-            "s.id DESC LIMIT 1)"
+            "s.id DESC LIMIT 1) "
+            "LEFT JOIN event_enrichments ai ON ai.event_id=e.id"
         )
         params.append(kol)
 
@@ -2315,14 +2706,19 @@ def query_events(
         params.append(cutoff)
     if impact:
         if impact == "high+":
-            where.append("e.impact IN ('high', 'medium')")
+            where.append(f"{effective_impact_sql} IN ('high', 'medium')")
         else:
-            where.append("e.impact = ?")
+            where.append(f"{effective_impact_sql} = ?")
             params.append(impact)
     if q:
-        where.append("(e.title LIKE ? OR IFNULL(e.snippet,'') LIKE ?)")
+        where.append(
+            "(e.title LIKE ? OR IFNULL(e.snippet,'') LIKE ? "
+            "OR IFNULL(ai.headline_zh,'') LIKE ? "
+            "OR IFNULL(ai.summary_zh,'') LIKE ? "
+            "OR IFNULL(ai.tags_json,'') LIKE ?)"
+        )
         like = f"%{q}%"
-        params.extend([like, like])
+        params.extend([like, like, like, like, like])
 
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
     sql = f"""
@@ -2339,7 +2735,73 @@ def query_events(
     params.extend([limit, offset])
     with conn() as c:
         rows = c.execute(sql, params).fetchall()
-    return [dict(row) for row in rows]
+    return [item for row in rows if (item := _event_row(row)) is not None]
+
+
+def get_event_detail(event_id: int) -> dict[str, Any] | None:
+    """Return a canonical event, all sightings and same-cluster stories."""
+    with conn() as c:
+        row = c.execute(
+            f"""
+            SELECT e.id, e.url, e.canonical_url, e.title, e.snippet, e.source,
+                   e.kol_key, e.kol_name, e.kol_name_cn,
+                   e.impact AS rule_impact,
+                   {_PUBLIC_IMPACT_SQL} AS impact,
+                   e.has_market_kw, e.tickers, e.source_count, e.fetched_at,
+                   e.fetched_at AS first_seen_at, e.last_seen_at,
+                   e.published_at, e.published_at_status AS time_status,
+                   e.published_at_epoch, {_EVENT_AI_SELECT}
+            FROM events e
+            LEFT JOIN event_enrichments ai ON ai.event_id=e.id
+            WHERE e.id=?
+            """,
+            (int(event_id),),
+        ).fetchone()
+        event = _event_row(row)
+        if event is None:
+            return None
+        sightings = [
+            dict(item)
+            for item in c.execute(
+                """
+                SELECT kol_key, kol_name, kol_name_cn, source, source_url,
+                       published_at, published_at_status AS time_status,
+                       first_seen_at, last_seen_at, source_count
+                FROM event_sightings
+                WHERE event_id=?
+                ORDER BY
+                  CASE WHEN source LIKE 'X @%' OR source LIKE 'Truth Social%'
+                    THEN 0 ELSE 1 END,
+                  CASE WHEN published_at_status='verified' THEN 0 ELSE 1 END,
+                  COALESCE(published_at, first_seen_at), id
+                """,
+                (int(event_id),),
+            ).fetchall()
+        ]
+        cluster_key = str(
+            (event.get("ai_enrichment") or {}).get("cluster_key") or ""
+        )
+        related: list[dict[str, Any]] = []
+        if cluster_key:
+            related = [
+                dict(item)
+                for item in c.execute(
+                    """
+                    SELECT e.id, e.title, e.source, e.kol_name_cn,
+                           e.canonical_url, e.url, e.published_at,
+                           ai.headline_zh, ai.summary_zh
+                    FROM event_enrichments ai
+                    JOIN events e ON e.id=ai.event_id
+                    WHERE ai.status='ready' AND ai.cluster_key=? AND e.id<>?
+                      AND e.published_at_status='verified'
+                    ORDER BY COALESCE(e.published_at_epoch,
+                      CAST(strftime('%s', e.fetched_at) AS INTEGER)) DESC
+                    LIMIT 12
+                    """,
+                    (cluster_key, int(event_id)),
+                ).fetchall()
+            ]
+    return {"event": event, "sightings": sightings, "related": related}
 
 
 def list_kols() -> list[dict[str, Any]]:

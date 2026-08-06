@@ -50,7 +50,7 @@ trap cleanup_local EXIT INT TERM
 
 echo "→ 打包应用与采集器"
 mkdir -p "$WORK/pkg/lib"
-cp "$LOCAL_DIR"/{app.py,auth.py,db.py,decision_collect.py,decision_service.py,market_data.py,portfolio.py,relation_engine.py,macro_collect.py,collect.sh} "$WORK/pkg/"
+cp "$LOCAL_DIR"/{app.py,auth.py,db.py,decision_collect.py,decision_service.py,market_data.py,portfolio.py,relation_engine.py,macro_collect.py,llm_enrichment.py,enrichment_collect.py,collect.sh} "$WORK/pkg/"
 cp -R "$LOCAL_DIR"/templates "$LOCAL_DIR"/static "$WORK/pkg/"
 cp "$LIB_DIR"/{kol_tracker.py,macro_fetcher.py,risk_radar.py} "$WORK/pkg/lib/"
 cp "$LIB_DIR/serenity_tracker.py" "$WORK/pkg/lib/"
@@ -180,6 +180,60 @@ restore_path() {
   return 0
 }
 
+record_unit_state() {
+  local unit=$1 enabled=disabled active=inactive
+  if systemctl is-enabled --quiet "$unit" 2>/dev/null; then
+    enabled=enabled
+  fi
+  if systemctl is-active --quiet "$unit" 2>/dev/null; then
+    active=active
+  fi
+  printf '%s %s\n' "$enabled" "$active" \
+    > "$ROLLBACK_DIR/config/$unit.state"
+}
+
+prepare_unit_state_rollback() {
+  local unit enabled active failed=0
+  for unit in kol-dashboard.service kol-collect-kol.timer \
+    kol-collect-macro.timer kol-collect-decision.timer \
+    kol-collect-enrich.timer; do
+    read -r enabled active < "$ROLLBACK_DIR/config/$unit.state" || {
+      failed=1
+      continue
+    }
+    if [[ "$enabled" == disabled ]] && \
+       systemctl cat "$unit" >/dev/null 2>&1; then
+      systemctl disable -q "$unit" >/dev/null 2>&1 || failed=1
+    fi
+  done
+  return "$failed"
+}
+
+restore_unit_states() {
+  local unit enabled active failed=0
+  for unit in kol-dashboard.service kol-collect-kol.timer \
+    kol-collect-macro.timer kol-collect-decision.timer \
+    kol-collect-enrich.timer; do
+    read -r enabled active < "$ROLLBACK_DIR/config/$unit.state" || {
+      failed=1
+      continue
+    }
+    if [[ "$enabled" == enabled ]]; then
+      systemctl enable -q "$unit" >/dev/null 2>&1 || failed=1
+    fi
+    if [[ "$active" == active ]]; then
+      systemctl start "$unit" >/dev/null 2>&1 || failed=1
+    fi
+  done
+  return "$failed"
+}
+
+unit_was_active() {
+  local unit=$1 enabled active
+  read -r enabled active < "$ROLLBACK_DIR/config/$unit.state" || return 1
+  [[ "$active" == active ]]
+}
+
 database_integrity() {
   python3 - "$1" <<'PY'
 import sqlite3
@@ -219,7 +273,7 @@ rollback_configuration() {
   restore_path /etc/kol-dashboard.env kol-dashboard.env || failed=1
   restore_path /etc/systemd/system/kol-dashboard.service \
     kol-dashboard.service || failed=1
-  for job in kol macro decision; do
+  for job in kol macro decision enrich; do
     restore_path "/etc/systemd/system/kol-collect-${job}.service" \
       "kol-collect-${job}.service" || failed=1
     restore_path "/etc/systemd/system/kol-collect-${job}.timer" \
@@ -232,17 +286,6 @@ rollback_configuration() {
   return "$failed"
 }
 
-start_available_units() {
-  local unit failed=0
-  for unit in kol-dashboard.service kol-collect-kol.timer \
-    kol-collect-macro.timer kol-collect-decision.timer; do
-    if systemctl cat "$unit" >/dev/null 2>&1; then
-      systemctl start "$unit" >/dev/null 2>&1 || failed=1
-    fi
-  done
-  return "$failed"
-}
-
 cleanup_remote() {
   local rc=$?
   trap - EXIT
@@ -252,17 +295,20 @@ cleanup_remote() {
     local rollback_failed=0 unit active_target
     echo "部署失败，恢复上一版本、数据库和配置" >&2
     systemctl stop kol-collect-kol.timer kol-collect-macro.timer \
-      kol-collect-decision.timer kol-collect-kol.service \
-      kol-collect-macro.service kol-collect-decision.service \
+      kol-collect-decision.timer kol-collect-enrich.timer \
+      kol-collect-kol.service kol-collect-macro.service \
+      kol-collect-decision.service kol-collect-enrich.service \
       kol-dashboard.service >/dev/null 2>&1 || true
     for unit in kol-collect-kol.service kol-collect-macro.service \
-      kol-collect-decision.service kol-dashboard.service; do
+      kol-collect-decision.service kol-collect-enrich.service \
+      kol-dashboard.service; do
       if systemctl is-active --quiet "$unit"; then
         echo "回滚前仍有写入进程: $unit" >&2
         rollback_failed=1
       fi
     done
     rollback_database || rollback_failed=1
+    prepare_unit_state_rollback || rollback_failed=1
     rollback_configuration || rollback_failed=1
     if [[ -n "$PREVIOUS_TARGET" && -d "$PREVIOUS_TARGET" ]]; then
       ln -s "$PREVIOUS_TARGET" "$CURRENT_NEXT" || rollback_failed=1
@@ -273,22 +319,24 @@ cleanup_remote() {
       rm -f "$CURRENT_LINK" || rollback_failed=1
     fi
     systemctl daemon-reload || rollback_failed=1
+    restore_unit_states || rollback_failed=1
     if nginx -t >/dev/null 2>&1; then
       systemctl reload nginx >/dev/null 2>&1 || rollback_failed=1
     else
       rollback_failed=1
     fi
-    start_available_units || rollback_failed=1
-    rollback_health=FAILED
-    for _ in $(seq 1 15); do
-      if curl -sf --max-time 4 \
-        http://127.0.0.1:8088/health >/dev/null; then
-        rollback_health=ok
-        break
-      fi
-      sleep 2
-    done
-    [[ "$rollback_health" == ok ]] || rollback_failed=1
+    if unit_was_active kol-dashboard.service; then
+      rollback_health=FAILED
+      for _ in $(seq 1 15); do
+        if curl -sf --max-time 4 \
+          http://127.0.0.1:8088/health >/dev/null; then
+          rollback_health=ok
+          break
+        fi
+        sleep 2
+      done
+      [[ "$rollback_health" == ok ]] || rollback_failed=1
+    fi
     if [[ $rollback_failed != 0 ]]; then
       : > "$REMOTE_STAGE/PRESERVE"
       chmod 600 "$REMOTE_STAGE/PRESERVE"
@@ -335,6 +383,14 @@ install -d -o kol-dashboard -g kol-dashboard -m 700 \
 install -d -o kol-dashboard -g kol-dashboard -m 750 \
   /var/log/kol-dashboard
 chown -R kol-dashboard:kol-dashboard /var/log/kol-dashboard
+for log_file in out.log err.log collect.log collect.err.log; do
+  if [[ ! -e "/var/log/kol-dashboard/$log_file" ]]; then
+    install -o kol-dashboard -g kol-dashboard -m 600 /dev/null \
+      "/var/log/kol-dashboard/$log_file"
+  fi
+  chown kol-dashboard:kol-dashboard "/var/log/kol-dashboard/$log_file"
+  chmod 600 "/var/log/kol-dashboard/$log_file"
+done
 chmod 700 "$DATA_DIR"
 chmod 700 "$PRIVATE_DIR"
 if [[ -f "$PRIVATE_DIR/holdings.md" ]]; then
@@ -373,7 +429,8 @@ tar xzf "$REMOTE_STAGE/app.tgz" --no-same-owner --no-same-permissions \
 chown -R root:root "$RELEASE_DIR"
 chgrp -R kol-dashboard "$RELEASE_DIR"
 chmod -R u=rwX,g=rX,o= "$RELEASE_DIR"
-chmod 750 "$RELEASE_DIR/collect.sh" "$RELEASE_DIR/decision_collect.py"
+chmod 750 "$RELEASE_DIR/collect.sh" "$RELEASE_DIR/decision_collect.py" \
+  "$RELEASE_DIR/enrichment_collect.py"
 runuser -u kol-dashboard -- test -r "$RELEASE_DIR/app.py"
 runuser -u kol-dashboard -- test -x "$RELEASE_DIR"
 
@@ -396,11 +453,16 @@ install -d -m 700 "$ROLLBACK_DIR/config"
 backup_path /etc/kol-dashboard.env kol-dashboard.env
 backup_path /etc/systemd/system/kol-dashboard.service \
   kol-dashboard.service
-for job in kol macro decision; do
+for job in kol macro decision enrich; do
   backup_path "/etc/systemd/system/kol-collect-${job}.service" \
     "kol-collect-${job}.service"
   backup_path "/etc/systemd/system/kol-collect-${job}.timer" \
     "kol-collect-${job}.timer"
+done
+for unit in kol-dashboard.service kol-collect-kol.timer \
+  kol-collect-macro.timer kol-collect-decision.timer \
+  kol-collect-enrich.timer; do
+  record_unit_state "$unit"
 done
 backup_path /etc/nginx/snippets/kol-dashboard.conf \
   kol-dashboard.conf
@@ -409,14 +471,16 @@ backup_path /etc/nginx/snippets/aidao.locations.conf \
 ROLLBACK_READY=1
 
 systemctl stop kol-collect-kol.timer kol-collect-macro.timer \
-  kol-collect-decision.timer 2>/dev/null || true
+  kol-collect-decision.timer kol-collect-enrich.timer 2>/dev/null || true
 for unit in kol-collect-kol.service kol-collect-macro.service \
-  kol-collect-decision.service kol-dashboard.service; do
+  kol-collect-decision.service kol-collect-enrich.service \
+  kol-dashboard.service; do
   systemctl stop "$unit" 2>/dev/null || true
 done
 for unit in kol-collect-kol.timer kol-collect-macro.timer \
   kol-collect-decision.timer kol-collect-kol.service \
   kol-collect-macro.service kol-collect-decision.service \
+  kol-collect-enrich.timer kol-collect-enrich.service \
   kol-dashboard.service; do
   if systemctl is-active --quiet "$unit"; then
     echo "active database writer remains: $unit" >&2
@@ -618,7 +682,27 @@ UNIT
 install -m 644 "$REMOTE_STAGE/kol-dashboard.service" \
   /etc/systemd/system/kol-dashboard.service
 
-for job in kol macro decision; do
+if [[ -e /etc/kol-dashboard/deepseek.env || \
+      -L /etc/kol-dashboard/deepseek.env ]]; then
+  [[ -f /etc/kol-dashboard/deepseek.env && \
+     ! -L /etc/kol-dashboard/deepseek.env ]] || {
+    echo "DeepSeek 环境文件必须是普通文件，不能是符号链接" >&2
+    exit 1
+  }
+  DEEPSEEK_SECRET_STAT=$(stat -c '%U:%G:%a' /etc/kol-dashboard/deepseek.env)
+  [[ "$DEEPSEEK_SECRET_STAT" == "root:root:600" ]] || {
+    echo "DeepSeek 环境文件权限必须为 root:root 0600" >&2
+    exit 1
+  }
+fi
+
+for job in kol macro decision enrich; do
+  EXTRA_ENVIRONMENT=""
+  EXTRA_HARDENING=""
+  if [[ "$job" == "enrich" ]]; then
+    EXTRA_ENVIRONMENT="EnvironmentFile=-/etc/kol-dashboard/deepseek.env"
+    EXTRA_HARDENING="LimitCORE=0"
+  fi
   cat > "$REMOTE_STAGE/kol-collect-${job}.service" <<UNIT
 [Unit]
 Description=KOL dashboard ${job} collection
@@ -630,6 +714,7 @@ User=kol-dashboard
 Group=kol-dashboard
 WorkingDirectory=/opt/kol-dashboard/current
 EnvironmentFile=-/etc/kol-dashboard.env
+${EXTRA_ENVIRONMENT}
 Environment=KOL_DASHBOARD_DB=/opt/kol-dashboard/data/kol_dashboard.db
 Environment=KOL_LOG_DIR=/var/log/kol-dashboard
 Environment=PYTHONDONTWRITEBYTECODE=1
@@ -639,6 +724,7 @@ PrivateTmp=true
 PrivateDevices=true
 ProtectHome=true
 ProtectSystem=strict
+${EXTRA_HARDENING}
 ReadWritePaths=/opt/kol-dashboard/data /opt/kol-dashboard/private /var/log/kol-dashboard
 TimeoutStartSec=20min
 ExecStart=/bin/bash /opt/kol-dashboard/current/collect.sh ${job}
@@ -689,7 +775,21 @@ Persistent=true
 WantedBy=timers.target
 UNIT
 
-for job in kol macro decision; do
+cat > "$REMOTE_STAGE/kol-collect-enrich.timer" <<'UNIT'
+[Unit]
+Description=Enrich recent KOL events with Chinese intelligence
+
+[Timer]
+OnBootSec=12min
+OnUnitActiveSec=15min
+RandomizedDelaySec=90s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+
+for job in kol macro decision enrich; do
   install -m 644 "$REMOTE_STAGE/kol-collect-${job}.timer" \
     "/etc/systemd/system/kol-collect-${job}.timer"
 done
@@ -726,7 +826,8 @@ fi
 
 systemctl daemon-reload
 systemctl enable -q kol-dashboard kol-collect-kol.timer \
-  kol-collect-macro.timer kol-collect-decision.timer
+  kol-collect-macro.timer kol-collect-decision.timer \
+  kol-collect-enrich.timer
 nginx -t
 systemctl restart kol-dashboard.service
 
@@ -761,7 +862,7 @@ done
 }
 
 systemctl start kol-collect-kol.timer kol-collect-macro.timer \
-  kol-collect-decision.timer
+  kol-collect-decision.timer kol-collect-enrich.timer
 SERVICES_STOPPED=0
 COMMITTED=1
 echo "service: $(systemctl is-active kol-dashboard)  health: ok"

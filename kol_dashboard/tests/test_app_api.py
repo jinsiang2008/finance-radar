@@ -18,8 +18,34 @@ if str(ROOT) not in sys.path:
 
 import auth  # noqa: E402
 import db  # noqa: E402
+import llm_enrichment  # noqa: E402
 import portfolio  # noqa: E402
 import app as dashboard_app  # noqa: E402
+
+
+def api_enrichment_result() -> dict:
+    return {
+        "headline_zh": "人工智能需求推动英伟达信号升温",
+        "summary_zh": "公开来源显示人工智能需求仍受关注，但订单与收入影响仍需等待公司披露确认。",
+        "why_it_matters_zh": "该信号可能通过算力需求影响美国半导体股票及相关供应链。",
+        "impact_level": "high",
+        "impact_path": ["人工智能需求 → 算力投入 → 半导体股票"],
+        "tags": ["人工智能", "半导体"],
+        "assets": [
+            {
+                "asset_key": "US:NVDA",
+                "name_zh": "英伟达",
+                "direction": "positive",
+                "horizon": "medium",
+                "reason_zh": "需求延续可能改善收入预期。",
+                "confidence": 0.8,
+            }
+        ],
+        "cluster_key": "nvidia-ai-demand-signal",
+        "language": "en",
+        "confidence": 0.77,
+        "schema_version": 1,
+    }
 
 
 class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
@@ -284,6 +310,157 @@ class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
             quarantine.json()["items"][0]["time_status"], "unknown"
         )
         self.assertEqual(invalid.status_code, 422)
+
+    async def test_event_list_and_integer_detail_expose_nested_enrichment(self) -> None:
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        event = {
+            "title": "Current NVIDIA AI demand signal",
+            "url": "https://example.com/current-nvidia-ai-demand",
+            "snippet": "NVIDIA AI demand remains in focus.",
+            "source": "Test News",
+            "kol_key": "tester",
+            "kol_name": "Tester",
+            "kol_name_cn": "测试者",
+            "impact": "medium",
+            "has_market_kw": True,
+            "tickers": ["NVDA"],
+            "published_at": (now - timedelta(hours=1)).isoformat(),
+        }
+        db.insert_events([event])
+        db.insert_events(
+            [
+                {
+                    **event,
+                    "url": "https://x.com/elonmusk/status/123",
+                    "source": "X @elonmusk",
+                    "kol_key": "musk",
+                    "kol_name": "Elon Musk",
+                    "kol_name_cn": "马斯克",
+                }
+            ]
+        )
+        db.insert_events(
+            [
+                {
+                    **event,
+                    "url": "https://example.com/musk-ai-interview",
+                    "source": "Interview transcript",
+                    "kol_key": "musk",
+                    "kol_name": "Elon Musk",
+                    "kol_name_cn": "马斯克",
+                    "published_at": (now - timedelta(minutes=30)).isoformat(),
+                }
+            ]
+        )
+        candidate = db.query_enrichment_candidates(now=now)[0]
+        event_input, input_hash = llm_enrichment.build_event_input(candidate)
+        claim = {
+            "event_id": candidate["id"],
+            "input_hash": input_hash,
+            "prompt_version": llm_enrichment.PROMPT_VERSION,
+            "model": llm_enrichment.DEFAULT_MODEL,
+            "evidence_basis": event_input["evidence_basis"],
+        }
+        claim_token = db.claim_event_enrichment(**claim, now=now)
+        self.assertIsInstance(claim_token, str)
+        self.assertTrue(
+            db.save_event_enrichment(
+                **claim,
+                claim_token=claim_token,
+                result=api_enrichment_result(),
+                generated_at=now.isoformat(),
+            )
+        )
+        db.replace_relations(
+            "event",
+            str(candidate["id"]),
+            [
+                {
+                    "topic_key": "ai_semiconductors",
+                    "asset_key": "US:NVDA",
+                    "relation_type": "view",
+                    "direction": "positive",
+                    "strength": 0.8,
+                    "confidence": 0.8,
+                    "horizon": "medium",
+                    "method": "deterministic_rules:test",
+                    "rationale": "Public mechanism evidence.",
+                    "evidence": {"title": event["title"]},
+                }
+            ],
+        )
+
+        listing = await self.client.get("/api/events")
+        detail = await self.client.get(f"/api/events/{candidate['id']}")
+        detail_for_kol = await self.client.get(
+            f"/api/events/{candidate['id']}",
+            params={"kol": "musk"},
+        )
+        detail_for_source = await self.client.get(
+            f"/api/events/{candidate['id']}",
+            params={
+                "kol": "musk",
+                "source_url": "https://example.com/musk-ai-interview",
+            },
+        )
+        missing = await self.client.get("/api/events/999999")
+        oversized = await self.client.get(f"/api/events/{10**40}")
+
+        self.assertEqual(listing.status_code, 200)
+        listed = listing.json()["items"][0]
+        self.assertEqual(listed["id"], candidate["id"])
+        self.assertEqual(listed["tickers"], ["NVDA"])
+        self.assertEqual(listed["rule_impact"], "medium")
+        self.assertEqual(listed["impact"], "high")
+        self.assertEqual(listed["ai_status"], "ready")
+        self.assertEqual(
+            listed["ai_enrichment"]["headline_zh"],
+            "人工智能需求推动英伟达信号升温",
+        )
+        self.assertEqual(
+            listed["ai_enrichment"]["assets"][0]["asset_key"],
+            "US:NVDA",
+        )
+        self.assertNotIn("ai_assets_json", listed)
+
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(detail.headers["cache-control"], "public, max-age=30")
+        body = detail.json()
+        self.assertEqual(body["event"]["id"], candidate["id"])
+        self.assertEqual(body["event"]["tickers"], ["NVDA"])
+        self.assertEqual(body["event"]["ai_enrichment"]["status"], "ready")
+        self.assertEqual(len(body["sightings"]), 3)
+        self.assertEqual(
+            {sighting["source_url"] for sighting in body["sightings"]},
+            {
+                "https://example.com/current-nvidia-ai-demand",
+                "https://example.com/musk-ai-interview",
+                "https://x.com/elonmusk/status/123",
+            },
+        )
+        self.assertEqual(body["relations"][0]["asset_key"], "US:NVDA")
+        self.assertEqual(body["market_reactions"], [])
+
+        self.assertEqual(detail_for_kol.status_code, 200)
+        selected = detail_for_kol.json()["event"]
+        self.assertEqual(selected["kol_key"], "musk")
+        self.assertEqual(selected["kol_name_cn"], "马斯克")
+        self.assertEqual(selected["source"], "X @elonmusk")
+        self.assertEqual(
+            selected["source_url"],
+            "https://x.com/elonmusk/status/123",
+        )
+        self.assertEqual(detail_for_source.status_code, 200)
+        exact = detail_for_source.json()["event"]
+        self.assertEqual(exact["kol_key"], "musk")
+        self.assertEqual(exact["source"], "Interview transcript")
+        self.assertEqual(
+            exact["source_url"],
+            "https://example.com/musk-ai-interview",
+        )
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(missing.json()["detail"], "event_not_found")
+        self.assertEqual(oversized.status_code, 422)
 
     async def test_unsafe_incremental_event_endpoint_is_not_exposed(self) -> None:
         response = await self.client.get("/api/events/new")
