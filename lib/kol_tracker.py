@@ -45,6 +45,8 @@ for _cand in _DASHBOARD_CANDIDATES:
             sys.path.insert(0, _cand)
         break
 
+from content_quality import has_substantive_social_text
+
 
 def _write_to_db(items: list[dict[str, Any]]) -> tuple[int, int]:
     """Best-effort write to dashboard DB; returns (inserted, skipped).
@@ -409,7 +411,14 @@ def _feed_field(fragment: str, tag: str) -> str:
     return _CDATA_RE.sub(r"\1", match.group(1)).strip()
 
 
-_ANCHOR_RE = re.compile(r"<a\b[^>]*\bhref=[\"']([^\"']+)[\"'][^>]*>.*?</a>", re.S | re.I)
+_ANCHOR_RE = re.compile(
+    r"<a\b[^>]*\bhref=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>",
+    re.S | re.I,
+)
+_TRUTH_PROFILE_LINK_RE = re.compile(
+    r"https?://(?:www\.)?truthsocial\.com/@([A-Za-z0-9_]{1,64})/?",
+    re.I,
+)
 
 
 def _post_body_text(markup: str) -> str:
@@ -421,7 +430,14 @@ def _post_body_text(markup: str) -> str:
     """
     if not markup:
         return ""
-    text = _ANCHOR_RE.sub(lambda m: f" {unescape(m.group(1))} ", markup)
+    def flatten_anchor(match: re.Match[str]) -> str:
+        href = unescape(match.group(1)).strip()
+        profile = _TRUTH_PROFILE_LINK_RE.fullmatch(href)
+        if profile:
+            return f" @{profile.group(1)} "
+        return f" {href} "
+
+    text = _ANCHOR_RE.sub(flatten_anchor, markup)
     text = re.sub(r"<[^>]+>", " ", text)
     return re.sub(r"\s+", " ", unescape(text)).strip()
 
@@ -443,7 +459,7 @@ def search_truth_social(
     results: list[dict[str, Any]] = []
     for fragment in _ITEM_RE.findall(xml):
         body = _post_body_text(_feed_field(fragment, "description"))
-        if len(body) < 12:
+        if not has_substantive_social_text(body):
             continue
         url = (
             _feed_field(fragment, "truth:originalUrl")

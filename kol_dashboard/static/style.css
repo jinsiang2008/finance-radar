@@ -726,7 +726,11 @@ details[open] .scenario-chev { transform: rotate(90deg); }
 .source-kind.media, .source-kind.is-media { color: var(--accent); }
 .source-kind.unverified, .source-kind.is-unverified { color: var(--med); }
 .card-src { color: var(--muted); }
-.card-time { color: var(--muted); margin-left: auto; font-variant-numeric: tabular-nums; }
+.card-time {
+  display: inline-flex; align-items: center; margin-left: auto;
+  color: var(--muted); font-family: var(--font-data); font-size: 10px;
+  font-variant-numeric: tabular-nums; letter-spacing: .015em; white-space: nowrap;
+}
 .card-time.is-unverified { color: var(--med); font-weight: 600; }
 .card-title {
   margin: 3px 0 0; font-family: var(--font-display);
@@ -1658,7 +1662,7 @@ button:focus-visible, a:focus-visible, [tabindex]:focus-visible, input:focus-vis
   .filter-kols .chips::-webkit-scrollbar { display: none; }
   .chip { min-height: 44px; padding: 7px 11px; }
   .card { padding: 13px 14px; }
-  .card-time { width: 100%; margin-left: 0; }
+  .card-time { width: 100%; margin-left: 0; white-space: normal; }
   .card-title { font-size: 16.5px; }
   .card-actions { align-items: stretch; }
   .card-evidence-btn { flex: 1 1 auto; }

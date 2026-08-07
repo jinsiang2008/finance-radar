@@ -240,6 +240,51 @@
     }).format(d);
   }
 
+  function fmtRelativeTime(iso) {
+    if (!iso) return "";
+    const d = new Date(String(iso));
+    if (Number.isNaN(d.getTime())) return "";
+    const mins = Math.floor((Date.now() - d.getTime()) / 60000);
+    if (mins < 1) return "刚刚";
+    if (mins < 60) return `${mins} 分钟前`;
+    if (mins < 1440) return `${Math.floor(mins / 60)} 小时前`;
+    return `${Math.floor(mins / 1440)} 天前`;
+  }
+
+  function fmtBeijingDateTime(iso) {
+    if (!iso) return "";
+    const d = new Date(String(iso));
+    if (Number.isNaN(d.getTime())) return "";
+    const parts = Object.fromEntries(
+      new Intl.DateTimeFormat("zh-CN", {
+        timeZone: "Asia/Shanghai",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hourCycle: "h23",
+      })
+        .formatToParts(d)
+        .filter((part) => part.type !== "literal")
+        .map((part) => [part.type, part.value])
+    );
+    const date = `${parts.year}-${parts.month}-${parts.day}`;
+    return `${date} ${parts.hour}:${parts.minute}:${parts.second}`;
+  }
+
+  function publicationTimeView(iso) {
+    const exact = fmtBeijingDateTime(iso);
+    if (!exact) return null;
+    const relative = fmtRelativeTime(iso);
+    return {
+      visible: `发布 ${exact}（北京时间） · ${relative}`,
+      accessible: `发布时间 ${exact}，北京时间，${relative}`,
+      datetime: new Date(String(iso)).toISOString(),
+    };
+  }
+
   const num = (v, digits = 2) =>
     typeof v === "number" && isFinite(v) ? v.toFixed(digits) : null;
 
@@ -2261,15 +2306,25 @@
         const collectedAt = it.first_seen_at || it.fetched_at;
         const timeStatus =
           it.time_status || (it.published_at ? "verified" : "unknown");
+        const publicationTime =
+          timeStatus === "verified" && it.published_at
+            ? publicationTimeView(it.published_at)
+            : null;
         const timeTitle = [
-          it.published_at ? `发布时间：${it.published_at}` : "发布时间：未知",
-          collectedAt ? `首次抓取：${collectedAt}` : "",
+          publicationTime
+            ? publicationTime.accessible
+            : it.published_at
+              ? `发布时间：${it.published_at}`
+              : "发布时间：未知",
+          collectedAt
+            ? `首次抓取：${fmtBeijingDateTime(collectedAt) || collectedAt}（北京时间）`
+            : "",
         ]
           .filter(Boolean)
           .join(" · ");
         const eventTime =
-          timeStatus === "verified" && it.published_at
-            ? `发布 ${fmtTime(it.published_at)}`
+          publicationTime
+            ? publicationTime.visible
             : timeStatus === "future"
               ? collectedAt
                 ? `发布时间异常 · 抓取 ${fmtTime(collectedAt)}`
@@ -2296,9 +2351,17 @@
             ${aiStateHTML(it)}
             <span class="card-src">${esc(it.source || "")}</span>
             <span class="source-kind ${sourceNature.key}">${sourceNature.label}</span>
-            <span class="card-time ${
-              timeStatus === "verified" ? "" : "is-unverified"
-            }" title="${esc(timeTitle)}">${esc(eventTime)}</span>
+            ${
+              publicationTime
+                ? `<time class="card-time" datetime="${esc(
+                    publicationTime.datetime
+                  )}" title="${esc(timeTitle)}" aria-label="${esc(
+                    publicationTime.accessible
+                  )}">${esc(eventTime)}</time>`
+                : `<span class="card-time is-unverified" title="${esc(
+                    timeTitle
+                  )}">${esc(eventTime)}</span>`
+            }
           </div>
           <h2 class="card-title" id="${titleId}">${esc(copy.headline)}</h2>
           <p class="card-snippet">${esc(copy.summary)}</p>
@@ -2493,9 +2556,12 @@
             );
             const timeStatus = String(sighting.time_status || "unknown");
             const sourceNature = sourceKind(sighting.source);
-            const when =
+            const publicationTime =
               timeStatus === "verified" && sighting.published_at
-                ? `发布 ${fmtTime(sighting.published_at)}`
+                ? publicationTimeView(sighting.published_at)
+                : null;
+            const when = publicationTime
+                ? publicationTime.visible
                 : sighting.first_seen_at
                   ? `抓取 ${fmtTime(sighting.first_seen_at)}`
                   : "时间待核验";
@@ -2506,9 +2572,17 @@
               </div>
               <div class="source-record-meta">
                 <span class="source-kind ${sourceNature.key}">${sourceNature.label}</span>
-                <span class="${timeStatus === "verified" ? "" : "is-unverified"}">${esc(
-                  when
-                )}</span>
+                ${
+                  publicationTime
+                    ? `<time datetime="${esc(
+                        publicationTime.datetime
+                      )}" title="${esc(
+                        publicationTime.accessible
+                      )}" aria-label="${esc(
+                        publicationTime.accessible
+                      )}">${esc(when)}</time>`
+                    : `<span class="is-unverified">${esc(when)}</span>`
+                }
                 ${
                   sighting.source_count > 1
                     ? `<span>采集 ${sighting.source_count} 次</span>`
@@ -2560,12 +2634,15 @@
         const headline = String(item.headline_zh || item.title || "未命名报道").trim();
         const original = String(item.title || "").trim();
         const url = eventExternalUrl(item);
+        const publicationTime = item.published_at
+          ? publicationTimeView(item.published_at)
+          : null;
         return `<li>
           <div class="related-copy">
             <strong>${esc(headline)}</strong>
             ${original && original !== headline ? `<span>原文：${esc(original)}</span>` : ""}
             <small>${esc(item.kol_name_cn || item.source || "未知来源")}${
-              item.published_at ? ` · ${esc(fmtTime(item.published_at))}` : ""
+              publicationTime ? ` · ${esc(publicationTime.visible)}` : ""
             }</small>
           </div>
           ${

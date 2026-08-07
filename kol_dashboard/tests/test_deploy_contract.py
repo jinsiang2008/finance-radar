@@ -17,6 +17,7 @@ class DeploymentContractTests(unittest.TestCase):
         for filename in (
             "app.py",
             "auth.py",
+            "content_quality.py",
             "db.py",
             "decision_collect.py",
             "decision_service.py",

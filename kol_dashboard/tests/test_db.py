@@ -243,6 +243,99 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(musk_all[1]["last_seen_at"], old)
         self.assertEqual(musk_all[1]["published_at"], old)
 
+    def test_kol_pagination_filters_noncontent_sighting_before_limit(self) -> None:
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        newest = (now - timedelta(minutes=5)).isoformat()
+        older = (now - timedelta(minutes=10)).isoformat()
+        db.insert_events(
+            [
+                self.event(
+                    title="AI",
+                    snippet="AI",
+                    url="https://example.com/brief-ai-item",
+                    source="Bing News",
+                    kol_key="reporter",
+                    published_at=newest,
+                )
+            ]
+        )
+        db.insert_events(
+            [
+                self.event(
+                    title="AI",
+                    snippet="RT https://truthsocial.com/@realDonaldTrump",
+                    url=(
+                        "https://truthsocial.com/@realDonaldTrump/"
+                        "117051398671535118"
+                    ),
+                    source="Truth Social @realDonaldTrump",
+                    kol_key="trump",
+                    kol_name="Donald Trump",
+                    kol_name_cn="特朗普",
+                    published_at=newest,
+                ),
+                self.event(
+                    title="Tariff review enters final stage",
+                    snippet="The semiconductor tariff review enters its final stage.",
+                    url=(
+                        "https://truthsocial.com/@realDonaldTrump/"
+                        "117051398671535119"
+                    ),
+                    source="Truth Social @realDonaldTrump",
+                    kol_key="trump",
+                    kol_name="Donald Trump",
+                    kol_name_cn="特朗普",
+                    published_at=older,
+                ),
+            ]
+        )
+        # The same KOL can sight a merged story through multiple sources. When
+        # publication times tie, both the feed and KOL counters must choose the
+        # source with the newest last_seen_at (not the newest first_seen_at).
+        db.insert_events(
+            [
+                self.event(
+                    title="AI",
+                    snippet="AI",
+                    url="https://example.com/brief-ai-item",
+                    source="Bing News",
+                    kol_key="trump",
+                    kol_name="Donald Trump",
+                    kol_name_cn="特朗普",
+                    published_at=newest,
+                )
+            ]
+        )
+        with db.conn() as connection:
+            connection.execute(
+                "UPDATE event_sightings SET first_seen_at=?, last_seen_at=? "
+                "WHERE kol_key='trump' AND source='Bing News'",
+                (
+                    (now - timedelta(minutes=1)).isoformat(),
+                    (now - timedelta(minutes=2)).isoformat(),
+                ),
+            )
+            connection.execute(
+                "UPDATE event_sightings SET first_seen_at=?, last_seen_at=? "
+                "WHERE kol_key='trump' AND source LIKE 'Truth Social%' "
+                "AND source_url LIKE '%117051398671535118'",
+                (
+                    (now - timedelta(minutes=30)).isoformat(),
+                    now.isoformat(),
+                ),
+            )
+
+        items = db.query_events(kol="trump", limit=1, now=now)
+
+        self.assertEqual(
+            [item["title"] for item in items],
+            ["Tariff review enters final stage"],
+        )
+        trump = next(item for item in db.list_kols() if item["kol_key"] == "trump")
+        self.assertEqual(trump["total"], 1)
+        self.assertEqual(trump["total_24h"], 1)
+        self.assertEqual(db.stats(hours=24)["active_kols"], 2)
+
     def test_recent_window_uses_publication_not_last_sighting(self) -> None:
         now = datetime(2026, 8, 3, 0, 0, tzinfo=timezone.utc)
         recent = (now - timedelta(hours=2)).isoformat()
@@ -604,6 +697,73 @@ class DatabaseTests(unittest.TestCase):
                 "SELECT published_at FROM event_sightings"
             ).fetchone()
         self.assertEqual(row["published_at"], reliable)
+
+    def test_merge_recovers_truth_placeholder_when_real_text_arrives(self) -> None:
+        url = "https://truthsocial.com/@realDonaldTrump/117051398671535118"
+        shell = self.event(
+            title="RT https://truthsocial.com/@realDonaldTrump",
+            snippet="RT https://truthsocial.com/@realDonaldTrump",
+            source="Truth Social @realDonaldTrump",
+            url=url,
+        )
+        recovered = self.event(
+            title="Tariff policy update",
+            snippet=(
+                "The administration will publish a semiconductor tariff "
+                "decision after the review."
+            ),
+            source="Truth Social @realDonaldTrump",
+            url=url,
+        )
+
+        db.insert_events([shell])
+        db.insert_events([recovered])
+        db.insert_events([shell])
+
+        with db.conn() as connection:
+            row = dict(
+                connection.execute(
+                    "SELECT title, snippet, source, canonical_url, url FROM events"
+                ).fetchone()
+            )
+
+        self.assertEqual(row["title"], recovered["title"])
+        self.assertEqual(row["snippet"], recovered["snippet"])
+        self.assertTrue(llm_enrichment.is_event_enrichment_eligible(row))
+
+    def test_merge_title_only_recovery_clears_stale_shell_snippet(self) -> None:
+        url = "https://truthsocial.com/@realDonaldTrump/117051398671535119"
+        db.insert_events(
+            [
+                self.event(
+                    title="RT https://truthsocial.com/@realDonaldTrump",
+                    snippet="RT https://truthsocial.com/@realDonaldTrump",
+                    source="Truth Social @realDonaldTrump",
+                    url=url,
+                )
+            ]
+        )
+        db.insert_events(
+            [
+                self.event(
+                    title="WAR TARIFF ANNOUNCEMENT",
+                    snippet="",
+                    source="Truth Social @realDonaldTrump",
+                    url=url,
+                )
+            ]
+        )
+
+        with db.conn() as connection:
+            row = dict(
+                connection.execute(
+                    "SELECT title, snippet, source, canonical_url, url FROM events"
+                ).fetchone()
+            )
+
+        self.assertEqual(row["title"], "WAR TARIFF ANNOUNCEMENT")
+        self.assertEqual(row["snippet"], "")
+        self.assertTrue(llm_enrichment.is_event_enrichment_eligible(row))
 
     def test_enrichment_claim_cache_input_change_and_retry_backoff(self) -> None:
         now = datetime(2026, 8, 6, 4, 0, tzinfo=timezone.utc)
@@ -1044,12 +1204,33 @@ class DatabaseTests(unittest.TestCase):
                 generated_at=now.isoformat(),
             )
         )
+        db.insert_events(
+            [
+                {
+                    **self.event(
+                        published_at=(now - timedelta(minutes=30)).isoformat()
+                    ),
+                    "url": "https://x.com/elonmusk/status/987",
+                    "source": "X @elonmusk",
+                    "kol_key": "musk",
+                    "kol_name": "Elon Musk",
+                    "kol_name_cn": "马斯克",
+                }
+            ]
+        )
 
         deterministic_items = db.query_events(hours=24, now=now)
         public_items = db.query_events(hours=24, now=now, use_ai_impact=True)
         searched = db.query_events(q="人工智能", hours=24, now=now)
         rule_high = db.query_events(impact="high", hours=24, now=now)
         ai_high = db.query_events(
+            impact="high",
+            hours=24,
+            now=now,
+            use_ai_impact=True,
+        )
+        musk_high = db.query_events(
+            kol="musk",
             impact="high",
             hours=24,
             now=now,
@@ -1075,6 +1256,117 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual([row["id"] for row in searched], [candidate["id"]])
         self.assertEqual(rule_high, [])
         self.assertEqual([row["id"] for row in ai_high], [candidate["id"]])
+        self.assertEqual(len(musk_high), 1)
+        self.assertEqual(musk_high[0]["impact"], "high")
+        self.assertEqual(musk_high[0]["ai_status"], "ready")
+        self.assertEqual(musk_high[0]["kol_key"], "musk")
+
+    def test_stale_enrichment_is_fail_closed_after_event_evidence_changes(self) -> None:
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        original = self.event(
+            published_at=(now - timedelta(hours=1)).isoformat()
+        )
+        db.insert_events([original])
+        candidate = db.query_enrichment_candidates(now=now)[0]
+        event_input, input_hash = llm_enrichment.build_event_input(candidate)
+        claim = {
+            "event_id": candidate["id"],
+            "input_hash": input_hash,
+            "prompt_version": llm_enrichment.PROMPT_VERSION,
+            "model": llm_enrichment.DEFAULT_MODEL,
+            "evidence_basis": event_input["evidence_basis"],
+        }
+        token = db.claim_event_enrichment(**claim, now=now)
+        self.assertIsInstance(token, str)
+        self.assertTrue(
+            db.save_event_enrichment(
+                **claim,
+                claim_token=token,
+                result=ready_enrichment(),
+                generated_at=now.isoformat(),
+            )
+        )
+        ready_summary = db.stats(hours=24)
+        ready_kols = db.list_kols()
+        self.assertEqual(ready_summary["high"], 1)
+        self.assertEqual(ready_summary["medium"], 0)
+        self.assertEqual(ready_kols[0]["high_24h"], 1)
+
+        db.insert_events(
+            [
+                {
+                    **original,
+                    "title": (
+                        "NVIDIA launches a new AI platform with expanded "
+                        "enterprise availability"
+                    ),
+                    "snippet": (
+                        "NVIDIA described the platform, its enterprise rollout, "
+                        "customer eligibility, timing, and supported deployment "
+                        "options in a substantially fuller source update."
+                    ),
+                }
+            ]
+        )
+
+        public = db.query_events(hours=24, now=now, use_ai_impact=True)
+        stale_search = db.query_events(q="人工智能", hours=24, now=now)
+        stale_high = db.query_events(
+            impact="high",
+            hours=24,
+            now=now,
+            use_ai_impact=True,
+        )
+        summary = db.stats(hours=24)
+        kols = db.list_kols()
+
+        self.assertEqual(len(public), 1)
+        self.assertEqual(public[0]["ai_status"], "pending")
+        self.assertIsNone(public[0]["ai_enrichment"])
+        self.assertEqual(public[0]["impact"], "medium")
+        self.assertEqual(stale_search, [])
+        self.assertEqual(stale_high, [])
+        self.assertEqual(summary["high"], 0)
+        self.assertEqual(summary["medium"], 1)
+        self.assertEqual(kols[0]["high_24h"], 0)
+
+    def test_supported_worker_model_is_valid_without_web_model_env(self) -> None:
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        db.insert_events(
+            [self.event(published_at=(now - timedelta(hours=1)).isoformat())]
+        )
+        candidate = db.query_enrichment_candidates(now=now)[0]
+        event_input, input_hash = llm_enrichment.build_event_input(candidate)
+        claim = {
+            "event_id": candidate["id"],
+            "input_hash": input_hash,
+            "prompt_version": llm_enrichment.PROMPT_VERSION,
+            "model": "deepseek-v4-pro",
+            "evidence_basis": event_input["evidence_basis"],
+        }
+        token = db.claim_event_enrichment(**claim, now=now)
+        self.assertIsInstance(token, str)
+        self.assertTrue(
+            db.save_event_enrichment(
+                **claim,
+                claim_token=token,
+                result=ready_enrichment(),
+                generated_at=now.isoformat(),
+            )
+        )
+
+        with mock.patch.dict(
+            llm_enrichment.os.environ,
+            {"DEEPSEEK_MODEL": "deepseek-v4-flash"},
+        ):
+            public = db.query_events(hours=24, now=now, use_ai_impact=True)
+
+        self.assertEqual(public[0]["ai_status"], "ready")
+        self.assertEqual(public[0]["impact"], "high")
+        self.assertEqual(
+            public[0]["ai_enrichment"]["model"],
+            "deepseek-v4-pro",
+        )
 
     def test_ai_none_only_downgrades_confident_medium_rule_impact(self) -> None:
         now = datetime(2026, 8, 6, 5, 30, tzinfo=timezone.utc)
@@ -1099,15 +1391,22 @@ class DatabaseTests(unittest.TestCase):
                 row["title"]: row["id"]
                 for row in connection.execute("SELECT id, title FROM events")
             }
+        candidates_by_id = {
+            item["id"]: item
+            for item in db.query_enrichment_candidates(now=now)
+        }
 
         for title, _impact, confidence in cases:
             event_id = event_ids[title]
+            event_input, input_hash = llm_enrichment.build_event_input(
+                candidates_by_id[event_id]
+            )
             claim = {
                 "event_id": event_id,
-                "input_hash": str(event_id).zfill(64),
+                "input_hash": input_hash,
                 "prompt_version": llm_enrichment.PROMPT_VERSION,
                 "model": llm_enrichment.DEFAULT_MODEL,
-                "evidence_basis": "title_only",
+                "evidence_basis": event_input["evidence_basis"],
             }
             claim_token = db.claim_event_enrichment(**claim, now=now)
             self.assertIsInstance(claim_token, str)

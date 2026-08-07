@@ -50,7 +50,7 @@ trap cleanup_local EXIT INT TERM
 
 echo "→ 打包应用与采集器"
 mkdir -p "$WORK/pkg/lib"
-cp "$LOCAL_DIR"/{app.py,auth.py,db.py,decision_collect.py,decision_service.py,market_data.py,portfolio.py,relation_engine.py,macro_collect.py,llm_enrichment.py,enrichment_collect.py,collect.sh} "$WORK/pkg/"
+cp "$LOCAL_DIR"/{app.py,auth.py,content_quality.py,db.py,decision_collect.py,decision_service.py,market_data.py,portfolio.py,relation_engine.py,macro_collect.py,llm_enrichment.py,enrichment_collect.py,collect.sh} "$WORK/pkg/"
 cp -R "$LOCAL_DIR"/templates "$LOCAL_DIR"/static "$WORK/pkg/"
 cp "$LIB_DIR"/{kol_tracker.py,macro_fetcher.py,risk_radar.py} "$WORK/pkg/lib/"
 cp "$LIB_DIR/serenity_tracker.py" "$WORK/pkg/lib/"

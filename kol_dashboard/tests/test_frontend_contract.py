@@ -65,6 +65,16 @@ class FrontendContractTests(unittest.TestCase):
             "it.last_seen_at || it.fetched_at",
             self.javascript,
         )
+        self.assertIn("function fmtBeijingDateTime", self.javascript)
+        self.assertIn("function fmtRelativeTime", self.javascript)
+        self.assertIn('timeZone: "Asia/Shanghai"', self.javascript)
+        self.assertIn('second: "2-digit"', self.javascript)
+        self.assertIn("function publicationTimeView", self.javascript)
+        self.assertIn("const relative = fmtRelativeTime(iso);", self.javascript)
+        self.assertIn("（北京时间）", self.javascript)
+        self.assertIn('datetime="${esc(', self.javascript)
+        self.assertIn('aria-label="${esc(', self.javascript)
+        self.assertIn("white-space: nowrap", self.css)
 
     def test_macro_view_lists_monitored_events_with_time_provenance(self) -> None:
         self.assertIn('id="macro-events-block"', self.html)
@@ -98,8 +108,8 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn('stale ? "数据延迟" : ""', self.javascript)
         self.assertIn('"高收益债利差"', self.javascript)
         self.assertIn("cs.hy_oas", self.javascript)
-        self.assertIn('static/app.js?v=14', self.html)
-        self.assertIn('static/style.css?v=14', self.html)
+        self.assertIn('static/app.js?v=15', self.html)
+        self.assertIn('static/style.css?v=15', self.html)
         self.assertIn(".metric.is-stale", self.css)
 
     def test_macro_events_render_compact_ai_digest_and_bounded_highlights(self) -> None:

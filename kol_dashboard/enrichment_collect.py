@@ -65,6 +65,7 @@ def run(
             "ready": 0,
             "retry": 0,
             "failed": 0,
+            "skipped_noncontent": 0,
             "macro_processed": 0,
             "macro_ready": 0,
             "macro_retry": 0,
@@ -148,6 +149,9 @@ def run(
         for event in candidates:
             if counts["processed"] >= limit:
                 break
+            if not llm_enrichment.is_event_enrichment_eligible(event):
+                counts["skipped_noncontent"] += 1
+                continue
             event_input, input_hash = llm_enrichment.build_event_input(event)
             claim_token = db.claim_event_enrichment(
                 int(event["id"]),
@@ -209,6 +213,7 @@ def run(
         "ready": counts["ready"],
         "retry": counts["retry"],
         "failed": counts["failed"],
+        "skipped_noncontent": counts["skipped_noncontent"],
         "superseded": counts["superseded"],
         "macro_processed": counts["macro_processed"],
         "macro_ready": counts["macro_ready"],

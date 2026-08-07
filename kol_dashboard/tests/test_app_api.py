@@ -313,6 +313,104 @@ class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(invalid.status_code, 422)
 
+    async def test_noncontent_truth_repost_is_hidden_from_public_intelligence(self) -> None:
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        db.insert_events(
+            [
+                {
+                    "title": "RT https://truthsocial.com/@realDonaldTrump",
+                    "url": (
+                        "https://truthsocial.com/@realDonaldTrump/"
+                        "117051398671535118"
+                    ),
+                    "snippet": "RT https://truthsocial.com/@realDonaldTrump",
+                    "source": "Truth Social @realDonaldTrump",
+                    "kol_key": "trump",
+                    "kol_name": "Donald Trump",
+                    "kol_name_cn": "特朗普",
+                    "impact": "high",
+                    "has_market_kw": True,
+                    "published_at": (now - timedelta(hours=1)).isoformat(),
+                }
+            ]
+        )
+        with db.conn() as connection:
+            event_id = connection.execute("SELECT id FROM events").fetchone()["id"]
+
+        listing = await self.client.get("/api/events")
+        detail = await self.client.get(f"/api/events/{event_id}")
+
+        self.assertEqual(listing.status_code, 200)
+        self.assertEqual(listing.json(), {"items": [], "count": 0})
+        self.assertEqual(detail.status_code, 404)
+        self.assertEqual(detail.json()["detail"], "event_not_available")
+
+    async def test_kol_feed_filters_noncontent_sighting_before_pagination(self) -> None:
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        newest = (now - timedelta(minutes=5)).isoformat()
+        older = (now - timedelta(minutes=10)).isoformat()
+        db.insert_events(
+            [
+                {
+                    "title": "AI",
+                    "url": "https://example.com/brief-ai-item",
+                    "snippet": "AI",
+                    "source": "Bing News",
+                    "kol_key": "reporter",
+                    "published_at": newest,
+                },
+                {
+                    "title": "AI",
+                    "url": (
+                        "https://truthsocial.com/@realDonaldTrump/"
+                        "117051398671535118"
+                    ),
+                    "snippet": "RT https://truthsocial.com/@realDonaldTrump",
+                    "source": "Truth Social @realDonaldTrump",
+                    "kol_key": "trump",
+                    "published_at": newest,
+                },
+                {
+                    "title": "Tariff review enters final stage",
+                    "url": (
+                        "https://truthsocial.com/@realDonaldTrump/"
+                        "117051398671535119"
+                    ),
+                    "snippet": (
+                        "The semiconductor tariff review enters its final stage."
+                    ),
+                    "source": "Truth Social @realDonaldTrump",
+                    "kol_key": "trump",
+                    "published_at": older,
+                },
+            ]
+        )
+
+        response = await self.client.get(
+            "/api/events",
+            params={"kol": "trump", "limit": 1, "hours": 24},
+        )
+        with db.conn() as connection:
+            merged_event_id = connection.execute(
+                "SELECT id FROM events WHERE title='AI'"
+            ).fetchone()["id"]
+        detail = await self.client.get(
+            f"/api/events/{merged_event_id}",
+            params={"kol": "trump"},
+        )
+        kols = await self.client.get("/api/kols")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            [item["title"] for item in response.json()["items"]],
+            ["Tariff review enters final stage"],
+        )
+        self.assertEqual(detail.status_code, 404)
+        self.assertEqual(detail.json()["detail"], "event_not_available")
+        trump = next(item for item in kols.json() if item["kol_key"] == "trump")
+        self.assertEqual(trump["total"], 1)
+        self.assertEqual(trump["total_24h"], 1)
+
     async def test_event_list_and_integer_detail_expose_nested_enrichment(self) -> None:
         now = datetime.now(timezone.utc).replace(microsecond=0)
         event = {

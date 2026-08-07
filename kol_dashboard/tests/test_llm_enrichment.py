@@ -111,6 +111,62 @@ class EventInputTests(unittest.TestCase):
         self.assertEqual(payload["mentioned_tickers"], ["AMD", "NVDA"])
         self.assertEqual(base_hash, equivalent_hash)
 
+    def test_truth_repost_profile_shell_is_not_eligible_for_ai(self) -> None:
+        event = {
+            "title": "RT https://truthsocial.com/@realDonaldTrump",
+            "snippet": "RT https://truthsocial.com/@realDonaldTrump",
+            "source": "Truth Social @realDonaldTrump",
+            "url": "https://truthsocial.com/@realDonaldTrump/117051398671535118",
+        }
+
+        payload, _ = llm_enrichment.build_event_input(event)
+
+        self.assertFalse(llm_enrichment.is_event_enrichment_eligible(event))
+        self.assertEqual(
+            payload["evidence_basis"],
+            "noncontent_social_placeholder",
+        )
+
+    def test_truth_repost_with_real_words_remains_ai_eligible(self) -> None:
+        event = {
+            "title": "RT @realDonaldTrump Donald Trump Won The Iran War",
+            "snippet": (
+                "RT @realDonaldTrump Donald Trump Won The Iran War: "
+                "https://example.com/analysis"
+            ),
+            "source": "Truth Social @realDonaldTrump",
+            "url": "https://truthsocial.com/@realDonaldTrump/117051823334652132",
+        }
+
+        payload, _ = llm_enrichment.build_event_input(event)
+
+        self.assertTrue(llm_enrichment.is_event_enrichment_eligible(event))
+        self.assertEqual(payload["evidence_basis"], "post_text")
+
+    def test_truth_placeholder_rule_handles_bare_links_and_short_signals(self) -> None:
+        base = {
+            "source": "Truth Social @realDonaldTrump",
+            "url": "https://truthsocial.com/@realDonaldTrump/1",
+        }
+        cases = {
+            "RT truthsocial.com/@realDonaldTrump": False,
+            "RT //truthsocial.com/@realDonaldTrump": False,
+            "RT from @realDonaldTrump": False,
+            "RT @realDonaldTrump $F": True,
+            "RT @realDonaldTrump $DJT": True,
+            "RT @realDonaldTrump WAR": True,
+            "RT @realDonaldTrump 降息": True,
+        }
+
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(
+                    llm_enrichment.is_event_enrichment_eligible(
+                        {**base, "title": text, "snippet": text}
+                    ),
+                    expected,
+                )
+
 
 class MacroEventInputTests(unittest.TestCase):
     def test_policy_identity_is_stable_and_ignores_feed_tracking_noise(self) -> None:
@@ -473,6 +529,66 @@ class EnrichmentWorkerQuotaTests(unittest.TestCase):
         self.assertEqual(save_macro.call_count, 2)
         self.assertEqual(save_kol.call_count, 1)
         self.assertEqual(enrich.call_count, 3)
+
+    def test_noncontent_truth_placeholder_never_reaches_deepseek(self) -> None:
+        candidates = [
+            {
+                "id": 1,
+                "title": "RT https://truthsocial.com/@realDonaldTrump",
+                "snippet": "RT https://truthsocial.com/@realDonaldTrump",
+                "source": "Truth Social @realDonaldTrump",
+                "url": "https://truthsocial.com/@realDonaldTrump/1",
+            },
+            {
+                "id": 2,
+                "title": "Federal Reserve officials discuss inflation",
+                "snippet": "Officials said future decisions remain data dependent.",
+                "source": "Test News",
+                "url": "https://example.com/fed",
+            },
+        ]
+        config = llm_enrichment.DeepSeekConfig(api_key="test-secret")
+
+        with (
+            mock.patch.object(enrichment_collect.db, "init"),
+            mock.patch.object(
+                enrichment_collect.llm_enrichment,
+                "load_config",
+                return_value=config,
+            ),
+            mock.patch.object(enrichment_collect.db, "latest_macro", return_value={}),
+            mock.patch.object(
+                enrichment_collect.db,
+                "query_enrichment_candidates",
+                return_value=candidates,
+            ),
+            mock.patch.object(
+                enrichment_collect.db,
+                "claim_event_enrichment",
+                return_value="claim-token",
+            ) as claim,
+            mock.patch.object(
+                enrichment_collect.llm_enrichment,
+                "enrich_event",
+                return_value=valid_result(),
+            ) as enrich,
+            mock.patch.object(
+                enrichment_collect.db,
+                "save_event_enrichment",
+                return_value=True,
+            ),
+        ):
+            counts, stopped = enrichment_collect.run(
+                limit=1,
+                macro_limit=0,
+                max_age_hours=72,
+            )
+
+        self.assertFalse(stopped)
+        self.assertEqual(counts["skipped_noncontent"], 1)
+        self.assertEqual(counts["processed"], 1)
+        self.assertEqual(claim.call_args.args[0], 2)
+        self.assertEqual(enrich.call_count, 1)
 
     def test_warm_macro_cache_does_not_consume_the_processing_quota(self) -> None:
         warm = self._macro_event(1)

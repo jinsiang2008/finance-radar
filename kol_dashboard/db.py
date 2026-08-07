@@ -50,6 +50,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+try:
+    from kol_dashboard.content_quality import is_event_content_eligible
+except ModuleNotFoundError:  # Flat production bundle in /opt/kol-dashboard.
+    from content_quality import is_event_content_eligible
+
 _DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "data"
 DB_PATH = os.environ.get(
     "KOL_DASHBOARD_DB", str(_DEFAULT_DATA_DIR / "kol_dashboard.db")
@@ -64,10 +69,65 @@ _TRACKING_PARAMS = {
 }
 
 
+def _event_ai_cache_current_sql(
+    input_hash: Any,
+    prompt_version: Any,
+    model: Any,
+    title: Any,
+    snippet: Any,
+    source: Any,
+    kol_name_cn: Any,
+    kol_name: Any,
+    tickers: Any,
+    url: Any,
+) -> int:
+    try:
+        from kol_dashboard import llm_enrichment as enrichment_domain
+    except ModuleNotFoundError:  # Flat production bundle.
+        import llm_enrichment as enrichment_domain
+
+    _, current_hash = enrichment_domain.build_event_input(
+        {
+            "title": title,
+            "snippet": snippet,
+            "source": source,
+            "kol_name_cn": kol_name_cn,
+            "kol_name": kol_name,
+            "tickers": tickers,
+            "url": url,
+        }
+    )
+    return int(
+        str(input_hash or "") == current_hash
+        and str(prompt_version or "") == enrichment_domain.PROMPT_VERSION
+        and enrichment_domain.is_supported_model(model)
+    )
+
+
 @contextmanager
 def conn(*, immediate: bool = False):
     c = sqlite3.connect(DB_PATH, timeout=10)
     c.row_factory = sqlite3.Row
+    c.create_function(
+        "event_content_eligible",
+        4,
+        lambda title, snippet, source, url: int(
+            is_event_content_eligible(
+                {
+                    "title": title,
+                    "snippet": snippet,
+                    "source": source,
+                    "url": url,
+                }
+            )
+        ),
+        deterministic=True,
+    )
+    c.create_function(
+        "event_ai_cache_current",
+        10,
+        _event_ai_cache_current_sql,
+    )
     c.execute("PRAGMA foreign_keys=ON")
     c.execute("PRAGMA journal_mode=WAL")
     c.execute("PRAGMA synchronous=NORMAL")
@@ -1391,7 +1451,8 @@ def insert_events(items: Iterable[dict[str, Any]]) -> tuple[int, int]:
                 tickers_text = ",".join(str(t) for t in tickers) or None
 
             existing = c.execute(
-                "SELECT id, impact, title, published_at, "
+                "SELECT id, impact, title, snippet, source, url, canonical_url, "
+                "published_at, "
                 "published_at_status, published_at_epoch, fetched_at "
                 "FROM events WHERE dedup_key=?",
                 (key,),
@@ -1399,7 +1460,8 @@ def insert_events(items: Iterable[dict[str, Any]]) -> tuple[int, int]:
             if not existing and pkey:
                 # Same story, truncated differently by the aggregator.
                 for cand in c.execute(
-                    "SELECT id, impact, title, published_at, "
+                    "SELECT id, impact, title, snippet, source, url, canonical_url, "
+                    "published_at, "
                     "published_at_status, published_at_epoch, fetched_at "
                     "FROM events WHERE prefix_key=?",
                     (pkey,),
@@ -1410,7 +1472,8 @@ def insert_events(items: Iterable[dict[str, Any]]) -> tuple[int, int]:
 
             if not existing:
                 existing = c.execute(
-                    "SELECT id, impact, title, published_at, "
+                    "SELECT id, impact, title, snippet, source, url, canonical_url, "
+                    "published_at, "
                     "published_at_status, published_at_epoch, fetched_at "
                     "FROM events WHERE url_hash=?",
                     (digest,),
@@ -1423,11 +1486,47 @@ def insert_events(items: Iterable[dict[str, Any]]) -> tuple[int, int]:
                     if rank.get(new_impact, 0) > rank.get(existing_row["impact"], 0)
                     else existing_row["impact"]
                 )
-                fuller = (
-                    title
-                    if len(title) > len(existing_row["title"])
-                    else existing_row["title"]
+                incoming_snippet = str(it.get("snippet") or "").strip()
+                existing_snippet = str(existing_row["snippet"] or "").strip()
+                existing_eligible = is_event_content_eligible(
+                    {
+                        "title": existing_row["title"],
+                        "snippet": existing_snippet,
+                        "source": existing_row["source"],
+                        "canonical_url": existing_row["canonical_url"],
+                        "url": existing_row["url"],
+                    }
                 )
+                incoming_eligible = is_event_content_eligible(
+                    {
+                        "title": title,
+                        "snippet": incoming_snippet,
+                        "source": it.get("source"),
+                        "canonical_url": canon,
+                        "url": url,
+                    }
+                )
+                richer_recovery = incoming_eligible and not existing_eligible
+                richer_snippet = (
+                    incoming_eligible
+                    and len(incoming_snippet) >= len(existing_snippet) + 20
+                )
+                if existing_eligible and not incoming_eligible:
+                    fuller = existing_row["title"]
+                elif richer_recovery or len(title) > len(existing_row["title"]):
+                    fuller = title
+                else:
+                    fuller = existing_row["title"]
+                if richer_recovery:
+                    # A substantive title with no snippet must clear a stale
+                    # link-shell snippet so eligibility can recover on title.
+                    best_snippet = incoming_snippet
+                elif incoming_snippet and (
+                    not existing_snippet or richer_snippet
+                ):
+                    best_snippet = incoming_snippet
+                else:
+                    best_snippet = existing_snippet
                 candidate_publication = _publication_metadata(
                     it.get("published_at"),
                     observed_at=existing_row["fetched_at"],
@@ -1442,7 +1541,7 @@ def insert_events(items: Iterable[dict[str, Any]]) -> tuple[int, int]:
                 )
                 c.execute(
                     "UPDATE events SET last_seen_at=?, "
-                    "impact=?, title=?, dedup_key=?, prefix_key=?, "
+                    "impact=?, title=?, snippet=?, dedup_key=?, prefix_key=?, "
                     "has_market_kw=MAX(has_market_kw, ?), "
                     "tickers=COALESCE(tickers, ?), "
                     "published_at=?, published_at_status=?, "
@@ -1451,6 +1550,7 @@ def insert_events(items: Iterable[dict[str, Any]]) -> tuple[int, int]:
                         now,
                         best,
                         fuller,
+                        best_snippet,
                         dedup_key(fuller, url),
                         prefix_key(fuller),
                         1 if it.get("has_market_kw") else 0,
@@ -1506,7 +1606,8 @@ def insert_events(items: Iterable[dict[str, Any]]) -> tuple[int, int]:
                 )
             except sqlite3.IntegrityError:
                 existing = c.execute(
-                    "SELECT id, impact, title, published_at, "
+                    "SELECT id, impact, title, snippet, source, url, canonical_url, "
+                    "published_at, "
                     "published_at_status, published_at_epoch, fetched_at "
                     "FROM events "
                     "WHERE dedup_key=? OR url_hash=? ORDER BY id LIMIT 1",
@@ -1560,7 +1661,11 @@ def query_enrichment_candidates(
                    ai.attempt_count AS ai_attempt_count
             FROM events e
             LEFT JOIN event_enrichments ai ON ai.event_id=e.id
-            WHERE (
+            WHERE event_content_eligible(
+                    e.title, e.snippet, e.source,
+                    COALESCE(NULLIF(e.canonical_url,''), e.url)
+                  )=1
+              AND (
                 (e.published_at_status='verified' AND e.published_at_epoch >= ?)
                 OR (
                     e.published_at_status IN ('unknown', 'future')
@@ -2430,8 +2535,19 @@ def query_market_reactions(
     asset_key: str | None = None,
     window: str | None = None,
     limit: int = 500,
+    eligible_events_only: bool = False,
 ) -> list[dict[str, Any]]:
     where: list[str] = []
+    if eligible_events_only:
+        where.append(
+            "(LOWER(TRIM(mr.source_type))<>'event' OR EXISTS ("
+            "SELECT 1 FROM events e WHERE "
+            "(mr.source_id=CAST(e.id AS TEXT) OR mr.source_id=e.dedup_key) "
+            "AND event_content_eligible("
+            "e.title, e.snippet, e.source, "
+            "COALESCE(NULLIF(e.canonical_url,''), e.url)"
+            ")=1))"
+        )
     params: list[Any] = []
     for column, value in (
         ("source_type", source_type),
@@ -2440,19 +2556,19 @@ def query_market_reactions(
         ("window", window),
     ):
         if value is not None:
-            where.append(f"{column}=?")
+            where.append(f"mr.{column}=?")
             params.append(str(value))
     where_sql = " WHERE " + " AND ".join(where) if where else ""
     params.append(max(1, min(int(limit), 5000)))
     with conn() as c:
         rows = c.execute(
-            "SELECT source_type, source_id, asset_key, window, "
-            "benchmark_asset_key, asset_return, benchmark_return, "
-            "abnormal_return, expected_direction, observed_direction, "
-            "direction_confirmed, status, sample_count, "
-            "data_timestamps_json, method_version, observed_at "
-            f"FROM market_reactions{where_sql} "
-            "ORDER BY observed_at DESC, id DESC LIMIT ?",
+            "SELECT mr.source_type, mr.source_id, mr.asset_key, mr.window, "
+            "mr.benchmark_asset_key, mr.asset_return, mr.benchmark_return, "
+            "mr.abnormal_return, mr.expected_direction, mr.observed_direction, "
+            "mr.direction_confirmed, mr.status, mr.sample_count, "
+            "mr.data_timestamps_json, mr.method_version, mr.observed_at "
+            f"FROM market_reactions mr{where_sql} "
+            "ORDER BY mr.observed_at DESC, mr.id DESC LIMIT ?",
             params,
         ).fetchall()
     output: list[dict[str, Any]] = []
@@ -2754,8 +2870,19 @@ def query_relations(
     asset_key: str | None = None,
     relation_type: str | None = None,
     limit: int = 200,
+    eligible_events_only: bool = False,
 ) -> list[dict[str, Any]]:
     where: list[str] = []
+    if eligible_events_only:
+        where.append(
+            "(LOWER(TRIM(r.source_type))<>'event' OR EXISTS ("
+            "SELECT 1 FROM events e WHERE "
+            "(r.source_id=CAST(e.id AS TEXT) OR r.source_id=e.dedup_key) "
+            "AND event_content_eligible("
+            "e.title, e.snippet, e.source, "
+            "COALESCE(NULLIF(e.canonical_url,''), e.url)"
+            ")=1))"
+        )
     params: list[Any] = []
     for column, value in (
         ("source_type", source_type),
@@ -2765,16 +2892,17 @@ def query_relations(
         ("relation_type", relation_type),
     ):
         if value is not None:
-            where.append(f"{column}=?")
+            where.append(f"r.{column}=?")
             params.append(str(value))
     where_sql = " WHERE " + " AND ".join(where) if where else ""
     params.append(max(1, min(int(limit), 1000)))
     with conn() as c:
         rows = c.execute(
-            "SELECT source_type, source_id, topic_key, asset_key, relation_type, "
-            "direction, strength, confidence, horizon, method, rationale, "
-            f"evidence_json, created_at FROM relations{where_sql} "
-            "ORDER BY created_at DESC, id DESC LIMIT ?",
+            "SELECT r.source_type, r.source_id, r.topic_key, r.asset_key, "
+            "r.relation_type, r.direction, r.strength, r.confidence, "
+            "r.horizon, r.method, r.rationale, r.evidence_json, r.created_at "
+            f"FROM relations r{where_sql} "
+            "ORDER BY r.created_at DESC, r.id DESC LIMIT ?",
             params,
         ).fetchall()
     return [dict(row) for row in rows]
@@ -2824,6 +2952,10 @@ def query_decision_relations(
                OR (
                  LOWER(TRIM(r.source_type))='event'
                  AND e.id IS NOT NULL
+                 AND event_content_eligible(
+                   e.title, e.snippet, e.source,
+                   COALESCE(NULLIF(e.canonical_url,''), e.url)
+                 )=1
                  AND e.published_at_status='verified'
                  AND e.published_at_epoch BETWEEN ? AND ?
                )
@@ -2864,6 +2996,10 @@ def query_market_validation_relations(
                OR r.source_id=e.dedup_key
              )
             WHERE e.published_at_status='verified'
+              AND event_content_eligible(
+                e.title, e.snippet, e.source,
+                COALESCE(NULLIF(e.canonical_url,''), e.url)
+              )=1
               AND e.published_at_epoch BETWEEN ? AND ?
             ORDER BY r.created_at DESC, r.id DESC
             """,
@@ -2874,8 +3010,20 @@ def query_market_validation_relations(
 
 # ─── Reads ─────────────────────────────────────────────
 
+_CURRENT_EVENT_AI_SQL = (
+    "ai.status='ready' AND event_ai_cache_current("
+    "ai.input_hash, ai.prompt_version, ai.model, "
+    "e.title, e.snippet, e.source, e.kol_name_cn, e.kol_name, e.tickers, "
+    "COALESCE(NULLIF(e.canonical_url,''), e.url)"
+    ")=1"
+)
+
 _EVENT_AI_SELECT = (
-    "ai.status AS ai_status, ai.headline_zh AS ai_headline_zh, "
+    "ai.status AS ai_status, ai.input_hash AS ai_input_hash, "
+    "ai.prompt_version AS ai_prompt_version, "
+    f"CASE WHEN {_CURRENT_EVENT_AI_SQL} THEN 1 ELSE 0 END "
+    "AS ai_cache_current, "
+    "ai.headline_zh AS ai_headline_zh, "
     "ai.summary_zh AS ai_summary_zh, "
     "ai.why_it_matters_zh AS ai_why_it_matters_zh, "
     "ai.impact_level AS ai_impact_level, "
@@ -2894,12 +3042,12 @@ _EVENT_AI_SELECT = (
 _PUBLIC_IMPACT_SQL = (
     "CASE "
     "WHEN e.impact='high' THEN 'high' "
-    "WHEN ai.status='ready' AND ai.impact_level='high' "
+    f"WHEN {_CURRENT_EVENT_AI_SQL} AND ai.impact_level='high' "
     "AND ai.confidence>=0.65 THEN 'high' "
-    "WHEN e.impact='medium' AND ai.status='ready' "
+    f"WHEN e.impact='medium' AND {_CURRENT_EVENT_AI_SQL} "
     "AND ai.impact_level='none' AND ai.confidence>=0.65 THEN 'low' "
     "WHEN e.impact='medium' THEN 'medium' "
-    "WHEN ai.status='ready' AND ai.impact_level='medium' "
+    f"WHEN {_CURRENT_EVENT_AI_SQL} AND ai.impact_level='medium' "
     "AND ai.confidence>=0.65 THEN 'medium' "
     "ELSE 'low' END"
 )
@@ -2910,6 +3058,11 @@ def _event_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
         return None
     item = dict(row)
     status = str(item.pop("ai_status", "") or "")
+    cache_current = bool(item.pop("ai_cache_current", 0))
+    if status == "ready" and not cache_current:
+        status = "pending"
+        if "rule_impact" in item:
+            item["impact"] = item["rule_impact"]
     if status != "ready":
         item["ai_enrichment"] = None
         item["ai_status"] = status or "pending"
@@ -2942,6 +3095,8 @@ def _event_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
         "model": item.pop("ai_model", "") or "",
         "generated_at": item.pop("ai_generated_at", None),
     }
+    item.pop("ai_input_hash", None)
+    item.pop("ai_prompt_version", None)
     item["ai_status"] = "ready"
     item["ai_enrichment"] = enrichment
     return item
@@ -3013,6 +3168,17 @@ def query_events(
         )
         params.append(kol)
 
+    # Match the exact source/URL semantics returned to the caller. In a KOL
+    # view the source comes from the selected sighting, while the canonical URL
+    # and content still belong to the merged event. Keeping this predicate in
+    # SQL prevents an ineligible sighting from consuming a pagination slot.
+    eligibility_source_sql = "m.source" if kol else "e.source"
+    where.append(
+        "event_content_eligible(e.title, e.snippet, "
+        f"{eligibility_source_sql}, "
+        "COALESCE(NULLIF(e.canonical_url,''), e.url))=1"
+    )
+
     published_status_sql = (
         "m.published_at_status" if kol else "e.published_at_status"
     )
@@ -3042,9 +3208,10 @@ def query_events(
     if q:
         where.append(
             "(e.title LIKE ? OR IFNULL(e.snippet,'') LIKE ? "
-            "OR IFNULL(ai.headline_zh,'') LIKE ? "
+            f"OR (({_CURRENT_EVENT_AI_SQL}) AND ("
+            "IFNULL(ai.headline_zh,'') LIKE ? "
             "OR IFNULL(ai.summary_zh,'') LIKE ? "
-            "OR IFNULL(ai.tags_json,'') LIKE ?)"
+            "OR IFNULL(ai.tags_json,'') LIKE ?)))"
         )
         like = f"%{q}%"
         params.extend([like, like, like, like, like])
@@ -3115,14 +3282,19 @@ def get_event_detail(event_id: int) -> dict[str, Any] | None:
             related = [
                 dict(item)
                 for item in c.execute(
-                    """
+                    f"""
                     SELECT e.id, e.title, e.source, e.kol_name_cn,
                            e.canonical_url, e.url, e.published_at,
                            ai.headline_zh, ai.summary_zh
                     FROM event_enrichments ai
                     JOIN events e ON e.id=ai.event_id
-                    WHERE ai.status='ready' AND ai.cluster_key=? AND e.id<>?
+                    WHERE {_CURRENT_EVENT_AI_SQL}
+                      AND ai.cluster_key=? AND e.id<>?
                       AND e.published_at_status='verified'
+                      AND event_content_eligible(
+                        e.title, e.snippet, e.source,
+                        COALESCE(NULLIF(e.canonical_url,''), e.url)
+                      )=1
                     ORDER BY COALESCE(e.published_at_epoch,
                       CAST(strftime('%s', e.fetched_at) AS INTEGER)) DESC
                     LIMIT 12
@@ -3137,23 +3309,54 @@ def list_kols() -> list[dict[str, Any]]:
     """Per-KOL summary: distinct stories, last sighting, high/medium counts in 24h."""
     with conn() as c:
         rows = c.execute(
-            """
-            WITH per_event AS (
+            f"""
+            WITH ranked_sightings AS (
+              SELECT s.*,
+                     ROW_NUMBER() OVER (
+                       PARTITION BY s.event_id, s.kol_key
+                       ORDER BY
+                         CASE WHEN s.published_at_status='verified'
+                           THEN 0 ELSE 1 END,
+                         CASE WHEN s.published_at_status='verified'
+                           THEN s.published_at_epoch END DESC,
+                         CASE WHEN s.published_at_status<>'verified'
+                           THEN s.first_seen_at END DESC,
+                         s.last_seen_at DESC,
+                         s.id DESC
+                     ) AS source_rank,
+                     MAX(s.kol_name) OVER (
+                       PARTITION BY s.event_id, s.kol_key
+                     ) AS grouped_kol_name,
+                     MAX(s.kol_name_cn) OVER (
+                       PARTITION BY s.event_id, s.kol_key
+                     ) AS grouped_kol_name_cn,
+                     MAX(s.last_seen_at) OVER (
+                       PARTITION BY s.event_id, s.kol_key
+                     ) AS grouped_last_seen_at,
+                     MAX(
+                       CASE WHEN s.published_at_status='verified'
+                         THEN s.published_at END
+                     ) OVER (
+                       PARTITION BY s.event_id, s.kol_key
+                     ) AS grouped_published_at,
+                     MAX(
+                       CASE WHEN s.published_at_status='verified'
+                         THEN s.published_at_epoch END
+                     ) OVER (
+                       PARTITION BY s.event_id, s.kol_key
+                     ) AS grouped_published_at_epoch
+              FROM event_sightings s
+            ), per_event AS (
               SELECT event_id,
                      kol_key,
-                     MAX(kol_name) AS kol_name,
-                     MAX(kol_name_cn) AS kol_name_cn,
-                     MAX(last_seen_at) AS last_seen_at,
-                     MAX(
-                       CASE WHEN published_at_status='verified'
-                         THEN published_at END
-                     ) AS published_at,
-                     MAX(
-                       CASE WHEN published_at_status='verified'
-                         THEN published_at_epoch END
-                     ) AS published_at_epoch
-              FROM event_sightings
-              GROUP BY event_id, kol_key
+                     grouped_kol_name AS kol_name,
+                     grouped_kol_name_cn AS kol_name_cn,
+                     source,
+                     grouped_last_seen_at AS last_seen_at,
+                     grouped_published_at AS published_at,
+                     grouped_published_at_epoch AS published_at_epoch
+              FROM ranked_sightings
+              WHERE source_rank=1
             )
             SELECT p.kol_key,
                    MAX(p.kol_name) AS kol_name,
@@ -3162,12 +3365,22 @@ def list_kols() -> list[dict[str, Any]]:
                    MAX(e.id) AS last_id,
                    MAX(p.last_seen_at) AS last_fetched,
                    MAX(p.published_at) AS last_published,
-                   SUM(CASE WHEN e.impact='high' THEN 1 ELSE 0 END) AS high_total,
-                   SUM(CASE WHEN e.impact='medium' THEN 1 ELSE 0 END) AS medium_total,
-                   SUM(CASE WHEN e.impact='high' AND p.published_at_epoch >= CAST(strftime('%s','now','-24 hours') AS INTEGER) THEN 1 ELSE 0 END) AS high_24h,
+                   SUM(CASE WHEN {_PUBLIC_IMPACT_SQL}='high'
+                     THEN 1 ELSE 0 END) AS high_total,
+                   SUM(CASE WHEN {_PUBLIC_IMPACT_SQL}='medium'
+                     THEN 1 ELSE 0 END) AS medium_total,
+                   SUM(CASE WHEN {_PUBLIC_IMPACT_SQL}='high'
+                     AND p.published_at_epoch >= CAST(
+                       strftime('%s','now','-24 hours') AS INTEGER
+                     ) THEN 1 ELSE 0 END) AS high_24h,
                    SUM(CASE WHEN p.published_at_epoch >= CAST(strftime('%s','now','-24 hours') AS INTEGER) THEN 1 ELSE 0 END) AS total_24h
             FROM per_event p
             JOIN events e ON e.id=p.event_id
+            LEFT JOIN event_enrichments ai ON ai.event_id=e.id
+            WHERE event_content_eligible(
+              e.title, e.snippet, p.source,
+              COALESCE(NULLIF(e.canonical_url,''), e.url)
+            )=1
             GROUP BY p.kol_key
             ORDER BY total_24h DESC, total DESC
             """
@@ -3181,23 +3394,41 @@ def stats(hours: int = 24) -> dict[str, Any]:
         raise ValueError("hours must be non-negative")
     modifier = f"-{hours} hours"
     win = (
-        "AND published_at_status='verified' "
-        "AND published_at_epoch >= CAST(strftime('%s','now',?) AS INTEGER)"
+        "AND e.published_at_status='verified' "
+        "AND e.published_at_epoch >= CAST(strftime('%s','now',?) AS INTEGER)"
     )
     with conn() as c:
         def count(cond: str = "") -> int:
             return c.execute(
-                f"SELECT COUNT(*) n FROM events WHERE 1=1 {cond} {win}",
+                "SELECT COUNT(*) n FROM events e "
+                "LEFT JOIN event_enrichments ai ON ai.event_id=e.id "
+                "WHERE event_content_eligible("
+                "e.title, e.snippet, e.source, "
+                "COALESCE(NULLIF(e.canonical_url,''), e.url)"
+                ")=1 "
+                f"{cond} {win}",
                 (modifier,),
             ).fetchone()["n"]
 
         total = count()
-        high = count("AND impact='high'")
-        med = count("AND impact='medium'")
-        with_market = count("AND has_market_kw=1")
+        high = count(f"AND {_PUBLIC_IMPACT_SQL}='high'")
+        med = count(f"AND {_PUBLIC_IMPACT_SQL}='medium'")
+        with_market = count("AND e.has_market_kw=1")
         active_kols = c.execute(
-            "SELECT COUNT(DISTINCT s.kol_key) n FROM event_sightings s "
-            "WHERE s.published_at_status='verified' "
+            "WITH ranked_sightings AS ("
+            "SELECT s.*, ROW_NUMBER() OVER ("
+            "PARTITION BY s.event_id, s.kol_key "
+            "ORDER BY s.published_at_epoch DESC, s.last_seen_at DESC, s.id DESC"
+            ") AS source_rank FROM event_sightings s "
+            "WHERE s.published_at_status='verified'"
+            ") "
+            "SELECT COUNT(DISTINCT s.kol_key) n FROM ranked_sightings s "
+            "JOIN events e ON e.id=s.event_id "
+            "WHERE s.source_rank=1 "
+            "AND event_content_eligible("
+            "e.title, e.snippet, s.source, "
+            "COALESCE(NULLIF(e.canonical_url,''), e.url)"
+            ")=1 "
             "AND s.published_at_epoch >= "
             "CAST(strftime('%s','now',?) AS INTEGER)",
             (modifier,),

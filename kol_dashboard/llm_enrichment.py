@@ -18,12 +18,18 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
+try:
+    from kol_dashboard.content_quality import is_event_content_eligible
+except ModuleNotFoundError:  # Flat production bundle in /opt/kol-dashboard.
+    from content_quality import is_event_content_eligible
+
 
 PROMPT_VERSION = "event-intelligence-v1"
 MACRO_PROMPT_VERSION = "macro-monitor-intelligence-v2"
 SCHEMA_VERSION = 1
 DEFAULT_MODEL = "deepseek-v4-flash"
 DEEPSEEK_ENDPOINT = "https://api.deepseek.com/chat/completions"
+SUPPORTED_MODELS = frozenset({"deepseek-v4-flash", "deepseek-v4-pro"})
 
 _OFFICIAL_BODY_STATUSES = {"ready"}
 _MACRO_BODY_MAX_LENGTH = 4_000
@@ -66,13 +72,20 @@ class EnrichmentError(RuntimeError):
         self.retry_after_seconds = retry_after_seconds
 
 
+def configured_model() -> str:
+    model = os.environ.get("DEEPSEEK_MODEL", DEFAULT_MODEL).strip()
+    return model if model in SUPPORTED_MODELS else DEFAULT_MODEL
+
+
+def is_supported_model(value: Any) -> bool:
+    return str(value or "").strip() in SUPPORTED_MODELS
+
+
 def load_config() -> DeepSeekConfig | None:
     key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
     if not key:
         return None
-    model = os.environ.get("DEEPSEEK_MODEL", DEFAULT_MODEL).strip()
-    if model not in {"deepseek-v4-flash", "deepseek-v4-pro"}:
-        model = DEFAULT_MODEL
+    model = configured_model()
     try:
         timeout = float(os.environ.get("DEEPSEEK_TIMEOUT_SECONDS", "45"))
     except ValueError:
@@ -84,6 +97,11 @@ def load_config() -> DeepSeekConfig | None:
 def _clean_source_text(value: Any, maximum: int) -> str:
     text = re.sub(r"\s+", " ", str(value or "")).strip()
     return text[:maximum]
+
+
+def is_event_enrichment_eligible(event: Mapping[str, Any]) -> bool:
+    """Return false for known social placeholders with no textual evidence."""
+    return is_event_content_eligible(event)
 
 
 def _official_macro_article_identity(value: Any) -> tuple[str, str] | None:
@@ -121,13 +139,16 @@ def _official_macro_article_identity(value: Any) -> tuple[str, str] | None:
 def build_event_input(event: Mapping[str, Any]) -> tuple[dict[str, Any], str]:
     title = _clean_source_text(event.get("title"), 700)
     snippet = _clean_source_text(event.get("snippet"), 2_200)
-    title_stem = re.sub(r"[…\.]+$", "", title).strip().lower()
-    if snippet and title_stem and snippet.lower().startswith(title_stem):
-        evidence_basis = "post_text"
-    elif snippet:
-        evidence_basis = "title_and_snippet"
+    if not is_event_enrichment_eligible(event):
+        evidence_basis = "noncontent_social_placeholder"
     else:
-        evidence_basis = "title_only"
+        title_stem = re.sub(r"[…\.]+$", "", title).strip().lower()
+        if snippet and title_stem and snippet.lower().startswith(title_stem):
+            evidence_basis = "post_text"
+        elif snippet:
+            evidence_basis = "title_and_snippet"
+        else:
+            evidence_basis = "title_only"
     tickers = event.get("tickers") or ""
     if isinstance(tickers, str):
         raw_tickers = tickers.split(",")

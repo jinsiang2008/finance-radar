@@ -234,6 +234,11 @@ def api_events(
         offset=offset,
         use_ai_impact=True,
     )
+    items = [
+        item
+        for item in items
+        if llm_enrichment.is_event_enrichment_eligible(item)
+    ]
     for it in items:
         it["tickers"] = [t for t in (it.get("tickers") or "").split(",") if t]
     return {"items": items, "count": len(items)}
@@ -249,6 +254,8 @@ def api_event_detail(
     if detail is None:
         raise HTTPException(status_code=404, detail="event_not_found")
     event = detail["event"]
+    if not llm_enrichment.is_event_enrichment_eligible(event):
+        raise HTTPException(status_code=404, detail="event_not_available")
     event["tickers"] = [
         ticker for ticker in (event.get("tickers") or "").split(",") if ticker
     ]
@@ -282,6 +289,8 @@ def api_event_detail(
                 "source_count",
             ):
                 event[field] = selected_sighting.get(field)
+        if not llm_enrichment.is_event_enrichment_eligible(event):
+            raise HTTPException(status_code=404, detail="event_not_available")
     relations = decision_service.project_public_relations(
         db.query_relations(
             source_type="event",
@@ -381,7 +390,10 @@ def _build_public_decisions() -> dict[str, Any]:
     relations = db.query_decision_relations(
         event_max_age_hours=decision_service.EVENT_RELATION_MAX_AGE_HOURS
     )
-    reactions = db.query_market_reactions(limit=5_000)
+    reactions = db.query_market_reactions(
+        limit=5_000,
+        eligible_events_only=True,
+    )
     return decision_service.build_public_decisions(
         relations,
         reactions,
@@ -414,6 +426,7 @@ def api_relations(
             asset_key=asset_key,
             relation_type=relation_type,
             limit=limit,
+            eligible_events_only=True,
         )
     )
     return JSONResponse(
@@ -437,6 +450,7 @@ def api_market_reactions(
             asset_key=asset_key,
             window=window,
             limit=limit,
+            eligible_events_only=True,
         )
     )
     return JSONResponse(

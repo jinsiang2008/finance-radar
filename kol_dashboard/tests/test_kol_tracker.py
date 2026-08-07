@@ -84,6 +84,72 @@ class TruthSocialTests(unittest.TestCase):
             "media-only reposts carry no analysable text",
         )
 
+    def test_repost_profile_link_shell_is_not_treated_as_post_text(self) -> None:
+        feed = """<?xml version="1.0" encoding="UTF-8"?>
+        <rss version="2.0" xmlns:truth="https://truthsocial.com/ns"><channel>
+          <item>
+            <title><![CDATA[RT @realDonaldTrump]]></title>
+            <link>https://trumpstruth.org/statuses/40620</link>
+            <description><![CDATA[<p>RT <span>
+              <a href="https://truthsocial.com/@realDonaldTrump">
+                @realDonaldTrump
+              </a>
+            </span></p>]]></description>
+            <pubDate>Fri, 07 Aug 2026 00:30:01 +0000</pubDate>
+            <truth:originalUrl>https://truthsocial.com/@realDonaldTrump/117051398671535118</truth:originalUrl>
+          </item>
+        </channel></rss>"""
+
+        with mock.patch.object(kol_tracker, "http_get", return_value=feed):
+            items = kol_tracker.search_truth_social("realDonaldTrump")
+
+        self.assertEqual(items, [])
+
+    def test_repost_with_substantive_text_and_link_is_retained(self) -> None:
+        feed = """<?xml version="1.0" encoding="UTF-8"?>
+        <rss version="2.0" xmlns:truth="https://truthsocial.com/ns"><channel>
+          <item>
+            <title><![CDATA[RT @realDonaldTrump]]></title>
+            <link>https://trumpstruth.org/statuses/40623</link>
+            <description><![CDATA[<p>RT @realDonaldTrump Donald Trump Won The Iran War:
+              <a href="https://www.19fortyfive.com/analysis">
+                Read the analysis
+              </a></p>]]></description>
+            <pubDate>Fri, 07 Aug 2026 02:18:01 +0000</pubDate>
+            <truth:originalUrl>https://truthsocial.com/@realDonaldTrump/117051823334652132</truth:originalUrl>
+          </item>
+        </channel></rss>"""
+
+        with mock.patch.object(kol_tracker, "http_get", return_value=feed):
+            items = kol_tracker.search_truth_social("realDonaldTrump")
+
+        self.assertEqual(len(items), 1)
+        self.assertIn("Won The Iran War", items[0]["snippet"])
+        self.assertIn("@realDonaldTrump", items[0]["snippet"])
+        self.assertNotIn("truthsocial.com/@realDonaldTrump ", items[0]["snippet"])
+        self.assertEqual(items[0]["published_at"], "2026-08-07T02:18:01+00:00")
+
+    def test_short_but_substantive_truth_signals_are_retained(self) -> None:
+        for index, body in enumerate(("$DJT", "WAR", "降息"), start=1):
+            with self.subTest(body=body):
+                feed = f"""<?xml version="1.0" encoding="UTF-8"?>
+                <rss version="2.0" xmlns:truth="https://truthsocial.com/ns">
+                  <channel><item>
+                    <title>{body}</title>
+                    <link>https://trumpstruth.org/statuses/{index}</link>
+                    <description><![CDATA[<p>{body}</p>]]></description>
+                    <pubDate>Fri, 07 Aug 2026 02:18:01 +0000</pubDate>
+                    <truth:originalUrl>https://truthsocial.com/@realDonaldTrump/{index}</truth:originalUrl>
+                  </item></channel>
+                </rss>"""
+                with mock.patch.object(
+                    kol_tracker, "http_get", return_value=feed
+                ):
+                    items = kol_tracker.search_truth_social("realDonaldTrump")
+
+                self.assertEqual(len(items), 1)
+                self.assertEqual(items[0]["snippet"], body)
+
     def test_long_posts_are_truncated_into_a_title(self) -> None:
         with mock.patch.object(kol_tracker, "http_get", return_value=TRUTH_FEED):
             items = kol_tracker.search_truth_social("realDonaldTrump")
