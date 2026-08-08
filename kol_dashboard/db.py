@@ -25,6 +25,9 @@ Schema:
 
   macro_snapshots(id, created_at, composite_score, composite_level, payload)
 
+  decision_snapshots(id, schema_version, engine_version, source_hash,
+                     source_as_of, generated_at, summary_json, full_json)
+
   meta(key, value)  — small KV store for last-sent-id state etc.
 
 Dedup: news aggregators hand out a fresh tracking URL for the same article on
@@ -42,13 +45,12 @@ import os
 import re
 import secrets
 import sqlite3
-import time
 import unicodedata
 import urllib.parse
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 try:
     from kol_dashboard.content_quality import is_event_content_eligible
@@ -403,6 +405,28 @@ def _observed_at(value: Any) -> str:
     if parsed.tzinfo is None:
         raise ValueError("observed_at must include a timezone")
     return parsed.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _event_ai_input_signature(
+    title: Any,
+    snippet: Any,
+    tickers: Any,
+) -> tuple[str, str, tuple[str, ...]]:
+    """Mirror the bounded event fields sent to the LLM for cache invalidation."""
+    clean_title = re.sub(r"\s+", " ", str(title or "")).strip()[:700]
+    clean_snippet = re.sub(r"\s+", " ", str(snippet or "")).strip()[:2_200]
+    raw_tickers = tickers.split(",") if isinstance(tickers, str) else []
+    clean_tickers = tuple(
+        sorted(
+            {
+                re.sub(r"[^A-Z0-9.^_-]", "", item.strip().upper())[:20]
+                for item in raw_tickers
+                if item.strip()
+            }
+            - {""}
+        )[:12]
+    )
+    return clean_title, clean_snippet, clean_tickers
 
 
 _MAX_FUTURE_SKEW_SECONDS = 5 * 60
@@ -1063,6 +1087,61 @@ def init() -> None:
             "ON macro_event_enrichments(status, next_attempt_at, updated_at)"
         )
 
+        # Provider-call telemetry deliberately stores only counters and
+        # bounded categories.  Prompts, responses, credentials, claim tokens
+        # and account data never enter this ledger.
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS llm_call_attempts (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              provider TEXT NOT NULL CHECK(provider='deepseek'),
+              subject_type TEXT NOT NULL
+                CHECK(subject_type IN ('event', 'macro_event')),
+              subject_key TEXT NOT NULL,
+              input_hash TEXT NOT NULL,
+              prompt_version TEXT NOT NULL,
+              model TEXT NOT NULL,
+              attempt_count INTEGER NOT NULL CHECK(attempt_count > 0),
+              outcome TEXT NOT NULL
+                CHECK(outcome IN (
+                  'started', 'ready', 'retry', 'failed',
+                  'superseded', 'cancelled', 'abandoned'
+                )),
+              error_code TEXT NOT NULL DEFAULT '',
+              http_status INTEGER
+                CHECK(http_status IS NULL OR http_status BETWEEN 100 AND 599),
+              started_at TEXT NOT NULL,
+              completed_at TEXT,
+              latency_ms INTEGER
+                CHECK(latency_ms IS NULL OR latency_ms BETWEEN 0 AND 3600000),
+              prompt_tokens INTEGER
+                CHECK(prompt_tokens IS NULL OR prompt_tokens BETWEEN 0 AND 2000000),
+              prompt_cache_hit_tokens INTEGER
+                CHECK(prompt_cache_hit_tokens IS NULL OR prompt_cache_hit_tokens BETWEEN 0 AND 2000000),
+              prompt_cache_miss_tokens INTEGER
+                CHECK(prompt_cache_miss_tokens IS NULL OR prompt_cache_miss_tokens BETWEEN 0 AND 2000000),
+              completion_tokens INTEGER
+                CHECK(completion_tokens IS NULL OR completion_tokens BETWEEN 0 AND 1000000),
+              reasoning_tokens INTEGER
+                CHECK(reasoning_tokens IS NULL OR reasoning_tokens BETWEEN 0 AND 1000000),
+              total_tokens INTEGER
+                CHECK(total_tokens IS NULL OR total_tokens BETWEEN 0 AND 3000000)
+            )
+            """
+        )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_llm_calls_time "
+            "ON llm_call_attempts(started_at DESC)"
+        )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_llm_calls_subject "
+            "ON llm_call_attempts(subject_type, subject_key, started_at DESC)"
+        )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_llm_calls_model_outcome "
+            "ON llm_call_attempts(model, outcome, started_at DESC)"
+        )
+
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS relations (
@@ -1225,6 +1304,29 @@ def init() -> None:
         )
         c.execute(
             "CREATE INDEX IF NOT EXISTS idx_macro_created ON macro_snapshots(created_at DESC)"
+        )
+
+        # Public decision output is expensive to aggregate but contains no
+        # account data.  Persist last-good, versioned snapshots so public and
+        # private requests can share the same evidence baseline without
+        # recomputing the entire graph on every page view.
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS decision_snapshots (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              schema_version INTEGER NOT NULL,
+              engine_version TEXT NOT NULL,
+              source_hash TEXT NOT NULL,
+              source_as_of TEXT,
+              generated_at TEXT NOT NULL,
+              summary_json TEXT NOT NULL,
+              full_json TEXT NOT NULL
+            )
+            """
+        )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_decision_snapshot_current "
+            "ON decision_snapshots(schema_version, engine_version, id DESC)"
         )
 
         c.execute(
@@ -1452,6 +1554,7 @@ def insert_events(items: Iterable[dict[str, Any]]) -> tuple[int, int]:
 
             existing = c.execute(
                 "SELECT id, impact, title, snippet, source, url, canonical_url, "
+                "tickers, "
                 "published_at, "
                 "published_at_status, published_at_epoch, fetched_at "
                 "FROM events WHERE dedup_key=?",
@@ -1461,6 +1564,7 @@ def insert_events(items: Iterable[dict[str, Any]]) -> tuple[int, int]:
                 # Same story, truncated differently by the aggregator.
                 for cand in c.execute(
                     "SELECT id, impact, title, snippet, source, url, canonical_url, "
+                    "tickers, "
                     "published_at, "
                     "published_at_status, published_at_epoch, fetched_at "
                     "FROM events WHERE prefix_key=?",
@@ -1473,6 +1577,7 @@ def insert_events(items: Iterable[dict[str, Any]]) -> tuple[int, int]:
             if not existing:
                 existing = c.execute(
                     "SELECT id, impact, title, snippet, source, url, canonical_url, "
+                    "tickers, "
                     "published_at, "
                     "published_at_status, published_at_epoch, fetched_at "
                     "FROM events WHERE url_hash=?",
@@ -1527,6 +1632,24 @@ def insert_events(items: Iterable[dict[str, Any]]) -> tuple[int, int]:
                     best_snippet = incoming_snippet
                 else:
                     best_snippet = existing_snippet
+                existing_tickers = existing_row["tickers"]
+                next_tickers = (
+                    existing_tickers
+                    if existing_tickers is not None
+                    else tickers_text
+                )
+                ai_input_changed = (
+                    _event_ai_input_signature(
+                        fuller,
+                        best_snippet,
+                        next_tickers,
+                    )
+                    != _event_ai_input_signature(
+                        existing_row["title"],
+                        existing_row["snippet"],
+                        existing_tickers,
+                    )
+                )
                 candidate_publication = _publication_metadata(
                     it.get("published_at"),
                     observed_at=existing_row["fetched_at"],
@@ -1559,6 +1682,20 @@ def insert_events(items: Iterable[dict[str, Any]]) -> tuple[int, int]:
                         existing_row["id"],
                     ),
                 )
+                if ai_input_changed:
+                    # Revoke any live worker lease in the same transaction as
+                    # the canonical input update.  The old hash remains as a
+                    # fail-closed marker until the next worker claims the new
+                    # input; generated output is never served while pending.
+                    c.execute(
+                        """
+                        UPDATE event_enrichments
+                        SET status='pending', updated_at=?, next_attempt_at=NULL,
+                            error_code='', claim_token=''
+                        WHERE event_id=?
+                        """,
+                        (now, existing_row["id"]),
+                    )
                 _upsert_sighting(
                     c,
                     existing_row["id"],
@@ -1607,6 +1744,7 @@ def insert_events(items: Iterable[dict[str, Any]]) -> tuple[int, int]:
             except sqlite3.IntegrityError:
                 existing = c.execute(
                     "SELECT id, impact, title, snippet, source, url, canonical_url, "
+                    "tickers, "
                     "published_at, "
                     "published_at_status, published_at_epoch, fetched_at "
                     "FROM events "
@@ -1673,6 +1811,7 @@ def query_enrichment_candidates(
                 )
             ) AND (
                 ai.event_id IS NULL
+                OR ai.status='pending'
                 OR ai.status='ready'
                 OR (
                     ai.status='retry'
@@ -1686,7 +1825,7 @@ def query_enrichment_candidates(
             )
             ORDER BY
               CASE
-                WHEN ai.event_id IS NULL THEN 0
+                WHEN ai.event_id IS NULL OR ai.status='pending' THEN 0
                 WHEN ai.status IN ('retry', 'processing') THEN 1
                 WHEN ai.status='ready' THEN 2
                 ELSE 3
@@ -3460,6 +3599,139 @@ def latest_macro() -> dict[str, Any] | None:
     return payload
 
 
+def save_decision_snapshot(
+    *,
+    schema_version: int,
+    engine_version: str,
+    source_hash: str,
+    source_as_of: str | None,
+    generated_at: str,
+    summary: dict[str, Any],
+    full: dict[str, Any],
+    keep: int = 48,
+) -> int:
+    """Atomically save a public decision snapshot and prune old versions."""
+    schema = _bounded_integer(
+        schema_version,
+        "schema_version",
+        maximum=1_000_000,
+    )
+    engine = _required_text(engine_version, "engine_version", maximum=80)
+    digest = _required_text(source_hash, "source_hash", maximum=128)
+    created = _observed_at(generated_at)
+    source_time = (
+        _observed_at(source_as_of) if source_as_of is not None else None
+    )
+    if not isinstance(summary, dict) or not isinstance(full, dict):
+        raise ValueError("decision snapshot payloads must be objects")
+    summary_json = json.dumps(
+        summary,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    full_json = json.dumps(
+        full,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    retain = max(2, min(int(keep), 720))
+    with conn(immediate=True) as c:
+        cur = c.execute(
+            """
+            INSERT INTO decision_snapshots (
+              schema_version, engine_version, source_hash, source_as_of,
+              generated_at, summary_json, full_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                schema,
+                engine,
+                digest,
+                source_time,
+                created,
+                summary_json,
+                full_json,
+            ),
+        )
+        snapshot_id = cur.lastrowid
+        if snapshot_id is None:
+            raise sqlite3.IntegrityError("decision snapshot insert returned no id")
+        c.execute(
+            """
+            DELETE FROM decision_snapshots
+            WHERE id IN (
+              SELECT id FROM decision_snapshots
+              ORDER BY id DESC LIMIT -1 OFFSET ?
+            )
+            """,
+            (retain,),
+        )
+    return int(snapshot_id)
+
+
+def _decision_snapshot_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    try:
+        summary = json.loads(row["summary_json"])
+        full = json.loads(row["full_json"])
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(summary, dict) or not isinstance(full, dict):
+        return None
+    return {
+        "snapshot_id": int(row["id"]),
+        "schema_version": int(row["schema_version"]),
+        "engine_version": row["engine_version"],
+        "source_hash": row["source_hash"],
+        "source_as_of": row["source_as_of"],
+        "generated_at": row["generated_at"],
+        "summary": summary,
+        "full": full,
+    }
+
+
+def latest_decision_snapshot(
+    *,
+    schema_version: int,
+    engine_version: str,
+) -> dict[str, Any] | None:
+    with conn() as c:
+        row = c.execute(
+            """
+            SELECT id, schema_version, engine_version, source_hash,
+                   source_as_of, generated_at, summary_json, full_json
+            FROM decision_snapshots
+            WHERE schema_version=? AND engine_version=?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (int(schema_version), str(engine_version)),
+        ).fetchone()
+    return _decision_snapshot_row(row)
+
+
+def get_decision_snapshot(
+    snapshot_id: int,
+    *,
+    schema_version: int,
+    engine_version: str,
+) -> dict[str, Any] | None:
+    with conn() as c:
+        row = c.execute(
+            """
+            SELECT id, schema_version, engine_version, source_hash,
+                   source_as_of, generated_at, summary_json, full_json
+            FROM decision_snapshots
+            WHERE id=? AND schema_version=? AND engine_version=?
+            LIMIT 1
+            """,
+            (int(snapshot_id), int(schema_version), str(engine_version)),
+        ).fetchone()
+    return _decision_snapshot_row(row)
+
+
 def macro_history(limit: int = 60) -> list[dict[str, Any]]:
     with conn() as c:
         rows = c.execute(
@@ -3485,6 +3757,194 @@ def set_meta(key: str, value: str) -> None:
         )
 
 
+_LLM_OUTCOMES = {
+    "started",
+    "ready",
+    "retry",
+    "failed",
+    "superseded",
+    "cancelled",
+    "abandoned",
+}
+
+
+def _telemetry_integer(value: Any, maximum: int) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if 0 <= value <= maximum else None
+
+
+def begin_llm_call(
+    *,
+    subject_type: str,
+    subject_key: str,
+    input_hash: str,
+    prompt_version: str,
+    model: str,
+    attempt_count: int = 1,
+    started_at: str | None = None,
+) -> int:
+    kind = str(subject_type or "").strip()
+    if kind not in {"event", "macro_event"}:
+        raise ValueError("unsupported llm subject_type")
+    key = _required_text(subject_key, "subject_key", maximum=160)
+    digest = _required_text(input_hash, "input_hash", maximum=128)
+    prompt = _required_text(prompt_version, "prompt_version", maximum=100)
+    clean_model = _required_text(model, "model", maximum=100)
+    attempt = _bounded_integer(
+        attempt_count,
+        "attempt_count",
+        minimum=1,
+        maximum=1_000_000,
+    )
+    started = _observed_at(started_at)
+    with conn(immediate=True) as c:
+        cur = c.execute(
+            """
+            INSERT INTO llm_call_attempts (
+              provider, subject_type, subject_key, input_hash,
+              prompt_version, model, attempt_count, outcome, started_at
+            ) VALUES ('deepseek', ?, ?, ?, ?, ?, ?, 'started', ?)
+            """,
+            (kind, key, digest, prompt, clean_model, attempt, started),
+        )
+        call_id = cur.lastrowid
+    if call_id is None:
+        raise sqlite3.IntegrityError("llm telemetry insert returned no id")
+    return int(call_id)
+
+
+def finish_llm_call(
+    call_id: int,
+    *,
+    outcome: str,
+    latency_ms: int | None,
+    usage: Any = None,
+    error_code: str = "",
+    http_status: int | None = None,
+    completed_at: str | None = None,
+) -> bool:
+    clean_outcome = str(outcome or "").strip().lower()
+    if clean_outcome not in _LLM_OUTCOMES - {"started"}:
+        raise ValueError("unsupported llm outcome")
+    values = usage.as_dict() if hasattr(usage, "as_dict") else usage
+    values = values if isinstance(values, Mapping) else {}
+    prompt_tokens = _telemetry_integer(values.get("prompt_tokens"), 2_000_000)
+    cache_hit = _telemetry_integer(
+        values.get("prompt_cache_hit_tokens"), 2_000_000
+    )
+    cache_miss = _telemetry_integer(
+        values.get("prompt_cache_miss_tokens"), 2_000_000
+    )
+    if (
+        prompt_tokens is not None
+        and cache_hit is not None
+        and cache_miss is not None
+        and cache_hit + cache_miss > prompt_tokens
+    ):
+        cache_hit = None
+        cache_miss = None
+    safe_latency = _telemetry_integer(latency_ms, 3_600_000)
+    safe_status = _telemetry_integer(http_status, 599)
+    if safe_status is not None and safe_status < 100:
+        safe_status = None
+    safe_error = re.sub(r"[^a-z0-9_:-]", "", str(error_code).lower())[:48]
+    completed = _observed_at(completed_at)
+    with conn(immediate=True) as c:
+        cur = c.execute(
+            """
+            UPDATE llm_call_attempts
+            SET outcome=?, error_code=?, http_status=?, completed_at=?,
+                latency_ms=?, prompt_tokens=?, prompt_cache_hit_tokens=?,
+                prompt_cache_miss_tokens=?, completion_tokens=?,
+                reasoning_tokens=?, total_tokens=?
+            WHERE id=? AND outcome='started'
+            """,
+            (
+                clean_outcome,
+                safe_error,
+                safe_status,
+                completed,
+                safe_latency,
+                prompt_tokens,
+                cache_hit,
+                cache_miss,
+                _telemetry_integer(values.get("completion_tokens"), 1_000_000),
+                _telemetry_integer(values.get("reasoning_tokens"), 1_000_000),
+                _telemetry_integer(values.get("total_tokens"), 3_000_000),
+                int(call_id),
+            ),
+        )
+    return cur.rowcount == 1
+
+
+def abandon_stale_llm_calls(
+    *,
+    older_than_seconds: int = 20 * 60,
+    now: datetime | None = None,
+) -> int:
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    cutoff = (
+        current - timedelta(seconds=max(60, int(older_than_seconds)))
+    ).replace(microsecond=0).isoformat()
+    with conn(immediate=True) as c:
+        cur = c.execute(
+            """
+            UPDATE llm_call_attempts
+            SET outcome='abandoned', error_code='worker_lease_expired',
+                completed_at=?
+            WHERE outcome='started' AND started_at<=?
+            """,
+            (current.replace(microsecond=0).isoformat(), cutoff),
+        )
+    return cur.rowcount
+
+
+def query_llm_usage_summary(
+    *,
+    hours: int = 24,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    window = max(1, min(int(hours), 24 * 365))
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None or current.utcoffset() is None:
+        raise ValueError("now must include a timezone")
+    cutoff_epoch = int(current.astimezone(timezone.utc).timestamp()) - window * 3600
+    with conn() as c:
+        row = c.execute(
+            """
+            SELECT COUNT(*) AS calls,
+                   SUM(CASE WHEN outcome='ready' THEN 1 ELSE 0 END) AS ready,
+                   SUM(COALESCE(prompt_tokens, 0)) AS prompt_tokens,
+                   SUM(COALESCE(prompt_cache_hit_tokens, 0)) AS cache_hit_tokens,
+                   SUM(COALESCE(prompt_cache_miss_tokens, 0)) AS cache_miss_tokens,
+                   SUM(COALESCE(completion_tokens, 0)) AS completion_tokens,
+                   SUM(COALESCE(total_tokens, 0)) AS total_tokens,
+                   AVG(latency_ms) AS average_latency_ms
+            FROM llm_call_attempts
+            WHERE CAST(strftime('%s', started_at) AS INTEGER) >= ?
+            """,
+            (cutoff_epoch,),
+        ).fetchone()
+    return {
+        "hours": window,
+        "calls": int(row["calls"] or 0),
+        "ready": int(row["ready"] or 0),
+        "prompt_tokens": int(row["prompt_tokens"] or 0),
+        "cache_hit_tokens": int(row["cache_hit_tokens"] or 0),
+        "cache_miss_tokens": int(row["cache_miss_tokens"] or 0),
+        "completion_tokens": int(row["completion_tokens"] or 0),
+        "total_tokens": int(row["total_tokens"] or 0),
+        "average_latency_ms": (
+            round(float(row["average_latency_ms"]), 1)
+            if row["average_latency_ms"] is not None
+            else None
+        ),
+    }
+
+
 def prune_old() -> int:
     with conn() as c:
         cur = c.execute(
@@ -3494,6 +3954,11 @@ def prune_old() -> int:
         c.execute(
             "DELETE FROM macro_snapshots WHERE strftime('%s', substr(created_at,1,19)) < "
             "strftime('%s','now','-90 days')"
+        )
+        c.execute(
+            "DELETE FROM llm_call_attempts "
+            "WHERE CAST(strftime('%s', started_at) AS INTEGER) < "
+            "CAST(strftime('%s','now','-90 days') AS INTEGER)"
         )
     return cur.rowcount
 

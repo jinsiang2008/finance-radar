@@ -1145,6 +1145,35 @@ class PrivateOverlayTests(unittest.TestCase):
 
         self.assertTrue(private["decisions"][0]["stale"])
 
+    def test_decision_summary_is_small_allowlist_and_detail_is_exact(self) -> None:
+        public = decision_service.build_public_decisions(
+            [_relation("summary-event", "positive")],
+            [],
+            1.0,
+            now=TEST_NOW,
+        )
+
+        summary = decision_service.project_decision_summary(public)
+        card = summary["decisions"][0]
+
+        self.assertTrue(summary["summary"])
+        self.assertEqual(summary["total_decisions"], 1)
+        self.assertTrue(card["detail_available"])
+        self.assertNotIn("evidence", card)
+        self.assertNotIn("mechanism_relations", card)
+        self.assertNotIn("contrary_evidence", card)
+        self.assertNotIn("records", card["market_validation"])
+        detail = decision_service.find_decision(
+            public,
+            card["topic_key"],
+            card["asset_key"],
+        )
+        self.assertIsNotNone(detail)
+        self.assertIn("evidence", detail)
+        self.assertIsNone(
+            decision_service.find_decision(public, "missing", card["asset_key"])
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

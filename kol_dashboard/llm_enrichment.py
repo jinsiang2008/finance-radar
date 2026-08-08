@@ -60,16 +60,47 @@ class DeepSeekConfig:
     max_output_tokens: int = 1_400
 
 
+@dataclass(frozen=True)
+class ProviderUsage:
+    prompt_tokens: int | None = None
+    prompt_cache_hit_tokens: int | None = None
+    prompt_cache_miss_tokens: int | None = None
+    completion_tokens: int | None = None
+    reasoning_tokens: int | None = None
+    total_tokens: int | None = None
+
+    def as_dict(self) -> dict[str, int | None]:
+        return {
+            "prompt_tokens": self.prompt_tokens,
+            "prompt_cache_hit_tokens": self.prompt_cache_hit_tokens,
+            "prompt_cache_miss_tokens": self.prompt_cache_miss_tokens,
+            "completion_tokens": self.completion_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
+            "total_tokens": self.total_tokens,
+        }
+
+
+@dataclass(frozen=True)
+class EnrichmentResponse:
+    result: dict[str, Any]
+    usage: ProviderUsage
+    http_status: int = 200
+
+
 class EnrichmentError(RuntimeError):
     def __init__(
         self,
         code: str,
         *,
         retry_after_seconds: int | None,
+        usage: ProviderUsage | None = None,
+        http_status: int | None = None,
     ) -> None:
         super().__init__(code)
         self.code = code
         self.retry_after_seconds = retry_after_seconds
+        self.usage = usage
+        self.http_status = http_status
 
 
 def configured_model() -> str:
@@ -512,16 +543,57 @@ def validate_result(raw: Any, *, input_hash: str) -> dict[str, Any]:
 
 def _response_error(status_code: int) -> EnrichmentError:
     if status_code in {401, 403}:
-        return EnrichmentError("authentication", retry_after_seconds=60 * 60)
+        return EnrichmentError(
+            "authentication", retry_after_seconds=60 * 60, http_status=status_code
+        )
     if status_code == 402:
-        return EnrichmentError("balance", retry_after_seconds=6 * 3600)
+        return EnrichmentError(
+            "balance", retry_after_seconds=6 * 3600, http_status=status_code
+        )
     if status_code == 429:
-        return EnrichmentError("rate_limit", retry_after_seconds=15 * 60)
+        return EnrichmentError(
+            "rate_limit", retry_after_seconds=15 * 60, http_status=status_code
+        )
     if status_code in {500, 502, 503, 504}:
-        return EnrichmentError("provider_unavailable", retry_after_seconds=20 * 60)
+        return EnrichmentError(
+            "provider_unavailable",
+            retry_after_seconds=20 * 60,
+            http_status=status_code,
+        )
     if status_code in {400, 404, 422}:
-        return EnrichmentError("invalid_request", retry_after_seconds=6 * 3600)
-    return EnrichmentError("provider_error", retry_after_seconds=30 * 60)
+        return EnrichmentError(
+            "invalid_request",
+            retry_after_seconds=6 * 3600,
+            http_status=status_code,
+        )
+    return EnrichmentError(
+        "provider_error", retry_after_seconds=30 * 60, http_status=status_code
+    )
+
+
+def _usage_integer(value: Any, maximum: int) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if 0 <= value <= maximum else None
+
+
+def parse_provider_usage(value: Any) -> ProviderUsage:
+    if not isinstance(value, Mapping):
+        return ProviderUsage()
+    prompt = _usage_integer(value.get("prompt_tokens"), 2_000_000)
+    hit = _usage_integer(value.get("prompt_cache_hit_tokens"), 2_000_000)
+    miss = _usage_integer(value.get("prompt_cache_miss_tokens"), 2_000_000)
+    if prompt is not None and hit is not None and miss is not None and hit + miss > prompt:
+        hit = None
+        miss = None
+    return ProviderUsage(
+        prompt_tokens=prompt,
+        prompt_cache_hit_tokens=hit,
+        prompt_cache_miss_tokens=miss,
+        completion_tokens=_usage_integer(value.get("completion_tokens"), 1_000_000),
+        reasoning_tokens=_usage_integer(value.get("reasoning_tokens"), 1_000_000),
+        total_tokens=_usage_integer(value.get("total_tokens"), 3_000_000),
+    )
 
 
 Transport = Callable[[bytes, Mapping[str, str], float], tuple[int, bytes]]
@@ -560,13 +632,13 @@ def _default_transport(
         raise EnrichmentError("network", retry_after_seconds=10 * 60) from None
 
 
-def enrich_event(
+def enrich_event_with_usage(
     event_input: Mapping[str, Any],
     *,
     input_hash: str,
     config: DeepSeekConfig,
     transport: Transport | None = None,
-) -> dict[str, Any]:
+) -> EnrichmentResponse:
     encoded = json.dumps(
         _request_payload(config, event_input),
         ensure_ascii=False,
@@ -584,19 +656,64 @@ def enrich_event(
     )
     if status_code != 200:
         raise _response_error(status_code)
+    usage = ProviderUsage()
     try:
         envelope = json.loads(body)
+        usage = parse_provider_usage(envelope.get("usage"))
         if envelope["choices"][0].get("finish_reason") != "stop":
-            raise EnrichmentError("invalid_output", retry_after_seconds=15 * 60)
+            raise EnrichmentError(
+                "invalid_output",
+                retry_after_seconds=15 * 60,
+                usage=usage,
+                http_status=200,
+            )
         content = envelope["choices"][0]["message"]["content"]
         decoded = json.loads(content)
     except EnrichmentError:
         raise
-    except (KeyError, IndexError, TypeError, json.JSONDecodeError, ValueError):
-        raise EnrichmentError("invalid_output", retry_after_seconds=15 * 60) from None
-    result = validate_result(decoded, input_hash=input_hash)
+    except (
+        AttributeError,
+        KeyError,
+        IndexError,
+        TypeError,
+        json.JSONDecodeError,
+        ValueError,
+    ):
+        raise EnrichmentError(
+            "invalid_output",
+            retry_after_seconds=15 * 60,
+            usage=usage,
+            http_status=200,
+        ) from None
+    try:
+        result = validate_result(decoded, input_hash=input_hash)
+    except EnrichmentError as exc:
+        raise EnrichmentError(
+            exc.code,
+            retry_after_seconds=exc.retry_after_seconds,
+            usage=usage,
+            http_status=200,
+        ) from None
     if str(event_input.get("evidence_basis") or "") == "title_only":
         result["confidence"] = min(0.55, result["confidence"])
         for asset in result["assets"]:
             asset["confidence"] = min(0.6, asset["confidence"])
-    return result
+    return EnrichmentResponse(result=result, usage=usage, http_status=200)
+
+
+def enrich_event(
+    event_input: Mapping[str, Any],
+    *,
+    input_hash: str,
+    config: DeepSeekConfig,
+    transport: Transport | None = None,
+    return_response: bool = False,
+) -> dict[str, Any] | EnrichmentResponse:
+    """Backward-compatible result-only wrapper for callers and tests."""
+    response = enrich_event_with_usage(
+        event_input,
+        input_hash=input_hash,
+        config=config,
+        transport=transport,
+    )
+    return response if return_response else response.result

@@ -97,6 +97,170 @@ class DatabaseTests(unittest.TestCase):
         self.assertIn("claim_token", columns)
         self.assertEqual(foreign_keys, [])
 
+    def test_llm_call_attempt_lifecycle_is_bounded_and_idempotent(self) -> None:
+        call_id = db.begin_llm_call(
+            subject_type="event",
+            subject_key="42",
+            input_hash="a" * 64,
+            prompt_version="event-intelligence-v1",
+            model="deepseek-v4-flash",
+            attempt_count=2,
+            started_at="2026-08-08T18:00:00+08:00",
+        )
+
+        self.assertTrue(
+            db.finish_llm_call(
+                call_id,
+                outcome="ready",
+                latency_ms=321,
+                http_status=200,
+                usage={
+                    "prompt_tokens": 100,
+                    "prompt_cache_hit_tokens": 80,
+                    "prompt_cache_miss_tokens": 20,
+                    "completion_tokens": 15,
+                    "reasoning_tokens": 4,
+                    "total_tokens": 115,
+                },
+                completed_at="2026-08-08T10:00:01+00:00",
+            )
+        )
+        self.assertFalse(
+            db.finish_llm_call(
+                call_id,
+                outcome="failed",
+                latency_ms=999,
+                error_code="late_writer",
+                completed_at="2026-08-08T10:00:02+00:00",
+            )
+        )
+
+        with db.conn() as connection:
+            columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(llm_call_attempts)"
+                ).fetchall()
+            }
+            row = dict(
+                connection.execute(
+                    "SELECT * FROM llm_call_attempts WHERE id=?",
+                    (call_id,),
+                ).fetchone()
+            )
+
+        self.assertTrue(
+            {"prompt", "response", "claim_token", "api_key"}.isdisjoint(columns)
+        )
+        self.assertEqual(row["provider"], "deepseek")
+        self.assertEqual(row["outcome"], "ready")
+        self.assertEqual(row["started_at"], "2026-08-08T10:00:00+00:00")
+        self.assertEqual(row["attempt_count"], 2)
+        self.assertEqual(row["latency_ms"], 321)
+        self.assertEqual(row["prompt_cache_hit_tokens"], 80)
+        self.assertEqual(row["total_tokens"], 115)
+
+    def test_llm_usage_summary_uses_a_numeric_utc_cutoff(self) -> None:
+        reference = datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc)
+        recent = db.begin_llm_call(
+            subject_type="event",
+            subject_key="recent",
+            input_hash="b" * 64,
+            prompt_version="event-intelligence-v1",
+            model="deepseek-v4-flash",
+            started_at="2026-08-08T19:30:00+08:00",
+        )
+        old = db.begin_llm_call(
+            subject_type="macro_event",
+            subject_key="old",
+            input_hash="c" * 64,
+            prompt_version="macro-intelligence-v1",
+            model="deepseek-v4-pro",
+            started_at="2026-08-08T08:00:00+00:00",
+        )
+        db.finish_llm_call(
+            recent,
+            outcome="ready",
+            latency_ms=250,
+            usage={
+                "prompt_tokens": 100,
+                "prompt_cache_hit_tokens": 75,
+                "prompt_cache_miss_tokens": 25,
+                "completion_tokens": 12,
+                "reasoning_tokens": 3,
+                "total_tokens": 112,
+            },
+            completed_at=reference.isoformat(),
+        )
+        db.finish_llm_call(
+            old,
+            outcome="failed",
+            latency_ms=800,
+            usage={"prompt_tokens": 900, "total_tokens": 990},
+            completed_at=reference.isoformat(),
+        )
+
+        summary = db.query_llm_usage_summary(hours=1, now=reference)
+
+        self.assertEqual(summary["calls"], 1)
+        self.assertEqual(summary["ready"], 1)
+        self.assertEqual(summary["prompt_tokens"], 100)
+        self.assertEqual(summary["cache_hit_tokens"], 75)
+        self.assertEqual(summary["cache_miss_tokens"], 25)
+        self.assertEqual(summary["completion_tokens"], 12)
+        self.assertEqual(summary["total_tokens"], 112)
+        self.assertEqual(summary["average_latency_ms"], 250.0)
+        with self.assertRaisesRegex(ValueError, "timezone"):
+            db.query_llm_usage_summary(hours=1, now=reference.replace(tzinfo=None))
+
+    def test_stale_llm_calls_are_abandoned_and_old_telemetry_is_pruned(self) -> None:
+        current = datetime.now(timezone.utc).replace(microsecond=0)
+        stale = db.begin_llm_call(
+            subject_type="event",
+            subject_key="stale",
+            input_hash="d" * 64,
+            prompt_version="event-intelligence-v1",
+            model="deepseek-v4-flash",
+            started_at=(current - timedelta(minutes=21)).isoformat(),
+        )
+        live = db.begin_llm_call(
+            subject_type="event",
+            subject_key="live",
+            input_hash="e" * 64,
+            prompt_version="event-intelligence-v1",
+            model="deepseek-v4-flash",
+            started_at=(current - timedelta(minutes=19)).isoformat(),
+        )
+        expired = db.begin_llm_call(
+            subject_type="macro_event",
+            subject_key="expired-ledger-row",
+            input_hash="f" * 64,
+            prompt_version="macro-intelligence-v1",
+            model="deepseek-v4-pro",
+            started_at=(current - timedelta(days=91)).isoformat(),
+        )
+
+        self.assertEqual(
+            db.abandon_stale_llm_calls(
+                older_than_seconds=20 * 60,
+                now=current,
+            ),
+            2,
+        )
+        db.prune_old()
+
+        with db.conn() as connection:
+            rows = {
+                row["id"]: dict(row)
+                for row in connection.execute(
+                    "SELECT id, outcome, error_code FROM llm_call_attempts"
+                ).fetchall()
+            }
+        self.assertEqual(rows[stale]["outcome"], "abandoned")
+        self.assertEqual(rows[stale]["error_code"], "worker_lease_expired")
+        self.assertEqual(rows[live]["outcome"], "started")
+        self.assertNotIn(expired, rows)
+
     def test_merge_fills_missing_published_at_then_preserves_it(self) -> None:
         reliable = "2026-07-31T10:34:56+00:00"
         later_claim = "2026-08-01T10:34:56+00:00"
@@ -1089,6 +1253,128 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(row["headline_zh"], "新 owner 的结果")
         self.assertEqual(row["claim_token"], "")
 
+    def test_event_input_change_revokes_live_claim_and_is_immediately_pending(
+        self,
+    ) -> None:
+        now = datetime(2026, 8, 8, 4, 0, tzinfo=timezone.utc)
+        original = self.event(
+            title="NVIDIA announces an AI platform",
+            snippet="NVIDIA announced a platform.",
+            tickers=[],
+            published_at=(now - timedelta(hours=1)).isoformat(),
+        )
+        db.insert_events([original])
+        candidate = db.query_enrichment_candidates(now=now)[0]
+        event_input, old_hash = llm_enrichment.build_event_input(candidate)
+        claim = {
+            "event_id": candidate["id"],
+            "input_hash": old_hash,
+            "prompt_version": llm_enrichment.PROMPT_VERSION,
+            "model": llm_enrichment.DEFAULT_MODEL,
+            "evidence_basis": event_input["evidence_basis"],
+        }
+        old_token = db.claim_event_enrichment(**claim, now=now)
+        self.assertIsInstance(old_token, str)
+
+        db.insert_events(
+            [
+                {
+                    **original,
+                    "title": (
+                        "NVIDIA announces an AI platform for enterprise "
+                        "customers worldwide"
+                    ),
+                    "snippet": (
+                        "NVIDIA announced the product, initial availability, "
+                        "supported deployments, and enterprise rollout timing."
+                    ),
+                    "tickers": ["NVDA"],
+                }
+            ]
+        )
+
+        with db.conn() as connection:
+            cache = dict(
+                connection.execute(
+                    "SELECT status, claim_token, next_attempt_at, error_code "
+                    "FROM event_enrichments WHERE event_id=?",
+                    (candidate["id"],),
+                ).fetchone()
+            )
+        pending = db.query_enrichment_candidates(now=now)
+
+        self.assertEqual(cache["status"], "pending")
+        self.assertEqual(cache["claim_token"], "")
+        self.assertIsNone(cache["next_attempt_at"])
+        self.assertEqual(cache["error_code"], "")
+        self.assertEqual([row["id"] for row in pending], [candidate["id"]])
+        self.assertEqual(pending[0]["ai_status"], "pending")
+        self.assertFalse(
+            db.save_event_enrichment(
+                **claim,
+                claim_token=old_token,
+                result=ready_enrichment(headline_zh="旧输入的迟到结果"),
+            )
+        )
+        self.assertFalse(
+            db.fail_event_enrichment(
+                candidate["id"],
+                input_hash=old_hash,
+                prompt_version=llm_enrichment.PROMPT_VERSION,
+                model=llm_enrichment.DEFAULT_MODEL,
+                claim_token=old_token,
+                error_code="provider_unavailable",
+                retry_after_seconds=1200,
+                now=now + timedelta(minutes=1),
+            )
+        )
+
+        new_input, new_hash = llm_enrichment.build_event_input(pending[0])
+        self.assertNotEqual(new_hash, old_hash)
+        new_token = db.claim_event_enrichment(
+            candidate["id"],
+            input_hash=new_hash,
+            prompt_version=llm_enrichment.PROMPT_VERSION,
+            model=llm_enrichment.DEFAULT_MODEL,
+            evidence_basis=new_input["evidence_basis"],
+            now=now + timedelta(minutes=1),
+        )
+        self.assertIsInstance(new_token, str)
+        with db.conn() as connection:
+            attempt_count = connection.execute(
+                "SELECT attempt_count FROM event_enrichments WHERE event_id=?",
+                (candidate["id"],),
+            ).fetchone()["attempt_count"]
+        self.assertEqual(attempt_count, 1)
+
+    def test_non_input_event_merge_preserves_live_enrichment_claim(self) -> None:
+        now = datetime(2026, 8, 8, 5, 0, tzinfo=timezone.utc)
+        original = self.event(
+            snippet=None,
+            published_at=(now - timedelta(hours=1)).isoformat()
+        )
+        db.insert_events([original])
+        candidate = db.query_enrichment_candidates(now=now)[0]
+        event_input, input_hash = llm_enrichment.build_event_input(candidate)
+        token = db.claim_event_enrichment(
+            candidate["id"],
+            input_hash=input_hash,
+            prompt_version=llm_enrichment.PROMPT_VERSION,
+            model=llm_enrichment.DEFAULT_MODEL,
+            evidence_basis=event_input["evidence_basis"],
+            now=now,
+        )
+
+        db.insert_events([{**original, "snippet": "", "impact": "high"}])
+
+        with db.conn() as connection:
+            cache = connection.execute(
+                "SELECT status, claim_token FROM event_enrichments WHERE event_id=?",
+                (candidate["id"],),
+            ).fetchone()
+        self.assertEqual(cache["status"], "processing")
+        self.assertEqual(cache["claim_token"], token)
+
     def test_candidate_pool_skips_live_backoff_without_starving_ready_rows(self) -> None:
         now = datetime(2026, 8, 6, 4, 0, tzinfo=timezone.utc)
         titles = (
@@ -1957,6 +2243,53 @@ class LegacyMigrationTests(unittest.TestCase):
                     for statement in statements
                 )
             )
+
+    def test_decision_snapshot_round_trip_versioning_and_pruning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "decision-snapshot.sqlite3")
+            with mock.patch.object(db, "DB_PATH", path):
+                db.init()
+                for index in range(3):
+                    snapshot_id = db.save_decision_snapshot(
+                        schema_version=1,
+                        engine_version="decision-test-v1",
+                        source_hash=f"source-{index}",
+                        source_as_of=f"2026-08-08T0{index}:00:00+00:00",
+                        generated_at=f"2026-08-08T0{index}:00:00+00:00",
+                        summary={"decisions": [], "index": index},
+                        full={
+                            "decisions": [],
+                            "index": index,
+                            "evidence_policy": "test",
+                        },
+                        keep=2,
+                    )
+
+                latest = db.latest_decision_snapshot(
+                    schema_version=1,
+                    engine_version="decision-test-v1",
+                )
+                self.assertEqual(latest["snapshot_id"], snapshot_id)
+                self.assertEqual(latest["summary"]["index"], 2)
+                self.assertEqual(latest["full"]["index"], 2)
+                self.assertIsNone(
+                    db.latest_decision_snapshot(
+                        schema_version=2,
+                        engine_version="decision-test-v1",
+                    )
+                )
+                with db.conn() as connection:
+                    rows = connection.execute(
+                        "SELECT id FROM decision_snapshots ORDER BY id"
+                    ).fetchall()
+                self.assertEqual(len(rows), 2)
+                self.assertIsNone(
+                    db.get_decision_snapshot(
+                        rows[0]["id"] - 1,
+                        schema_version=1,
+                        engine_version="decision-test-v1",
+                    )
+                )
 
 
 if __name__ == "__main__":

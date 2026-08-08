@@ -8,6 +8,7 @@
 # Both are idempotent; the DB dedups repeat sightings.
 
 set -euo pipefail
+umask 077
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$DIR/.." && pwd)"
@@ -25,6 +26,7 @@ export SERENITY_CACHE_DIR="${SERENITY_CACHE_DIR:-$DATA_DIR/serenity}"
 LOG_DIR="${KOL_LOG_DIR:-$REPO_DIR/logs}"
 mkdir -p "$(dirname "$KOL_DASHBOARD_DB")" "$LOG_DIR"
 ERROR_LOG="$LOG_DIR/collect.err.log"
+ENRICHMENT_MARKER="${KOL_ENRICH_WAKE_PATH:-$(dirname "$KOL_DASHBOARD_DB")/enrichment.pending}"
 
 TRACKER="$LIB_DIR/kol_tracker.py"
 [[ -f "$TRACKER" ]] || {
@@ -33,6 +35,10 @@ TRACKER="$LIB_DIR/kol_tracker.py"
 }
 
 stamp() { TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S'; }
+
+signal_enrichment() {
+  touch "$ENRICHMENT_MARKER"
+}
 
 on_error() {
   local rc=$?
@@ -63,12 +69,14 @@ run_capture() {
 case "${1:-kol}" in
   kol)
     OUT=$(run_capture python3 "$TRACKER" collect 6)
+    signal_enrichment
     RELATIONS=$(run_capture python3 "$DIR/decision_collect.py" relations)
     OUT="$OUT; $RELATIONS"
     echo "[$(stamp)] kol: $OUT" >> "$LOG_DIR/collect.log"
     ;;
   macro)
     OUT=$(run_capture python3 "$DIR/macro_collect.py")
+    signal_enrichment
     RELATIONS=$(run_capture python3 "$DIR/decision_collect.py" relations)
     OUT="$OUT; $RELATIONS"
     echo "[$(stamp)] macro: $OUT" >> "$LOG_DIR/collect.log"

@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
+import time
 import unittest
 from pathlib import Path
 from urllib.request import Request
@@ -472,6 +474,9 @@ class EnrichmentWorkerQuotaTests(unittest.TestCase):
 
         with (
             mock.patch.object(enrichment_collect.db, "init"),
+            mock.patch.object(enrichment_collect.db, "abandon_stale_llm_calls"),
+            mock.patch.object(enrichment_collect.db, "begin_llm_call", return_value=1),
+            mock.patch.object(enrichment_collect.db, "finish_llm_call", return_value=True),
             mock.patch.object(
                 enrichment_collect.llm_enrichment,
                 "load_config",
@@ -551,6 +556,9 @@ class EnrichmentWorkerQuotaTests(unittest.TestCase):
 
         with (
             mock.patch.object(enrichment_collect.db, "init"),
+            mock.patch.object(enrichment_collect.db, "abandon_stale_llm_calls"),
+            mock.patch.object(enrichment_collect.db, "begin_llm_call", return_value=1),
+            mock.patch.object(enrichment_collect.db, "finish_llm_call", return_value=True),
             mock.patch.object(
                 enrichment_collect.llm_enrichment,
                 "load_config",
@@ -603,6 +611,9 @@ class EnrichmentWorkerQuotaTests(unittest.TestCase):
 
         with (
             mock.patch.object(enrichment_collect.db, "init"),
+            mock.patch.object(enrichment_collect.db, "abandon_stale_llm_calls"),
+            mock.patch.object(enrichment_collect.db, "begin_llm_call", return_value=1),
+            mock.patch.object(enrichment_collect.db, "finish_llm_call", return_value=True),
             mock.patch.object(
                 enrichment_collect.llm_enrichment,
                 "load_config",
@@ -646,6 +657,87 @@ class EnrichmentWorkerQuotaTests(unittest.TestCase):
         self.assertEqual(claim_macro.call_count, 2)
         self.assertEqual(enrich.call_count, 1)
         self.assertEqual(save_macro.call_args.args[0], pending_key)
+
+    def test_provider_calls_run_concurrently_within_the_configured_bound(self) -> None:
+        candidates = [
+            {
+                "id": index,
+                "title": f"KOL event {index}",
+                "snippet": "Market-relevant evidence for concurrency testing.",
+            }
+            for index in range(1, 5)
+        ]
+        config = llm_enrichment.DeepSeekConfig(api_key="test-secret")
+        lock = threading.Lock()
+        first_wave = threading.Barrier(2)
+        active = 0
+        max_active = 0
+        call_count = 0
+
+        def enrich(*args, **kwargs):
+            nonlocal active, max_active, call_count
+            with lock:
+                active += 1
+                call_count += 1
+                current_call = call_count
+                max_active = max(max_active, active)
+            try:
+                if current_call <= 2:
+                    first_wave.wait(timeout=2)
+                time.sleep(0.01)
+                return valid_result()
+            finally:
+                with lock:
+                    active -= 1
+
+        with (
+            mock.patch.object(enrichment_collect.db, "init"),
+            mock.patch.object(enrichment_collect.db, "abandon_stale_llm_calls"),
+            mock.patch.object(
+                enrichment_collect.db, "begin_llm_call", return_value=1
+            ),
+            mock.patch.object(
+                enrichment_collect.db, "finish_llm_call", return_value=True
+            ),
+            mock.patch.object(
+                enrichment_collect.llm_enrichment,
+                "load_config",
+                return_value=config,
+            ),
+            mock.patch.object(enrichment_collect.db, "latest_macro", return_value={}),
+            mock.patch.object(
+                enrichment_collect.db,
+                "query_enrichment_candidates",
+                return_value=candidates,
+            ),
+            mock.patch.object(
+                enrichment_collect.db,
+                "claim_event_enrichment",
+                side_effect=lambda event_id, **kwargs: f"claim-{event_id}",
+            ),
+            mock.patch.object(
+                enrichment_collect.llm_enrichment,
+                "enrich_event",
+                side_effect=enrich,
+            ),
+            mock.patch.object(
+                enrichment_collect.db,
+                "save_event_enrichment",
+                return_value=True,
+            ),
+        ):
+            counts, stopped = enrichment_collect.run(
+                limit=4,
+                macro_limit=0,
+                max_age_hours=72,
+                concurrency=2,
+            )
+
+        self.assertFalse(stopped)
+        self.assertEqual(counts["processed"], 4)
+        self.assertEqual(counts["ready"], 4)
+        self.assertEqual(counts["concurrency"], 2)
+        self.assertEqual(max_active, 2)
 
 
 class ResultValidationTests(unittest.TestCase):
@@ -809,6 +901,99 @@ class DeepSeekRequestTests(unittest.TestCase):
         self.assertEqual(headers["Authorization"], "Bearer secret-token")
         self.assertEqual(captured["timeout"], 45.0)
         self.assertEqual(result["headline_zh"], provider_result["headline_zh"])
+
+    def test_provider_usage_is_returned_without_changing_the_legacy_contract(self) -> None:
+        usage = {
+            "prompt_tokens": 120,
+            "prompt_cache_hit_tokens": 90,
+            "prompt_cache_miss_tokens": 30,
+            "completion_tokens": 48,
+            "reasoning_tokens": 12,
+            "total_tokens": 168,
+        }
+
+        def transport(body: bytes, headers, timeout: float):
+            return 200, json.dumps(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {"content": json.dumps(valid_result())},
+                        }
+                    ],
+                    "usage": usage,
+                }
+            ).encode()
+
+        config = llm_enrichment.DeepSeekConfig(api_key="secret-token")
+        response = llm_enrichment.enrich_event_with_usage(
+            {"title": "event", "evidence_basis": "title_only"},
+            input_hash="1" * 64,
+            config=config,
+            transport=transport,
+        )
+        legacy_result = llm_enrichment.enrich_event(
+            {"title": "event", "evidence_basis": "title_only"},
+            input_hash="1" * 64,
+            config=config,
+            transport=transport,
+        )
+
+        self.assertEqual(response.usage.as_dict(), usage)
+        self.assertEqual(response.http_status, 200)
+        self.assertIsInstance(legacy_result, dict)
+        self.assertNotIsInstance(legacy_result, llm_enrichment.EnrichmentResponse)
+
+    def test_untrusted_usage_fields_fail_closed_without_failing_the_result(self) -> None:
+        usage = llm_enrichment.parse_provider_usage(
+            {
+                "prompt_tokens": 100,
+                "prompt_cache_hit_tokens": 80,
+                "prompt_cache_miss_tokens": 30,
+                "completion_tokens": True,
+                "reasoning_tokens": -1,
+                "total_tokens": "130",
+            }
+        )
+
+        self.assertEqual(usage.prompt_tokens, 100)
+        self.assertIsNone(usage.prompt_cache_hit_tokens)
+        self.assertIsNone(usage.prompt_cache_miss_tokens)
+        self.assertIsNone(usage.completion_tokens)
+        self.assertIsNone(usage.reasoning_tokens)
+        self.assertIsNone(usage.total_tokens)
+
+    def test_invalid_completion_retains_provider_usage_for_cost_accounting(self) -> None:
+        def transport(body: bytes, headers, timeout: float):
+            return 200, json.dumps(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "length",
+                            "message": {"content": json.dumps(valid_result())},
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 80,
+                        "completion_tokens": 20,
+                        "total_tokens": 100,
+                    },
+                }
+            ).encode()
+
+        with self.assertRaises(llm_enrichment.EnrichmentError) as caught:
+            llm_enrichment.enrich_event_with_usage(
+                {"title": "event", "evidence_basis": "title_only"},
+                input_hash="2" * 64,
+                config=llm_enrichment.DeepSeekConfig(api_key="secret-token"),
+                transport=transport,
+            )
+
+        self.assertEqual(caught.exception.code, "invalid_output")
+        self.assertEqual(caught.exception.http_status, 200)
+        self.assertIsNotNone(caught.exception.usage)
+        assert caught.exception.usage is not None
+        self.assertEqual(caught.exception.usage.total_tokens, 100)
 
     def test_title_only_output_confidence_is_capped(self) -> None:
         provider_result = valid_result(

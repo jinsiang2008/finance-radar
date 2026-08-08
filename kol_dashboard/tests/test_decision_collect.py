@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import unittest
+from unittest import mock
 
 
 try:
@@ -187,6 +188,55 @@ class DecisionCollectorTests(unittest.TestCase):
         self.assertTrue(stored["available"])
         self.assertEqual(stored["snapshot_id"], 3)
         self.assertEqual(len(repository.saved_snapshots), 1)
+
+    def test_public_input_commands_refresh_exactly_one_snapshot(self) -> None:
+        repository = mock.Mock()
+        with (
+            mock.patch.object(
+                decision_collect, "collect_relations", return_value={"ok": 1}
+            ),
+            mock.patch.object(
+                decision_collect,
+                "collect_market_reactions",
+                return_value={"ok": 1},
+            ),
+            mock.patch.object(
+                decision_collect, "collect_portfolio", return_value={"ok": 1}
+            ),
+            mock.patch.object(
+                decision_collect,
+                "collect_snapshot",
+                return_value={"snapshot_id": 7},
+            ) as snapshot,
+        ):
+            all_result = decision_collect.run("all", repository=repository)
+            self.assertIn("snapshot", all_result)
+            snapshot.assert_called_once_with(repository=repository)
+
+            snapshot.reset_mock()
+            relations_result = decision_collect.run(
+                "relations", repository=repository
+            )
+            self.assertIn("snapshot", relations_result)
+            snapshot.assert_called_once_with(repository=repository)
+
+            snapshot.reset_mock()
+            market_result = decision_collect.run("market", repository=repository)
+            self.assertIn("snapshot", market_result)
+            snapshot.assert_called_once_with(repository=repository)
+
+    def test_private_portfolio_refresh_does_not_rebuild_public_snapshot(self) -> None:
+        repository = mock.Mock()
+        with (
+            mock.patch.object(
+                decision_collect, "collect_portfolio", return_value={"ok": 1}
+            ),
+            mock.patch.object(decision_collect, "collect_snapshot") as snapshot,
+        ):
+            result = decision_collect.run("portfolio", repository=repository)
+
+        self.assertEqual(result, {"portfolio": {"ok": 1}})
+        snapshot.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -16,15 +16,22 @@
     q: "",
     authenticated: false,
     authConfigured: false,
+    authStatusLoaded: false,
     logoutPending: false,
     decisionData: null,
     selectedDecisionKey: "",
     decisionQueueExpanded: false,
     matrixExpanded: false,
     decisionRequestGeneration: 0,
+    decisionDetailRequestGeneration: 0,
+    decisionDetailCache: new Map(),
     macroData: null,
     macroHistory: [],
+    macroRequestGeneration: 0,
+    macroHistoryRequestGeneration: 0,
     stats: null,
+    statsRequestGeneration: 0,
+    kolsRequestGeneration: 0,
     feedItems: [],
     expandedClusters: new Set(),
     feedLoadedCount: 0,
@@ -33,10 +40,16 @@
     feedHighPriority: false,
     feedRegularCapped: false,
     feedRequestGeneration: 0,
+    feedAbortController: null,
+    viewLoadedAt: { decision: 0, macro: 0, kol: 0 },
+    viewLoadPromises: {},
+    refreshTimer: null,
+    supportFactsLoaded: false,
     drawerEventId: null,
     drawerKol: "",
     drawerSourceUrl: "",
     drawerRequestGeneration: 0,
+    drawerAbortController: null,
     drawerReturnFocus: null,
     drawerPreviousOverflow: "",
     drawerInertNodes: [],
@@ -288,15 +301,34 @@
   const num = (v, digits = 2) =>
     typeof v === "number" && isFinite(v) ? v.toFixed(digits) : null;
 
-  async function fetchJSON(url, timeoutMs = 12000) {
+  async function fetchJSON(url, timeoutMs = 12000, options = {}) {
     const ctrl = new AbortController();
+    const externalSignal = options.signal;
+    const abortFromExternal = () => ctrl.abort();
+    if (externalSignal) {
+      if (externalSignal.aborted) ctrl.abort();
+      else externalSignal.addEventListener("abort", abortFromExternal, { once: true });
+    }
     const t = setTimeout(() => ctrl.abort(), timeoutMs);
     try {
-      const r = await fetch(url, { signal: ctrl.signal, cache: "no-store" });
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const r = await fetch(url, {
+        signal: ctrl.signal,
+        cache: options.cache || "no-cache",
+      });
+      if (!r.ok) {
+        let payload = null;
+        try {
+          payload = await r.json();
+        } catch (e) {}
+        const error = new Error((payload && payload.detail) || `HTTP ${r.status}`);
+        error.status = r.status;
+        error.payload = payload;
+        throw error;
+      }
       return await r.json();
     } finally {
       clearTimeout(t);
+      externalSignal?.removeEventListener("abort", abortFromExternal);
     }
   }
 
@@ -661,7 +693,8 @@
 
   function renderDecisionQueue(data) {
     const cards = orderedDecisions(data.decisions || []);
-    $("#decision-count").textContent = cards.length;
+    const total = Number(data.total_decisions) || cards.length;
+    $("#decision-count").textContent = total;
     if (!cards.length) {
       $("#decision-queue").innerHTML = `<div class="empty">
         <span class="empty-icon">🧭</span>尚未生成可展示的关联
@@ -705,10 +738,10 @@
       })
       .join("");
     const moreHTML =
-      cards.length > 10
+      total > 10
         ? `<button class="decision-more" id="decision-show-all" type="button"
             aria-expanded="${state.decisionQueueExpanded}">
-            ${state.decisionQueueExpanded ? "收起到重点信号" : `查看全部 ${cards.length} 条`}
+            ${state.decisionQueueExpanded ? "收起到重点信号" : `查看全部 ${total} 条`}
           </button>`
         : "";
     $("#decision-queue").innerHTML = cardHTML + moreHTML;
@@ -735,6 +768,7 @@
     const visibleColumns = state.matrixExpanded
       ? orderedColumns
       : orderedColumns.slice(0, 8);
+    const totalAssets = Number(data.total_assets) || columns.length;
     $("#decision-matrix").innerHTML = `<table class="impact-matrix">
       <thead><tr><th scope="col">主题</th>${visibleColumns
         .map(
@@ -768,10 +802,10 @@
         )
         .join("")}</tbody>
     </table>${
-        columns.length > 8
+        totalAssets > 8
           ? `<button class="matrix-more" id="matrix-show-all" type="button"
               aria-expanded="${state.matrixExpanded}">
-              ${state.matrixExpanded ? "收起到重点资产" : `查看全部 ${columns.length} 个资产`}
+              ${state.matrixExpanded ? "收起到重点资产" : `查看全部 ${totalAssets} 个资产`}
             </button>`
           : ""
       }`;
@@ -950,7 +984,7 @@
       )}</p>`;
   }
 
-  function selectDecision(key, { focusDetail = false } = {}) {
+  async function selectDecision(key, { focusDetail = false } = {}) {
     const cards = state.decisionData?.decisions || [];
     const card = cards.find((item) => decisionKey(item) === key);
     if (!card) return;
@@ -958,7 +992,48 @@
     $$(".decision-card, .matrix-cell").forEach((node) =>
       node.classList.toggle("is-selected", node.dataset.decisionKey === key)
     );
-    renderDecisionDetail(card, state.decisionData.evidence_policy);
+    const hasInlineDetail = Array.isArray(card.evidence) || Array.isArray(card.mechanism_relations);
+    if (hasInlineDetail || !card.detail_available) {
+      renderDecisionDetail(card, state.decisionData.evidence_policy);
+    } else {
+      const snapshotId = Number(state.decisionData?.snapshot_id || 0);
+      const cacheKey = `${snapshotId}:${key}`;
+      const cached = state.decisionDetailCache.get(cacheKey);
+      if (cached) {
+        renderDecisionDetail(cached.decision, cached.evidence_policy);
+      } else {
+        const generation = ++state.decisionDetailRequestGeneration;
+        $("#decision-detail").innerHTML = `<div class="decision-detail-loading" aria-busy="true">
+          <div class="skeleton skeleton-card"></div>
+          <p class="empty-hint">正在按需加载这条信号的证据链…</p>
+        </div>`;
+        const params = new URLSearchParams({
+          topic_key: String(card.topic_key || ""),
+          asset_key: String(card.asset_key || ""),
+        });
+        if (snapshotId > 0) params.set("snapshot_id", String(snapshotId));
+        const url = api(`api/decisions/detail?${params}`);
+        try {
+          const payload = await fetchJSON(url, 12000);
+          if (
+            generation !== state.decisionDetailRequestGeneration ||
+            state.selectedDecisionKey !== key ||
+            Number(state.decisionData?.snapshot_id || 0) !== snapshotId
+          ) {
+            return;
+          }
+          state.decisionDetailCache.set(cacheKey, payload);
+          renderDecisionDetail(payload.decision, payload.evidence_policy);
+        } catch (error) {
+          if (generation !== state.decisionDetailRequestGeneration) return;
+          if (error.status === 409) {
+            await loadDecisions();
+            return;
+          }
+          $("#decision-detail").innerHTML = errorHTML(error, url);
+        }
+      }
+    }
     if (focusDetail) $("#decision-detail").scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
@@ -972,7 +1047,7 @@
     renderDecisionQueue(data);
     renderDecisionMatrix(data);
     if (state.selectedDecisionKey) {
-      selectDecision(state.selectedDecisionKey);
+      void selectDecision(state.selectedDecisionKey);
     } else {
       $("#decision-detail").innerHTML = `<div class="empty">
         <span class="empty-icon">⛓</span>暂无可展开的证据链
@@ -982,6 +1057,8 @@
   }
 
   function clearDecisionView(message = "私人数据已从当前页面清除") {
+    state.decisionDetailRequestGeneration += 1;
+    state.decisionDetailCache.clear();
     state.decisionData = null;
     state.selectedDecisionKey = "";
     $("#decision-hero").innerHTML = `<div class="empty">${esc(message)}</div>`;
@@ -997,10 +1074,12 @@
     const requestGeneration = ++state.decisionRequestGeneration;
     const endpoint = requestedPrivate
       ? "api/private/decisions"
-      : "api/decisions";
+      : "api/decisions/summary";
     const url = api(endpoint);
     try {
-      const data = await requestJSON(url);
+      const data = requestedPrivate
+        ? await requestJSON(url)
+        : await fetchJSON(url);
       if (
         requestGeneration !== state.decisionRequestGeneration ||
         requestedPrivate !== state.authenticated
@@ -1018,6 +1097,25 @@
       }
       clearDecisionView("决策数据加载失败，已清除上一份页面数据");
       $("#decision-hero").innerHTML = errorHTML(error, url);
+    }
+  }
+
+  async function loadFullDecisions() {
+    if (!state.decisionData?.summary || state.authenticated) return true;
+    const requestGeneration = ++state.decisionRequestGeneration;
+    const url = api("api/decisions");
+    try {
+      const data = await fetchJSON(url, 15000);
+      if (requestGeneration !== state.decisionRequestGeneration || state.authenticated) {
+        return false;
+      }
+      renderDecisions(data || { decisions: [], impact_matrix: {} });
+      return true;
+    } catch (error) {
+      if (requestGeneration === state.decisionRequestGeneration) {
+        $("#decision-detail").innerHTML = errorHTML(error, url);
+      }
+      return false;
     }
   }
 
@@ -1051,6 +1149,7 @@
       state.authConfigured = false;
       state.authenticated = false;
     }
+    state.authStatusLoaded = true;
     updatePrivateModeButton();
   }
 
@@ -1970,57 +2069,77 @@
     $("#macro-opps-block").hidden = false;
   }
 
-  async function loadMacro() {
-    const currentUrl = api("api/macro");
+  function renderMacroView() {
+    const d = state.macroData;
+    if (!d || state.view !== "macro") return;
+    if (!d.available) {
+      $("#macro-hero").innerHTML = `<div class="empty">
+        <span class="empty-icon">📡</span>${esc(d.reason || "暂无宏观快照")}
+        <div class="empty-hint">首次采集约需 45 秒</div>
+      </div>`;
+    } else {
+      renderHero(d);
+      renderSubscores(d);
+      renderMetrics(d);
+      renderMonitoredEvents(d);
+      renderSwans(d);
+      renderRhinos(d);
+      renderOpps(d);
+      renderSupportCard("macro");
+    }
+    renderMacroTrend(state.macroHistory);
+  }
+
+  async function loadMacroHistory() {
+    const generation = ++state.macroHistoryRequestGeneration;
     const historyUrl = api("api/macro/history?limit=72");
+    try {
+      const payload = await fetchJSON(historyUrl);
+      if (generation !== state.macroHistoryRequestGeneration) return;
+      state.macroHistory = Array.isArray(payload?.items) ? payload.items : [];
+      if (state.view === "macro") renderMacroTrend(state.macroHistory);
+      if (state.decisionData) renderDecisionHero(state.decisionData);
+    } catch (error) {
+      if (generation !== state.macroHistoryRequestGeneration) return;
+      console.warn("macro history", error);
+      if (state.view === "macro") renderMacroTrend(state.macroHistory);
+    }
+  }
+
+  async function loadMacro({ includeHistory = state.view === "macro" } = {}) {
+    const generation = ++state.macroRequestGeneration;
+    const currentUrl = api("api/macro");
     const currentRequest = fetchJSON(currentUrl)
       .then((d) => {
+        if (generation !== state.macroRequestGeneration) return;
         state.macroData = d;
         updateMacroStatus(d);
-        if (!d.available) {
-          $("#macro-hero").innerHTML = `<div class="empty">
-            <span class="empty-icon">📡</span>${esc(d.reason || "暂无宏观快照")}
-            <div class="empty-hint">首次采集约需 45 秒</div>
-          </div>`;
-        } else {
-          renderHero(d);
-          renderSubscores(d);
-          renderMetrics(d);
-          renderMonitoredEvents(d);
-          renderSwans(d);
-          renderRhinos(d);
-          renderOpps(d);
-          renderSupportCard("macro");
-        }
-        renderMacroTrend(state.macroHistory);
+        renderMacroView();
         if (state.decisionData) renderDecisionHero(state.decisionData);
       })
       .catch((error) => {
+        if (generation !== state.macroRequestGeneration) return;
         setSystemStatus(
           "error",
           "快照异常",
           `最新宏观快照加载失败：${error.message || error}`
         );
-        $("#macro-hero").innerHTML = errorHTML(error, currentUrl);
+        if (state.view === "macro") {
+          $("#macro-hero").innerHTML = errorHTML(error, currentUrl);
+        }
       });
-    const historyRequest = fetchJSON(historyUrl)
-      .then((payload) => {
-        state.macroHistory = Array.isArray(payload?.items) ? payload.items : [];
-        renderMacroTrend(state.macroHistory);
-        if (state.decisionData) renderDecisionHero(state.decisionData);
-      })
-      .catch((error) => {
-        console.warn("macro history", error);
-        renderMacroTrend(state.macroHistory);
-      });
-    await Promise.allSettled([currentRequest, historyRequest]);
+    const requests = [currentRequest];
+    if (includeHistory) requests.push(loadMacroHistory());
+    await Promise.allSettled(requests);
   }
 
   // ─── KOL view ─────────────────────────────
 
   async function loadStats() {
+    const generation = ++state.statsRequestGeneration;
     try {
       const s = await fetchJSON(api(`api/stats?hours=${state.hours}`), 8000);
+      if (generation !== state.statsRequestGeneration) return;
       state.stats = s;
       $("#stat-total").textContent = s.total;
       $("#stat-high").textContent = s.high;
@@ -2035,8 +2154,10 @@
   }
 
   async function loadKols() {
+    const generation = ++state.kolsRequestGeneration;
     try {
       const list = await fetchJSON(api("api/kols"), 8000);
+      if (generation !== state.kolsRequestGeneration) return;
       const host = $("#kol-chips");
       host.querySelectorAll("button[data-kol]:not([data-kol=''])").forEach((b) => b.remove());
       list.forEach((k) => {
@@ -2758,6 +2879,9 @@
 
   async function loadIntelDetail(eventId) {
     const generation = ++state.drawerRequestGeneration;
+    state.drawerAbortController?.abort();
+    const requestController = new AbortController();
+    state.drawerAbortController = requestController;
     const params = new URLSearchParams();
     if (state.drawerKol) params.set("kol", state.drawerKol);
     if (state.drawerSourceUrl) params.set("source_url", state.drawerSourceUrl);
@@ -2772,7 +2896,9 @@
       <p>正在组装结论、来源与关联报道…</p>
     </div>`;
     try {
-      const payload = await fetchJSON(url, 15000);
+      const payload = await fetchJSON(url, 15000, {
+        signal: requestController.signal,
+      });
       if (
         generation !== state.drawerRequestGeneration ||
         $("#intel-drawer-shell").hidden
@@ -2788,6 +2914,7 @@
       ) {
         return;
       }
+      if (error?.name === "AbortError") return;
       const message = /abort/i.test(error?.name || error?.message || "")
         ? "证据链请求超时"
         : `证据链加载失败：${error?.message || error}`;
@@ -2798,6 +2925,10 @@
         <button type="button" data-event-retry="${esc(eventId)}">重新加载证据链</button>
       </div>`;
       setDrawerBusy(false, message);
+    } finally {
+      if (state.drawerAbortController === requestController) {
+        state.drawerAbortController = null;
+      }
     }
   }
 
@@ -2828,6 +2959,8 @@
     const shell = $("#intel-drawer-shell");
     if (!shell || shell.hidden) return;
     state.drawerRequestGeneration += 1;
+    state.drawerAbortController?.abort();
+    state.drawerAbortController = null;
     shell.hidden = true;
     setDrawerBusy(false, "");
     document.body.classList.remove("intel-drawer-open");
@@ -2923,6 +3056,9 @@
 
   async function loadEvents() {
     const generation = ++state.feedRequestGeneration;
+    state.feedAbortController?.abort();
+    const requestController = new AbortController();
+    state.feedAbortController = requestController;
     const feed = $("#feed");
     feed.setAttribute("aria-busy", "true");
     $("#feed-status").textContent = "正在更新信号流…";
@@ -2939,15 +3075,15 @@
       let priorityItems = [];
       let highPriorityLoaded = false;
       if (state.impact) {
-        regularData = await fetchJSON(url);
+        regularData = await fetchJSON(url, 12000, { signal: requestController.signal });
       } else {
         const highParams = new URLSearchParams(p);
         highParams.set("impact", "high");
         highParams.set("limit", "50");
         const highUrl = api(`api/events?${highParams}`);
         const [regularResult, highResult] = await Promise.allSettled([
-          fetchJSON(url),
-          fetchJSON(highUrl),
+          fetchJSON(url, 12000, { signal: requestController.signal }),
+          fetchJSON(highUrl, 12000, { signal: requestController.signal }),
         ]);
         if (regularResult.status === "rejected") throw regularResult.reason;
         regularData = regularResult.value;
@@ -2970,11 +3106,15 @@
       updateFeedStatus();
     } catch (e) {
       if (generation !== state.feedRequestGeneration) return;
+      if (e?.name === "AbortError") return;
       $("#feed").innerHTML = errorHTML(e, url);
       const host = $("#feed-status");
       if (host) host.textContent = "动态加载失败";
     } finally {
       if (generation === state.feedRequestGeneration) {
+        if (state.feedAbortController === requestController) {
+          state.feedAbortController = null;
+        }
         feed.setAttribute("aria-busy", "false");
       }
     }
@@ -3031,10 +3171,14 @@
 
   // Fixed 24h window regardless of the feed's current filter.
   async function loadSupportFacts() {
+    if (state.supportFactsLoaded) return;
     try {
-      const s = await fetchJSON(api("api/stats?hours=24"), 8000);
+      const s = state.stats && Number(state.stats.hours) === 24
+        ? state.stats
+        : await fetchJSON(api("api/stats?hours=24"), 8000);
       $("#fact-events").textContent = s.total;
       $("#fact-kols").textContent = s.active_kols;
+      state.supportFactsLoaded = true;
     } catch (e) {
       $("#support-facts").hidden = true;
     }
@@ -3045,6 +3189,7 @@
     m.hidden = false;
     m.querySelector(".support-close").focus();
     document.body.style.overflow = "hidden";
+    void loadSupportFacts();
     // Once opened intentionally, this session no longer needs a visual nudge.
     try {
       sessionStorage.setItem(NUDGE_KEY, "1");
@@ -3130,7 +3275,54 @@
         : "隔离区按首次抓取时间筛选";
   }
 
-  function switchView(view) {
+  const VIEW_REFRESH_MS = 300_000;
+
+  function scheduleIdle(task) {
+    if ("requestIdleCallback" in window) {
+      window.requestIdleCallback(task, { timeout: 2000 });
+    } else {
+      setTimeout(task, 0);
+    }
+  }
+
+  async function ensureViewLoaded(view, { force = false } = {}) {
+    const loadedAt = Number(state.viewLoadedAt[view] || 0);
+    if (!force && loadedAt && Date.now() - loadedAt < VIEW_REFRESH_MS) {
+      if (view === "macro") renderMacroView();
+      return;
+    }
+    if (!force && state.viewLoadPromises[view]) {
+      return state.viewLoadPromises[view];
+    }
+    const promise = (async () => {
+      if (view === "decision") {
+        const macroPromise = loadMacro({ includeHistory: false });
+        if (!state.authStatusLoaded) await loadAuthStatus();
+        await Promise.allSettled([loadDecisions(), macroPromise]);
+        if (!state.macroHistory.length) scheduleIdle(() => void loadMacroHistory());
+      } else if (view === "macro") {
+        await loadMacro({ includeHistory: true });
+      } else if (view === "kol") {
+        await Promise.allSettled([loadStats(), loadKols(), loadEvents()]);
+      }
+      state.viewLoadedAt[view] = Date.now();
+      updateRefreshTime();
+    })();
+    state.viewLoadPromises[view] = promise;
+    try {
+      await promise;
+    } finally {
+      if (state.viewLoadPromises[view] === promise) {
+        delete state.viewLoadPromises[view];
+      }
+    }
+  }
+
+  function switchView(view, { load = true } = {}) {
+    if (!["decision", "macro", "kol"].includes(view)) return;
+    if (state.view === "kol" && view !== "kol") {
+      state.feedAbortController?.abort();
+    }
     state.view = view;
     $$("#tabs .tab").forEach((t) => {
       const on = t.dataset.view === view;
@@ -3144,23 +3336,8 @@
     try {
       history.replaceState(null, "", `#${view}`);
     } catch (e) {}
-  }
-
-  async function refreshAll() {
-    const btn = $("#refresh-btn");
-    btn.classList.add("spinning");
-    try {
-      await Promise.all([
-        loadDecisions(),
-        loadMacro(),
-        loadStats(),
-        loadKols(),
-        loadEvents(),
-      ]);
-      updateRefreshTime();
-    } finally {
-      btn.classList.remove("spinning");
-    }
+    if (view === "macro") renderMacroView();
+    if (load) void ensureViewLoaded(view);
   }
 
   function updateRefreshTime() {
@@ -3169,16 +3346,27 @@
     $("#last-update").textContent = `${pad(t.getHours())}:${pad(t.getMinutes())}`;
   }
 
-  async function refreshCurrentView() {
-    const tasks = [loadDecisions(), loadMacro()];
-    if (state.view === "kol") {
-      tasks.push(loadStats(), loadKols(), loadEvents());
+  async function refreshCurrentView({ showSpinner = false } = {}) {
+    const button = $("#refresh-btn");
+    if (showSpinner) button.classList.add("spinning");
+    try {
+      await ensureViewLoaded(state.view, { force: true });
+    } finally {
+      if (showSpinner) button.classList.remove("spinning");
     }
-    await Promise.all(tasks);
-    updateRefreshTime();
   }
 
-  document.addEventListener("DOMContentLoaded", () => {
+  function scheduleRefresh() {
+    clearTimeout(state.refreshTimer);
+    state.refreshTimer = null;
+    if (document.hidden) return;
+    state.refreshTimer = setTimeout(async () => {
+      await refreshCurrentView();
+      scheduleRefresh();
+    }, VIEW_REFRESH_MS);
+  }
+
+  document.addEventListener("DOMContentLoaded", async () => {
     bindChips("#time-chips button", "hours", "hours", () => {
       loadEvents();
       loadStats();
@@ -3197,23 +3385,35 @@
     bindSupport();
     bindIntelDrawer();
 
-    $("#view-decision").addEventListener("click", (event) => {
+    $("#view-decision").addEventListener("click", async (event) => {
       const more = event.target.closest("#decision-show-all");
       if (more) {
-        state.decisionQueueExpanded = !state.decisionQueueExpanded;
+        const nextExpanded = !state.decisionQueueExpanded;
+        if (nextExpanded && state.decisionData?.summary) {
+          more.disabled = true;
+          more.textContent = "正在加载完整决策集…";
+          if (!(await loadFullDecisions())) return;
+        }
+        state.decisionQueueExpanded = nextExpanded;
         renderDecisionQueue(state.decisionData || { decisions: [] });
         requestAnimationFrame(() => $("#decision-show-all")?.focus());
         return;
       }
       const matrixMore = event.target.closest("#matrix-show-all");
       if (matrixMore) {
-        state.matrixExpanded = !state.matrixExpanded;
+        const nextExpanded = !state.matrixExpanded;
+        if (nextExpanded && state.decisionData?.summary) {
+          matrixMore.disabled = true;
+          matrixMore.textContent = "正在加载完整矩阵…";
+          if (!(await loadFullDecisions())) return;
+        }
+        state.matrixExpanded = nextExpanded;
         renderDecisionMatrix(state.decisionData || { decisions: [], impact_matrix: {} });
         requestAnimationFrame(() => $("#matrix-show-all")?.focus());
         return;
       }
       const target = event.target.closest("[data-decision-key]");
-      if (target) selectDecision(target.dataset.decisionKey, { focusDetail: true });
+      if (target) void selectDecision(target.dataset.decisionKey, { focusDetail: true });
     });
 
     $("#private-mode-btn").addEventListener("click", () => {
@@ -3247,16 +3447,18 @@
         next.focus();
       });
     });
-    if (location.hash === "#kol") switchView("kol");
-    else if (location.hash === "#macro") switchView("macro");
-    else switchView("decision");
+    if (location.hash === "#kol") switchView("kol", { load: false });
+    else if (location.hash === "#macro") switchView("macro", { load: false });
+    else switchView("decision", { load: false });
 
     $(".brand")?.addEventListener("click", (event) => {
       event.preventDefault();
       switchView("decision");
     });
 
-    $("#refresh-btn").addEventListener("click", refreshAll);
+    $("#refresh-btn").addEventListener("click", () =>
+      void refreshCurrentView({ showSpinner: true })
+    );
 
     $("#theme-btn").addEventListener("click", () => {
       const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
@@ -3276,8 +3478,24 @@
       }, 250);
     });
 
-    loadAuthStatus().then(refreshAll);
-    loadSupportFacts();
-    setInterval(refreshCurrentView, 300_000);
+    if (state.view !== "decision") void loadAuthStatus();
+    await ensureViewLoaded(state.view);
+    scheduleRefresh();
+
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) {
+        clearTimeout(state.refreshTimer);
+        state.refreshTimer = null;
+        return;
+      }
+      const age = Date.now() - Number(state.viewLoadedAt[state.view] || 0);
+      if (age >= VIEW_REFRESH_MS) void refreshCurrentView();
+      scheduleRefresh();
+    });
+    window.addEventListener("pagehide", () => {
+      clearTimeout(state.refreshTimer);
+      state.feedAbortController?.abort();
+      state.drawerAbortController?.abort();
+    });
   });
 })();

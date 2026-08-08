@@ -12,12 +12,14 @@ from typing import Any, Callable
 try:
     from kol_dashboard import (
         db,
+        decision_snapshot,
         decision_service,
         market_data,
         portfolio,
     )
 except ModuleNotFoundError:  # Flat production bundle in /opt/kol-dashboard.
     import db
+    import decision_snapshot
     import decision_service
     import market_data
     import portfolio
@@ -241,6 +243,24 @@ def collect_portfolio(
     }
 
 
+def collect_snapshot(
+    *,
+    repository: Any = db,
+    now: Any = None,
+) -> dict[str, Any]:
+    """Materialize the public decision graph after its inputs are current."""
+    record = decision_snapshot.refresh_public_snapshot(
+        repository=repository,
+        now=now,
+    )
+    summary = record.get("summary") or {}
+    return {
+        "snapshot_id": record.get("snapshot_id"),
+        "generated_at": record.get("generated_at"),
+        "decisions": summary.get("total_decisions", 0),
+    }
+
+
 def run(command: str, *, repository: Any = db) -> dict[str, Any]:
     repository.init()
     summary: dict[str, Any] = {}
@@ -250,6 +270,8 @@ def run(command: str, *, repository: Any = db) -> dict[str, Any]:
         summary["market"] = collect_market_reactions(repository=repository)
     if command in {"all", "portfolio"}:
         summary["portfolio"] = collect_portfolio(repository=repository)
+    if command in {"all", "relations", "market", "snapshot"}:
+        summary["snapshot"] = collect_snapshot(repository=repository)
     return summary
 
 
@@ -258,7 +280,7 @@ def main() -> int:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("all", "relations", "market", "portfolio"),
+        choices=("all", "relations", "market", "portfolio", "snapshot"),
         default="all",
     )
     args = parser.parse_args()

@@ -38,6 +38,8 @@ SCORE_WEIGHTS = {
     "coverage": 0.10,
 }
 EVENT_RELATION_MAX_AGE_HOURS = 72
+DECISION_SNAPSHOT_SCHEMA_VERSION = 1
+DECISION_ENGINE_VERSION = "decision-v1"
 
 _PUBLIC_FORBIDDEN_TOKENS = (
     "shares",
@@ -1497,6 +1499,119 @@ def build_public_decisions(
         "evidence_policy": EVIDENCE_POLICY,
     }
     return _public_sanitize(result)
+
+
+_SUMMARY_CARD_FIELDS = (
+    "topic_key",
+    "asset_key",
+    "classification",
+    "direction",
+    "horizon",
+    "data_as_of",
+    "source_count",
+    "score_components",
+    "confidence",
+    "total_score",
+    "action_stage",
+    "trigger",
+    "invalidation",
+    "human_review_required",
+)
+
+
+def _decision_sort_key(card: Mapping[str, Any]) -> tuple[int, float, str, str]:
+    stage_rank = {
+        "reduce_or_hedge": 0,
+        "scale_in": 1,
+        "verify": 2,
+        "observe": 3,
+    }
+    stage = str(card.get("action_stage") or "")
+    try:
+        score = float(card.get("total_score") or 0.0)
+    except (TypeError, ValueError, OverflowError):
+        score = 0.0
+    if not math.isfinite(score):
+        score = 0.0
+    return (
+        stage_rank.get(stage, 9),
+        -score,
+        str(card.get("topic_key") or ""),
+        str(card.get("asset_key") or ""),
+    )
+
+
+def project_decision_summary(
+    payload: Any,
+    *,
+    decision_limit: int = 12,
+) -> dict[str, Any]:
+    """Return a small, public allow-list projection for the first screen.
+
+    Evidence, mechanism relations and raw market records stay in the matching
+    detail response.  The summary matrix is built only from the projected
+    cards so every interactive cell has a matching decision card.
+    """
+    if not isinstance(payload, Mapping):
+        raise TypeError("decision payload must be an object")
+    raw_cards = payload.get("decisions")
+    cards = [card for card in raw_cards or [] if isinstance(card, Mapping)]
+    cards.sort(key=_decision_sort_key)
+    limit = max(1, min(int(decision_limit), 50))
+
+    projected: list[dict[str, Any]] = []
+    for card in cards[:limit]:
+        item = {
+            field: deepcopy(card[field])
+            for field in _SUMMARY_CARD_FIELDS
+            if field in card
+        }
+        market = card.get("market_validation")
+        if isinstance(market, Mapping):
+            item["market_validation"] = {
+                key: deepcopy(value)
+                for key, value in market.items()
+                if key != "records"
+            }
+        item["detail_available"] = True
+        projected.append(item)
+
+    full_matrix = payload.get("impact_matrix")
+    total_assets = 0
+    if isinstance(full_matrix, Mapping) and isinstance(
+        full_matrix.get("columns"), list
+    ):
+        total_assets = len(full_matrix["columns"])
+
+    return _public_sanitize(
+        {
+            "decisions": projected,
+            "impact_matrix": _build_impact_matrix(projected),
+            "evidence_policy": payload.get("evidence_policy", EVIDENCE_POLICY),
+            "summary": True,
+            "total_decisions": len(cards),
+            "total_assets": total_assets,
+        }
+    )
+
+
+def find_decision(
+    payload: Any,
+    topic_key: str,
+    asset_key: str,
+) -> dict[str, Any] | None:
+    """Find one exact decision card without exposing unrelated evidence."""
+    if not isinstance(payload, Mapping):
+        return None
+    for card in payload.get("decisions") or []:
+        if not isinstance(card, Mapping):
+            continue
+        if (
+            str(card.get("topic_key") or "") == str(topic_key or "")
+            and str(card.get("asset_key") or "") == str(asset_key or "")
+        ):
+            return _public_sanitize(deepcopy(dict(card)))
+    return None
 
 
 def ingest_sources(

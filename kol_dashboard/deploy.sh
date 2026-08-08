@@ -50,7 +50,7 @@ trap cleanup_local EXIT INT TERM
 
 echo "→ 打包应用与采集器"
 mkdir -p "$WORK/pkg/lib"
-cp "$LOCAL_DIR"/{app.py,auth.py,content_quality.py,db.py,decision_collect.py,decision_service.py,market_data.py,portfolio.py,relation_engine.py,macro_collect.py,llm_enrichment.py,enrichment_collect.py,collect.sh} "$WORK/pkg/"
+cp "$LOCAL_DIR"/{app.py,auth.py,content_quality.py,db.py,decision_collect.py,decision_service.py,decision_snapshot.py,market_data.py,portfolio.py,relation_engine.py,macro_collect.py,llm_enrichment.py,enrichment_collect.py,collect.sh} "$WORK/pkg/"
 cp -R "$LOCAL_DIR"/templates "$LOCAL_DIR"/static "$WORK/pkg/"
 cp "$LIB_DIR"/{kol_tracker.py,macro_fetcher.py,risk_radar.py} "$WORK/pkg/lib/"
 cp "$LIB_DIR/serenity_tracker.py" "$WORK/pkg/lib/"
@@ -196,7 +196,7 @@ prepare_unit_state_rollback() {
   local unit enabled active failed=0
   for unit in kol-dashboard.service kol-collect-kol.timer \
     kol-collect-macro.timer kol-collect-decision.timer \
-    kol-collect-enrich.timer; do
+    kol-collect-enrich.timer kol-enrich-wakeup.path; do
     read -r enabled active < "$ROLLBACK_DIR/config/$unit.state" || {
       failed=1
       continue
@@ -213,7 +213,7 @@ restore_unit_states() {
   local unit enabled active failed=0
   for unit in kol-dashboard.service kol-collect-kol.timer \
     kol-collect-macro.timer kol-collect-decision.timer \
-    kol-collect-enrich.timer; do
+    kol-collect-enrich.timer kol-enrich-wakeup.path; do
     read -r enabled active < "$ROLLBACK_DIR/config/$unit.state" || {
       failed=1
       continue
@@ -279,6 +279,8 @@ rollback_configuration() {
     restore_path "/etc/systemd/system/kol-collect-${job}.timer" \
       "kol-collect-${job}.timer" || failed=1
   done
+  restore_path /etc/systemd/system/kol-enrich-wakeup.path \
+    kol-enrich-wakeup.path || failed=1
   restore_path /etc/nginx/snippets/kol-dashboard.conf \
     kol-dashboard.conf || failed=1
   restore_path /etc/nginx/snippets/aidao.locations.conf \
@@ -294,7 +296,8 @@ cleanup_remote() {
   if [[ $rc != 0 && $ROLLBACK_READY == 1 && $COMMITTED == 0 ]]; then
     local rollback_failed=0 unit active_target
     echo "部署失败，恢复上一版本、数据库和配置" >&2
-    systemctl stop kol-collect-kol.timer kol-collect-macro.timer \
+    systemctl stop kol-enrich-wakeup.path \
+      kol-collect-kol.timer kol-collect-macro.timer \
       kol-collect-decision.timer kol-collect-enrich.timer \
       kol-collect-kol.service kol-collect-macro.service \
       kol-collect-decision.service kol-collect-enrich.service \
@@ -459,9 +462,11 @@ for job in kol macro decision enrich; do
   backup_path "/etc/systemd/system/kol-collect-${job}.timer" \
     "kol-collect-${job}.timer"
 done
+backup_path /etc/systemd/system/kol-enrich-wakeup.path \
+  kol-enrich-wakeup.path
 for unit in kol-dashboard.service kol-collect-kol.timer \
   kol-collect-macro.timer kol-collect-decision.timer \
-  kol-collect-enrich.timer; do
+  kol-collect-enrich.timer kol-enrich-wakeup.path; do
   record_unit_state "$unit"
 done
 backup_path /etc/nginx/snippets/kol-dashboard.conf \
@@ -470,14 +475,16 @@ backup_path /etc/nginx/snippets/aidao.locations.conf \
   aidao.locations.conf
 ROLLBACK_READY=1
 
-systemctl stop kol-collect-kol.timer kol-collect-macro.timer \
+systemctl stop kol-enrich-wakeup.path \
+  kol-collect-kol.timer kol-collect-macro.timer \
   kol-collect-decision.timer kol-collect-enrich.timer 2>/dev/null || true
 for unit in kol-collect-kol.service kol-collect-macro.service \
   kol-collect-decision.service kol-collect-enrich.service \
   kol-dashboard.service; do
   systemctl stop "$unit" 2>/dev/null || true
 done
-for unit in kol-collect-kol.timer kol-collect-macro.timer \
+for unit in kol-enrich-wakeup.path \
+  kol-collect-kol.timer kol-collect-macro.timer \
   kol-collect-decision.timer kol-collect-kol.service \
   kol-collect-macro.service kol-collect-decision.service \
   kol-collect-enrich.timer kol-collect-enrich.service \
@@ -645,6 +652,14 @@ chown kol-dashboard:kol-dashboard "$DB_PATH"
 chmod 600 "$DB_PATH"
 rm -f "$DB_PATH-wal" "$DB_PATH-shm"
 
+echo "→ 预热公共决策快照"
+runuser -u kol-dashboard -- /usr/bin/env \
+  KOL_DASHBOARD_DB="$DB_PATH" \
+  KOL_DB_WRITE_REQUIRED=1 \
+  PYTHONDONTWRITEBYTECODE=1 \
+  /usr/bin/python3 "$RELEASE_DIR/decision_collect.py" snapshot
+database_integrity "$DB_PATH"
+
 ln -s "$RELEASE_DIR" "$CURRENT_NEXT"
 mv -Tf "$CURRENT_NEXT" "$CURRENT_LINK"
 
@@ -699,9 +714,11 @@ fi
 for job in kol macro decision enrich; do
   EXTRA_ENVIRONMENT=""
   EXTRA_HARDENING=""
+  EXTRA_EXEC_START_PRE=""
   if [[ "$job" == "enrich" ]]; then
     EXTRA_ENVIRONMENT="EnvironmentFile=-/etc/kol-dashboard/deepseek.env"
     EXTRA_HARDENING="LimitCORE=0"
+    EXTRA_EXEC_START_PRE="ExecStartPre=/usr/bin/rm -f /opt/kol-dashboard/data/enrichment.pending"
   fi
   cat > "$REMOTE_STAGE/kol-collect-${job}.service" <<UNIT
 [Unit]
@@ -727,11 +744,26 @@ ProtectSystem=strict
 ${EXTRA_HARDENING}
 ReadWritePaths=/opt/kol-dashboard/data /opt/kol-dashboard/private /var/log/kol-dashboard
 TimeoutStartSec=20min
+${EXTRA_EXEC_START_PRE}
 ExecStart=/bin/bash /opt/kol-dashboard/current/collect.sh ${job}
 UNIT
   install -m 644 "$REMOTE_STAGE/kol-collect-${job}.service" \
     "/etc/systemd/system/kol-collect-${job}.service"
 done
+
+cat > "$REMOTE_STAGE/kol-enrich-wakeup.path" <<'UNIT'
+[Unit]
+Description=Wake KOL enrichment when new source data arrives
+
+[Path]
+PathExists=/opt/kol-dashboard/data/enrichment.pending
+Unit=kol-collect-enrich.service
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+install -m 644 "$REMOTE_STAGE/kol-enrich-wakeup.path" \
+  /etc/systemd/system/kol-enrich-wakeup.path
 
 cat > "$REMOTE_STAGE/kol-collect-kol.timer" <<'UNIT'
 [Unit]
@@ -797,6 +829,25 @@ done
 cat > "$REMOTE_STAGE/kol-dashboard.conf" <<'NGINX'
 # KOL Dashboard — reverse proxy at /kol/
 location = /kol { return 301 /kol/; }
+location ^~ /kol/static/ {
+    proxy_pass http://127.0.0.1:8088/static/;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_read_timeout 60s;
+
+    gzip on;
+    gzip_vary on;
+    gzip_proxied any;
+    gzip_comp_level 5;
+    gzip_min_length 512;
+    gzip_types application/json application/javascript text/javascript text/css image/svg+xml;
+
+    proxy_hide_header Cache-Control;
+    add_header Cache-Control "public, max-age=604800, immutable" always;
+}
 location /kol/ {
     proxy_pass http://127.0.0.1:8088/;
     proxy_http_version 1.1;
@@ -805,6 +856,13 @@ location /kol/ {
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto $scheme;
     proxy_read_timeout 60s;
+
+    gzip on;
+    gzip_vary on;
+    gzip_proxied any;
+    gzip_comp_level 5;
+    gzip_min_length 512;
+    gzip_types application/json application/javascript text/javascript text/css image/svg+xml;
 }
 NGINX
 install -m 644 "$REMOTE_STAGE/kol-dashboard.conf" \
@@ -827,7 +885,7 @@ fi
 systemctl daemon-reload
 systemctl enable -q kol-dashboard kol-collect-kol.timer \
   kol-collect-macro.timer kol-collect-decision.timer \
-  kol-collect-enrich.timer
+  kol-collect-enrich.timer kol-enrich-wakeup.path
 nginx -t
 systemctl restart kol-dashboard.service
 
@@ -862,7 +920,16 @@ done
 }
 
 systemctl start kol-collect-kol.timer kol-collect-macro.timer \
-  kol-collect-decision.timer kol-collect-enrich.timer
+  kol-collect-decision.timer kol-collect-enrich.timer \
+  kol-enrich-wakeup.path
+systemctl is-enabled --quiet kol-enrich-wakeup.path || {
+  echo "enrichment 唤醒 path 未启用" >&2
+  exit 1
+}
+systemctl is-active --quiet kol-enrich-wakeup.path || {
+  echo "enrichment 唤醒 path 未运行" >&2
+  exit 1
+}
 SERVICES_STOPPED=0
 COMMITTED=1
 echo "service: $(systemctl is-active kol-dashboard)  health: ok"

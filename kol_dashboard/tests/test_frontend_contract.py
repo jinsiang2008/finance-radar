@@ -108,8 +108,8 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn('stale ? "数据延迟" : ""', self.javascript)
         self.assertIn('"高收益债利差"', self.javascript)
         self.assertIn("cs.hy_oas", self.javascript)
-        self.assertIn('static/app.js?v=15', self.html)
-        self.assertIn('static/style.css?v=15', self.html)
+        self.assertIn('static/app.js?v=16', self.html)
+        self.assertIn('static/style.css?v=16', self.html)
         self.assertIn(".metric.is-stale", self.css)
 
     def test_macro_events_render_compact_ai_digest_and_bounded_highlights(self) -> None:
@@ -278,7 +278,7 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn("decisionQueueExpanded: false", self.javascript)
         self.assertIn("cards.slice(0, 10)", self.javascript)
         self.assertIn('id="decision-show-all"', self.javascript)
-        self.assertIn("查看全部 ${cards.length} 条", self.javascript)
+        self.assertIn("查看全部 ${total} 条", self.javascript)
         self.assertIn("收起到重点信号", self.javascript)
         self.assertIn("matrixExpanded: false", self.javascript)
         self.assertIn("orderedColumns.slice(0, 8)", self.javascript)
@@ -296,9 +296,24 @@ class FrontendContractTests(unittest.TestCase):
             self.assertIn(f'event.key === "{key}"', self.javascript)
         self.assertIn('setAttribute("aria-pressed", "false")', self.javascript)
         self.assertIn('setAttribute("aria-pressed", "true")', self.javascript)
-        self.assertIn("function refreshCurrentView()", self.javascript)
-        self.assertIn("setInterval(refreshCurrentView, 300_000)", self.javascript)
+        self.assertIn("function refreshCurrentView(", self.javascript)
+        self.assertIn("function ensureViewLoaded(view", self.javascript)
+        self.assertIn('document.addEventListener("visibilitychange"', self.javascript)
+        self.assertIn("state.refreshTimer = setTimeout", self.javascript)
+        self.assertNotIn("setInterval(refreshCurrentView", self.javascript)
         self.assertNotIn("setInterval(refreshAll", self.javascript)
+
+    def test_first_screen_uses_summary_lazy_detail_and_public_revalidation(self) -> None:
+        self.assertIn('"api/decisions/summary"', self.javascript)
+        self.assertIn("api/decisions/detail?${params}", self.javascript)
+        self.assertIn("decisionDetailCache: new Map()", self.javascript)
+        self.assertIn('cache: options.cache || "no-cache"', self.javascript)
+        self.assertIn("feedAbortController: null", self.javascript)
+        self.assertIn("requestController.signal", self.javascript)
+        self.assertIn("loadFullDecisions()", self.javascript)
+        self.assertNotIn("loadAuthStatus().then(refreshAll)", self.javascript)
+        self.assertNotIn("setInterval(refreshCurrentView", self.javascript)
+        self.assertIn("void loadSupportFacts();", self.javascript)
 
     def test_system_status_reflects_macro_snapshot_freshness(self) -> None:
         self.assertIn('id="system-status"', self.html)

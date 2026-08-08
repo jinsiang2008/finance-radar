@@ -21,6 +21,7 @@ class DeploymentContractTests(unittest.TestCase):
             "db.py",
             "decision_collect.py",
             "decision_service.py",
+            "decision_snapshot.py",
             "market_data.py",
             "portfolio.py",
             "relation_engine.py",
@@ -57,6 +58,18 @@ class DeploymentContractTests(unittest.TestCase):
         self.assertIn("python3 -c 'import db; db.init()'", self.deploy)
         self.assertIn("KOL_DB_WRITE_REQUIRED=1", self.collect)
 
+    def test_decision_snapshot_is_prewarmed_before_release_switch(self) -> None:
+        prewarm = self.deploy.index(
+            '"$RELEASE_DIR/decision_collect.py" snapshot'
+        )
+        release_switch = self.deploy.index(
+            'ln -s "$RELEASE_DIR" "$CURRENT_NEXT"', prewarm
+        )
+        self.assertLess(prewarm, release_switch)
+        self.assertIn("runuser -u kol-dashboard -- /usr/bin/env", self.deploy)
+        self.assertIn('KOL_DASHBOARD_DB="$DB_PATH"', self.deploy)
+        self.assertIn("database_integrity \"$DB_PATH\"", self.deploy[prewarm:])
+
     def test_enrichment_has_an_isolated_secret_file_and_hardened_timer(self) -> None:
         self.assertIn('enrich)', self.collect)
         self.assertIn('enrichment_collect.py")', self.collect)
@@ -83,6 +96,113 @@ class DeploymentContractTests(unittest.TestCase):
         # copied, rewritten or bundled by this deployment script.
         self.assertNotIn("put-secret deepseek", self.deploy)
         self.assertNotIn("deepseek.env\" <<", self.deploy)
+
+    def test_successful_source_collection_wakes_enrichment(self) -> None:
+        self.assertIn(
+            'ENRICHMENT_MARKER="${KOL_ENRICH_WAKE_PATH:-$(dirname '
+            '"$KOL_DASHBOARD_DB")/enrichment.pending}"',
+            self.collect,
+        )
+        self.assertEqual(
+            self.collect.count("\n    signal_enrichment\n"),
+            2,
+        )
+        kol_start = self.collect.index("  kol)")
+        macro_start = self.collect.index("  macro)", kol_start)
+        decision_start = self.collect.index("  decision)", macro_start)
+        kol_job = self.collect[kol_start:macro_start]
+        macro_job = self.collect[macro_start:decision_start]
+        self.assertLess(
+            kol_job.index("signal_enrichment"),
+            kol_job.index('decision_collect.py" relations'),
+        )
+        self.assertLess(
+            macro_job.index("signal_enrichment"),
+            macro_job.index('decision_collect.py" relations'),
+        )
+
+    def test_enrichment_path_unit_is_atomic_and_rollback_safe(self) -> None:
+        self.assertIn(
+            'cat > "$REMOTE_STAGE/kol-enrich-wakeup.path"',
+            self.deploy,
+        )
+        self.assertIn(
+            "PathExists=/opt/kol-dashboard/data/enrichment.pending",
+            self.deploy,
+        )
+        self.assertIn("Unit=kol-collect-enrich.service", self.deploy)
+        self.assertIn(
+            "ExecStartPre=/usr/bin/rm -f "
+            "/opt/kol-dashboard/data/enrichment.pending",
+            self.deploy,
+        )
+        self.assertIn(
+            "backup_path /etc/systemd/system/kol-enrich-wakeup.path",
+            self.deploy,
+        )
+        self.assertIn(
+            "restore_path /etc/systemd/system/kol-enrich-wakeup.path",
+            self.deploy,
+        )
+        self.assertIn("systemctl stop kol-enrich-wakeup.path", self.deploy)
+        self.assertIn(
+            "kol-collect-enrich.timer kol-enrich-wakeup.path; do",
+            self.deploy,
+        )
+
+        enable = self.deploy.index("systemctl enable -q kol-dashboard")
+        nginx_test = self.deploy.index("nginx -t", enable)
+        self.assertIn(
+            "kol-enrich-wakeup.path",
+            self.deploy[enable:nginx_test],
+        )
+        start = self.deploy.index(
+            "systemctl start kol-collect-kol.timer", nginx_test
+        )
+        acceptance = self.deploy.index(
+            "systemctl is-enabled --quiet kol-enrich-wakeup.path", start
+        )
+        self.assertIn(
+            "kol-enrich-wakeup.path",
+            self.deploy[start:acceptance],
+        )
+        self.assertIn(
+            "systemctl is-active --quiet kol-enrich-wakeup.path",
+            self.deploy[acceptance:],
+        )
+
+    def test_nginx_gzips_dynamic_payloads_and_caches_versioned_assets(self) -> None:
+        static_start = self.deploy.index("location ^~ /kol/static/ {")
+        dynamic_start = self.deploy.index("location /kol/ {", static_start)
+        nginx_end = self.deploy.index("\nNGINX", dynamic_start)
+        static_location = self.deploy[static_start:dynamic_start]
+        dynamic_location = self.deploy[dynamic_start:nginx_end]
+
+        self.assertIn(
+            "proxy_pass http://127.0.0.1:8088/static/;",
+            static_location,
+        )
+        self.assertIn("gzip on;", static_location)
+        self.assertIn("gzip_vary on;", static_location)
+        self.assertIn("gzip_comp_level 5;", static_location)
+        self.assertIn(
+            "gzip_types application/json application/javascript "
+            "text/javascript text/css image/svg+xml;",
+            static_location,
+        )
+        self.assertIn("proxy_hide_header Cache-Control;", static_location)
+        self.assertIn(
+            'add_header Cache-Control "public, max-age=604800, immutable" always;',
+            static_location,
+        )
+        self.assertIn("gzip on;", dynamic_location)
+        self.assertIn("gzip_vary on;", dynamic_location)
+        self.assertIn("gzip_comp_level 5;", dynamic_location)
+        self.assertIn(
+            "gzip_types application/json application/javascript "
+            "text/javascript text/css image/svg+xml;",
+            dynamic_location,
+        )
 
     def test_existing_deepseek_secret_file_must_be_root_only(self) -> None:
         self.assertIn(

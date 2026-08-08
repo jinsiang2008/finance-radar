@@ -18,7 +18,7 @@
     } catch (e) {}
   })();
 </script>
-  <link rel="stylesheet" href="static/style.css?v=15" />
+  <link rel="stylesheet" href="static/style.css?v=16" />
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ccircle cx='50' cy='50' r='42' fill='%230b1720' stroke='%2331d69b' stroke-width='6'/%3E%3Ccircle cx='50' cy='50' r='20' fill='none' stroke='%234ab8d8' stroke-width='5'/%3E%3Cpath d='M50 50L82 24' stroke='%23f4b942' stroke-width='6' stroke-linecap='round'/%3E%3Ccircle cx='50' cy='50' r='7' fill='%23eef4f2'/%3E%3C/svg%3E" />
 </head>
 <body>
@@ -55,7 +55,7 @@
         <span id="system-status-label">状态待确认</span>
       </span>
       <span class="updated" title="浏览器页面上次刷新时间">
-        <span class="updated-label">页面刷新</span><time id="last-update">—</time>
+        <span class="updated-label">当前视图</span><time id="last-update">—</time>
       </span>
       <button class="private-mode-btn" id="private-mode-btn" type="button"
               aria-haspopup="dialog" aria-controls="auth-modal">
@@ -64,7 +64,7 @@
       <button class="icon-btn support-topbar" data-support-open
               title="支持服务器运行" aria-label="支持服务器运行">☕</button>
       <button class="icon-btn" id="theme-btn" title="切换主题" aria-label="切换主题">◐</button>
-      <button class="icon-btn" id="refresh-btn" title="立即刷新" aria-label="立即刷新">↻</button>
+      <button class="icon-btn" id="refresh-btn" title="刷新当前视图" aria-label="刷新当前视图">↻</button>
     </div>
   </div>
 </header>
@@ -262,7 +262,7 @@
   <div class="wrap footer-inner">
     <span>研究辅助 · 风险分值不等于事件概率 · 条件性方向不构成投资建议</span>
     <span class="footer-right">
-      <span>KOL 约 30 分钟采集 · 宏观/决策每小时计算 · 页面每 5 分钟检查更新</span>
+      <span>KOL 约 30 分钟采集 · 宏观/决策每小时计算 · 当前视图可见时每 5 分钟检查更新</span>
       <span id="footer-meta"></span>
       <button type="button" class="footer-support" data-support-open>☕ 支持服务器运行</button>
     </span>
@@ -339,6 +339,6 @@
   </div>
 </div>
 
-<script src="static/app.js?v=15"></script>
+<script src="static/app.js?v=16"></script>
 </body>
 </html>

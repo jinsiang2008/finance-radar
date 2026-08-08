@@ -9,7 +9,9 @@ Routes:
   GET  /api/events/{id}     — event intelligence, evidence and related stories
   GET  /api/macro           — latest macro risk snapshot
   GET  /api/macro/history   — composite risk score over time
-  GET  /api/decisions       — public risk/opportunity decision cards
+  GET  /api/decisions       — complete public decision snapshot
+  GET  /api/decisions/summary — small first-screen decision projection
+  GET  /api/decisions/detail — one decision's evidence chain
   GET  /api/relations       — public mechanism relations
   GET  /api/market/reactions — public market validation records
   POST /api/auth/login      — unlock private mode
@@ -33,12 +35,13 @@ from pathlib import Path
 from typing import Any, Literal, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Path as ApiPath, Query, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 import auth
 import db
+import decision_snapshot
 import decision_service
 import llm_enrichment
 
@@ -53,6 +56,10 @@ _NO_STORE_HEADERS = {
     "Pragma": "no-cache",
 }
 _PUBLIC_CACHE_HEADERS = {"Cache-Control": "public, max-age=30"}
+_PUBLIC_REVALIDATE_HEADERS = {
+    "Cache-Control": "public, max-age=30, stale-while-revalidate=120",
+    "Vary": "Accept-Encoding",
+}
 
 
 class LoginBody(BaseModel):
@@ -367,44 +374,98 @@ def api_macro_history(limit: int = Query(60, ge=2, le=500)) -> dict:
 
 
 def _macro_coverage() -> float:
-    snapshot = db.latest_macro()
-    if not isinstance(snapshot, Mapping):
-        return 0.0
-    coverage = snapshot.get("data_coverage")
-    if not isinstance(coverage, Mapping):
-        return 0.0
-    available = coverage.get("available")
-    total = coverage.get("total")
-    if (
-        isinstance(available, (int, float))
-        and not isinstance(available, bool)
-        and isinstance(total, (int, float))
-        and not isinstance(total, bool)
-        and total > 0
-    ):
-        return round(max(0.0, min(1.0, float(available) / float(total))), 4)
-    return 0.0
+    """Compatibility wrapper for collector coverage accounting."""
+    return decision_snapshot.macro_coverage(db)
 
 
 def _build_public_decisions() -> dict[str, Any]:
-    relations = db.query_decision_relations(
-        event_max_age_hours=decision_service.EVENT_RELATION_MAX_AGE_HOURS
-    )
-    reactions = db.query_market_reactions(
-        limit=5_000,
-        eligible_events_only=True,
-    )
-    return decision_service.build_public_decisions(
-        relations,
-        reactions,
-        _macro_coverage(),
+    try:
+        record = decision_snapshot.ensure_public_snapshot()
+        return decision_snapshot.response_payload(record, kind="full")
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="decision_snapshot_unavailable",
+            headers={"Retry-After": "30"},
+        ) from exc
+
+
+def _decision_record() -> dict[str, Any]:
+    try:
+        return decision_snapshot.ensure_public_snapshot()
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="decision_snapshot_unavailable",
+            headers={"Retry-After": "30"},
+        ) from exc
+
+
+def _etag_matches(request: Request, etag: str) -> bool:
+    values = request.headers.get("if-none-match", "")
+    return any(value.strip() in {etag, "*"} for value in values.split(","))
+
+
+def _decision_json_response(
+    request: Request,
+    record: Mapping[str, Any],
+    *,
+    kind: str,
+) -> Response:
+    etag = decision_snapshot.etag(record, kind)
+    headers = {**_PUBLIC_REVALIDATE_HEADERS, "ETag": etag}
+    if _etag_matches(request, etag):
+        return Response(status_code=304, headers=headers)
+    return JSONResponse(
+        decision_snapshot.response_payload(record, kind=kind),
+        headers=headers,
     )
 
 
 @app.get("/api/decisions")
-def api_decisions() -> JSONResponse:
+def api_decisions(request: Request) -> Response:
+    return _decision_json_response(request, _decision_record(), kind="full")
+
+
+@app.get("/api/decisions/summary")
+def api_decision_summary(request: Request) -> Response:
+    return _decision_json_response(request, _decision_record(), kind="summary")
+
+
+@app.get("/api/decisions/detail")
+def api_decision_detail(
+    topic_key: str = Query(..., min_length=1, max_length=120),
+    asset_key: str = Query(..., min_length=1, max_length=80),
+    snapshot_id: Optional[int] = Query(None, ge=1),
+) -> JSONResponse:
+    current = _decision_record()
+    record = current
+    if snapshot_id is not None and snapshot_id != current["snapshot_id"]:
+        record = decision_snapshot.load_public_snapshot(snapshot_id=snapshot_id)
+        if record is None:
+            return JSONResponse(
+                {
+                    "detail": "decision_snapshot_changed",
+                    "current_snapshot_id": current["snapshot_id"],
+                },
+                status_code=409,
+                headers=_PUBLIC_CACHE_HEADERS,
+            )
+    card = decision_service.find_decision(record["full"], topic_key, asset_key)
+    if card is None:
+        raise HTTPException(status_code=404, detail="decision_not_found")
+    metadata = decision_snapshot.response_payload(record, kind="summary")
     return JSONResponse(
-        _build_public_decisions(),
+        {
+            "snapshot_id": record["snapshot_id"],
+            "generated_at": record.get("generated_at"),
+            "age_seconds": metadata["age_seconds"],
+            "stale": metadata["stale"],
+            "decision": card,
+            "evidence_policy": record["full"].get(
+                "evidence_policy", decision_service.EVIDENCE_POLICY
+            ),
+        },
         headers=_PUBLIC_CACHE_HEADERS,
     )
 

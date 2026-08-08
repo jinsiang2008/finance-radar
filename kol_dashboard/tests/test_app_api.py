@@ -1196,6 +1196,37 @@ class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(limited.status_code, 429)
         self.assertGreater(int(limited.headers["retry-after"]), 0)
 
+    async def test_public_decision_summary_detail_and_etag_share_snapshot(self) -> None:
+        self._seed_decision_and_portfolio()
+
+        summary = await self.client.get("/api/decisions/summary")
+        self.assertEqual(summary.status_code, 200)
+        payload = summary.json()
+        self.assertTrue(payload["summary"])
+        self.assertEqual(payload["total_decisions"], 1)
+        self.assertNotIn("evidence", payload["decisions"][0])
+        self.assertIn("etag", summary.headers)
+
+        not_modified = await self.client.get(
+            "/api/decisions/summary",
+            headers={"If-None-Match": summary.headers["etag"]},
+        )
+        self.assertEqual(not_modified.status_code, 304)
+
+        card = payload["decisions"][0]
+        detail = await self.client.get(
+            "/api/decisions/detail",
+            params={
+                "topic_key": card["topic_key"],
+                "asset_key": card["asset_key"],
+                "snapshot_id": payload["snapshot_id"],
+            },
+        )
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(detail.json()["snapshot_id"], payload["snapshot_id"])
+        self.assertIn("evidence", detail.json()["decision"])
+        self.assertNotIn("must-never-be-public", detail.text.lower())
+
 
 if __name__ == "__main__":
     unittest.main()
