@@ -403,7 +403,18 @@ def _decision_record() -> dict[str, Any]:
 
 def _etag_matches(request: Request, etag: str) -> bool:
     values = request.headers.get("if-none-match", "")
-    return any(value.strip() in {etag, "*"} for value in values.split(","))
+    expected = etag.strip()
+    if expected[:2].lower() == "w/":
+        expected = expected[2:].lstrip()
+    for value in values.split(","):
+        candidate = value.strip()
+        if candidate == "*":
+            return True
+        if candidate[:2].lower() == "w/":
+            candidate = candidate[2:].lstrip()
+        if candidate == expected:
+            return True
+    return False
 
 
 def _decision_json_response(

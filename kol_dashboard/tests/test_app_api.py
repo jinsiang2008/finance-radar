@@ -1213,6 +1213,15 @@ class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(not_modified.status_code, 304)
 
+        # nginx weakens strong ETags when it gzip-compresses a representation.
+        # GET/HEAD revalidation uses weak comparison, so the transformed value
+        # must still hit the same application snapshot.
+        weak_not_modified = await self.client.get(
+            "/api/decisions/summary",
+            headers={"If-None-Match": f'W/{summary.headers["etag"]}'},
+        )
+        self.assertEqual(weak_not_modified.status_code, 304)
+
         card = payload["decisions"][0]
         detail = await self.client.get(
             "/api/decisions/detail",
