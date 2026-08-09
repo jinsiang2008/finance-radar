@@ -223,15 +223,35 @@ class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
 
         public = await self.client.get("/api/decisions")
         self.assertEqual(public.status_code, 200)
+        public_body = public.json()
         public_text = public.text.lower()
         self.assertIn("ai_semiconductors", public_text)
+        summary = await self.client.get("/api/decisions/summary")
+        self.assertEqual(summary.status_code, 200)
+        self.assertIn("decision_overview", summary.json())
+        public_card = public_body["decisions"][0]
+        detail = await self.client.get(
+            "/api/decisions/detail",
+            params={
+                "topic_key": public_card["topic_key"],
+                "asset_key": public_card["asset_key"],
+                "snapshot_id": public_body["snapshot_id"],
+            },
+        )
+        self.assertEqual(detail.status_code, 200)
+        public_payloads = (
+            public.text + "\n" + summary.text + "\n" + detail.text
+        ).lower()
         for private_value in (
             "must-never-be-public",
             "robinhood",
             "quantity",
             "matched_positions",
+            "portfolio_overview",
+            "portfolio_matched",
+            "trade_execution_available",
         ):
-            self.assertNotIn(private_value, public_text)
+            self.assertNotIn(private_value, public_payloads)
 
         relations = await self.client.get("/api/relations")
         self.assertEqual(relations.status_code, 200)
@@ -244,15 +264,36 @@ class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
         private = await self.client.get("/api/private/decisions")
         self.assertEqual(private.status_code, 200)
         self.assertEqual(private.headers["cache-control"], "no-store")
-        card = private.json()["decisions"][0]
+        private_body = private.json()
+        card = private_body["decisions"][0]
         self.assertEqual(card["matched_positions"][0]["asset_key"], "US:NVDA")
         self.assertEqual(card["matched_positions"][0]["quantity"], 10.0)
+        self.assertEqual(
+            private_body["portfolio_overview"]["matched_position_count"],
+            1,
+        )
+        self.assertEqual(
+            private_body["decision_overview"]["portfolio_matched"],
+            1,
+        )
 
         impact = await self.client.get("/api/private/portfolio-impact")
         self.assertEqual(impact.status_code, 200)
+        self.assertEqual(impact.headers["cache-control"], "no-store")
         body = impact.json()
+        self.assertEqual(body["schema_version"], 1)
         self.assertTrue(body["available"])
+        self.assertEqual(
+            body["decision_snapshot_id"],
+            private_body["snapshot_id"],
+        )
         self.assertEqual(body["snapshot"]["position_count"], 1)
+        self.assertEqual(body["summary"]["position_count"], 1)
+        self.assertEqual(body["summary"]["matched_position_count"], 1)
+        self.assertEqual(body["summary"]["unmatched_position_count"], 0)
+        self.assertEqual(body["matching_policy"], "exact_asset_key_v1")
+        self.assertFalse(body["indirect_exposure_calculated"])
+        self.assertFalse(body["trade_execution_available"])
         self.assertEqual(body["impacts"][0]["asset_key"], "US:NVDA")
         self.assertTrue(body["human_review_required"])
 

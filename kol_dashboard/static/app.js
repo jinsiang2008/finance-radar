@@ -20,12 +20,17 @@
     logoutPending: false,
     decisionData: null,
     selectedDecisionKey: "",
+    decisionLens: "all",
+    decisionLensLoading: false,
+    decisionLensRequestGeneration: 0,
     decisionQueueExpanded: false,
     matrixExpanded: false,
     decisionRequestGeneration: 0,
     decisionDetailRequestGeneration: 0,
     decisionDetailCache: new Map(),
     fullDecisionLoadError: null,
+    fullDecisionLoadPromise: null,
+    watchAssets: new Set(),
     macroData: null,
     macroHistory: [],
     macroRequestGeneration: 0,
@@ -490,11 +495,308 @@
     ].includes(String(card?.action_stage || ""));
   }
 
+  const DECISION_WATCHLIST_STORAGE_KEY =
+    "finance-radar-public-asset-watchlist-v1";
+  const DECISION_WATCHLIST_LIMIT = 50;
+  const PUBLIC_ASSET_KEY_PATTERN = /^[A-Z][A-Z0-9_]*:[A-Z0-9._\/-]+$/;
+  const DECISION_LENS_LABEL = {
+    all: "全部",
+    candidate: "候选",
+    portfolio: "我的资产",
+    watchlist: "本机关注",
+  };
+
+  function normalizedPublicAssetKey(value) {
+    const key = String(value || "").trim().toUpperCase();
+    return key.length <= 80 && PUBLIC_ASSET_KEY_PATTERN.test(key) ? key : "";
+  }
+
+  function loadDecisionWatchlist() {
+    try {
+      const stored = JSON.parse(
+        localStorage.getItem(DECISION_WATCHLIST_STORAGE_KEY) || "[]"
+      );
+      const keys = Array.from(
+        new Set(
+          (Array.isArray(stored) ? stored : [])
+            .map(normalizedPublicAssetKey)
+            .filter(Boolean)
+        )
+      ).slice(0, DECISION_WATCHLIST_LIMIT);
+      state.watchAssets = new Set(keys);
+    } catch (error) {
+      state.watchAssets = new Set();
+    }
+  }
+
+  function persistDecisionWatchlist() {
+    try {
+      localStorage.setItem(
+        DECISION_WATCHLIST_STORAGE_KEY,
+        JSON.stringify(Array.from(state.watchAssets).slice(0, DECISION_WATCHLIST_LIMIT))
+      );
+      return true;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  function isWatchedAsset(assetKey) {
+    const key = normalizedPublicAssetKey(assetKey);
+    return Boolean(key && state.watchAssets.has(key));
+  }
+
+  function setWatchlistStatus(message) {
+    const status = $("#decision-watchlist-status");
+    if (status) status.textContent = message;
+  }
+
+  function updateWatchButtons() {
+    $$('[data-watch-asset]').forEach((button) => {
+      const watched = isWatchedAsset(button.dataset.watchAsset);
+      button.setAttribute("aria-pressed", String(watched));
+      button.classList.toggle("is-watched", watched);
+      const icon = button.querySelector("[aria-hidden]");
+      if (icon) icon.textContent = watched ? "★" : "☆";
+      const label = button.querySelector(".decision-watch-label");
+      if (label) label.textContent = watched ? "已关注 · 本机保存" : "关注此资产";
+    });
+  }
+
+  function toggleWatchAsset(assetKey, returnFocus = null) {
+    const key = normalizedPublicAssetKey(assetKey);
+    if (!key) return;
+    const wasWatched = state.watchAssets.has(key);
+    if (wasWatched) {
+      state.watchAssets.delete(key);
+    } else if (state.watchAssets.size < DECISION_WATCHLIST_LIMIT) {
+      state.watchAssets.add(key);
+    } else {
+      setWatchlistStatus(`本机关注最多保存 ${DECISION_WATCHLIST_LIMIT} 个公开资产代码。`);
+      return;
+    }
+    const persisted = persistDecisionWatchlist();
+    setWatchlistStatus(
+      `${assetLabel(key)}${wasWatched ? "已移出" : "已加入"}本机关注。${
+        persisted
+          ? "仅公开资产代码保存在本机浏览器。"
+          : "浏览器拒绝持久保存，本次页面内仍保留。"
+      }`
+    );
+    if (state.decisionData) {
+      renderDecisions(state.decisionData);
+    }
+    updateWatchButtons();
+    if (returnFocus) {
+      requestAnimationFrame(() => {
+        const replacement = $$('[data-watch-asset]').find(
+          (button) => normalizedPublicAssetKey(button.dataset.watchAsset) === key
+        );
+        const selectedCard = $$("[data-decision-key]").find(
+          (node) => node.dataset.decisionKey === state.selectedDecisionKey
+        );
+        const lensButton = $(`[data-decision-lens="${state.decisionLens}"]`);
+        (replacement || selectedCard || lensButton)?.focus();
+      });
+    }
+  }
+
+  function evidenceStatusInfo(card) {
+    const sourceCount = Math.max(0, Number(card?.source_count || 0));
+    if (sourceCount >= 2) {
+      return {
+        tone: "ok",
+        state: "multi_source",
+        label: `多源证据 · ${sourceCount} 个独立来源`,
+      };
+    }
+    if (sourceCount === 1) {
+      return {
+        tone: "warn",
+        state: "single_source",
+        label: "单一来源 · 待交叉核验",
+      };
+    }
+    return { tone: "error", state: "no_source", label: "暂无可核验来源" };
+  }
+
+  function marketReasonCount(market, key) {
+    const declared = Number(market?.reason_counts?.[key] || 0);
+    if (Number.isFinite(declared) && declared > 0) return declared;
+    return (Array.isArray(market?.records) ? market.records : []).filter(
+      (record) =>
+        String(record?.reason_code || record?.reason || "").toLowerCase() === key
+    ).length;
+  }
+
+  function marketReasonTotal(market) {
+    const declared = market?.reason_counts;
+    if (declared && typeof declared === "object") {
+      return Object.values(declared).reduce((sum, value) => {
+        const count = Number(value);
+        return sum + (Number.isFinite(count) && count > 0 ? count : 0);
+      }, 0);
+    }
+    return (Array.isArray(market?.records) ? market.records : []).filter(
+      (record) => String(record?.reason_code || record?.reason || "").trim()
+    ).length;
+  }
+
+  function marketIsPurePending(market) {
+    const status = String(market?.status || "").toLowerCase();
+    const windowNotDue = marketReasonCount(market, "window_not_due");
+    const reasonTotal = marketReasonTotal(market);
+    const unavailableWindows = Array.isArray(market?.unavailable_windows)
+      ? market.unavailable_windows.length
+      : 0;
+    return (
+      market?.degraded !== true &&
+      unavailableWindows === 0 &&
+      (status === "pending" || (status === "unavailable" && windowNotDue > 0)) &&
+      (reasonTotal === 0 || reasonTotal === windowNotDue)
+    );
+  }
+
+  function earliestMarketDue(market) {
+    return [
+      market?.next_review_at,
+      ...(Array.isArray(market?.records)
+        ? market.records.map((record) => record?.next_due_at)
+        : []),
+    ]
+      .map((value) => ({ value, epoch: new Date(String(value || "")).getTime() }))
+      .filter((item) => Number.isFinite(item.epoch))
+      .sort((a, b) => a.epoch - b.epoch)[0];
+  }
+
+  function decisionNextReview(card) {
+    const market = card?.market_validation || {};
+    const applicability = String(market.applicability || "").toLowerCase();
+    const reason = String(market.applicability_reason || "").toLowerCase();
+    const phase = String(market.phase || "").toLowerCase();
+    if (
+      reason === "no_event_anchor" ||
+      applicability === "no_event_anchor" ||
+      phase === "scenario_monitoring"
+    ) {
+      return { epoch: Number.POSITIVE_INFINITY, datetime: "", label: "等待触发指标", detail: "宏观情景监控" };
+    }
+    if (
+      reason === "direction_missing" ||
+      applicability === "direction_missing" ||
+      ["direction_missing", "direction_unavailable"].includes(phase)
+    ) {
+      return { epoch: Number.POSITIVE_INFINITY, datetime: "", label: "先补方向证据", detail: "重试行情无法解决" };
+    }
+    if (phase === "contrary" || market.direction_confirmed === false) {
+      return { epoch: Number.POSITIVE_INFINITY, datetime: "", label: "新证据出现时复核", detail: "候选已停止" };
+    }
+    const declared = earliestMarketDue(market);
+    if (marketIsPurePending(market)) {
+      if (declared) {
+        return {
+          epoch: declared.epoch,
+          datetime: String(declared.value),
+          label:
+            declared.epoch <= Date.now()
+              ? "现在需复核"
+              : fmtAbsoluteTime(declared.value),
+          detail: declared.epoch <= Date.now() ? "市场窗口已到" : "等待所需窗口",
+        };
+      }
+      return { epoch: Number.POSITIVE_INFINITY, datetime: "", label: "等待所需窗口", detail: "窗口时间待补齐" };
+    }
+    if (
+      market.degraded === true ||
+      ["degraded", "unavailable", "error", "failed"].includes(
+        String(market.status || "").toLowerCase()
+      )
+    ) {
+      if (declared) {
+        return {
+          epoch: declared.epoch,
+          datetime: String(declared.value),
+          label:
+            declared.epoch <= Date.now()
+              ? "现在重试行情"
+              : `${fmtAbsoluteTime(declared.value)} 重试行情`,
+          detail: "技术 / 数据重试，不是市场窗口确认",
+        };
+      }
+      return { epoch: Number.POSITIVE_INFINITY, datetime: "", label: "按采集计划重试", detail: "保持降级核验" };
+    }
+    if (
+      phase.startsWith("confirmed_") &&
+      market.required_window_complete !== true
+    ) {
+      if (declared) {
+        return {
+          epoch: declared.epoch,
+          datetime: String(declared.value),
+          label:
+            declared.epoch <= Date.now()
+              ? "现在需复核"
+              : fmtAbsoluteTime(declared.value),
+          detail: "等待所需确认窗口",
+        };
+      }
+      return { epoch: Number.POSITIVE_INFINITY, datetime: "", label: "等待所需窗口", detail: "窗口时间待补齐" };
+    }
+    if (market.abstain === false && market.direction_confirmed === true) {
+      return { epoch: Number.POSITIVE_INFINITY, datetime: "", label: "人工复核失效条件", detail: "不自动执行" };
+    }
+    return { epoch: Number.POSITIVE_INFINITY, datetime: "", label: "窗口时间待补齐", detail: "保持观察" };
+  }
+
+  function marketSourceScopeLabel(card) {
+    const market = card?.market_validation || {};
+    const scope = String(market.source_scope || market.validation_scope || "").toLowerCase();
+    if (scope === "mixed") return "事件 + 宏观";
+    if (scope === "macro_only") return "宏观情景";
+    if (scope === "event_only" || scope === "event_anchored") return "事件锚点";
+    return "来源范围待核验";
+  }
+
   function marketStatusInfo(card) {
     const market = card?.market_validation || {};
     const status = String(market.status || "").toLowerCase();
     const phase = String(market.phase || "").toLowerCase();
+    const applicability = String(market.applicability || "").toLowerCase();
+    const applicabilityReason = String(
+      market.applicability_reason || ""
+    ).toLowerCase();
+    const sourceScope = String(
+      market.source_scope || market.validation_scope || ""
+    ).toLowerCase();
     const directionConfirmed = market.direction_confirmed;
+    const noEventAnchor =
+      applicabilityReason === "no_event_anchor" ||
+      applicability === "no_event_anchor" ||
+      phase === "scenario_monitoring" ||
+      ((applicability === "not_applicable" || status === "not_applicable") &&
+        sourceScope === "macro_only");
+    if (noEventAnchor) {
+      return {
+        tone: "warn",
+        state: "scenario_monitoring",
+        label: "宏观情景监控",
+        guidance:
+          "宏观情景无单一事件锚点，不套用事件后 1D/3D/5D 回测；请核验触发指标与失效条件。这不是行情链路故障。",
+      };
+    }
+    if (
+      applicabilityReason === "direction_missing" ||
+      applicability === "direction_missing" ||
+      ["direction_missing", "direction_unavailable"].includes(phase)
+    ) {
+      return {
+        tone: "warn",
+        state: "direction_missing",
+        label: "机制方向未明确",
+        guidance:
+          "当前仅有提及或多空分歧，无法判断同向或反向；请先补方向证据，重试行情无法解决此问题。",
+      };
+    }
     if (phase === "contrary" || directionConfirmed === false) {
       return {
         tone: "warn",
@@ -517,15 +819,55 @@
       };
     }
     if (
+      marketIsPurePending(market) &&
+      directionConfirmed !== true &&
+      !phase.startsWith("confirmed_")
+    ) {
+      return {
+        tone: "warn",
+        state: "pending",
+        label: "等待共同交易日窗口",
+        guidance:
+          "所需窗口尚未到期；未来窗口不构成数据故障，也不能提前视为市场确认。",
+      };
+    }
+    if (
       market.degraded === true ||
       ["degraded", "unavailable", "error", "failed"].includes(status)
     ) {
+      const unsupportedBenchmark = marketReasonCount(market, "unsupported_benchmark");
+      const requestFailed =
+        marketReasonCount(market, "request_failed") +
+        marketReasonCount(market, "provider_error");
+      const followUpUnavailable =
+        marketReasonCount(market, "follow_up") +
+        marketReasonCount(market, "follow_up_unavailable") +
+        marketReasonCount(market, "insufficient") +
+        marketReasonCount(market, "insufficient_follow_up");
+      const noRecords = marketReasonCount(market, "no_records");
+      const label = unsupportedBenchmark
+        ? "独立基准暂不支持"
+        : requestFailed
+          ? "行情获取失败"
+          : followUpUnavailable
+            ? "所需窗口数据不足"
+            : noRecords
+              ? "暂无事件级验证记录"
+              : "所需行情或基准数据不可用";
+      const guidance = unsupportedBenchmark
+        ? "事件与方向均已具备，但缺少独立基准，本轮无法完成验证；保持降级核验。"
+        : requestFailed
+          ? "市场验证暂不可用：行情获取失败，系统将按采集计划重试；当前保持降级核验。"
+          : followUpUnavailable
+            ? "事件与方向均已具备，但所需共同交易日数据不足；当前保持降级核验。"
+            : noRecords
+              ? "暂无事件级验证记录；请核验事件锚点与采集状态，不能把缺失记录视为市场确认。"
+              : "市场验证暂不可用：所需行情或基准数据缺失；仅可核验证据，等待数据链路补齐。";
       return {
         tone: "error",
-        state: "unavailable",
-        label: "市场验证暂不可用",
-        guidance:
-          "市场验证暂不可用；仅可核验证据，不能据此确认交易动作。请等待行情链路恢复后重试。",
+        state: "data_failure",
+        label,
+        guidance,
       };
     }
     if (
@@ -542,13 +884,13 @@
           "已有同向市场样本；仍需人工确认仓位、风险预算与失效条件。",
       };
     }
-    if (market.veto === true || phase === "direction_unavailable") {
+    if (market.veto === true) {
       return {
         tone: "warn",
         state: "vetoed",
-        label: "市场否决，候选停止并复核",
+        label: "验证门禁未通过",
         guidance:
-          "市场验证未通过行动门槛；停止候选行动，先复核机制方向和数据完整性。",
+          "市场验证未通过候选门槛；先复核机制方向、相反证据和数据完整性。",
       };
     }
     const earlyConfirmation =
@@ -686,6 +1028,11 @@
     const allPending =
       marketStates.length > 0 &&
       marketStates.every((item) => item.tone !== "ok");
+    const allNotApplicable =
+      marketStates.length > 0 &&
+      marketStates.every((item) =>
+        ["scenario_monitoring", "direction_missing"].includes(item.state)
+      );
     const businessHealth = declaredBusinessDegraded(data);
     const businessUnavailable = businessHealth.unavailable;
     const businessPartiallyDegraded = businessHealth.partial;
@@ -742,6 +1089,23 @@
           "决策快照缺少可核验的生成时间；当前只可检查证据，不能推进候选行动。",
         systemKind: "warn",
         systemLabel: "快照时间待核验",
+      };
+    }
+    if (allNotApplicable) {
+      const scenarioCount = marketStates.filter(
+        (item) => item.state === "scenario_monitoring"
+      ).length;
+      const directionCount = marketStates.filter(
+        (item) => item.state === "direction_missing"
+      ).length;
+      return {
+        tone: "warn",
+        evidenceTone: hasEvidence ? "warn" : "error",
+        evidenceLabel: hasEvidence ? "有来源，待补验证条件" : "证据不足",
+        marketLabel: "当前无适用事件窗口",
+        guidance: `当前卡片中 ${scenarioCount} 项为宏观情景监控，${directionCount} 项需先明确机制方向；这不表示行情链路故障。`,
+        systemKind: "warn",
+        systemLabel: "事件窗口不适用",
       };
     }
     if (contraryMarket || inconclusiveMarket) {
@@ -972,8 +1336,214 @@
     </svg>`;
   }
 
+  function cardHasPortfolioMatch(card) {
+    return Array.isArray(card?.matched_positions) && card.matched_positions.length > 0;
+  }
+
+  function decisionMatchesLens(card, lens = state.decisionLens) {
+    if (lens === "candidate") return isCandidateAction(card);
+    if (lens === "portfolio") return cardHasPortfolioMatch(card);
+    if (lens === "watchlist") return isWatchedAsset(card?.asset_key);
+    return true;
+  }
+
+  function decisionLensCards(data) {
+    return orderedDecisions(data?.decisions || []).filter((card) =>
+      decisionMatchesLens(card)
+    );
+  }
+
+  function renderDecisionLenses(data) {
+    const cards = Array.isArray(data?.decisions) ? data.decisions : [];
+    const overview = data?.decision_overview || {};
+    const portfolio = data?.portfolio_overview || {};
+    const counts = {
+      all: Number(data?.total_decisions ?? overview.total ?? cards.length) || 0,
+      candidate:
+        Number.isFinite(Number(overview.candidate))
+          ? Number(overview.candidate)
+          : cards.filter(isCandidateAction).length,
+      portfolio:
+        Number.isFinite(Number(overview.portfolio_matched))
+          ? Number(overview.portfolio_matched)
+          : Number.isFinite(Number(portfolio.impacted_asset_count))
+            ? Number(portfolio.impacted_asset_count)
+            : cards.filter(cardHasPortfolioMatch).length,
+      watchlist: cards.filter((card) => isWatchedAsset(card.asset_key)).length,
+    };
+    $$("#decision-lenses [data-decision-lens]").forEach((button) => {
+      const active = button.dataset.decisionLens === state.decisionLens;
+      button.classList.toggle("is-active", active);
+      button.setAttribute("aria-pressed", String(active));
+      button.disabled = state.decisionLensLoading;
+    });
+    Object.entries(counts).forEach(([lens, count]) => {
+      const target = $(`[data-lens-count="${lens}"]`);
+      if (target) target.textContent = String(Math.max(0, count));
+    });
+    const group = $("#decision-lenses");
+    if (group) group.setAttribute("aria-busy", String(state.decisionLensLoading));
+    const notes = {
+      all: "私人直接命中与本机关注资产会优先排序。",
+      candidate: "只显示达到候选门槛且仍待人工确认的卡片。",
+      portfolio: state.authenticated
+        ? "仅显示精确 asset_key 直接命中的持仓；ETF、行业与相关性等间接暴露尚未计算。"
+        : "请先解锁私人模式，才能查看精确 asset_key 直接命中的持仓。",
+      watchlist:
+        "仅显示本机关注资产；只保存公开 asset_key，不上传持仓、账户或成本信息。",
+    };
+    let note = notes[state.decisionLens] || notes.all;
+    if (state.decisionLensLoading) {
+      note = `正在加载完整决策集，以应用“${DECISION_LENS_LABEL[state.decisionLens]}”视角…`;
+    } else if (
+      state.decisionLens !== "all" &&
+      data?.summary === true &&
+      state.fullDecisionLoadError
+    ) {
+      note += " 完整决策集加载失败，当前结果仅基于首屏摘要。";
+    }
+    const status = $("#decision-lens-status");
+    if (status) status.textContent = note;
+  }
+
+  function privatePortfolioSummaryHTML(data) {
+    if (!state.authenticated) {
+      return `<div class="private-summary is-public">
+        <span aria-hidden="true">🔒</span>
+        <span>公共模式不加载持仓；本机关注仅保存公开资产代码。</span>
+      </div>`;
+    }
+    const snapshot = data?.portfolio_snapshot || null;
+    const portfolio = data?.portfolio_overview || {};
+    const cards = Array.isArray(data?.decisions) ? data.decisions : [];
+    const fallbackMatchedAssets = new Set(
+      cards.filter(cardHasPortfolioMatch).map((card) => String(card.asset_key || ""))
+    ).size;
+    const positionCount = Number(portfolio.position_count ?? snapshot?.position_count ?? 0) || 0;
+    const matchedPositionsKnown = Number.isFinite(
+      Number(portfolio.matched_position_count)
+    );
+    const matchedPositions = matchedPositionsKnown
+      ? Number(portfolio.matched_position_count)
+      : 0;
+    const matchedAssets = Number.isFinite(Number(portfolio.impacted_asset_count))
+      ? Number(portfolio.impacted_asset_count)
+      : fallbackMatchedAssets;
+    const leveragedMatches = Number.isFinite(Number(portfolio.leveraged_match_count))
+      ? Number(portfolio.leveraged_match_count)
+      : cards.filter((card) => cardHasPortfolioMatch(card) && card.leverage_flag).length;
+    const candidateMatches = Number(portfolio.candidate_matched_decisions || 0);
+    const stalePositions = Number(portfolio.stale_position_count || 0);
+    const snapshotStale = snapshot?.staleness?.is_stale === true;
+    if (positionCount <= 0) {
+      return `<div class="private-summary is-empty">
+        <span aria-hidden="true">🔓</span>
+        <strong>私人模式已开启 · 尚无持仓快照</strong>
+        <span>继续显示公开信号与本机关注；这不代表组合无风险。</span>
+      </div>`;
+    }
+    if (matchedAssets <= 0) {
+      return `<div class="private-summary is-empty">
+        <span aria-hidden="true">🔓</span>
+        <strong>持仓 ${positionCount} 项 · 暂无直接命中</strong>
+        <span>当前仅做精确 asset_key 匹配；间接暴露尚未计算，不代表组合无风险。</span>
+        ${
+          snapshotStale || stalePositions
+            ? '<span class="status-badge warn">⚠ 持仓快照含过期记录</span>'
+            : ""
+        }
+      </div>`;
+    }
+    return `<div class="private-summary is-private">
+      <span aria-hidden="true">🔓</span>
+      <strong>私人覆盖层已开启</strong>
+      <span>持仓 ${positionCount} 项 · ${
+        matchedPositionsKnown
+          ? `直接命中 ${matchedPositions} 项 / ${matchedAssets} 个资产`
+          : `直接命中 ${matchedAssets} 个资产`
+      }</span>
+      ${
+        leveragedMatches
+          ? `<span class="status-badge warn">⚠ 杠杆命中 ${leveragedMatches}</span>`
+          : ""
+      }
+      ${
+        candidateMatches
+          ? `<span class="status-badge warn">候选命中 ${candidateMatches} · 待人工确认</span>`
+          : ""
+      }
+      ${
+        snapshotStale || stalePositions
+          ? `<span class="status-badge warn">⚠ 过期 ${Math.max(stalePositions, 1)} 项，置信度已降级</span>`
+          : ""
+      }
+      <span>仅直接匹配；间接暴露未计算。</span>
+    </div>`;
+  }
+
+  function decisionRunwayHTML(data, lensCards) {
+    const allCards = orderedDecisions(data?.decisions || []);
+    const portfolio = data?.portfolio_overview || {};
+    const marketHealth = data?.business_health?.market_validation || {};
+    const applicableCount = Number(marketHealth.applicable_decisions);
+    const coveredCount = Number(marketHealth.covered_decisions);
+    const scenarioCount = Number(
+      marketHealth.scenario_monitoring_decisions ??
+        marketHealth.no_event_anchor_decisions
+    );
+    const directionCount = Number(marketHealth.direction_missing_decisions);
+    const failureCount = Number(marketHealth.data_failure_decisions);
+    const hasSemanticCoverage =
+      Number(marketHealth.semantics_version) >= 2 &&
+      Number.isFinite(applicableCount) &&
+      Number.isFinite(coveredCount);
+    const marketCoverageLabel = hasSemanticCoverage
+      ? applicableCount > 0
+        ? `市场样本 ${coveredCount}/${applicableCount}`
+        : "无适用事件窗口"
+      : "覆盖口径待更新";
+    const marketCoverageDetail = hasSemanticCoverage
+      ? `情景 ${Number.isFinite(scenarioCount) ? scenarioCount : 0} · 方向待补 ${
+          Number.isFinite(directionCount) ? directionCount : 0
+        } · 数据故障 ${Number.isFinite(failureCount) ? failureCount : 0}`
+      : "逐卡核验证据与市场状态";
+    const matchedAssets = Number(portfolio.impacted_asset_count) ||
+      allCards.filter(cardHasPortfolioMatch).length;
+    const watchedVisible = allCards.filter((card) => isWatchedAsset(card.asset_key)).length;
+    const reviewCards = lensCards.length ? lensCards : allCards;
+    const nextReview = reviewCards
+      .map((card) => ({ card, review: decisionNextReview(card) }))
+      .sort((a, b) => a.review.epoch - b.review.epoch)[0];
+    const ownedLabel = state.authenticated
+      ? matchedAssets
+        ? `${matchedAssets} 个直接命中`
+        : "暂无直接命中"
+      : `${state.watchAssets.size} 个本机关注`;
+    const ownedDetail = state.authenticated
+      ? `${watchedVisible} 个关注资产在当前数据中 · 仅精确匹配`
+      : "解锁后叠加私人持仓直接命中";
+    return `<div class="decision-runway" aria-label="个性化核验跑道">
+      <div class="runway-cell is-market">
+        <small>验证结构</small><strong>${esc(marketCoverageLabel)}</strong>
+        <span>${esc(marketCoverageDetail)}</span>
+      </div>
+      <div class="runway-cell">
+        <small>我的资产</small><strong>${esc(ownedLabel)}</strong>
+        <span>${esc(ownedDetail)}</span>
+      </div>
+      <div class="runway-cell">
+        <small>下一复核</small><strong>${esc(nextReview?.review.label || "等待新证据")}</strong>
+        <span>${esc(
+          nextReview
+            ? `${assetLabel(nextReview.card.asset_key)} · ${nextReview.review.detail}`
+            : "当前视角暂无待复核卡片"
+        )}</span>
+      </div>
+    </div>`;
+  }
+
   function renderDecisionHero(data) {
-    const cards = orderedDecisions(data.decisions || []);
+    const cards = decisionLensCards(data);
     const counts = cards.reduce(
       (acc, card) => {
         acc[card.classification] = (acc[card.classification] || 0) + 1;
@@ -1023,27 +1593,7 @@
       : lead
         ? "历史快照仍在积累，先按当前重点信号核验证据链与市场确认。"
         : "历史快照仍在积累，当前以观察和补充证据为主。";
-    const snapshot = data.portfolio_snapshot;
-    const privateSummary = state.authenticated
-      ? `<div class="private-summary">
-          <span aria-hidden="true">🔓</span>
-          <strong>私人覆盖层已开启</strong>
-          ${
-            snapshot
-              ? `<span>持仓 ${snapshot.position_count} 项 · 数据 ${esc(
-                  snapshot.as_of || "日期未知"
-                )}${
-                  snapshot.staleness?.is_stale
-                    ? ' · <span class="status-badge warn">⚠ 已过期，置信度已降级</span>'
-                    : ""
-                }</span>`
-              : "<span>尚无持仓快照</span>"
-          }
-        </div>`
-      : `<div class="private-summary">
-          <span aria-hidden="true">🔒</span>
-          <span>公共模式不加载持仓；解锁后才显示直接敞口与杠杆风险。</span>
-        </div>`;
+    const privateSummary = privatePortfolioSummaryHTML(data);
 
     const leadAction = lead ? actionInfo(lead) : ACTION_CN.observe;
     const leadIsCandidate = Boolean(lead && isCandidateAction(lead));
@@ -1083,7 +1633,7 @@
           <p class="brief-narrative">${esc(narrative)}</p>
         </section>
         <section class="brief-lead">
-          <p class="brief-kicker">当前首要传导 · ${
+          <p class="brief-kicker">${esc(DECISION_LENS_LABEL[state.decisionLens] || "全部")}视角 · 当前首要传导 · ${
             leadNeedsReview
               ? "候选行动 · 待人工确认"
               : leadIsCandidate
@@ -1126,6 +1676,7 @@
         </div>
         <p>${esc(boundary.guidance)}</p>
       </div>
+      ${decisionRunwayHTML(data, cards)}
       ${privateSummary}`;
   }
 
@@ -1138,21 +1689,60 @@
       verify: 2,
       observe: 3,
     };
-    return cards.slice().sort(
-      (a, b) =>
-        (order[a.action_stage] ?? 9) - (order[b.action_stage] ?? 9) ||
-        (b.total_score || 0) - (a.total_score || 0)
-    );
+    return cards.slice().sort((a, b) => {
+      const stageRank =
+        (order[a.action_stage] ?? 9) - (order[b.action_stage] ?? 9);
+      if (stageRank) return stageRank;
+      const portfolioRank = Number(!cardHasPortfolioMatch(a)) - Number(!cardHasPortfolioMatch(b));
+      if (portfolioRank) return portfolioRank;
+      const watchRank = Number(!isWatchedAsset(a.asset_key)) - Number(!isWatchedAsset(b.asset_key));
+      if (watchRank) return watchRank;
+      const leverageRank = Number(!a.leverage_flag) - Number(!b.leverage_flag);
+      if (leverageRank) return leverageRank;
+      const aReview = decisionNextReview(a).epoch;
+      const bReview = decisionNextReview(b).epoch;
+      if (aReview !== bReview) {
+        if (!Number.isFinite(aReview)) return 1;
+        if (!Number.isFinite(bReview)) return -1;
+        return aReview - bReview;
+      }
+      return (
+        (b.total_score || 0) - (a.total_score || 0) ||
+        decisionKey(a).localeCompare(decisionKey(b))
+      );
+    });
   }
 
   function renderDecisionQueue(data) {
-    const cards = orderedDecisions(data.decisions || []);
-    const total = Number(data.total_decisions) || cards.length;
-    $("#decision-count").textContent = total;
+    const cards = decisionLensCards(data);
+    const allTotal = Number(data.total_decisions) || (data.decisions || []).length;
+    const total = state.decisionLens === "all" ? allTotal : cards.length;
+    $("#decision-count").textContent =
+      state.decisionLens === "all" ? String(total) : `${cards.length}/${allTotal}`;
     if (!cards.length) {
-      $("#decision-queue").innerHTML = `<div class="empty">
-        <span class="empty-icon">🧭</span>尚未生成可展示的关联
-        <div class="empty-hint">等待事件或宏观快照完成关系提取</div>
+      const emptyByLens = {
+        candidate: [
+          "本轮暂无候选",
+          "其余影响假设仍需补齐证据、方向或市场窗口。",
+        ],
+        portfolio: state.authenticated
+          ? [
+              "当前持仓暂无直接命中",
+              "仅按精确 asset_key 匹配；间接暴露尚未计算，不代表组合无风险。",
+            ]
+          : ["私人视角尚未解锁", "使用顶部私人模式后查看直接持仓命中。"],
+        watchlist: [
+          "当前关注资产暂无命中",
+          state.watchAssets.size
+            ? "关注列表有资产，但当前决策集中尚无对应卡片。"
+            : "打开任一资产证据链，使用“关注此资产”保存在本机。",
+        ],
+        all: ["尚未生成可展示的关联", "等待事件或宏观快照完成关系提取。"],
+      };
+      const [title, hint] = emptyByLens[state.decisionLens] || emptyByLens.all;
+      $("#decision-queue").innerHTML = `<div class="empty decision-lens-empty">
+        <span class="empty-icon">🧭</span>${esc(title)}
+        <div class="empty-hint">${esc(hint)}</div>
       </div>`;
       return;
     }
@@ -1162,17 +1752,23 @@
         const action = actionInfo(card);
         const key = decisionKey(card);
         const marketInfo = marketStatusInfo(card);
-        const evidenceLabel = card.human_review_required
-          ? "待人工核验"
-          : Number(card.source_count || 0) > 0
-            ? "有来源可核验"
-            : "证据不足";
+        const evidenceInfo = evidenceStatusInfo(card);
+        const nextReview = decisionNextReview(card);
+        const nextReviewLabelHTML = nextReview.datetime
+          ? `<time datetime="${esc(nextReview.datetime)}">${esc(nextReview.label)}</time>`
+          : esc(nextReview.label);
+        const watched = isWatchedAsset(card.asset_key);
         const privateBadge = card.matched_positions?.length
           ? `<span class="status-badge private">私 · 匹配 ${card.matched_positions.length}</span>`
           : "";
         return `<button class="decision-card ${
           key === state.selectedDecisionKey ? "is-selected" : ""
+        } ${cardHasPortfolioMatch(card) ? "is-owned" : ""} ${
+          watched ? "is-watched" : ""
         }" type="button" data-decision-key="${esc(key)}"
+          aria-label="${esc(
+            `${assetLabel(card.asset_key)}，${action.label}，${evidenceInfo.label}，${marketInfo.label}，下一复核 ${nextReview.label}`
+          )}"
           style="--decision-color:${action.color}">
           <div class="decision-card-top">
             <span class="decision-action">${action.icon} ${action.label}</span>
@@ -1183,17 +1779,20 @@
           </div>
           <div class="decision-topic">${esc(topicName(card.topic_key))}</div>
           <div class="decision-card-trigger">${esc(card.trigger || "")}</div>
-          <div class="decision-card-boundary" aria-label="证据状态与市场状态">
-            <span class="is-${card.human_review_required ? "warn" : "ok"}">
-              <small>证据状态</small><strong>${esc(evidenceLabel)}</strong>
+          <div class="decision-card-boundary" aria-label="证据状态、市场状态与下一复核">
+            <span class="is-${esc(evidenceInfo.tone)}">
+              <small>证据状态</small><strong>${esc(evidenceInfo.label)}</strong>
             </span>
             <span class="is-${esc(marketInfo.tone)}">
               <small>市场状态</small><strong>${esc(marketInfo.label)}</strong>
             </span>
+            <span class="is-review">
+              <small>下一复核</small><strong>${nextReviewLabelHTML}</strong>
+            </span>
           </div>
           <div class="decision-card-meta">
             <span>置信 ${confidencePct(card)}</span>
-            <span>· ${card.source_count || 0} 个来源</span>
+            <span>· ${esc(marketSourceScopeLabel(card))}</span>
             ${
               card.human_review_required
                 ? '<span class="status-badge warn">候选行动 · 待人工确认</span>'
@@ -1201,6 +1800,7 @@
             }
             ${card.leverage_flag ? '<span class="status-badge warn">⚠ 杠杆</span>' : ""}
             ${card.stale ? '<span class="status-badge warn">⚠ 数据过期</span>' : ""}
+            ${watched ? '<span class="status-badge watch">★ 本机关注</span>' : ""}
             ${privateBadge}
           </div>
         </button>`;
@@ -1220,24 +1820,43 @@
     const matrix = data.impact_matrix || {};
     const columns = matrix.columns || [];
     const rows = matrix.rows || [];
-    if (!columns.length || !rows.length) {
+    const lensCards = decisionLensCards(data);
+    const allowedKeys = new Set(lensCards.map(decisionKey));
+    const lensColumns = columns.filter((asset) =>
+      rows.some((row) => allowedKeys.has(`${row.topic_key}::${asset}`))
+    );
+    const lensRows = rows.filter((row) =>
+      lensColumns.some((asset) => allowedKeys.has(`${row.topic_key}::${asset}`))
+    );
+    if (!lensColumns.length || !lensRows.length) {
       $("#decision-matrix").innerHTML = `<div class="empty">
-        <span class="empty-icon">▦</span>暂无主题 × 资产矩阵
+        <span class="empty-icon">▦</span>当前视角暂无主题 × 资产矩阵
       </div>`;
       return;
     }
-    const assetScores = (data.decisions || []).reduce((scores, card) => {
+    const assetScores = lensCards.reduce((scores, card) => {
       const key = String(card.asset_key || "");
       scores[key] = Math.max(scores[key] || 0, Number(card.total_score) || 0);
       return scores;
     }, {});
-    const orderedColumns = columns
+    const portfolioAssets = new Set(
+      lensCards.filter(cardHasPortfolioMatch).map((card) => String(card.asset_key || ""))
+    );
+    const orderedColumns = lensColumns
       .slice()
-      .sort((a, b) => (assetScores[b] || 0) - (assetScores[a] || 0));
+      .sort(
+        (a, b) =>
+          Number(!portfolioAssets.has(a)) - Number(!portfolioAssets.has(b)) ||
+          Number(!isWatchedAsset(a)) - Number(!isWatchedAsset(b)) ||
+          (assetScores[b] || 0) - (assetScores[a] || 0)
+      );
     const visibleColumns = state.matrixExpanded
       ? orderedColumns
       : orderedColumns.slice(0, 8);
-    const totalAssets = Number(data.total_assets) || columns.length;
+    const totalAssets =
+      state.decisionLens === "all"
+        ? Number(data.total_assets) || orderedColumns.length
+        : orderedColumns.length;
     $("#decision-matrix").innerHTML = `<table class="impact-matrix">
       <thead><tr><th scope="col">主题</th>${visibleColumns
         .map(
@@ -1245,17 +1864,17 @@
             `<th scope="col" title="${esc(asset)}">${esc(assetLabel(asset))}</th>`
         )
         .join("")}</tr></thead>
-      <tbody>${rows
+      <tbody>${lensRows
         .map(
           (row) => `<tr>
             <th scope="row">${esc(topicName(row.topic_key))}</th>
             ${visibleColumns
               .map((asset) => {
                 const index = columns.indexOf(asset);
-                const cell = (row.cells || [])[index];
+                const key = `${row.topic_key}::${asset}`;
+                const cell = allowedKeys.has(key) ? (row.cells || [])[index] : null;
                 if (!cell) return '<td class="matrix-empty">·</td>';
                 const info = CLASS_CN[cell.classification] || CLASS_CN.conflict;
-                const key = `${row.topic_key}::${asset}`;
                 return `<td><button type="button" class="matrix-cell ${
                   key === state.selectedDecisionKey ? "is-selected" : ""
                 }" data-decision-key="${esc(key)}" style="--cell-color:${info.color}"
@@ -1303,6 +1922,9 @@
     const evidence = distinctEvidence(card);
     const market = card.market_validation || {};
     const marketInfo = marketStatusInfo(card);
+    const evidenceInfo = evidenceStatusInfo(card);
+    const nextReview = decisionNextReview(card);
+    const watched = isWatchedAsset(card.asset_key);
     const records = market.records || [];
     const positions = card.matched_positions || [];
     const sourceNodes = evidence.slice(0, 3).map((item) => {
@@ -1343,6 +1965,12 @@
           })
           .join("")
       : "<li>暂无可公开展示的机制摘录</li>";
+    const noMarketRows =
+      marketInfo.state === "scenario_monitoring"
+        ? "宏观情景不适用事件后市场窗口；请改用触发指标监控。"
+        : marketInfo.state === "direction_missing"
+          ? "机制方向未明确，当前样本不能判断同向或反向。"
+          : "暂无可用共同交易日样本。";
     const marketRows = records.length
       ? records
           .map(
@@ -1361,7 +1989,7 @@
             </tr>`
           )
           .join("")
-      : '<tr><td colspan="5">暂无共同交易日样本</td></tr>';
+      : `<tr><td colspan="5">${esc(noMarketRows)}</td></tr>`;
     const positionSection = positions.length
       ? `<section class="evidence-section wide">
           <h3>私人持仓影响 ${
@@ -1402,6 +2030,9 @@
           )
           .join("")
       : "<li>当前未记录独立的相反证据；这不表示反例不存在。</li>";
+    const nextReviewHTML = nextReview.datetime
+      ? `<time datetime="${esc(nextReview.datetime)}">${esc(nextReview.label)}</time>`
+      : `<span>${esc(nextReview.label)}</span>`;
 
     $("#decision-detail").innerHTML = `
       <div class="evidence-head">
@@ -1411,6 +2042,10 @@
               action.label
             }</span>
             <span class="pill" style="--lvl:${kind.color}">${kind.icon} ${kind.label}</span>
+            <span class="status-badge is-${esc(evidenceInfo.tone)}">${esc(
+              evidenceInfo.label
+            )}</span>
+            <span class="status-badge">${esc(marketSourceScopeLabel(card))}</span>
             ${
               card.human_review_required
                 ? '<span class="status-badge warn">候选行动 · 待人工确认</span>'
@@ -1422,11 +2057,21 @@
           )}">${esc(assetLabel(card.asset_key))} · ${esc(topicName(card.topic_key))}</h2>
           <div class="evidence-subtitle">数据截至 ${esc(
             card.data_as_of ? fmtTime(card.data_as_of) : "未知"
-          )} · 期限 ${esc(card.horizon || "未知")} · ${card.source_count || 0} 个独立来源</div>
+          )} · 期限 ${esc(card.horizon || "未知")} · 下一复核 ${nextReviewHTML}</div>
         </div>
-        <div class="evidence-score"><strong>${Math.round(
-          (card.total_score || 0) * 100
-        )}</strong><span>决策分 · 置信 ${confidencePct(card)}</span></div>
+        <div class="evidence-head-actions">
+          <button class="decision-watch-btn ${watched ? "is-watched" : ""}" type="button"
+                  data-watch-asset="${esc(card.asset_key)}" aria-pressed="${String(watched)}"
+                  title="仅公开 asset_key 保存在本机浏览器，不上传持仓信息">
+            <span aria-hidden="true">${watched ? "★" : "☆"}</span>
+            <span class="decision-watch-label">${
+              watched ? "已关注 · 本机保存" : "关注此资产"
+            }</span>
+          </button>
+          <div class="evidence-score"><strong>${Math.round(
+            (card.total_score || 0) * 100
+          )}</strong><span>决策分 · 置信 ${confidencePct(card)}</span></div>
+        </div>
       </div>
       <div class="relation-chain">${chain.join("")}</div>
       <div class="evidence-grid">
@@ -1443,6 +2088,9 @@
           <p class="validation-boundary is-${esc(marketInfo.tone)}">${esc(
             marketInfo.guidance
           )}</p>
+          <p class="decision-next-review">
+            <strong>下一复核</strong>${nextReviewHTML}<span>${esc(nextReview.detail)}</span>
+          </p>
           <div class="impact-matrix-wrap"><table class="validation-table">
             <thead><tr><th>窗口</th><th>资产收益</th><th>超额收益</th><th>方向</th><th>样本</th></tr></thead>
             <tbody>${marketRows}</tbody>
@@ -1537,7 +2185,14 @@
         }
       }
     }
-    if (focusDetail) $("#decision-detail").scrollIntoView({ behavior: "smooth", block: "start" });
+    if (focusDetail) {
+      const reduceMotion =
+        window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches === true;
+      $("#decision-detail").scrollIntoView({
+        behavior: reduceMotion ? "auto" : "smooth",
+        block: "start",
+      });
+    }
   }
 
   function renderDecisions(data, { autoSelect = true } = {}) {
@@ -1549,10 +2204,11 @@
       boundary.systemLabel,
       boundary.guidance
     );
-    const cards = orderedDecisions(data.decisions || []);
+    const cards = decisionLensCards(data);
     if (!cards.some((card) => decisionKey(card) === state.selectedDecisionKey)) {
       state.selectedDecisionKey = cards.length ? decisionKey(cards[0]) : "";
     }
+    renderDecisionLenses(data);
     renderDecisionHero(data);
     renderDecisionQueue(data);
     renderDecisionMatrix(data);
@@ -1568,11 +2224,27 @@
 
   function clearDecisionView(message = "私人数据已从当前页面清除") {
     state.decisionDetailRequestGeneration += 1;
+    state.decisionLensRequestGeneration += 1;
     state.decisionDetailCache.clear();
     state.decisionData = null;
     state.selectedDecisionKey = "";
+    state.decisionLens = "all";
+    state.decisionLensLoading = false;
     state.decisionQueueExpanded = false;
     state.matrixExpanded = false;
+    $$("#decision-lenses [data-decision-lens]").forEach((button) => {
+      const active = button.dataset.decisionLens === "all";
+      button.classList.toggle("is-active", active);
+      button.setAttribute("aria-pressed", String(active));
+      button.disabled = false;
+    });
+    $$('[data-lens-count]').forEach((node) => {
+      node.textContent = "—";
+    });
+    const lensStatus = $("#decision-lens-status");
+    if (lensStatus) {
+      lensStatus.textContent = "私人决策与组合命中已从当前页面清除。";
+    }
     $("#decision-hero").innerHTML = `<div class="empty">${esc(message)}</div>`;
     $("#decision-queue").innerHTML = "";
     $("#decision-matrix").innerHTML = "";
@@ -1584,9 +2256,15 @@
   async function loadDecisions({ autoSelect = true } = {}) {
     const requestedPrivate = state.authenticated;
     const requestGeneration = ++state.decisionRequestGeneration;
+    const preserveFullPublicContext =
+      !requestedPrivate &&
+      state.decisionData &&
+      state.decisionData.summary !== true;
     const endpoint = requestedPrivate
       ? "api/private/decisions"
-      : "api/decisions/summary";
+      : preserveFullPublicContext
+        ? "api/decisions"
+        : "api/decisions/summary";
     const url = api(endpoint);
     try {
       const data = requestedPrivate
@@ -1599,6 +2277,7 @@
         return false;
       }
       if (data?.summary === true) {
+        state.decisionLens = "all";
         state.decisionQueueExpanded = false;
         state.matrixExpanded = false;
       }
@@ -1633,22 +2312,33 @@
 
   async function loadFullDecisions() {
     if (!state.decisionData?.summary || state.authenticated) return true;
+    if (state.fullDecisionLoadPromise) return state.fullDecisionLoadPromise;
     state.fullDecisionLoadError = null;
-    const requestGeneration = ++state.decisionRequestGeneration;
-    const url = api("api/decisions");
-    try {
-      const data = await fetchJSON(url, 15000);
-      if (requestGeneration !== state.decisionRequestGeneration || state.authenticated) {
-        state.fullDecisionLoadError = new Error("决策状态已变化，请重新尝试");
+    const promise = (async () => {
+      const requestGeneration = ++state.decisionRequestGeneration;
+      const url = api("api/decisions");
+      try {
+        const data = await fetchJSON(url, 15000);
+        if (requestGeneration !== state.decisionRequestGeneration || state.authenticated) {
+          state.fullDecisionLoadError = new Error("决策状态已变化，请重新尝试");
+          return false;
+        }
+        renderDecisions(data || { decisions: [], impact_matrix: {} });
+        return true;
+      } catch (error) {
+        if (requestGeneration === state.decisionRequestGeneration) {
+          state.fullDecisionLoadError = error;
+        }
         return false;
       }
-      renderDecisions(data || { decisions: [], impact_matrix: {} });
-      return true;
-    } catch (error) {
-      if (requestGeneration === state.decisionRequestGeneration) {
-        state.fullDecisionLoadError = error;
+    })();
+    state.fullDecisionLoadPromise = promise;
+    try {
+      return await promise;
+    } finally {
+      if (state.fullDecisionLoadPromise === promise) {
+        state.fullDecisionLoadPromise = null;
       }
-      return false;
     }
   }
 
@@ -1666,6 +2356,40 @@
       state.fullDecisionLoadError
     )}）。当前仍显示重点内容，可重试。`;
     button.parentElement.insertBefore(alert, button);
+  }
+
+  async function activateDecisionLens(lens, returnFocus) {
+    if (!(lens in DECISION_LENS_LABEL) || state.decisionLensLoading) return;
+    const generation = ++state.decisionLensRequestGeneration;
+    state.decisionLens = lens;
+    state.decisionQueueExpanded = false;
+    state.matrixExpanded = false;
+    const canResolveWithoutFull =
+      lens === "all" ||
+      (lens === "portfolio" && !state.authenticated) ||
+      (lens === "watchlist" && state.watchAssets.size === 0);
+    const needsFull =
+      !canResolveWithoutFull &&
+      state.decisionData?.summary === true &&
+      !state.authenticated;
+    let fullLoaded = false;
+    if (needsFull) {
+      state.decisionLensLoading = true;
+      renderDecisionLenses(state.decisionData);
+      fullLoaded = await loadFullDecisions();
+      if (generation !== state.decisionLensRequestGeneration) return;
+      state.decisionLensLoading = false;
+    }
+    if (state.decisionData) {
+      if (needsFull && fullLoaded) renderDecisionLenses(state.decisionData);
+      else renderDecisions(state.decisionData);
+    }
+    requestAnimationFrame(() => {
+      const current = returnFocus?.isConnected
+        ? returnFocus
+        : $(`[data-decision-lens="${state.decisionLens}"]`);
+      current?.focus();
+    });
   }
 
   function updatePrivateModeButton() {
@@ -1720,6 +2444,9 @@
   async function lockPrivateMode() {
     state.authenticated = false;
     state.logoutPending = true;
+    state.decisionLensRequestGeneration += 1;
+    state.decisionLensLoading = false;
+    if (state.decisionLens === "portfolio") state.decisionLens = "all";
     state.decisionRequestGeneration += 1;
     clearDecisionView();
     updatePrivateModeButton();
@@ -3985,6 +4712,7 @@
   }
 
   document.addEventListener("DOMContentLoaded", async () => {
+    loadDecisionWatchlist();
     bindChips("#time-chips button", "hours", "hours", () => {
       loadEvents();
       loadStats();
@@ -4005,6 +4733,16 @@
     bindViewRetries();
 
     $("#view-decision").addEventListener("click", async (event) => {
+      const watchButton = event.target.closest("[data-watch-asset]");
+      if (watchButton) {
+        toggleWatchAsset(watchButton.dataset.watchAsset, watchButton);
+        return;
+      }
+      const lensButton = event.target.closest("[data-decision-lens]");
+      if (lensButton) {
+        await activateDecisionLens(lensButton.dataset.decisionLens, lensButton);
+        return;
+      }
       const detailRetry = event.target.closest("[data-decision-detail-retry]");
       if (detailRetry) {
         void selectDecision(detailRetry.dataset.decisionDetailRetry, {
@@ -4067,6 +4805,21 @@
       if (target) void selectDecision(target.dataset.decisionKey, { focusDetail: true });
     });
 
+    const lensGroup = $("#decision-lenses");
+    lensGroup?.addEventListener("keydown", (event) => {
+      const buttons = $$("#decision-lenses [data-decision-lens]");
+      const current = event.target.closest("[data-decision-lens]");
+      if (!current || !buttons.length) return;
+      let index = buttons.indexOf(current);
+      if (event.key === "ArrowRight") index = (index + 1) % buttons.length;
+      else if (event.key === "ArrowLeft") index = (index - 1 + buttons.length) % buttons.length;
+      else if (event.key === "Home") index = 0;
+      else if (event.key === "End") index = buttons.length - 1;
+      else return;
+      event.preventDefault();
+      buttons[index].focus();
+    });
+
     $("#private-mode-btn").addEventListener("click", () => {
       if (state.authenticated || state.logoutPending) lockPrivateMode();
       else if (state.authConfigured) openAuth();
@@ -4117,6 +4870,13 @@
       try {
         localStorage.setItem("kol-theme", next);
       } catch (e) {}
+    });
+
+    window.addEventListener("storage", (event) => {
+      if (event.key !== DECISION_WATCHLIST_STORAGE_KEY) return;
+      loadDecisionWatchlist();
+      if (state.decisionData) renderDecisions(state.decisionData);
+      updateWatchButtons();
     });
 
     let qTimer = null;

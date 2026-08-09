@@ -26,6 +26,8 @@ def _relation(
     direction: str,
     *,
     source_type: str = "event",
+    topic_key: str = "ai_semiconductors",
+    asset_key: str = "US:NVDA",
     strength: float = 0.8,
     confidence: float = 0.8,
     horizon: str = "medium",
@@ -34,8 +36,8 @@ def _relation(
     return {
         "source_type": source_type,
         "source_id": source_id,
-        "topic_key": "ai_semiconductors",
-        "asset_key": "US:NVDA",
+        "topic_key": topic_key,
+        "asset_key": asset_key,
         "relation_type": "view" if source_type == "event" else "opportunity",
         "direction": direction,
         "strength": strength,
@@ -57,6 +59,7 @@ def _relation(
 def _reaction(
     source_id: str,
     *,
+    asset_key: str = "US:NVDA",
     direction_confirmed: bool = True,
     status: str = "complete",
     window: str = "3D",
@@ -67,7 +70,7 @@ def _reaction(
     reaction = {
         "source_type": "event",
         "source_id": source_id,
-        "asset_key": "US:NVDA",
+        "asset_key": asset_key,
         "window": window,
         "benchmark_asset_key": "US:SOXX",
         "asset_return": 0.12 if direction_confirmed else -0.02,
@@ -140,7 +143,13 @@ class PublicDecisionTests(unittest.TestCase):
         self.assertEqual(len(card["evidence"]), 3)
         self.assertEqual(len(card["mechanism_relations"]), 3)
         self.assertIn("market_validation", card)
-        self.assertEqual(card["data_as_of"], "2026-08-01T00:00:00+00:00")
+        self.assertEqual(card["data_as_of"], "2026-07-31T12:00:00+00:00")
+        self.assertEqual(
+            card["market_validation"]["applicability_reason"],
+            "direction_missing",
+        )
+        self.assertEqual(card["market_validation"]["records"], [])
+        self.assertIsNone(card["market_validation"]["next_review_at"])
         self.assertEqual(card["confidence"], card["score_components"]["confidence"])
         self.assertTrue(card["human_review_required"])
         self.assertIn(
@@ -214,6 +223,191 @@ class PublicDecisionTests(unittest.TestCase):
             "matched_positions",
         ):
             self.assertNotIn(forbidden, encoded)
+
+    def test_cost_ticker_and_public_cost_text_survive_without_private_fields(
+        self,
+    ) -> None:
+        relation = _relation(
+            "costco-event",
+            "positive",
+            asset_key="US:COST",
+            evidence={
+                "title": "$COST beats estimates while freight cost falls",
+                "item_id": "costco-earnings",
+                "matched_asset": "US:COST",
+                "avg_cost": 123.45,
+                "published_at": "2026-07-31T10:00:00+00:00",
+            },
+        )
+        reaction = _reaction(
+            "costco-event",
+            asset_key="US:COST",
+            window="3D",
+        )
+
+        public = decision_service.build_public_decisions(
+            [relation],
+            [reaction],
+            1.0,
+            now=TEST_NOW,
+        )
+        card = public["decisions"][0]
+        detail = card["evidence"][0]["detail"]
+        self.assertEqual(card["asset_key"], "US:COST")
+        self.assertEqual(card["evidence"][0]["source_id"], "costco-event")
+        self.assertEqual(
+            detail["title"],
+            "$COST beats estimates while freight cost falls",
+        )
+        self.assertEqual(detail["matched_asset"], "US:COST")
+        self.assertNotIn("avg_cost", json.dumps(public, ensure_ascii=False))
+
+        private = decision_service.build_private_overlay(
+            public,
+            [
+                {
+                    "account": "broker",
+                    "asset_key": "US:COST",
+                    "quantity": 2,
+                    "avg_cost": 800,
+                    "currency": "USD",
+                    "as_of": "2026-08-04",
+                }
+            ],
+            {},
+            now=TEST_NOW,
+        )
+        self.assertEqual(private["portfolio_overview"]["matched_position_count"], 1)
+        self.assertEqual(private["portfolio_overview"]["unmatched_position_count"], 0)
+
+    def test_public_opaque_identifiers_fail_closed_on_private_vocabulary(
+        self,
+    ) -> None:
+        relation = _relation(
+            "account_123-robinhood",
+            "positive",
+            evidence={
+                "title": "Public market update",
+                "item_id": "portfolio_456-secret",
+                "url": (
+                    "https://example.com/update?account_123=secret-broker"
+                    "&portfolio_456=retirement"
+                ),
+                "published_at": "2026-07-31T10:00:00+00:00",
+            },
+        )
+
+        result = decision_service.build_public_decisions(
+            [relation],
+            [],
+            1.0,
+            now=TEST_NOW,
+        )
+        encoded = json.dumps(result, ensure_ascii=False).lower()
+        for private_value in (
+            "account_123-robinhood",
+            "portfolio_456-secret",
+            "secret-broker",
+            "retirement",
+        ):
+            self.assertNotIn(private_value, encoded)
+        self.assertIn("[redacted]", encoded)
+
+        cost_relation = _relation(
+            "cost_123-robinhood",
+            "positive",
+            evidence={
+                "title": "$COST logistics costs improved",
+                "item_id": "avg_cost_123.45",
+                "url": "https://example.com/update?avg_cost=123.45",
+                "published_at": "2026-07-31T10:00:00+00:00",
+            },
+        )
+        cost_result = decision_service.build_public_decisions(
+            [cost_relation],
+            [],
+            1.0,
+            now=TEST_NOW,
+        )
+        cost_encoded = json.dumps(cost_result, ensure_ascii=False).lower()
+        for private_value in (
+            "cost_123-robinhood",
+            "avg_cost_123.45",
+            "avg_cost=123.45",
+        ):
+            self.assertNotIn(private_value, cost_encoded)
+        self.assertIn("$cost logistics costs improved", cost_encoded)
+
+    def test_public_projection_drops_private_topic_and_asset_identities(
+        self,
+    ) -> None:
+        relation = _relation(
+            "public-source",
+            "positive",
+            asset_key="US:ACCOUNT-SECRET",
+        )
+        relation["topic_key"] = "account-retirement"
+        reaction = _reaction(
+            "public-source",
+            asset_key="US:ACCOUNT-SECRET",
+            window="1D",
+        )
+
+        self.assertEqual(decision_service.project_public_relations([relation]), [])
+        self.assertEqual(decision_service.project_public_reactions([reaction]), [])
+        public = decision_service.build_public_decisions(
+            [relation],
+            [reaction],
+            1.0,
+            now=TEST_NOW,
+        )
+        encoded = json.dumps(public, ensure_ascii=False).lower()
+        self.assertEqual(public["decisions"], [])
+        self.assertNotIn("account-retirement", encoded)
+        self.assertNotIn("us:account-secret", encoded)
+
+        cost_relation = _relation(
+            "public-source",
+            "positive",
+            asset_key="US:AVG_COST_123",
+        )
+        cost_relation["topic_key"] = "avg_cost_123"
+        self.assertEqual(
+            decision_service.project_public_relations([cost_relation]),
+            [],
+        )
+
+    def test_redacted_source_ids_remain_distinct_for_market_matching(self) -> None:
+        relation = _relation(
+            "account-alpha",
+            "positive",
+            strength=1.0,
+            confidence=1.0,
+            horizon="short",
+        )
+        reaction = _reaction(
+            "portfolio-beta",
+            window="1D",
+        )
+
+        result = decision_service.build_public_decisions(
+            [relation],
+            [reaction],
+            1.0,
+            now=TEST_NOW,
+        )
+
+        card = result["decisions"][0]
+        market = card["market_validation"]
+        self.assertNotEqual(
+            card["evidence"][0]["source_id"],
+            decision_service.project_public_reactions([reaction])[0]["source_id"],
+        )
+        self.assertEqual(market["status"], "unavailable")
+        self.assertEqual(market["records"], [])
+        self.assertTrue(market["abstain"])
+        self.assertTrue(market["veto"])
+        self.assertNotIn("candidate", card["action_stage"])
 
     def test_public_projection_drops_unapproved_private_aliases(self) -> None:
         relation = _relation(
@@ -361,7 +555,8 @@ class PublicDecisionTests(unittest.TestCase):
         )
 
         self.assertEqual(len(result["decisions"]), 1)
-        market = result["decisions"][0]["market_validation"]
+        card = result["decisions"][0]
+        market = card["market_validation"]
         self.assertEqual(market["required_window"], "5D")
         self.assertEqual(market["status"], "preliminary")
         self.assertEqual(market["phase"], "confirmed_1d")
@@ -379,6 +574,8 @@ class PublicDecisionTests(unittest.TestCase):
             result["decisions"][0]["action_stage"],
             {"verify", "observe"},
         )
+        self.assertEqual(result["decision_overview"]["market_confirmed"], 0)
+        self.assertEqual(result["decision_overview"]["pending_window"], 1)
 
     def test_human_review_actions_are_explicit_candidates(self) -> None:
         card = decision_service.build_public_decisions(
@@ -509,6 +706,332 @@ class PublicDecisionTests(unittest.TestCase):
         self.assertEqual(health["covered_decisions"], 1)
         self.assertEqual(health["pending_decisions"], 1)
         self.assertEqual(health["unavailable_decisions"], 0)
+
+    def test_macro_only_decision_uses_no_event_anchor_semantics(self) -> None:
+        result = decision_service.build_public_decisions(
+            [
+                _relation(
+                    "macro-only",
+                    "positive",
+                    source_type="macro_snapshot",
+                )
+            ],
+            [],
+            1.0,
+            now=TEST_NOW,
+        )
+
+        card = result["decisions"][0]
+        market = card["market_validation"]
+        self.assertEqual(market["applicability"], "not_applicable")
+        self.assertEqual(market["applicability_reason"], "no_event_anchor")
+        self.assertEqual(market["source_scope"], "macro_only")
+        self.assertTrue(market["abstain"])
+        self.assertTrue(market["veto"])
+        self.assertFalse(market["degraded"])
+        self.assertIsNone(market["next_review_at"])
+        self.assertEqual(market["reason_counts"], {"no_event_anchor": 1})
+        self.assertIn(card["action_stage"], {"observe", "verify"})
+
+        health = result["business_health"]["market_validation"]
+        self.assertEqual(health["status"], "not_applicable")
+        self.assertFalse(health["degraded"])
+        self.assertEqual(health["applicable_decisions"], 0)
+        self.assertEqual(health["no_event_anchor_decisions"], 1)
+        self.assertEqual(health["data_failure_decisions"], 0)
+        self.assertEqual(result["decision_overview"]["scenario_monitoring"], 1)
+        self.assertEqual(result["decision_overview"]["data_unavailable"], 0)
+
+    def test_event_without_direction_is_not_reported_as_data_failure(self) -> None:
+        result = decision_service.build_public_decisions(
+            [_relation("directionless", "neutral")],
+            [_reaction("directionless")],
+            1.0,
+            now=TEST_NOW,
+        )
+
+        card = result["decisions"][0]
+        market = card["market_validation"]
+        self.assertEqual(market["applicability"], "not_applicable")
+        self.assertEqual(market["applicability_reason"], "direction_missing")
+        self.assertEqual(market["source_scope"], "event_only")
+        self.assertEqual(market["phase"], "direction_unavailable")
+        self.assertTrue(market["abstain"])
+        self.assertTrue(market["veto"])
+        self.assertFalse(market["degraded"])
+        self.assertIn(card["action_stage"], {"observe", "verify"})
+
+        health = result["business_health"]["market_validation"]
+        self.assertEqual(health["status"], "not_applicable")
+        self.assertFalse(health["degraded"])
+        self.assertEqual(health["direction_missing_decisions"], 1)
+        self.assertEqual(health["data_failure_decisions"], 0)
+        self.assertEqual(result["decision_overview"]["direction_missing"], 1)
+        self.assertEqual(result["decision_overview"]["data_unavailable"], 0)
+
+    def test_macro_direction_cannot_borrow_a_neutral_event_market_anchor(
+        self,
+    ) -> None:
+        relations = [
+            _relation("neutral-event", "neutral"),
+            _relation(
+                "positive-macro",
+                "positive",
+                source_type="macro_snapshot",
+            ),
+        ]
+        reactions = [_reaction("neutral-event", window="1D")]
+
+        result = decision_service.build_public_decisions(
+            relations,
+            reactions,
+            1.0,
+            now=TEST_NOW,
+        )
+
+        card = result["decisions"][0]
+        market = card["market_validation"]
+        self.assertEqual(card["classification"], "opportunity")
+        self.assertEqual(market["applicability"], "not_applicable")
+        self.assertEqual(market["applicability_reason"], "direction_missing")
+        self.assertEqual(market["source_scope"], "mixed")
+        self.assertEqual(market["records"], [])
+        self.assertIsNone(market["direction_confirmed"])
+        self.assertFalse(market["required_window_complete"])
+        self.assertTrue(market["abstain"])
+        self.assertTrue(market["veto"])
+        self.assertNotIn("candidate", card["action_stage"])
+        self.assertEqual(result["decision_overview"]["market_confirmed"], 0)
+
+    def test_direction_missing_discards_pending_market_schedule(self) -> None:
+        pending = _reaction(
+            "neutral-event",
+            status="pending",
+            window="1D",
+            sample_count=0,
+            reason_code="window_not_due",
+            next_due_at="2026-08-10T12:00:00+00:00",
+        )
+        result = decision_service.build_public_decisions(
+            [
+                _relation("neutral-event", "neutral"),
+                _relation(
+                    "positive-macro",
+                    "positive",
+                    source_type="macro_snapshot",
+                ),
+            ],
+            [pending],
+            1.0,
+            now=TEST_NOW,
+        )
+
+        market = result["decisions"][0]["market_validation"]
+        self.assertEqual(market["applicability_reason"], "direction_missing")
+        self.assertEqual(market["pending_windows"], [])
+        self.assertIsNone(market["next_review_at"])
+        self.assertEqual(result["decision_overview"]["pending_window"], 0)
+
+    def test_applicable_event_data_failure_remains_degraded(self) -> None:
+        failed = _reaction(
+            "data-failure",
+            status="unavailable",
+            window="1D",
+            sample_count=0,
+            reason_code="request_failed",
+        )
+
+        result = decision_service.build_public_decisions(
+            [
+                _relation(
+                    "data-failure",
+                    "positive",
+                    horizon="short",
+                )
+            ],
+            [failed],
+            1.0,
+            now=TEST_NOW,
+        )
+
+        card = result["decisions"][0]
+        market = card["market_validation"]
+        self.assertEqual(market["applicability"], "applicable")
+        self.assertIsNone(market["applicability_reason"])
+        self.assertEqual(market["source_scope"], "event_only")
+        self.assertEqual(market["status"], "unavailable")
+        self.assertTrue(market["degraded"])
+        self.assertEqual(market["reason_counts"], {"request_failed": 1})
+        self.assertIn(card["action_stage"], {"observe", "verify"})
+
+        health = result["business_health"]["market_validation"]
+        self.assertEqual(health["status"], "unavailable")
+        self.assertTrue(health["degraded"])
+        self.assertEqual(health["applicable_decisions"], 1)
+        self.assertEqual(health["data_failure_decisions"], 1)
+        self.assertEqual(health["not_applicable_decisions"], 0)
+        self.assertEqual(result["decision_overview"]["data_unavailable"], 1)
+
+    def test_mixed_source_scope_preserves_earliest_next_review(self) -> None:
+        relations = [
+            _relation("mixed-event", "positive"),
+            _relation(
+                "mixed-macro",
+                "positive",
+                source_type="macro_snapshot",
+            ),
+        ]
+        reactions = [
+            _reaction(
+                "mixed-event",
+                status="pending",
+                window="1D",
+                sample_count=0,
+                reason_code="window_not_due",
+                next_due_at="2026-08-01T12:00:00+00:00",
+            ),
+            _reaction(
+                "mixed-event",
+                status="pending",
+                window="3D",
+                sample_count=2,
+                reason_code="window_not_due",
+                next_due_at="2026-08-03T12:00:00+00:00",
+            ),
+        ]
+
+        result = decision_service.build_public_decisions(
+            relations,
+            reactions,
+            1.0,
+            now=TEST_NOW,
+        )
+
+        market = result["decisions"][0]["market_validation"]
+        self.assertEqual(market["applicability"], "applicable")
+        self.assertIsNone(market["applicability_reason"])
+        self.assertEqual(market["source_scope"], "mixed")
+        self.assertEqual(market["status"], "pending")
+        self.assertEqual(market["pending_windows"], ["1D", "3D"])
+        self.assertEqual(
+            market["next_review_at"],
+            "2026-08-01T12:00:00+00:00",
+        )
+
+        summary = decision_service.project_decision_summary(result)
+        summary_market = summary["decisions"][0]["market_validation"]
+        self.assertEqual(summary_market["source_scope"], "mixed")
+        self.assertEqual(
+            summary_market["next_review_at"],
+            "2026-08-01T12:00:00+00:00",
+        )
+        self.assertNotIn("records", summary_market)
+
+    def test_decision_overview_separates_each_market_semantic(self) -> None:
+        relations = [
+            _relation(
+                "confirmed",
+                "positive",
+                topic_key="confirmed",
+                asset_key="US:CONF",
+                strength=1.0,
+                confidence=1.0,
+                horizon="short",
+            ),
+            _relation(
+                "contrary",
+                "positive",
+                topic_key="contrary",
+                asset_key="US:CONT",
+                horizon="short",
+            ),
+            _relation(
+                "pending",
+                "positive",
+                topic_key="pending",
+                asset_key="US:PEND",
+                horizon="short",
+            ),
+            _relation(
+                "scenario",
+                "positive",
+                source_type="macro_snapshot",
+                topic_key="scenario",
+                asset_key="US:SCEN",
+                horizon="short",
+            ),
+            _relation(
+                "direction",
+                "neutral",
+                topic_key="direction",
+                asset_key="US:DIR",
+                horizon="short",
+            ),
+            _relation(
+                "failure",
+                "positive",
+                topic_key="failure",
+                asset_key="US:FAIL",
+                horizon="short",
+            ),
+        ]
+        reactions = [
+            _reaction(
+                "confirmed",
+                asset_key="US:CONF",
+                window="1D",
+            ),
+            _reaction(
+                "contrary",
+                asset_key="US:CONT",
+                direction_confirmed=False,
+                window="1D",
+            ),
+            _reaction(
+                "pending",
+                asset_key="US:PEND",
+                status="pending",
+                window="1D",
+                sample_count=0,
+                reason_code="window_not_due",
+                next_due_at="2026-08-02T00:00:00+00:00",
+            ),
+            _reaction(
+                "failure",
+                asset_key="US:FAIL",
+                status="unavailable",
+                window="1D",
+                sample_count=0,
+                reason_code="provider_error",
+            ),
+        ]
+
+        result = decision_service.build_public_decisions(
+            relations,
+            reactions,
+            1.0,
+            now=TEST_NOW,
+        )
+
+        self.assertEqual(
+            result["decision_overview"],
+            {
+                "total": 6,
+                "candidate": 1,
+                "market_confirmed": 1,
+                "contrary": 1,
+                "pending_window": 1,
+                "scenario_monitoring": 1,
+                "direction_missing": 1,
+                "data_unavailable": 1,
+            },
+        )
+        summary = decision_service.project_decision_summary(
+            result,
+            decision_limit=10,
+        )
+        self.assertEqual(summary["decision_overview"], result["decision_overview"])
+        self.assertNotIn("portfolio_matched", summary["decision_overview"])
 
     def test_complete_but_contrary_market_never_escalates_action(self) -> None:
         result = decision_service.build_public_decisions(
@@ -1343,6 +1866,108 @@ class PrivateOverlayTests(unittest.TestCase):
         self.assertEqual(public, original_public)
         self.assertEqual(positions, original_positions)
         self.assertEqual(quotes, original_quotes)
+
+    def test_private_overlay_adds_portfolio_overview_without_public_leakage(
+        self,
+    ) -> None:
+        public = decision_service.build_public_decisions(
+            [
+                _relation(
+                    "portfolio-nvda",
+                    "positive",
+                    topic_key="ai",
+                    asset_key="US:NVDA",
+                ),
+                _relation(
+                    "portfolio-nvdl",
+                    "negative",
+                    topic_key="leverage",
+                    asset_key="US:NVDL",
+                ),
+            ],
+            [],
+            1.0,
+            now=TEST_NOW,
+        )
+        positions = [
+            {
+                "account": "Schwab",
+                "asset_key": "US:NVDA",
+                "symbol": "NVDA",
+                "name": "NVIDIA",
+                "quantity": 10.0,
+                "avg_cost": 100.0,
+                "currency": "USD",
+                "asset_class": "stock",
+                "is_leveraged": False,
+                "as_of": "2026-07-31",
+            },
+            {
+                "account": "Robinhood",
+                "asset_key": "US:NVDL",
+                "symbol": "NVDL",
+                "name": "NVIDIA 2x Long",
+                "quantity": 4.0,
+                "avg_cost": 82.47,
+                "currency": "USD",
+                "asset_class": "etf",
+                "is_leveraged": True,
+                "as_of": "2026-06-01",
+            },
+            {
+                "account": "Robinhood",
+                "asset_key": "US:AAPL",
+                "symbol": "AAPL",
+                "name": "Apple",
+                "quantity": 2.0,
+                "avg_cost": 150.0,
+                "currency": "USD",
+                "asset_class": "stock",
+                "is_leveraged": False,
+                "as_of": "2026-07-31",
+            },
+        ]
+        quotes = {
+            "US:NVDA": {
+                "price": 120.0,
+                "currency": "USD",
+                "observed_at": "2026-08-01T00:00:00+00:00",
+            },
+            "US:NVDL": {
+                "price": 90.0,
+                "currency": "USD",
+                "observed_at": "2026-08-01T00:00:00+00:00",
+            },
+        }
+        original_public = deepcopy(public)
+
+        private = decision_service.build_private_overlay(
+            public,
+            positions,
+            quotes,
+            now=TEST_NOW,
+        )
+
+        expected_overview = {
+            "position_count": 3,
+            "matched_position_count": 2,
+            "unmatched_position_count": 1,
+            "impacted_asset_count": 2,
+            "leveraged_match_count": 1,
+            "stale_position_count": 1,
+            "oldest_as_of": "2026-06-01",
+            "candidate_matched_decisions": 0,
+            "matching_policy": "exact_asset_key_v1",
+            "indirect_exposure_calculated": False,
+            "trade_execution_available": False,
+        }
+        for field, expected in expected_overview.items():
+            self.assertEqual(private["portfolio_overview"][field], expected)
+        self.assertEqual(private["decision_overview"]["portfolio_matched"], 2)
+        self.assertNotIn("portfolio_overview", public)
+        self.assertNotIn("portfolio_matched", public["decision_overview"])
+        self.assertNotIn("portfolio_overview", original_public)
+        self.assertEqual(public, original_public)
 
     def test_private_overlay_estimates_exposure_from_fresh_quote(self) -> None:
         public = decision_service.build_public_decisions(

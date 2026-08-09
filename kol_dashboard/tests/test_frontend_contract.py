@@ -108,8 +108,9 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn('stale ? "数据延迟" : ""', self.javascript)
         self.assertIn('"高收益债利差"', self.javascript)
         self.assertIn("cs.hy_oas", self.javascript)
-        self.assertIn('static/app.js?v=17', self.html)
-        self.assertIn('static/style.css?v=17', self.html)
+        self.assertIn('static/app.js?v=18', self.html)
+        self.assertIn('static/style.css?v=18', self.html)
+        self.assertNotIn('?v=17', self.html)
         self.assertIn(".metric.is-stale", self.css)
 
     def test_macro_events_render_compact_ai_digest_and_bounded_highlights(self) -> None:
@@ -218,6 +219,191 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn("市场验证", self.javascript)
         self.assertIn("相反证据与不确定性", self.javascript)
         self.assertIn("失效条件", self.javascript)
+
+    def test_decision_lenses_filter_queue_and_matrix_with_bounded_full_load(
+        self,
+    ) -> None:
+        hero = self.html.index('id="decision-hero"')
+        lenses = self.html.index('id="decision-lenses"')
+        layout = self.html.index('class="decision-layout"')
+        self.assertLess(hero, lenses)
+        self.assertLess(lenses, layout)
+        for lens in ("all", "candidate", "portfolio", "watchlist"):
+            self.assertIn(f'data-decision-lens="{lens}"', self.html)
+        self.assertIn('decisionLens: "all"', self.javascript)
+        self.assertIn("function decisionMatchesLens", self.javascript)
+        self.assertIn("function decisionLensCards", self.javascript)
+        self.assertIn("function renderDecisionLenses(data)", self.javascript)
+        self.assertIn("const allowedKeys = new Set(lensCards.map(decisionKey));", self.javascript)
+        self.assertIn("await loadFullDecisions();", self.javascript)
+        self.assertIn("state.fullDecisionLoadPromise", self.javascript)
+        self.assertIn("fetchJSON(url, 15000)", self.javascript)
+        self.assertIn("state.decisionLensLoading", self.javascript)
+        load_start = self.javascript.index("async function loadDecisions")
+        load_end = self.javascript.index("async function loadFullDecisions", load_start)
+        load_contract = self.javascript[load_start:load_end]
+        summary_branch = load_contract.index("if (data?.summary === true)")
+        self.assertGreater(
+            load_contract.index('state.decisionLens = "all"', summary_branch),
+            summary_branch,
+        )
+        self.assertIn("const preserveFullPublicContext", load_contract)
+        self.assertIn("state.decisionData.summary !== true", load_contract)
+        self.assertIn('? "api/decisions"', load_contract)
+        self.assertIn(".decision-lenses", self.css)
+        self.assertIn(".decision-lens", self.css)
+
+    def test_watchlist_persists_only_bounded_public_asset_keys(self) -> None:
+        for text in (
+            "DECISION_WATCHLIST_STORAGE_KEY",
+            "DECISION_WATCHLIST_LIMIT = 50",
+            "PUBLIC_ASSET_KEY_PATTERN",
+            "function loadDecisionWatchlist()",
+            "function persistDecisionWatchlist()",
+            "localStorage.getItem(DECISION_WATCHLIST_STORAGE_KEY)",
+            "localStorage.setItem(",
+            "JSON.stringify(Array.from(state.watchAssets)",
+            "key.length <= 80",
+        ):
+            self.assertIn(text, self.javascript)
+        self.assertIn("[A-Z0-9._\\/-]", self.javascript)
+        self.assertIn("Array.from(\n        new Set(", self.javascript)
+        self.assertLess(
+            self.javascript.rindex("loadDecisionWatchlist();"),
+            self.javascript.index("await ensureViewLoaded(state.view)"),
+        )
+        self.assertIn('data-watch-asset="${esc(card.asset_key)}"', self.javascript)
+        self.assertIn('aria-pressed="${String(watched)}"', self.javascript)
+        self.assertIn("仅公开 asset_key 保存在本机浏览器", self.javascript)
+        self.assertIn("不上传持仓、账户或成本信息", self.html)
+        persist_start = self.javascript.index("function persistDecisionWatchlist")
+        persist_end = self.javascript.index("function isWatchedAsset", persist_start)
+        persist_contract = self.javascript[persist_start:persist_end]
+        for private_field in ("matched_positions", "account", "quantity", "avg_cost"):
+            self.assertNotIn(private_field, persist_contract)
+
+        clear_start = self.javascript.index("function clearDecisionView")
+        clear_end = self.javascript.index("async function loadDecisions", clear_start)
+        clear_contract = self.javascript[clear_start:clear_end]
+        self.assertIn('state.decisionLens = "all"', clear_contract)
+        self.assertIn("[data-lens-count]", clear_contract)
+        self.assertIn("私人决策与组合命中已从当前页面清除", clear_contract)
+        self.assertNotIn("watchAssets.clear", clear_contract)
+        toggle_start = self.javascript.index("function toggleWatchAsset")
+        toggle_end = self.javascript.index("function evidenceStatusInfo", toggle_start)
+        toggle_contract = self.javascript[toggle_start:toggle_end]
+        self.assertIn("requestAnimationFrame", toggle_contract)
+        self.assertIn("replacement || selectedCard || lensButton", toggle_contract)
+
+    def test_market_status_prioritizes_applicability_and_pending_before_failure(
+        self,
+    ) -> None:
+        start = self.javascript.index("function marketStatusInfo")
+        end = self.javascript.index(
+            "const DECISION_SNAPSHOT_MAX_AGE_SECONDS", start
+        )
+        contract = self.javascript[start:end]
+        failure = contract.index("market.degraded === true")
+        for predicate in (
+            'applicabilityReason === "no_event_anchor"',
+            'applicabilityReason === "direction_missing"',
+            '"direction_unavailable"',
+            "marketIsPurePending(market)",
+        ):
+            self.assertIn(predicate, contract)
+            self.assertLess(contract.index(predicate), failure)
+        for reason in (
+            "follow_up_unavailable",
+            "insufficient_follow_up",
+            "no_records",
+            "request_failed",
+            "unsupported_benchmark",
+        ):
+            self.assertIn(reason, contract)
+        self.assertIn("这不是行情链路故障", contract)
+        self.assertIn("重试行情无法解决此问题", contract)
+        self.assertIn("未来窗口不构成数据故障", contract)
+        self.assertIn('state: "data_failure"', contract)
+        reason_start = self.javascript.index("function marketReasonCount")
+        reason_end = self.javascript.index("function decisionNextReview", reason_start)
+        reason_contract = self.javascript[reason_start:reason_end]
+        self.assertIn("market?.reason_counts", reason_contract)
+        self.assertIn("record?.reason_code || record?.reason", reason_contract)
+        pending_start = self.javascript.index("function marketIsPurePending")
+        pending_end = self.javascript.index("function earliestMarketDue", pending_start)
+        pending_contract = self.javascript[pending_start:pending_end]
+        self.assertIn('marketReasonCount(market, "window_not_due")', pending_contract)
+        self.assertIn("marketReasonTotal(market)", pending_contract)
+        self.assertIn("market?.degraded !== true", pending_contract)
+        self.assertIn("unavailableWindows === 0", pending_contract)
+
+    def test_decision_runway_portfolio_summary_and_next_review_are_explicit(
+        self,
+    ) -> None:
+        for field in (
+            "portfolio_overview",
+            "position_count",
+            "matched_position_count",
+            "impacted_asset_count",
+            "candidate_matched_decisions",
+            "leveraged_match_count",
+            "stale_position_count",
+            "market?.next_review_at",
+            "record?.next_due_at",
+        ):
+            self.assertIn(field, self.javascript)
+        self.assertIn('class="decision-runway"', self.javascript)
+        self.assertIn("我的资产", self.javascript)
+        self.assertIn("下一复核", self.javascript)
+        self.assertIn("现在需复核", self.javascript)
+        self.assertIn('<time datetime="${esc(nextReview.datetime)}">', self.javascript)
+        self.assertIn("尚无持仓快照", self.javascript)
+        self.assertIn("间接暴露尚未计算，不代表组合无风险", self.javascript)
+        self.assertIn("多源证据", self.javascript)
+        self.assertIn("单一来源 · 待交叉核验", self.javascript)
+        self.assertIn(".decision-runway", self.css)
+        self.assertIn(".decision-next-review", self.css)
+        self.assertIn(".decision-watch-btn", self.css)
+        review_start = self.javascript.index("function decisionNextReview")
+        review_end = self.javascript.index("function marketSourceScopeLabel", review_start)
+        review_contract = self.javascript[review_start:review_end]
+        self.assertLess(
+            review_contract.index('reason === "direction_missing"'),
+            review_contract.index("const declared = earliestMarketDue(market)"),
+        )
+        self.assertIn("技术 / 数据重试，不是市场窗口确认", review_contract)
+        self.assertIn('phase.startsWith("confirmed_")', review_contract)
+        self.assertIn("market.required_window_complete !== true", review_contract)
+        self.assertIn("等待所需确认窗口", review_contract)
+
+    def test_decision_priority_keeps_stage_first_then_private_and_watchlist(
+        self,
+    ) -> None:
+        start = self.javascript.index("function orderedDecisions")
+        end = self.javascript.index("function renderDecisionQueue", start)
+        contract = self.javascript[start:end]
+        self.assertLess(contract.index("const stageRank"), contract.index("const portfolioRank"))
+        self.assertLess(contract.index("const portfolioRank"), contract.index("const watchRank"))
+        self.assertIn("cardHasPortfolioMatch", contract)
+        self.assertIn("isWatchedAsset", contract)
+        self.assertIn('class="decision-card ${', self.javascript)
+        self.assertIn('watched ? "is-watched"', self.javascript)
+
+    def test_decision_controls_are_keyboard_mobile_and_reduced_motion_safe(
+        self,
+    ) -> None:
+        self.assertIn('id="decision-lenses" role="group"', self.html)
+        self.assertIn('aria-pressed="true"', self.html)
+        self.assertIn('aria-live="polite"', self.html)
+        self.assertIn('event.key === "ArrowRight"', self.javascript)
+        self.assertIn('event.key === "ArrowLeft"', self.javascript)
+        self.assertIn('window.matchMedia?.("(prefers-reduced-motion: reduce)")', self.javascript)
+        self.assertIn('behavior: reduceMotion ? "auto" : "smooth"', self.javascript)
+        self.assertIn(".decision-lens { min-height: 44px", self.css)
+        self.assertIn(".decision-watch-btn { min-height: 44px", self.css)
+        forbidden = self.html + self.javascript
+        for phrase in ("买入", "卖出", "自动交易", "自动下单", "一键下单"):
+            self.assertNotIn(phrase, forbidden)
 
     def test_decision_boundary_exposes_market_degradation_without_false_green(
         self,

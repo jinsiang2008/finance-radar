@@ -630,8 +630,14 @@ def api_private_portfolio_impact(
     if snapshot is None:
         return _private_response(
             {
+                "schema_version": 1,
                 "available": False,
                 "reason": "portfolio_snapshot_unavailable",
+                "decision_snapshot_id": overlay.get("snapshot_id"),
+                "summary": overlay.get("portfolio_overview", {}),
+                "matching_policy": "exact_asset_key_v1",
+                "indirect_exposure_calculated": False,
+                "trade_execution_available": False,
                 "impacts": [],
                 "unmatched_positions": [],
                 "human_review_required": True,
@@ -650,7 +656,9 @@ def api_private_portfolio_impact(
     }
     return _private_response(
         {
+            "schema_version": 1,
             "available": True,
+            "decision_snapshot_id": overlay.get("snapshot_id"),
             "snapshot": {
                 "snapshot_id": snapshot.get("snapshot_id"),
                 "as_of": snapshot.get("as_of"),
@@ -658,6 +666,10 @@ def api_private_portfolio_impact(
                 "position_count": len(positions),
                 "staleness": snapshot.get("staleness"),
             },
+            "summary": overlay.get("portfolio_overview", {}),
+            "matching_policy": "exact_asset_key_v1",
+            "indirect_exposure_calculated": False,
+            "trade_execution_available": False,
             "impacts": impacts,
             "unmatched_positions": [
                 position

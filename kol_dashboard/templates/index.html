@@ -18,7 +18,7 @@
     } catch (e) {}
   })();
 </script>
-  <link rel="stylesheet" href="static/style.css?v=17" />
+  <link rel="stylesheet" href="static/style.css?v=18" />
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ccircle cx='50' cy='50' r='42' fill='%230b1720' stroke='%2331d69b' stroke-width='6'/%3E%3Ccircle cx='50' cy='50' r='20' fill='none' stroke='%234ab8d8' stroke-width='5'/%3E%3Cpath d='M50 50L82 24' stroke='%23f4b942' stroke-width='6' stroke-linecap='round'/%3E%3Ccircle cx='50' cy='50' r='7' fill='%23eef4f2'/%3E%3C/svg%3E" />
 </head>
 <body>
@@ -74,6 +74,31 @@
   <div class="wrap decision-wrap">
     <section class="decision-hero" id="decision-hero" aria-live="polite">
       <div class="skeleton skeleton-hero"></div>
+    </section>
+
+    <section class="decision-lenses" aria-labelledby="decision-lenses-title">
+      <div class="decision-lenses-copy">
+        <p class="section-kicker">DECISION LENSES</p>
+        <h2 id="decision-lenses-title">切换核验视角</h2>
+      </div>
+      <div class="decision-lens-group" id="decision-lenses" role="group"
+           aria-label="筛选重点信号">
+        <button class="decision-lens is-active" type="button" data-decision-lens="all"
+                aria-pressed="true">全部 <span data-lens-count="all">—</span></button>
+        <button class="decision-lens" type="button" data-decision-lens="candidate"
+                aria-pressed="false">候选 <span data-lens-count="candidate">—</span></button>
+        <button class="decision-lens" type="button" data-decision-lens="portfolio"
+                aria-pressed="false">我的资产 <span data-lens-count="portfolio">—</span></button>
+        <button class="decision-lens" type="button" data-decision-lens="watchlist"
+                aria-pressed="false">本机关注 <span data-lens-count="watchlist">—</span></button>
+      </div>
+      <p class="decision-lens-status" id="decision-lens-status" role="status"
+         aria-live="polite">私人直接命中与本机关注资产会优先排序。</p>
+      <p class="decision-watchlist-privacy">
+        关注列表仅保存公开资产代码到本机浏览器，不上传持仓、账户或成本信息。
+      </p>
+      <span class="sr-only" id="decision-watchlist-status" role="status"
+            aria-live="polite"></span>
     </section>
 
     <div class="decision-layout">
@@ -339,6 +364,6 @@
   </div>
 </div>
 
-<script src="static/app.js?v=17"></script>
+<script src="static/app.js?v=18"></script>
 </body>
 </html>

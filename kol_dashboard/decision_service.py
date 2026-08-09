@@ -7,6 +7,7 @@ signals for review, not as proof of causality or instructions to trade.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -41,7 +42,7 @@ SCORE_WEIGHTS = {
 EVENT_RELATION_INGEST_MAX_AGE_HOURS = 72
 EVENT_RELATION_MAX_AGE_HOURS = 14 * 24
 DECISION_SNAPSHOT_SCHEMA_VERSION = 2
-DECISION_ENGINE_VERSION = "decision-v2"
+DECISION_ENGINE_VERSION = "decision-v3"
 
 _PUBLIC_FORBIDDEN_TOKENS = (
     "shares",
@@ -50,6 +51,38 @@ _PUBLIC_FORBIDDEN_TOKENS = (
     "cost",
     "portfolio",
     "matched_positions",
+)
+_PUBLIC_FORBIDDEN_VALUE_TOKENS = tuple(
+    token for token in _PUBLIC_FORBIDDEN_TOKENS if token != "cost"
+)
+_PUBLIC_IDENTITY_FIELDS = frozenset(
+    {
+        "affected_assets",
+        "affected_markets",
+        "asset_key",
+        "benchmark_asset_key",
+        "matched_asset",
+        "provider_symbol",
+        "proxy_for",
+        "symbol",
+        "ticker",
+        "tickers",
+        "topic_key",
+    }
+)
+_PUBLIC_OPAQUE_ID_FIELDS = frozenset({"id", "item_id", "source_id"})
+_PUBLIC_COST_MARKET_IDENTITY_FIELDS = frozenset(
+    {
+        "affected_assets",
+        "asset_key",
+        "benchmark_asset_key",
+        "matched_asset",
+        "provider_symbol",
+        "proxy_for",
+        "symbol",
+        "ticker",
+        "tickers",
+    }
 )
 _PUBLIC_EVIDENCE_FIELDS = (
     "title",
@@ -432,14 +465,74 @@ def _contains_forbidden_token(value: Any) -> bool:
     return any(token in lowered for token in _PUBLIC_FORBIDDEN_TOKENS)
 
 
+def _contains_forbidden_value_token(value: Any) -> bool:
+    return _contains_bounded_token(value, _PUBLIC_FORBIDDEN_VALUE_TOKENS)
+
+
+def _contains_bounded_token(value: Any, tokens: Iterable[str]) -> bool:
+    text = str(value)
+    return any(
+        re.search(
+            rf"(?<![A-Za-z]){re.escape(token)}(?![A-Za-z])",
+            text,
+            flags=re.IGNORECASE,
+        )
+        is not None
+        for token in tokens
+    )
+
+
+def _contains_forbidden_opaque_token(value: Any) -> bool:
+    return _contains_bounded_token(value, _PUBLIC_FORBIDDEN_TOKENS)
+
+
+def _contains_forbidden_identity_token(
+    value: Any,
+    field_name: str | None,
+) -> bool:
+    text = str(value).strip()
+    lowered_field = str(field_name or "").lower()
+    tokens: Iterable[str] = _PUBLIC_FORBIDDEN_TOKENS
+    if (
+        lowered_field in _PUBLIC_COST_MARKET_IDENTITY_FIELDS
+        and text.upper() in {"COST", "US:COST"}
+    ):
+        tokens = _PUBLIC_FORBIDDEN_VALUE_TOKENS
+    return _contains_bounded_token(text, tokens)
+
+
 def _sanitize_public_string(value: str) -> str:
     result = value
-    for token in _PUBLIC_FORBIDDEN_TOKENS:
-        result = re.sub(re.escape(token), "[redacted]", result, flags=re.IGNORECASE)
+    # ``cost`` is a legitimate finance word and the NASDAQ ticker COST. It is
+    # forbidden in field names (for example avg_cost), but not in public text.
+    for token in _PUBLIC_FORBIDDEN_VALUE_TOKENS:
+        result = re.sub(
+            rf"(?<![A-Za-z]){re.escape(token)}(?![A-Za-z])",
+            "[redacted]",
+            result,
+            flags=re.IGNORECASE,
+        )
     return result
 
 
-def _public_sanitize(value: Any) -> Any:
+def _redacted_public_identity(value: str, field_name: str) -> str:
+    digest = hashlib.sha256(
+        f"{field_name.lower()}\0{value}".encode("utf-8")
+    ).hexdigest()[:16]
+    return f"[redacted]-{digest}"
+
+
+def _is_public_identity_field(field_name: str | None) -> bool:
+    if not field_name:
+        return False
+    lowered = field_name.lower()
+    return (
+        lowered in _PUBLIC_IDENTITY_FIELDS
+        or lowered.endswith("_key")
+    )
+
+
+def _public_sanitize(value: Any, *, field_name: str | None = None) -> Any:
     """Return JSON-safe public data with private vocabulary removed recursively."""
     if isinstance(value, Mapping):
         result: dict[str, Any] = {}
@@ -447,11 +540,28 @@ def _public_sanitize(value: Any) -> Any:
             clean_key = str(key)
             if _contains_forbidden_token(clean_key):
                 continue
-            result[clean_key] = _public_sanitize(item)
+            result[clean_key] = _public_sanitize(item, field_name=clean_key)
         return result
     if isinstance(value, (list, tuple, set)):
-        return [_public_sanitize(item) for item in value]
+        return [
+            _public_sanitize(item, field_name=field_name)
+            for item in value
+        ]
     if isinstance(value, str):
+        if _is_public_identity_field(field_name):
+            if _contains_forbidden_identity_token(value, field_name):
+                return _redacted_public_identity(
+                    value,
+                    str(field_name or "identity"),
+                )
+            return value
+        lowered_field = str(field_name or "").lower()
+        if (
+            lowered_field in _PUBLIC_OPAQUE_ID_FIELDS
+            or lowered_field.endswith("_url")
+            or lowered_field == "url"
+        ) and _contains_forbidden_opaque_token(value):
+            return _redacted_public_identity(value, lowered_field)
         return _sanitize_public_string(value)
     if isinstance(value, datetime):
         parsed = value
@@ -464,7 +574,8 @@ def _public_sanitize(value: Any) -> Any:
         return value
     if isinstance(value, float):
         return value if math.isfinite(value) else None
-    return _sanitize_public_string(str(value))
+    text = str(value)
+    return text if _is_public_identity_field(field_name) else _sanitize_public_string(text)
 
 
 def _coverage_value(value: Any) -> float:
@@ -560,6 +671,50 @@ def _classification(relations: list[dict[str, Any]]) -> tuple[str, str]:
     return "conflict", "mixed"
 
 
+def _market_applicability(
+    relations: Iterable[Mapping[str, Any]],
+    expected_direction: str,
+) -> tuple[str, str | None, str]:
+    records = list(relations)
+    source_types = {
+        str(relation.get("source_type") or "").strip().lower()
+        for relation in records
+    }
+    has_event = "event" in source_types
+    source_scope = (
+        "mixed"
+        if has_event and "macro_snapshot" in source_types
+        else "event_only"
+        if has_event
+        else "macro_only"
+    )
+    if not has_event:
+        return "not_applicable", "no_event_anchor", source_scope
+    if expected_direction not in {"positive", "negative"}:
+        return "not_applicable", "direction_missing", source_scope
+    has_directional_event = any(
+        str(relation.get("source_type") or "").strip().lower() == "event"
+        and _direction(relation.get("direction")) == expected_direction
+        for relation in records
+    )
+    if not has_directional_event:
+        return "not_applicable", "direction_missing", source_scope
+    return "applicable", None, source_scope
+
+
+def _directional_event_source_pairs(
+    relations: Iterable[Mapping[str, Any]],
+    expected_direction: str,
+) -> set[tuple[str, str]]:
+    return {
+        identity
+        for index, relation in enumerate(relations)
+        if str(relation.get("source_type") or "").strip().lower() == "event"
+        and _direction(relation.get("direction")) == expected_direction
+        and (identity := _source_identity(relation, index)) is not None
+    }
+
+
 def _source_identity(
     relation: Mapping[str, Any], index: int
 ) -> tuple[str, str] | None:
@@ -611,7 +766,7 @@ def _public_evidence_detail(relation: Mapping[str, Any]) -> dict[str, Any]:
             continue
         value = raw.get(field)
         if _is_public_scalar(value):
-            result[field] = _public_sanitize(value)
+            result[field] = _public_sanitize(value, field_name=field)
     return result
 
 
@@ -619,7 +774,10 @@ def _public_relation(relation: Mapping[str, Any]) -> dict[str, Any]:
     result = {}
     for field in _PUBLIC_RELATION_FIELDS:
         if field in relation and _is_public_scalar(relation[field]):
-            result[field] = _public_sanitize(relation[field])
+            result[field] = _public_sanitize(
+                relation[field],
+                field_name=field,
+            )
     result["evidence"] = _public_evidence_detail(relation)
     return result
 
@@ -634,7 +792,7 @@ def _public_reaction(reaction: Mapping[str, Any]) -> dict[str, Any]:
             if not isinstance(value, Mapping):
                 continue
             result[field] = {
-                key: _public_sanitize(value[key])
+                key: _public_sanitize(value[key], field_name=key)
                 for key in (
                     "start",
                     "end",
@@ -654,9 +812,9 @@ def _public_reaction(reaction: Mapping[str, Any]) -> dict[str, Any]:
                 text = text.lower()
                 if _SAFE_REASON_CODE.fullmatch(text) is None:
                     continue
-            result[field] = _public_sanitize(text)
+            result[field] = _public_sanitize(text, field_name=field)
         elif _is_public_scalar(value):
-            result[field] = _public_sanitize(value)
+            result[field] = _public_sanitize(value, field_name=field)
     return result
 
 
@@ -664,6 +822,19 @@ def project_public_relations(relations: Any) -> list[dict[str, Any]]:
     """Project stored relations onto the strict public API schema."""
     output: list[dict[str, Any]] = []
     for relation in _records(relations):
+        # Topic and asset identities drive public grouping and portfolio
+        # matching. If upstream storage is polluted with private vocabulary,
+        # dropping the edge is safer than exposing it or creating an invalid
+        # redacted asset card. ``cost`` is intentionally not a forbidden value
+        # token, so the legitimate US:COST identity remains valid.
+        if _contains_forbidden_identity_token(
+            relation.get("topic_key") or "",
+            "topic_key",
+        ) or _contains_forbidden_identity_token(
+            relation.get("asset_key") or "",
+            "asset_key",
+        ):
+            continue
         source_type = str(relation.get("source_type") or "").strip().lower()
         if source_type not in {"event", "macro_snapshot"}:
             continue
@@ -708,12 +879,12 @@ def project_public_relations(relations: Any) -> list[dict[str, Any]]:
     return output
 
 
-def _public_macro_value(value: Any) -> Any:
+def _public_macro_value(value: Any, field_name: str) -> Any:
     if _is_public_scalar(value):
-        return _public_sanitize(value)
+        return _public_sanitize(value, field_name=field_name)
     if isinstance(value, list):
         return [
-            _public_sanitize(item)
+            _public_sanitize(item, field_name=field_name)
             for item in value
             if isinstance(item, str)
         ]
@@ -731,7 +902,7 @@ def _project_macro_items(value: Any, fields: tuple[str, ...]) -> list[dict[str, 
         for field in fields:
             if field not in item:
                 continue
-            clean = _public_macro_value(item[field])
+            clean = _public_macro_value(item[field], field)
             if clean is not None:
                 projected[field] = clean
         output.append(projected)
@@ -1024,7 +1195,10 @@ def _project_macro_sub_scores(
                     not in {"critical", "high", "medium", "low"}
                 ):
                     continue
-                projected[field] = _public_sanitize(item[field])
+                projected[field] = _public_sanitize(
+                    item[field],
+                    field_name=field,
+                )
         signals = item.get("signals")
         if include_text and isinstance(signals, list):
             projected["signals"] = [
@@ -1042,7 +1216,7 @@ def _project_market_point(
     if not isinstance(value, Mapping):
         return {}
     return {
-        field: _public_sanitize(value[field])
+        field: _public_sanitize(value[field], field_name=field)
         for field in _PUBLIC_MACRO_MARKET_SCALARS
         if field in value
         and _is_public_scalar(value[field])
@@ -1089,14 +1263,17 @@ def project_public_macro(
     output: dict[str, Any] = {}
     for field in ("timestamp", "snapshot_id", "created_at"):
         if field in snapshot and _is_public_scalar(snapshot[field]):
-            output[field] = _public_sanitize(snapshot[field])
+            output[field] = _public_sanitize(
+                snapshot[field],
+                field_name=field,
+            )
     if trusted:
         output["public_schema_version"] = PUBLIC_MACRO_SCHEMA_VERSION
     composite = snapshot.get("composite_risk")
     if isinstance(composite, Mapping):
         composite_fields = ("score", "level", "label") if trusted else ("score", "level")
         output["composite_risk"] = {
-            field: _public_sanitize(composite[field])
+            field: _public_sanitize(composite[field], field_name=field)
             for field in composite_fields
             if field in composite and _is_public_scalar(composite[field])
             and (
@@ -1117,7 +1294,7 @@ def project_public_macro(
     coverage = snapshot.get("data_coverage")
     if isinstance(coverage, Mapping):
         projected_coverage = {
-            field: _public_sanitize(coverage[field])
+            field: _public_sanitize(coverage[field], field_name=field)
             for field in ("available", "total", "pct")
             if field in coverage and _is_public_scalar(coverage[field])
         }
@@ -1125,7 +1302,7 @@ def project_public_macro(
         projected_coverage["sources"] = (
             [
                 {
-                    field: _public_sanitize(source[field])
+                    field: _public_sanitize(source[field], field_name=field)
                     for field in _PUBLIC_MACRO_COVERAGE_SOURCE_FIELDS
                     if field in source and _is_public_scalar(source[field])
                 }
@@ -1165,6 +1342,11 @@ def project_public_reactions(reactions: Any) -> list[dict[str, Any]]:
     """Project market reactions onto the strict public API schema."""
     output: list[dict[str, Any]] = []
     for reaction in _records(reactions):
+        if _contains_forbidden_identity_token(
+            reaction.get("asset_key") or "",
+            "asset_key",
+        ):
+            continue
         projected = _public_reaction(reaction)
         if (
             isinstance(projected.get("asset_key"), str)
@@ -1300,6 +1482,9 @@ def _market_business_health(
     covered_decisions = 0
     pending_decisions = 0
     unavailable_decisions = 0
+    not_applicable_decisions = 0
+    scenario_monitoring_decisions = 0
+    direction_missing_decisions = 0
     for decision in decision_records:
         validation = decision.get("market_validation")
         validation_status = (
@@ -1307,24 +1492,64 @@ def _market_business_health(
             if isinstance(validation, Mapping)
             else "unavailable"
         )
-        if validation_status in {"complete", "preliminary"}:
-            covered_decisions += 1
+        applicability = (
+            str(validation.get("applicability") or "").strip().lower()
+            if isinstance(validation, Mapping)
+            else ""
+        )
+        applicability_reason = (
+            str(validation.get("applicability_reason") or "").strip().lower()
+            if isinstance(validation, Mapping)
+            else ""
+        )
+        degraded = (
+            bool(validation.get("degraded"))
+            if isinstance(validation, Mapping)
+            else True
+        )
+        if applicability == "not_applicable":
+            not_applicable_decisions += 1
+            if applicability_reason == "no_event_anchor":
+                scenario_monitoring_decisions += 1
+            elif applicability_reason == "direction_missing":
+                direction_missing_decisions += 1
+        elif degraded or validation_status in {
+            "unavailable",
+            "degraded",
+            "error",
+            "failed",
+        }:
+            unavailable_decisions += 1
         elif validation_status == "pending":
             pending_decisions += 1
+        elif validation_status in {"complete", "preliminary"}:
+            covered_decisions += 1
         else:
             unavailable_decisions += 1
 
     total_decisions = len(decision_records)
-    if total_decisions and unavailable_decisions == total_decisions:
-        status = "unavailable"
-        note = "当前决策均缺少可用市场验证，全部只能作为待核验候选。"
-    elif unavailable_decisions:
-        status = "degraded"
-        note = "部分当前决策缺少市场验证，不得以其他卡片的样本掩盖。"
-    elif total_decisions and covered_decisions == 0 and pending_decisions:
-        status = "pending"
-        note = "当前市场窗口均尚未到期；pending 不构成数据故障。"
+    applicable_decisions = total_decisions - not_applicable_decisions
+    if decision_records:
+        if (
+            applicable_decisions
+            and unavailable_decisions == applicable_decisions
+        ):
+            status = "unavailable"
+            note = "当前适用事件窗口的决策均缺少可用市场验证，只能作为待核验候选。"
+        elif unavailable_decisions:
+            status = "degraded"
+            note = "部分适用事件窗口的决策缺少市场验证，不得以其他卡片样本掩盖。"
+        elif applicable_decisions and covered_decisions == 0 and pending_decisions:
+            status = "pending"
+            note = "当前市场窗口均尚未到期；pending 不构成数据故障。"
+        elif applicable_decisions == 0 and not_applicable_decisions:
+            status = "not_applicable"
+            note = "当前决策需采用情景触发或先明确机制方向，不适用事件窗口确认。"
+        else:
+            status = "healthy"
+            note = "适用事件窗口已有市场样本；统计相关仍不表示因果。"
     return {
+        "semantics_version": 2,
         "status": status,
         "degraded": status in {"degraded", "unavailable"},
         "total_records": total,
@@ -1336,9 +1561,20 @@ def _market_business_health(
         "coverage": round(available / total, 4) if total else 0.0,
         "asset_count": len(assets),
         "total_decisions": total_decisions,
+        "applicable_decisions": applicable_decisions,
         "covered_decisions": covered_decisions,
         "pending_decisions": pending_decisions,
         "unavailable_decisions": unavailable_decisions,
+        "data_failure_decisions": unavailable_decisions,
+        "not_applicable_decisions": not_applicable_decisions,
+        "no_event_anchor_decisions": scenario_monitoring_decisions,
+        "scenario_monitoring_decisions": scenario_monitoring_decisions,
+        "direction_missing_decisions": direction_missing_decisions,
+        "decision_coverage": (
+            round(covered_decisions / applicable_decisions, 4)
+            if applicable_decisions
+            else None
+        ),
         "last_observed_at": (
             max(observed).isoformat() if observed else None
         ),
@@ -1354,13 +1590,76 @@ def _market_validation(
     reactions: list[dict[str, Any]],
     expected_direction: str,
     horizon: str,
+    *,
+    applicability: str = "applicable",
+    applicability_reason: str | None = None,
+    source_scope: str = "event_only",
 ) -> tuple[dict[str, Any], float]:
     required_window = _required_market_window(horizon)
-    if not reactions:
+    if applicability_reason == "no_event_anchor":
         return (
             {
                 "status": "unavailable",
                 "phase": "unavailable",
+                "applicability": applicability,
+                "applicability_reason": applicability_reason,
+                "source_scope": source_scope,
+                "abstain": True,
+                "veto": True,
+                "degraded": False,
+                "direction_confirmed": None,
+                "sample_count": 0,
+                "required_window": required_window,
+                "required_window_complete": False,
+                "completed_windows": [],
+                "pending_windows": [],
+                "unavailable_windows": [],
+                "next_review_at": None,
+                "reason_counts": {"no_event_anchor": 1},
+                "note": (
+                    "宏观情景尚无单一事件锚点；改用触发指标监控，"
+                    "不以事件后收益验证。"
+                ),
+                "records": [],
+            },
+            0.0,
+        )
+    if not reactions:
+        if applicability_reason == "direction_missing":
+            return (
+                {
+                    "status": "unavailable",
+                    "phase": "direction_unavailable",
+                    "applicability": applicability,
+                    "applicability_reason": applicability_reason,
+                    "source_scope": source_scope,
+                    "abstain": True,
+                    "veto": True,
+                    "degraded": False,
+                    "direction_confirmed": None,
+                    "sample_count": 0,
+                    "required_window": required_window,
+                    "required_window_complete": False,
+                    "completed_windows": [],
+                    "pending_windows": [],
+                    "unavailable_windows": [],
+                    "next_review_at": None,
+                    "reason_counts": {"direction_missing": 1},
+                    "note": (
+                        "机制方向尚未明确，无法判断市场同向或反向；"
+                        "先补充方向证据。"
+                    ),
+                    "records": [],
+                },
+                0.0,
+            )
+        return (
+            {
+                "status": "unavailable",
+                "phase": "unavailable",
+                "applicability": applicability,
+                "applicability_reason": applicability_reason,
+                "source_scope": source_scope,
                 "abstain": True,
                 "veto": True,
                 "degraded": True,
@@ -1371,6 +1670,7 @@ def _market_validation(
                 "completed_windows": [],
                 "pending_windows": [],
                 "unavailable_windows": [],
+                "next_review_at": None,
                 "reason_counts": {"no_records": 1},
                 "note": "暂无可用市场样本，必须 abstain 并等待共同交易日数据。",
                 "records": [],
@@ -1384,6 +1684,7 @@ def _market_validation(
     completed_windows: set[str] = set()
     pending_windows: set[str] = set()
     unavailable_windows: set[str] = set()
+    next_review_times: list[datetime] = []
     for reaction in reactions:
         status = str(reaction.get("status") or "").strip().lower()
         window = str(reaction.get("window") or "").strip().upper()
@@ -1408,6 +1709,9 @@ def _market_validation(
         projected["direction_confirmed"] = effective_confirmation
         projected["evaluated_direction"] = expected_direction
         public_records.append(projected)
+        next_due = _utc_datetime(reaction.get("next_due_at"))
+        if next_due is not None:
+            next_review_times.append(next_due)
         if complete:
             completed_windows.add(window)
             confirmations_by_window[window].append(effective_confirmation)
@@ -1444,13 +1748,16 @@ def _market_validation(
         _MARKET_WINDOWS.index(window) <= required_index
         for window in unavailable_windows
     )
-    invalid_direction = expected_direction not in {"positive", "negative"}
+    invalid_direction = (
+        applicability_reason == "direction_missing"
+        or expected_direction not in {"positive", "negative"}
+    )
     veto = contrary or inconclusive or unavailable_due or invalid_direction
 
     if invalid_direction:
         status = "unavailable"
         phase = "direction_unavailable"
-        note = "机制方向尚不明确，市场样本不能形成方向确认。"
+        note = "机制方向尚未明确，现有市场样本不能判断同向或反向。"
     elif contrary:
         status = "complete" if required_done else "preliminary"
         phase = "contrary"
@@ -1493,9 +1800,12 @@ def _market_validation(
         {
             "status": status,
             "phase": phase,
+            "applicability": applicability,
+            "applicability_reason": applicability_reason,
+            "source_scope": source_scope,
             "abstain": abstain,
             "veto": veto,
-            "degraded": unavailable_due,
+            "degraded": unavailable_due and not invalid_direction,
             "direction_confirmed": direction_confirmed,
             "sample_count": max(sample_counts, default=0),
             "required_window": required_window,
@@ -1511,6 +1821,11 @@ def _market_validation(
             "unavailable_windows": sorted(
                 unavailable_windows,
                 key=_MARKET_WINDOWS.index,
+            ),
+            "next_review_at": (
+                min(next_review_times).isoformat()
+                if next_review_times
+                else None
             ),
             "reason_counts": _market_reason_counts(reactions),
             "note": note,
@@ -1572,7 +1887,7 @@ def _public_evidence(relation: Mapping[str, Any]) -> dict[str, Any]:
     for field in ("source_type", "source_id", "relation_type", "rationale"):
         value = relation.get(field)
         if _is_public_scalar(value):
-            result[field] = _public_sanitize(value)
+            result[field] = _public_sanitize(value, field_name=field)
     direction = relation.get("direction")
     result["direction"] = (
         _direction(direction) if _is_public_scalar(direction) else "neutral"
@@ -1660,7 +1975,10 @@ def _contrary_evidence(
         }
         for field in ("source_type", "source_id"):
             if _is_public_scalar(reaction.get(field)):
-                item[field] = _public_sanitize(reaction[field])
+                item[field] = _public_sanitize(
+                    reaction[field],
+                    field_name=field,
+                )
         contrary.append(item)
     return contrary
 
@@ -1693,6 +2011,74 @@ def _build_impact_matrix(decisions: list[dict[str, Any]]) -> dict[str, Any]:
     return {"columns": assets, "rows": rows}
 
 
+def _decision_overview(
+    decisions: Iterable[Mapping[str, Any]],
+) -> dict[str, int]:
+    cards = [card for card in decisions if isinstance(card, Mapping)]
+    overview = {
+        "total": len(cards),
+        "candidate": 0,
+        "market_confirmed": 0,
+        "contrary": 0,
+        "pending_window": 0,
+        "scenario_monitoring": 0,
+        "direction_missing": 0,
+        "data_unavailable": 0,
+    }
+    for card in cards:
+        stage = str(card.get("action_stage") or "").strip().lower()
+        if stage in {
+            "candidate_reduce_or_hedge",
+            "candidate_scale_in",
+            "reduce_or_hedge",
+            "scale_in",
+        }:
+            overview["candidate"] += 1
+        market = card.get("market_validation")
+        if not isinstance(market, Mapping):
+            overview["data_unavailable"] += 1
+            continue
+        status = str(market.get("status") or "").strip().lower()
+        phase = str(market.get("phase") or "").strip().lower()
+        applicability = str(
+            market.get("applicability") or "applicable"
+        ).strip().lower()
+        applicability_reason = str(
+            market.get("applicability_reason") or ""
+        ).strip().lower()
+        if (
+            status == "complete"
+            and phase.startswith("confirmed_")
+            and market.get("required_window_complete") is True
+            and market.get("direction_confirmed") is True
+            and market.get("abstain") is False
+            and market.get("veto") is False
+        ):
+            overview["market_confirmed"] += 1
+        if phase == "contrary":
+            overview["contrary"] += 1
+        if applicability == "applicable" and (
+            market.get("pending_windows") or status == "pending"
+        ):
+            overview["pending_window"] += 1
+        if applicability_reason == "no_event_anchor":
+            overview["scenario_monitoring"] += 1
+        elif applicability_reason == "direction_missing":
+            overview["direction_missing"] += 1
+        elif applicability == "applicable" and (
+            market.get("degraded") is True
+            or status
+            in {
+                "unavailable",
+                "degraded",
+                "error",
+                "failed",
+            }
+        ):
+            overview["data_unavailable"] += 1
+    return overview
+
+
 def build_public_decisions(
     relations: Any,
     market_reactions: Any = None,
@@ -1722,15 +2108,25 @@ def build_public_decisions(
     used_reaction_keys: set[tuple[str, str, str, str]] = set()
     for topic_key, asset_key in sorted(grouped):
         group = grouped[(topic_key, asset_key)]
-        source_pairs = {
+        classification, direction = _classification(group)
+        horizon = _group_horizon(group)
+        applicability, applicability_reason, source_scope = (
+            _market_applicability(group, direction)
+        )
+        evidence_source_pairs = {
             identity
             for index, relation in enumerate(group)
             if (identity := _source_identity(relation, index)) is not None
         }
+        market_source_pairs = (
+            _directional_event_source_pairs(group, direction)
+            if applicability == "applicable"
+            else set()
+        )
         matched_reactions = [
             reaction
             for reaction in clean_reactions
-            if _matches_reaction(reaction, asset_key, source_pairs)
+            if _matches_reaction(reaction, asset_key, market_source_pairs)
         ]
         for reaction in matched_reactions:
             reaction_key = (
@@ -1743,12 +2139,13 @@ def build_public_decisions(
                 continue
             used_reaction_keys.add(reaction_key)
             used_reactions.append(reaction)
-        classification, direction = _classification(group)
-        horizon = _group_horizon(group)
         market_validation, market_score = _market_validation(
             matched_reactions,
             direction,
             horizon,
+            applicability=applicability,
+            applicability_reason=applicability_reason,
+            source_scope=source_scope,
         )
         confidence_values: list[float] = []
         for relation in group:
@@ -1767,7 +2164,7 @@ def build_public_decisions(
                 _average(_relation_freshness(item, current) for item in group),
                 4,
             ),
-            "corroboration": _corroboration(len(source_pairs)),
+            "corroboration": _corroboration(len(evidence_source_pairs)),
             "market_confirmation": market_score,
             "coverage": coverage_score,
         }
@@ -1781,7 +2178,7 @@ def build_public_decisions(
             "horizon": horizon,
             "data_as_of": _data_as_of(group, matched_reactions, current),
             "evidence": evidence,
-            "source_count": len(source_pairs),
+            "source_count": len(evidence_source_pairs),
             "mechanism_relations": [_public_relation(item) for item in group],
             "market_validation": market_validation,
             "score_components": components,
@@ -1808,6 +2205,7 @@ def build_public_decisions(
     result = {
         "decisions": decisions,
         "impact_matrix": _build_impact_matrix(decisions),
+        "decision_overview": _decision_overview(decisions),
         "evidence_policy": EVIDENCE_POLICY,
         "business_health": {
             "market_validation": _market_business_health(
@@ -1838,7 +2236,9 @@ _SUMMARY_CARD_FIELDS = (
 )
 
 
-def _decision_sort_key(card: Mapping[str, Any]) -> tuple[int, float, str, str]:
+def _decision_sort_key(
+    card: Mapping[str, Any],
+) -> tuple[int, int, float, str, str]:
     stage_rank = {
         "candidate_reduce_or_hedge": 0,
         "candidate_scale_in": 1,
@@ -1856,8 +2256,28 @@ def _decision_sort_key(card: Mapping[str, Any]) -> tuple[int, float, str, str]:
         score = 0.0
     if not math.isfinite(score):
         score = 0.0
+    market = card.get("market_validation")
+    status = (
+        str(market.get("status") or "").strip().lower()
+        if isinstance(market, Mapping)
+        else "unavailable"
+    )
+    applicability = (
+        str(market.get("applicability") or "applicable").strip().lower()
+        if isinstance(market, Mapping)
+        else "applicable"
+    )
+    if status in {"complete", "preliminary"}:
+        market_rank = 0
+    elif status == "pending":
+        market_rank = 1
+    elif applicability == "applicable":
+        market_rank = 2
+    else:
+        market_rank = 3
     return (
         stage_rank.get(stage, 9),
+        market_rank,
         -score,
         str(card.get("topic_key") or ""),
         str(card.get("asset_key") or ""),
@@ -1971,6 +2391,9 @@ def project_decision_summary(
             "impact_matrix": _build_impact_matrix(projected),
             "evidence_policy": payload.get("evidence_policy", EVIDENCE_POLICY),
             "business_health": deepcopy(payload.get("business_health", {})),
+            "decision_overview": deepcopy(
+                payload.get("decision_overview", _decision_overview(cards))
+            ),
             "summary": True,
             "total_decisions": len(cards),
             "total_assets": total_assets,
@@ -2209,4 +2632,66 @@ def build_private_overlay(
     result["impact_matrix"] = _build_impact_matrix(
         [card for card in decisions if isinstance(card, dict)]
     )
+    matched_asset_keys = {
+        str(card.get("asset_key") or "")
+        for card in decisions
+        if isinstance(card, Mapping) and card.get("matched_positions")
+    }
+    matched_positions = [
+        position
+        for position in position_records
+        if str(position.get("asset_key") or "") in matched_asset_keys
+    ]
+    position_dates = [
+        parsed
+        for position in position_records
+        if (parsed := _utc_datetime(position.get("as_of"))) is not None
+    ]
+    stale_position_count = sum(
+        1
+        for position in position_records
+        if _is_older_than(
+            position.get("as_of"),
+            current,
+            position_days * 86_400,
+        )
+    )
+    candidate_stages = {
+        "candidate_reduce_or_hedge",
+        "candidate_scale_in",
+        "reduce_or_hedge",
+        "scale_in",
+    }
+    result["portfolio_overview"] = {
+        "position_count": len(position_records),
+        "matched_position_count": len(matched_positions),
+        "unmatched_position_count": len(position_records) - len(matched_positions),
+        "impacted_asset_count": len(matched_asset_keys),
+        "leveraged_match_count": sum(
+            1 for position in matched_positions if position.get("is_leveraged")
+        ),
+        "stale_position_count": stale_position_count,
+        "oldest_as_of": (
+            min(position_dates).date().isoformat() if position_dates else None
+        ),
+        "candidate_matched_decisions": sum(
+            1
+            for card in decisions
+            if isinstance(card, Mapping)
+            and card.get("matched_positions")
+            and str(card.get("action_stage") or "") in candidate_stages
+        ),
+        "matching_policy": "exact_asset_key_v1",
+        "indirect_exposure_calculated": False,
+        "trade_execution_available": False,
+    }
+    private_overview = _decision_overview(
+        card for card in decisions if isinstance(card, Mapping)
+    )
+    private_overview["portfolio_matched"] = sum(
+        1
+        for card in decisions
+        if isinstance(card, Mapping) and card.get("matched_positions")
+    )
+    result["decision_overview"] = private_overview
     return result
