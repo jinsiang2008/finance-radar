@@ -231,6 +231,26 @@ class DecisionCollectorTests(unittest.TestCase):
             "2026-08-03T12:00:00+00:00",
         )
 
+    def test_fresh_neutral_relation_omits_expected_direction(self) -> None:
+        class NeutralRepository(FakeRepository):
+            def query_market_validation_relations(self, **kwargs):
+                rows = super().query_market_validation_relations(**kwargs)
+                rows[0]["direction"] = "neutral"
+                return rows
+
+        repository = NeutralRepository()
+
+        summary = decision_collect.collect_market_reactions(
+            repository=repository,
+            history_fetcher=lambda *_a, **_k: self.fail("must not fetch"),
+            now="2026-08-03T00:00:00+00:00",
+            max_edges=10,
+        )
+
+        self.assertEqual(summary["pending_scheduled"], 1)
+        persisted = repository.reaction_batches[0][3]
+        self.assertIsNone(persisted["expected_direction"])
+
     def test_weekend_follow_up_stays_pending_without_degradation(self) -> None:
         class WeekendRepository(FakeRepository):
             def query_events(self, **kwargs):

@@ -439,7 +439,14 @@ def collect_market_reactions(
         )
         resolution = market_data.resolve_provider_asset(asset_key, "yahoo")
         result = market_data.unavailable_event_reaction("window_not_due")
-        result["expected_direction"] = relation.get("direction")
+        expected_direction = str(
+            relation.get("direction") or ""
+        ).strip().lower()
+        result["expected_direction"] = (
+            expected_direction
+            if expected_direction in {"positive", "negative"}
+            else None
+        )
         result = schedule_result(
             result,
             event_time=event_time,
