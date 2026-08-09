@@ -158,19 +158,38 @@ def response_payload(
         raise ValueError("decision snapshot payload is unavailable")
     current = _utc_datetime(now)
     generated = _utc_datetime(record.get("generated_at"))
-    age_seconds = max(0, int((current - generated).total_seconds()))
+    exact_age_seconds = max(0.0, (current - generated).total_seconds())
+    age_seconds = int(exact_age_seconds)
     return {
         **dict(payload),
         "snapshot_id": int(record["snapshot_id"]),
         "generated_at": record.get("generated_at"),
         "source_as_of": record.get("source_as_of"),
         "age_seconds": age_seconds,
-        "stale": age_seconds > STALE_AFTER_SECONDS,
+        "stale": exact_age_seconds > STALE_AFTER_SECONDS,
     }
 
 
-def etag(record: Mapping[str, Any], kind: str) -> str:
+def freshness_phase(record: Mapping[str, Any], *, now: Any = None) -> str:
+    current = _utc_datetime(now)
+    generated = _utc_datetime(record.get("generated_at"))
+    age_seconds = max(0.0, (current - generated).total_seconds())
+    return "stale" if age_seconds > STALE_AFTER_SECONDS else "fresh"
+
+
+def cache_max_age(record: Mapping[str, Any], *, now: Any = None) -> int:
+    """Bound public caching so a fresh response cannot cross into stale."""
+    current = _utc_datetime(now)
+    generated = _utc_datetime(record.get("generated_at"))
+    age_seconds = max(0.0, (current - generated).total_seconds())
+    if age_seconds > STALE_AFTER_SECONDS:
+        return 30
+    return max(0, min(30, int(STALE_AFTER_SECONDS - age_seconds)))
+
+
+def etag(record: Mapping[str, Any], kind: str, *, now: Any = None) -> str:
+    phase = freshness_phase(record, now=now)
     return (
         f'"decision-{int(record["snapshot_id"])}-'
-        f'{str(record.get("source_hash") or "")[:16]}-{kind}"'
+        f'{str(record.get("source_hash") or "")[:16]}-{kind}-{phase}"'
     )

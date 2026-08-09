@@ -108,8 +108,8 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn('stale ? "数据延迟" : ""', self.javascript)
         self.assertIn('"高收益债利差"', self.javascript)
         self.assertIn("cs.hy_oas", self.javascript)
-        self.assertIn('static/app.js?v=16', self.html)
-        self.assertIn('static/style.css?v=16', self.html)
+        self.assertIn('static/app.js?v=17', self.html)
+        self.assertIn('static/style.css?v=17', self.html)
         self.assertIn(".metric.is-stale", self.css)
 
     def test_macro_events_render_compact_ai_digest_and_bounded_highlights(self) -> None:
@@ -219,6 +219,84 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn("相反证据与不确定性", self.javascript)
         self.assertIn("失效条件", self.javascript)
 
+    def test_decision_boundary_exposes_market_degradation_without_false_green(
+        self,
+    ) -> None:
+        self.assertIn("function decisionBoundaryState(data)", self.javascript)
+        self.assertIn("function declaredBusinessDegraded(data)", self.javascript)
+        self.assertIn("market.degraded === true", self.javascript)
+        self.assertIn("市场验证暂不可用", self.javascript)
+        self.assertIn(
+            "仅可核验证据，不能据此确认交易动作",
+            self.javascript,
+        )
+        self.assertIn("decision-boundary-rail is-${esc(boundary.tone)}", self.javascript)
+        self.assertIn('aria-label="证据状态与市场状态"', self.javascript)
+        self.assertIn('class="decision-card-boundary"', self.javascript)
+        self.assertIn("setSystemSignal(", self.javascript)
+        self.assertIn("applySystemStatus", self.javascript)
+        self.assertIn(".decision-boundary-rail.is-error", self.css)
+        self.assertIn(".decision-card-boundary", self.css)
+        self.assertIn(".validation-boundary.is-error", self.css)
+
+    def test_decision_boundary_fails_closed_on_snapshot_age_and_market_phase(
+        self,
+    ) -> None:
+        self.assertIn("DECISION_SNAPSHOT_MAX_AGE_SECONDS = 90 * 60", self.javascript)
+        self.assertIn("function decisionSnapshotFreshness(data)", self.javascript)
+        self.assertIn("metadata.stale === true", self.javascript)
+        self.assertIn("metadata.age_seconds", self.javascript)
+        self.assertIn("metadata.generated_at", self.javascript)
+        self.assertIn("computedAgeSeconds", self.javascript)
+        self.assertIn("computedAgeSeconds < -300", self.javascript)
+        self.assertIn(
+            "Math.max(rawAgeSeconds, liveAgeSeconds)",
+            self.javascript,
+        )
+        self.assertIn(
+            "ageSeconds > DECISION_SNAPSHOT_MAX_AGE_SECONDS",
+            self.javascript,
+        )
+        self.assertIn("决策快照延迟", self.javascript)
+        self.assertIn("快照时间待核验", self.javascript)
+        self.assertIn('status === "complete"', self.javascript)
+        self.assertIn("market.abstain === false", self.javascript)
+        self.assertIn("market.veto === false", self.javascript)
+        self.assertIn("directionConfirmed === true", self.javascript)
+        self.assertIn('phase === "contrary"', self.javascript)
+        self.assertIn("市场反向，候选停止并复核", self.javascript)
+        self.assertIn("市场方向中性或不一致", self.javascript)
+
+    def test_partial_business_degradation_and_macro_failure_remain_visible(
+        self,
+    ) -> None:
+        self.assertIn("function businessHealthSeverity(data)", self.javascript)
+        self.assertIn("rawAvailableRecords", self.javascript)
+        self.assertIn("availableRecords <= 0", self.javascript)
+        self.assertIn("fallbackAllUnavailable", self.javascript)
+        self.assertIn("!businessHealth.declared", self.javascript)
+        self.assertIn('partial: severity === "warn"', self.javascript)
+        self.assertIn('unavailable: severity === "error"', self.javascript)
+        self.assertIn("市场验证部分降级", self.javascript)
+        self.assertIn('state.systemSignals.macro?.kind === "error"', self.javascript)
+        self.assertIn("宏观快照刷新失败", self.javascript)
+        self.assertIn(
+            "if (state.decisionData) renderDecisionHero(state.decisionData)",
+            self.javascript,
+        )
+
+    def test_human_review_actions_remain_candidates_in_every_decision_surface(
+        self,
+    ) -> None:
+        self.assertIn("candidate_reduce_or_hedge", self.javascript)
+        self.assertIn("candidate_scale_in", self.javascript)
+        self.assertIn("候选减仓 / 对冲", self.javascript)
+        self.assertIn("候选分批布局", self.javascript)
+        self.assertIn("候选行动 · 待人工确认", self.javascript)
+        self.assertIn("候选行动，待人工确认", self.javascript)
+        self.assertNotIn("已确认行动", self.javascript)
+        self.assertNotIn("已进入分级行动", self.javascript)
+
     def test_current_topic_keys_and_asset_labels_are_user_facing(self) -> None:
         for topic_key in (
             "inflation",
@@ -268,7 +346,7 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn('class="brief-score"', self.javascript)
         self.assertIn('class="transmission-ribbon"', self.javascript)
         self.assertIn("信号 → 主题 → 资产", self.javascript)
-        self.assertIn("本轮无已确认行动", self.javascript)
+        self.assertIn("本轮暂无候选行动", self.javascript)
         self.assertIn(
             "if (state.decisionData) renderDecisionHero(state.decisionData)",
             self.javascript,
@@ -284,6 +362,28 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn("orderedColumns.slice(0, 8)", self.javascript)
         self.assertIn('id="matrix-show-all"', self.javascript)
         self.assertIn("收起到重点资产", self.javascript)
+        self.assertIn("if (data?.summary === true)", self.javascript)
+        self.assertGreaterEqual(
+            self.javascript.count("state.decisionQueueExpanded = false"),
+            2,
+        )
+        self.assertGreaterEqual(
+            self.javascript.count("state.matrixExpanded = false"),
+            2,
+        )
+
+    def test_full_decision_failure_restores_controls_and_reports_in_place(
+        self,
+    ) -> None:
+        self.assertIn("fullDecisionLoadError", self.javascript)
+        self.assertIn("function showDecisionExpansionError", self.javascript)
+        self.assertIn("decision-inline-error", self.javascript)
+        self.assertIn("if (more.isConnected)", self.javascript)
+        self.assertIn("more.disabled = false", self.javascript)
+        self.assertIn("if (matrixMore.isConnected)", self.javascript)
+        self.assertIn("matrixMore.disabled = false", self.javascript)
+        self.assertIn("finally", self.javascript)
+        self.assertIn(".decision-inline-error", self.css)
 
     def test_external_links_are_protocol_allowlisted(self) -> None:
         self.assertIn("function safeExternalUrl(value)", self.javascript)
@@ -302,6 +402,40 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn("state.refreshTimer = setTimeout", self.javascript)
         self.assertNotIn("setInterval(refreshCurrentView", self.javascript)
         self.assertNotIn("setInterval(refreshAll", self.javascript)
+
+    def test_failed_view_refresh_keeps_last_good_and_is_not_cached(self) -> None:
+        self.assertIn("viewLastGoodAt", self.javascript)
+        self.assertIn("viewLoadErrors", self.javascript)
+        self.assertIn("function renderViewLoadState(view)", self.javascript)
+        self.assertIn('data-view-retry="${esc(view)}"', self.javascript)
+        self.assertIn("viewLastGoodDataAt", self.javascript)
+        self.assertIn("function recordViewLastGoodDataAt", self.javascript)
+        self.assertIn("payload?.generated_at", self.javascript)
+        self.assertIn("payload?.source_as_of", self.javascript)
+        self.assertIn("继续显示数据截至 ${fmtAbsoluteTime", self.javascript)
+        self.assertNotIn(
+            "fmtAbsoluteTime(new Date(lastGoodAt).toISOString())",
+            self.javascript,
+        )
+        self.assertIn("criticalSucceeded", self.javascript)
+        self.assertIn("state.viewLoadedAt[view] = loadedNow", self.javascript)
+        self.assertIn("state.viewLoadedAt[view] = 0", self.javascript)
+        self.assertIn("eventsResult.value === true", self.javascript)
+        self.assertIn("decisionResult.value === true", self.javascript)
+        self.assertNotIn("已清除上一份页面数据", self.javascript)
+        self.assertIn(".view-load-state", self.css)
+        self.assertIn(".view-retry-btn", self.css)
+
+    def test_decision_detail_409_retries_once_then_requires_user_action(self) -> None:
+        self.assertIn("conflictRetryCount = 0", self.javascript)
+        self.assertIn("if (conflictRetryCount >= 1)", self.javascript)
+        self.assertIn('loadDecisions({ autoSelect: false })', self.javascript)
+        self.assertIn("conflictRetryCount: 1", self.javascript)
+        self.assertIn("function renderDecisionDetailConflict", self.javascript)
+        self.assertIn("已停止自动重试", self.javascript)
+        self.assertIn("data-decision-detail-retry", self.javascript)
+        self.assertIn("人工重试证据链", self.javascript)
+        self.assertIn(".decision-detail-conflict", self.css)
 
     def test_first_screen_uses_summary_lazy_detail_and_public_revalidation(self) -> None:
         self.assertIn('"api/decisions/summary"', self.javascript)

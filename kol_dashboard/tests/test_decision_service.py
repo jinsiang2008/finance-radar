@@ -4,6 +4,7 @@ import importlib
 import json
 import tempfile
 import unittest
+from collections import Counter
 from copy import deepcopy
 from pathlib import Path
 from unittest import mock
@@ -27,6 +28,7 @@ def _relation(
     source_type: str = "event",
     strength: float = 0.8,
     confidence: float = 0.8,
+    horizon: str = "medium",
     evidence: dict | None = None,
 ) -> dict:
     return {
@@ -38,7 +40,7 @@ def _relation(
         "direction": direction,
         "strength": strength,
         "confidence": confidence,
-        "horizon": "medium",
+        "horizon": horizon,
         "method": "deterministic_rules:test",
         "rationale": (
             "文本与资产同现；这是相关性证据，不表示该陈述导致价格变化。"
@@ -57,12 +59,16 @@ def _reaction(
     *,
     direction_confirmed: bool = True,
     status: str = "complete",
+    window: str = "3D",
+    sample_count: int | None = None,
+    reason_code: str | None = None,
+    next_due_at: str | None = None,
 ) -> dict:
-    return {
+    reaction = {
         "source_type": "event",
         "source_id": source_id,
         "asset_key": "US:NVDA",
-        "window": "3D",
+        "window": window,
         "benchmark_asset_key": "US:SOXX",
         "asset_return": 0.12 if direction_confirmed else -0.02,
         "benchmark_return": 0.03,
@@ -71,7 +77,11 @@ def _reaction(
         "observed_direction": "positive" if direction_confirmed else "negative",
         "direction_confirmed": direction_confirmed,
         "status": status,
-        "sample_count": 4,
+        "sample_count": (
+            sample_count
+            if sample_count is not None
+            else {"1D": 2, "3D": 4, "5D": 6}.get(window, 0)
+        ),
         "data_timestamps": {
             "start": "2026-07-30T00:00:00+00:00",
             "end": "2026-08-01T00:00:00+00:00",
@@ -79,6 +89,11 @@ def _reaction(
         "method_version": "common_trading_days:test",
         "observed_at": "2026-08-01T00:00:00+00:00",
     }
+    if reason_code is not None:
+        reaction["reason_code"] = reason_code
+    if next_due_at is not None:
+        reaction["next_due_at"] = next_due_at
+    return reaction
 
 
 class PublicDecisionTests(unittest.TestCase):
@@ -130,7 +145,12 @@ class PublicDecisionTests(unittest.TestCase):
         self.assertTrue(card["human_review_required"])
         self.assertIn(
             card["action_stage"],
-            {"observe", "verify", "reduce_or_hedge", "scale_in"},
+            {
+                "observe",
+                "verify",
+                "candidate_reduce_or_hedge",
+                "candidate_scale_in",
+            },
         )
         self.assertEqual(
             set(card["score_components"]),
@@ -301,6 +321,195 @@ class PublicDecisionTests(unittest.TestCase):
         self.assertIn(card["action_stage"], {"observe", "verify"})
         self.assertIn("样本", card["market_validation"]["note"])
 
+    def test_recent_long_horizon_event_remains_reachable_while_5d_is_pending(
+        self,
+    ) -> None:
+        relation = _relation(
+            "recent-long",
+            "positive",
+            horizon="long",
+            evidence={
+                "title": "recent long-horizon evidence",
+                "published_at": "2026-07-29T01:00:00+00:00",
+            },
+        )
+        reactions = [
+            _reaction("recent-long", window="1D"),
+            _reaction(
+                "recent-long",
+                window="3D",
+                status="pending",
+                sample_count=2,
+                reason_code="window_not_due",
+                next_due_at="2026-08-03T00:00:00+00:00",
+            ),
+            _reaction(
+                "recent-long",
+                window="5D",
+                status="pending",
+                sample_count=2,
+                reason_code="window_not_due",
+                next_due_at="2026-08-05T00:00:00+00:00",
+            ),
+        ]
+
+        result = decision_service.build_public_decisions(
+            [relation],
+            reactions,
+            1.0,
+            now=TEST_NOW,
+        )
+
+        self.assertEqual(len(result["decisions"]), 1)
+        market = result["decisions"][0]["market_validation"]
+        self.assertEqual(market["required_window"], "5D")
+        self.assertEqual(market["status"], "preliminary")
+        self.assertEqual(market["phase"], "confirmed_1d")
+        self.assertEqual(market["completed_windows"], ["1D"])
+        self.assertEqual(market["pending_windows"], ["3D", "5D"])
+        self.assertFalse(market["veto"])
+        self.assertTrue(market["abstain"])
+        self.assertFalse(market["required_window_complete"])
+        self.assertTrue(market["direction_confirmed"])
+        self.assertEqual(
+            result["decisions"][0]["score_components"]["market_confirmation"],
+            0.55,
+        )
+        self.assertIn(
+            result["decisions"][0]["action_stage"],
+            {"verify", "observe"},
+        )
+
+    def test_human_review_actions_are_explicit_candidates(self) -> None:
+        card = decision_service.build_public_decisions(
+            [
+                _relation(
+                    "candidate-a",
+                    "positive",
+                    strength=1.0,
+                    confidence=1.0,
+                )
+            ],
+            [_reaction("candidate-a")],
+            1.0,
+            now=TEST_NOW,
+        )["decisions"][0]
+
+        self.assertTrue(card["human_review_required"])
+        self.assertEqual(card["decision_status"], "candidate")
+        self.assertEqual(card["action_stage"], "candidate_scale_in")
+        self.assertNotIn(
+            card["action_stage"],
+            {"scale_in", "reduce_or_hedge"},
+        )
+
+    def test_market_business_health_aggregates_only_bounded_reason_codes(
+        self,
+    ) -> None:
+        failed = {
+            **_reaction("health-a", status="unavailable"),
+            "reason_code": "invalid_range",
+            "reason": "request_failed:SecretProviderException(private-token)",
+            "provider": "yahoo",
+            "provider_symbol": "NVDA",
+            "asset_status": "unavailable",
+        }
+
+        result = decision_service.build_public_decisions(
+            [_relation("health-a", "positive")],
+            [failed],
+            1.0,
+            now=TEST_NOW,
+        )
+
+        health = result["business_health"]["market_validation"]
+        self.assertEqual(health["status"], "unavailable")
+        self.assertTrue(health["degraded"])
+        self.assertEqual(health["reason_counts"], {"invalid_range": 1})
+        encoded = json.dumps(result, ensure_ascii=False)
+        self.assertIn('"reason_code": "invalid_range"', encoded)
+        self.assertNotIn("SecretProviderException", encoded)
+        self.assertNotIn("private-token", encoded)
+
+    def test_unrelated_old_unavailable_reactions_do_not_degrade_current_health(
+        self,
+    ) -> None:
+        old_unrelated = {
+            **_reaction("old-unrelated", status="unavailable"),
+            "reason_code": "asset_unavailable",
+            "observed_at": "2026-07-18T00:00:00+00:00",
+        }
+
+        result = decision_service.build_public_decisions(
+            [_relation("current", "positive")],
+            [_reaction("current"), old_unrelated],
+            1.0,
+            now=TEST_NOW,
+        )
+
+        health = result["business_health"]["market_validation"]
+        self.assertEqual(health["status"], "healthy")
+        self.assertFalse(health["degraded"])
+        self.assertEqual(health["total_records"], 1)
+        self.assertEqual(health["complete_records"], 1)
+        self.assertEqual(health["unavailable_records"], 0)
+        self.assertEqual(health["reason_counts"], {})
+
+    def test_partial_current_decision_coverage_cannot_report_healthy(self) -> None:
+        missing_relation = {
+            **_relation("missing-current", "negative"),
+            "topic_key": "rates",
+            "asset_key": "US:TLT",
+        }
+
+        result = decision_service.build_public_decisions(
+            [_relation("covered-current", "positive"), missing_relation],
+            [_reaction("covered-current")],
+            1.0,
+            now=TEST_NOW,
+        )
+
+        health = result["business_health"]["market_validation"]
+        self.assertEqual(health["status"], "degraded")
+        self.assertTrue(health["degraded"])
+        self.assertEqual(health["total_decisions"], 2)
+        self.assertEqual(health["covered_decisions"], 1)
+        self.assertEqual(health["pending_decisions"], 0)
+        self.assertEqual(health["unavailable_decisions"], 1)
+        self.assertEqual(health["reason_counts"], {})
+
+    def test_pending_current_decision_is_not_a_business_health_failure(
+        self,
+    ) -> None:
+        pending_relation = {
+            **_relation("pending-current", "negative"),
+            "topic_key": "rates",
+            "asset_key": "US:TLT",
+        }
+        pending_reaction = {
+            **_reaction(
+                "pending-current",
+                status="pending",
+                reason_code="window_not_due",
+                next_due_at="2026-08-03T00:00:00+00:00",
+            ),
+            "asset_key": "US:TLT",
+        }
+
+        result = decision_service.build_public_decisions(
+            [_relation("covered-current", "positive"), pending_relation],
+            [_reaction("covered-current"), pending_reaction],
+            1.0,
+            now=TEST_NOW,
+        )
+
+        health = result["business_health"]["market_validation"]
+        self.assertEqual(health["status"], "healthy")
+        self.assertFalse(health["degraded"])
+        self.assertEqual(health["covered_decisions"], 1)
+        self.assertEqual(health["pending_decisions"], 1)
+        self.assertEqual(health["unavailable_decisions"], 0)
+
     def test_complete_but_contrary_market_never_escalates_action(self) -> None:
         result = decision_service.build_public_decisions(
             [_relation("kol-a", "positive", strength=1.0, confidence=1.0)],
@@ -434,6 +643,129 @@ class PublicDecisionTests(unittest.TestCase):
             [item["source_id"] for item in result["decisions"][0]["evidence"]],
             ["recent"],
         )
+
+    def test_event_retention_is_horizon_aware(self) -> None:
+        def relation(
+            source_id: str,
+            horizon: str,
+            published_at: str,
+            asset_key: str,
+        ) -> dict:
+            return {
+                **_relation(
+                    source_id,
+                    "positive",
+                    horizon=horizon,
+                    evidence={
+                        "title": source_id,
+                        "published_at": published_at,
+                    },
+                ),
+                "topic_key": source_id,
+                "asset_key": asset_key,
+            }
+
+        result = decision_service.build_public_decisions(
+            [
+                relation(
+                    "short-expired",
+                    "short",
+                    "2026-08-03T00:00:00+00:00",
+                    "US:S1",
+                ),
+                relation(
+                    "medium-current",
+                    "medium",
+                    "2026-08-02T00:00:00+00:00",
+                    "US:M1",
+                ),
+                relation(
+                    "medium-expired",
+                    "medium",
+                    "2026-07-30T00:00:00+00:00",
+                    "US:M2",
+                ),
+                relation(
+                    "long-current",
+                    "long",
+                    "2026-07-26T00:00:00+00:00",
+                    "US:L1",
+                ),
+                relation(
+                    "long-expired",
+                    "long",
+                    "2026-07-24T00:00:00+00:00",
+                    "US:L2",
+                ),
+            ],
+            [],
+            1.0,
+            now="2026-08-08T00:00:00+00:00",
+        )
+
+        self.assertEqual(
+            {card["topic_key"] for card in result["decisions"]},
+            {"medium-current", "long-current"},
+        )
+
+    def test_friday_long_event_survives_until_5d_window_completes(self) -> None:
+        relation = _relation(
+            "friday-long",
+            "positive",
+            horizon="long",
+            strength=1.0,
+            confidence=1.0,
+            evidence={
+                "title": "Friday long-horizon event",
+                "published_at": "2026-07-24T20:00:00+00:00",
+            },
+        )
+        before = decision_service.build_public_decisions(
+            [relation],
+            [
+                _reaction("friday-long", window="1D"),
+                _reaction("friday-long", window="3D"),
+                _reaction(
+                    "friday-long",
+                    window="5D",
+                    status="pending",
+                    sample_count=4,
+                    reason_code="window_not_due",
+                    next_due_at="2026-07-31T20:00:00+00:00",
+                ),
+            ],
+            1.0,
+            now="2026-07-29T20:00:00+00:00",
+        )
+        after = decision_service.build_public_decisions(
+            [relation],
+            [
+                _reaction("friday-long", window="1D"),
+                _reaction("friday-long", window="3D"),
+                _reaction("friday-long", window="5D"),
+            ],
+            1.0,
+            now="2026-08-06T20:00:00+00:00",
+        )
+
+        self.assertEqual(len(before["decisions"]), 1)
+        before_card = before["decisions"][0]
+        self.assertTrue(before_card["market_validation"]["abstain"])
+        self.assertFalse(before_card["market_validation"]["veto"])
+        self.assertEqual(
+            before_card["market_validation"]["phase"],
+            "confirmed_3d",
+        )
+        self.assertIn(before_card["action_stage"], {"verify", "observe"})
+
+        self.assertEqual(len(after["decisions"]), 1)
+        after_card = after["decisions"][0]
+        self.assertTrue(
+            after_card["market_validation"]["required_window_complete"]
+        )
+        self.assertFalse(after_card["market_validation"]["abstain"])
+        self.assertEqual(after_card["market_validation"]["phase"], "confirmed_5d")
+        self.assertEqual(after_card["action_stage"], "candidate_scale_in")
 
     def test_only_known_sources_and_nonfuture_event_evidence_are_allowed(
         self,
@@ -1172,6 +1504,74 @@ class PrivateOverlayTests(unittest.TestCase):
         self.assertIn("evidence", detail)
         self.assertIsNone(
             decision_service.find_decision(public, "missing", card["asset_key"])
+        )
+
+    def test_decision_summary_reserves_global_leaders_then_diversifies_topics(
+        self,
+    ) -> None:
+        def card(topic: str, asset: str, score: float) -> dict:
+            return {
+                "topic_key": topic,
+                "asset_key": asset,
+                "classification": "risk",
+                "direction": "negative",
+                "horizon": "medium",
+                "source_count": 2,
+                "score_components": {},
+                "confidence": score,
+                "total_score": score,
+                "action_stage": "candidate_reduce_or_hedge",
+                "trigger": "review",
+                "invalidation": "reverse",
+                "human_review_required": True,
+                "decision_status": "candidate",
+                "market_validation": {
+                    "status": "complete",
+                    "abstain": False,
+                },
+            }
+
+        concentrated = [
+            card("ai_semiconductors", f"US:AI{index}", 1.0 - index / 100)
+            for index in range(9)
+        ]
+        diverse = [
+            card(f"topic_{index}", f"US:D{index}", 0.80 - index / 100)
+            for index in range(10)
+        ]
+        payload = {
+            "decisions": concentrated + diverse,
+            "impact_matrix": {
+                "columns": [
+                    item["asset_key"] for item in concentrated + diverse
+                ],
+                "rows": [],
+            },
+            "business_health": {
+                "market_validation": {"status": "healthy"}
+            },
+        }
+
+        summary = decision_service.project_decision_summary(
+            payload,
+            decision_limit=12,
+        )
+
+        topics = Counter(
+            item["topic_key"] for item in summary["decisions"]
+        )
+        self.assertEqual(len(summary["decisions"]), 12)
+        self.assertLessEqual(topics["ai_semiconductors"], 3)
+        self.assertIn("US:AI0", {
+            item["asset_key"] for item in summary["decisions"]
+        })
+        self.assertEqual(
+            summary["selection_policy"]["name"],
+            "diversified_top_score_v1",
+        )
+        self.assertEqual(
+            summary["business_health"]["market_validation"]["status"],
+            "healthy",
         )
 
 

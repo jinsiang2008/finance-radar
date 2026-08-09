@@ -56,10 +56,6 @@ _NO_STORE_HEADERS = {
     "Pragma": "no-cache",
 }
 _PUBLIC_CACHE_HEADERS = {"Cache-Control": "public, max-age=30"}
-_PUBLIC_REVALIDATE_HEADERS = {
-    "Cache-Control": "public, max-age=30, stale-while-revalidate=120",
-    "Vary": "Accept-Encoding",
-}
 
 
 class LoginBody(BaseModel):
@@ -417,18 +413,40 @@ def _etag_matches(request: Request, etag: str) -> bool:
     return False
 
 
+def _decision_response_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _decision_cache_headers(
+    record: Mapping[str, Any],
+    *,
+    now: datetime,
+) -> dict[str, str]:
+    max_age = decision_snapshot.cache_max_age(record, now=now)
+    return {
+        "Cache-Control": (
+            f"public, max-age={max_age}, stale-while-revalidate=120"
+        ),
+        "Vary": "Accept-Encoding",
+    }
+
+
 def _decision_json_response(
     request: Request,
     record: Mapping[str, Any],
     *,
     kind: str,
 ) -> Response:
-    etag = decision_snapshot.etag(record, kind)
-    headers = {**_PUBLIC_REVALIDATE_HEADERS, "ETag": etag}
+    current = _decision_response_now()
+    etag = decision_snapshot.etag(record, kind, now=current)
+    headers = {
+        **_decision_cache_headers(record, now=current),
+        "ETag": etag,
+    }
     if _etag_matches(request, etag):
         return Response(status_code=304, headers=headers)
     return JSONResponse(
-        decision_snapshot.response_payload(record, kind=kind),
+        decision_snapshot.response_payload(record, kind=kind, now=current),
         headers=headers,
     )
 
@@ -465,7 +483,12 @@ def api_decision_detail(
     card = decision_service.find_decision(record["full"], topic_key, asset_key)
     if card is None:
         raise HTTPException(status_code=404, detail="decision_not_found")
-    metadata = decision_snapshot.response_payload(record, kind="summary")
+    current = _decision_response_now()
+    metadata = decision_snapshot.response_payload(
+        record,
+        kind="summary",
+        now=current,
+    )
     return JSONResponse(
         {
             "snapshot_id": record["snapshot_id"],
@@ -476,8 +499,9 @@ def api_decision_detail(
             "evidence_policy": record["full"].get(
                 "evidence_policy", decision_service.EVIDENCE_POLICY
             ),
+            "business_health": record["full"].get("business_health", {}),
         },
-        headers=_PUBLIC_CACHE_HEADERS,
+        headers=_decision_cache_headers(record, now=current),
     )
 
 

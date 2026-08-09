@@ -64,6 +64,34 @@ DB_PATH = os.environ.get(
 
 RETENTION_DAYS = 14
 
+_MARKET_REACTION_STATUSES = {
+    "pending",
+    "preliminary",
+    "complete",
+    "unavailable",
+}
+_MARKET_SERIES_STATUSES = {"available", "unavailable", "unsupported"}
+_MARKET_REASON_CODES = {
+    "asset_unavailable",
+    "bad_payload",
+    "baseline_unavailable",
+    "benchmark_unavailable",
+    "follow_up_unavailable",
+    "insufficient_follow_up",
+    "invalid_event_time",
+    "invalid_interval",
+    "invalid_range",
+    "invalid_timeout",
+    "no_common_trading_dates",
+    "provider_error",
+    "request_failed",
+    "same_proxy_as_benchmark",
+    "unknown",
+    "unsupported_asset",
+    "unsupported_benchmark",
+    "window_not_due",
+}
+
 # Tracking params that differ per fetch and must not affect identity.
 _TRACKING_PARAMS = {
     "ref", "aid", "tid", "c", "mkt", "utm_source", "utm_medium",
@@ -405,6 +433,148 @@ def _observed_at(value: Any) -> str:
     if parsed.tzinfo is None:
         raise ValueError("observed_at must include a timezone")
     return parsed.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _optional_utc_at(value: Any, field: str) -> str | None:
+    if value is None or not str(value).strip():
+        return None
+    text = _required_text(value, field, maximum=64)
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"{field} must be an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None:
+        raise ValueError(f"{field} must include a timezone")
+    return parsed.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _market_reason_code(value: Any) -> str | None:
+    if value is None or not str(value).strip():
+        return None
+    candidate = str(value).strip().lower().split(":", 1)[0]
+    return candidate if candidate in _MARKET_REASON_CODES else "unknown"
+
+
+def _create_market_reactions_table(c: sqlite3.Connection) -> None:
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS market_reactions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          source_type TEXT NOT NULL,
+          source_id TEXT NOT NULL,
+          asset_key TEXT NOT NULL,
+          window TEXT NOT NULL,
+          benchmark_asset_key TEXT,
+          asset_return REAL,
+          benchmark_return REAL,
+          abnormal_return REAL,
+          expected_direction TEXT
+            CHECK(expected_direction IS NULL OR expected_direction IN ('positive', 'negative')),
+          observed_direction TEXT
+            CHECK(observed_direction IS NULL OR observed_direction IN ('positive', 'negative', 'neutral')),
+          direction_confirmed INTEGER
+            CHECK(direction_confirmed IS NULL OR direction_confirmed IN (0, 1)),
+          status TEXT NOT NULL
+            CHECK(status IN ('pending', 'preliminary', 'complete', 'unavailable')),
+          sample_count INTEGER NOT NULL DEFAULT 0 CHECK(sample_count >= 0),
+          data_timestamps_json TEXT NOT NULL DEFAULT '{}',
+          method_version TEXT NOT NULL,
+          observed_at TEXT NOT NULL,
+          provider TEXT,
+          provider_symbol TEXT,
+          proxy_for TEXT,
+          asset_status TEXT
+            CHECK(asset_status IS NULL OR asset_status IN ('available', 'unavailable', 'unsupported')),
+          benchmark_status TEXT
+            CHECK(benchmark_status IS NULL OR benchmark_status IN ('available', 'unavailable', 'unsupported')),
+          reason_code TEXT CHECK(
+            reason_code IS NULL OR reason_code IN (
+              'asset_unavailable', 'bad_payload', 'baseline_unavailable',
+              'benchmark_unavailable', 'follow_up_unavailable',
+              'insufficient_follow_up', 'invalid_event_time',
+              'invalid_interval', 'invalid_range', 'invalid_timeout',
+              'no_common_trading_dates', 'provider_error', 'request_failed',
+              'same_proxy_as_benchmark', 'unknown', 'unsupported_asset',
+              'unsupported_benchmark', 'window_not_due'
+            )
+          ),
+          next_due_at TEXT,
+          UNIQUE(source_type, source_id, asset_key, window, method_version)
+        )
+        """
+    )
+
+
+def _migrate_market_reactions_in(c: sqlite3.Connection) -> None:
+    """Atomically add pending/diagnostic support to an existing reaction table."""
+    row = c.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='market_reactions'"
+    ).fetchone()
+    if row is None:
+        _create_market_reactions_table(c)
+        return
+    table_sql = str(row["sql"] or "").lower()
+    if "'pending'" not in table_sql:
+        legacy = "market_reactions_legacy_p0"
+        c.execute(f"ALTER TABLE market_reactions RENAME TO {legacy}")
+        _create_market_reactions_table(c)
+        legacy_columns = _columns(c, legacy)
+        target_columns = [
+            "id",
+            "source_type",
+            "source_id",
+            "asset_key",
+            "window",
+            "benchmark_asset_key",
+            "asset_return",
+            "benchmark_return",
+            "abnormal_return",
+            "expected_direction",
+            "observed_direction",
+            "direction_confirmed",
+            "status",
+            "sample_count",
+            "data_timestamps_json",
+            "method_version",
+            "observed_at",
+            "provider",
+            "provider_symbol",
+            "proxy_for",
+            "asset_status",
+            "benchmark_status",
+            "reason_code",
+            "next_due_at",
+        ]
+        select_columns = [
+            column if column in legacy_columns else "NULL" for column in target_columns
+        ]
+        c.execute(
+            f"INSERT INTO market_reactions ({', '.join(target_columns)}) "
+            f"SELECT {', '.join(select_columns)} FROM {legacy}"
+        )
+        c.execute(f"DROP TABLE {legacy}")
+        return
+    columns = _columns(c, "market_reactions")
+    additions = {
+        "provider": "TEXT",
+        "provider_symbol": "TEXT",
+        "proxy_for": "TEXT",
+        "asset_status": (
+            "TEXT CHECK(asset_status IS NULL OR "
+            "asset_status IN ('available', 'unavailable', 'unsupported'))"
+        ),
+        "benchmark_status": (
+            "TEXT CHECK(benchmark_status IS NULL OR "
+            "benchmark_status IN ('available', 'unavailable', 'unsupported'))"
+        ),
+        "reason_code": "TEXT",
+        "next_due_at": "TEXT",
+    }
+    for column, definition in additions.items():
+        if column not in columns:
+            c.execute(
+                f"ALTER TABLE market_reactions ADD COLUMN {column} {definition}"
+            )
 
 
 def _event_ai_input_signature(
@@ -1199,34 +1369,7 @@ def init() -> None:
             "CREATE INDEX IF NOT EXISTS idx_market_price_lookup "
             "ON market_prices(asset_key, provider, timestamp)"
         )
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS market_reactions (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              source_type TEXT NOT NULL,
-              source_id TEXT NOT NULL,
-              asset_key TEXT NOT NULL,
-              window TEXT NOT NULL,
-              benchmark_asset_key TEXT,
-              asset_return REAL,
-              benchmark_return REAL,
-              abnormal_return REAL,
-              expected_direction TEXT
-                CHECK(expected_direction IS NULL OR expected_direction IN ('positive', 'negative')),
-              observed_direction TEXT
-                CHECK(observed_direction IS NULL OR observed_direction IN ('positive', 'negative', 'neutral')),
-              direction_confirmed INTEGER
-                CHECK(direction_confirmed IS NULL OR direction_confirmed IN (0, 1)),
-              status TEXT NOT NULL
-                CHECK(status IN ('preliminary', 'complete', 'unavailable')),
-              sample_count INTEGER NOT NULL DEFAULT 0 CHECK(sample_count >= 0),
-              data_timestamps_json TEXT NOT NULL DEFAULT '{}',
-              method_version TEXT NOT NULL,
-              observed_at TEXT NOT NULL,
-              UNIQUE(source_type, source_id, asset_key, window, method_version)
-            )
-            """
-        )
+        _migrate_market_reactions_in(c)
         reaction_columns = _columns(c, "market_reactions")
         if "expected_direction" not in reaction_columns:
             c.execute(
@@ -2476,7 +2619,7 @@ def upsert_market_reaction(
     if window not in {"1D", "3D", "5D"}:
         raise ValueError("window must be one of 1D, 3D, or 5D")
     status = _required_text(reaction.get("status"), "status", maximum=20)
-    if status not in {"preliminary", "complete", "unavailable"}:
+    if status not in _MARKET_REACTION_STATUSES:
         raise ValueError("invalid reaction status")
     method_version = _required_text(
         reaction.get("method_version"), "method_version", maximum=100
@@ -2560,6 +2703,40 @@ def upsert_market_reaction(
         if observed_at is not None
         else reaction.get("observed_at")
     )
+    provider = _optional_text(
+        reaction.get("provider"), "provider", maximum=32
+    )
+    if provider is not None:
+        provider = provider.lower()
+    provider_symbol = _optional_text(
+        reaction.get("provider_symbol"), "provider_symbol", maximum=100
+    )
+    proxy_for = _optional_text(
+        reaction.get("proxy_for"), "proxy_for", maximum=100
+    )
+    asset_status = _optional_text(
+        reaction.get("asset_status"), "asset_status", maximum=20
+    )
+    if asset_status is not None:
+        asset_status = asset_status.lower()
+        if asset_status not in _MARKET_SERIES_STATUSES:
+            raise ValueError("invalid asset_status")
+    benchmark_status = _optional_text(
+        reaction.get("benchmark_status"), "benchmark_status", maximum=20
+    )
+    if benchmark_status is not None:
+        benchmark_status = benchmark_status.lower()
+        if benchmark_status not in _MARKET_SERIES_STATUSES:
+            raise ValueError("invalid benchmark_status")
+    reason_code = _market_reason_code(
+        reaction.get("reason_code", reaction.get("reason"))
+    )
+    next_due_at = _optional_utc_at(reaction.get("next_due_at"), "next_due_at")
+    if status == "pending" and next_due_at is None:
+        raise ValueError("pending reactions require next_due_at")
+    if status == "complete":
+        reason_code = None
+        next_due_at = None
     values = (
         clean_source_type,
         clean_source_id,
@@ -2577,6 +2754,13 @@ def upsert_market_reaction(
         timestamps_json,
         method_version,
         clean_observed,
+        provider,
+        provider_symbol,
+        proxy_for,
+        asset_status,
+        benchmark_status,
+        reason_code,
+        next_due_at,
     )
 
     def execute(connection: sqlite3.Connection) -> None:
@@ -2587,8 +2771,12 @@ def upsert_market_reaction(
               asset_return, benchmark_return, abnormal_return,
               expected_direction, observed_direction, direction_confirmed,
               status, sample_count, data_timestamps_json, method_version,
-              observed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              observed_at, provider, provider_symbol, proxy_for, asset_status,
+              benchmark_status, reason_code, next_due_at
+            ) VALUES (
+              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+              ?, ?, ?
+            )
             ON CONFLICT(
               source_type, source_id, asset_key, window, method_version
             ) DO UPDATE SET
@@ -2602,19 +2790,40 @@ def upsert_market_reaction(
               status=excluded.status,
               sample_count=excluded.sample_count,
               data_timestamps_json=excluded.data_timestamps_json,
+              provider=excluded.provider,
+              provider_symbol=excluded.provider_symbol,
+              proxy_for=excluded.proxy_for,
+              asset_status=excluded.asset_status,
+              benchmark_status=excluded.benchmark_status,
+              reason_code=excluded.reason_code,
+              next_due_at=excluded.next_due_at,
               observed_at=excluded.observed_at
             WHERE
               CASE excluded.status
-                WHEN 'complete' THEN 2
-                WHEN 'preliminary' THEN 1
-                ELSE 0
+                WHEN 'complete' THEN 3
+                WHEN 'preliminary' THEN 2
+                ELSE 1
               END
-              >=
+              >
               CASE market_reactions.status
-                WHEN 'complete' THEN 2
-                WHEN 'preliminary' THEN 1
-                ELSE 0
+                WHEN 'complete' THEN 3
+                WHEN 'preliminary' THEN 2
+                ELSE 1
               END
+              OR (
+                CASE excluded.status
+                  WHEN 'complete' THEN 3
+                  WHEN 'preliminary' THEN 2
+                  ELSE 1
+                END
+                =
+                CASE market_reactions.status
+                  WHEN 'complete' THEN 3
+                  WHEN 'preliminary' THEN 2
+                  ELSE 1
+                END
+                AND excluded.observed_at >= market_reactions.observed_at
+              )
             """,
             values,
         )
@@ -2655,6 +2864,17 @@ def upsert_market_reactions(
                 item.get("expected_direction")
                 or reaction_result.get("expected_direction")
             )
+            for field in (
+                "provider",
+                "provider_symbol",
+                "proxy_for",
+                "asset_status",
+                "benchmark_status",
+                "reason_code",
+                "next_due_at",
+            ):
+                if field not in item:
+                    item[field] = reaction_result.get(field)
             count += upsert_market_reaction(
                 source_type,
                 source_id,
@@ -2705,7 +2925,9 @@ def query_market_reactions(
             "mr.benchmark_asset_key, mr.asset_return, mr.benchmark_return, "
             "mr.abnormal_return, mr.expected_direction, mr.observed_direction, "
             "mr.direction_confirmed, mr.status, mr.sample_count, "
-            "mr.data_timestamps_json, mr.method_version, mr.observed_at "
+            "mr.data_timestamps_json, mr.method_version, mr.observed_at, "
+            "mr.provider, mr.provider_symbol, mr.proxy_for, mr.asset_status, "
+            "mr.benchmark_status, mr.reason_code, mr.next_due_at "
             f"FROM market_reactions mr{where_sql} "
             "ORDER BY mr.observed_at DESC, mr.id DESC LIMIT ?",
             params,

@@ -66,6 +66,21 @@ class ProviderSymbolTests(unittest.TestCase):
         self.assertIsNone(market_data.benchmark_for("CRYPTO:BTC"))
         self.assertIsNone(market_data.benchmark_for("THEME:UNMAPPED"))
 
+    def test_theme_resolution_is_explicit_and_uses_independent_benchmark(
+        self,
+    ) -> None:
+        resolution = market_data.resolve_provider_asset("THEME:AI", "yahoo")
+
+        self.assertEqual(resolution["price_asset_key"], "US:SOXX")
+        self.assertEqual(resolution["provider_symbol"], "SOXX")
+        self.assertEqual(resolution["proxy_for"], "THEME:AI")
+        self.assertEqual(market_data.benchmark_for("THEME:AI"), "US:SPY")
+        self.assertNotEqual(
+            resolution["price_asset_key"],
+            market_data.benchmark_for("THEME:AI"),
+        )
+        self.assertIsNone(market_data.provider_symbol("THEME:AI", "yahoo"))
+
 
 class MarketParsingTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -260,6 +275,81 @@ class MarketParsingTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertIn("/v8/finance/chart/SPY", calls[0][0])
 
+    def test_yahoo_accepts_month_ranges_and_rejects_ambiguous_m(self) -> None:
+        payload = {
+            "chart": {
+                "result": [
+                    {
+                        "meta": {"currency": "USD"},
+                        "timestamp": [1704067200],
+                        "indicators": {
+                            "quote": [{"close": [100.0], "volume": [5]}]
+                        },
+                    }
+                ],
+                "error": None,
+            }
+        }
+        urls = []
+
+        def opener(request, timeout):
+            urls.append(request.full_url)
+            return _Response(json.dumps(payload).encode("utf-8"))
+
+        accepted = market_data.fetch_yahoo_history(
+            "US:SPY", range_="3mo", opener=opener
+        )
+        rejected = market_data.fetch_yahoo_history(
+            "US:SPY", range_="3m", opener=opener
+        )
+
+        self.assertEqual(accepted["status"], "available")
+        self.assertIn("range=3mo", urls[0])
+        self.assertEqual(rejected["status"], "unavailable")
+        self.assertEqual(rejected["reason_code"], "invalid_range")
+        self.assertEqual(len(urls), 1)
+
+    def test_theme_history_exposes_proxy_lineage(self) -> None:
+        payload = {
+            "chart": {
+                "result": [
+                    {
+                        "meta": {"currency": "USD"},
+                        "timestamp": [1704067200],
+                        "indicators": {
+                            "quote": [{"close": [100.0], "volume": [5]}]
+                        },
+                    }
+                ],
+                "error": None,
+            }
+        }
+        urls = []
+
+        def opener(request, timeout):
+            urls.append(request.full_url)
+            return _Response(json.dumps(payload).encode("utf-8"))
+
+        result = market_data.fetch_yahoo_history(
+            "THEME:AI", range_="3mo", opener=opener
+        )
+
+        self.assertIn("/v8/finance/chart/SOXX", urls[0])
+        self.assertEqual(result["asset_key"], "THEME:AI")
+        self.assertEqual(result["price_asset_key"], "US:SOXX")
+        self.assertEqual(result["proxy_for"], "THEME:AI")
+        self.assertEqual(result["symbol"], "SOXX")
+
+    def test_provider_exception_details_are_not_exposed(self) -> None:
+        def timeout(*_args, **_kwargs):
+            raise TimeoutError("secret upstream detail")
+
+        result = market_data.fetch_yahoo_history("US:SPY", opener=timeout)
+
+        self.assertEqual(result["reason"], "request_failed")
+        self.assertEqual(result["reason_code"], "request_failed")
+        self.assertNotIn("TimeoutError", json.dumps(result))
+
     def test_parses_tencent_a_share_quote(self) -> None:
         text = (
             'v_sh600519="1~贵州茅台~600519~1418.50~1400.00~1395.00~'
@@ -438,6 +528,7 @@ class EventReactionTests(unittest.TestCase):
         )
 
         self.assertEqual(result["status"], "preliminary")
+        self.assertEqual(result["reason_code"], "insufficient_follow_up")
         self.assertEqual(result["windows"]["1D"]["status"], "complete")
         self.assertEqual(result["windows"]["3D"]["status"], "unavailable")
         self.assertEqual(result["windows"]["5D"]["status"], "unavailable")

@@ -185,6 +185,32 @@ button { font: inherit; cursor: pointer; }
 .block-head-row { display: flex; align-items: flex-end; justify-content: space-between; gap: 18px; }
 .block-sub { margin: 3px 0 0; font-size: 12.5px; color: var(--muted); }
 
+/* A failed refresh never erases the last useful screen. */
+.view-load-state {
+  display: grid; grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center; gap: 10px 13px; margin-bottom: 12px; padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--high) 42%, var(--border));
+  border-left: 3px solid var(--high); border-radius: 10px;
+  background: color-mix(in srgb, var(--high) 7%, var(--panel));
+}
+.view-load-mark {
+  width: 24px; height: 24px; display: grid; place-items: center;
+  border: 1px solid color-mix(in srgb, var(--high) 48%, var(--border));
+  border-radius: 50%; color: var(--high); font-family: var(--font-data);
+  font-size: 12px; font-weight: 750;
+}
+.view-load-copy { min-width: 0; }
+.view-load-copy strong, .view-load-copy span { display: block; }
+.view-load-copy strong { color: var(--high); font-size: 11.5px; }
+.view-load-copy span { margin-top: 2px; color: var(--text-2); font-size: 10.5px; line-height: 1.55; }
+.view-retry-btn {
+  min-height: 44px; padding: 7px 12px; border: 1px solid var(--high);
+  border-radius: 8px; background: transparent; color: var(--high);
+  font-size: 11.5px; font-weight: 650; white-space: nowrap;
+}
+.view-retry-btn:hover { background: color-mix(in srgb, var(--high) 9%, transparent); }
+.view-retry-btn:disabled { cursor: wait; opacity: .64; }
+
 /* ─── Skeletons ───────────────────────────── */
 .skeleton {
   background: linear-gradient(90deg, var(--panel) 25%, var(--panel-2) 37%, var(--panel) 63%);
@@ -1337,6 +1363,36 @@ button:focus-visible, a:focus-visible, [tabindex]:focus-visible, input:focus-vis
   display: flex; flex-wrap: wrap; gap: 6px 12px; margin-top: 10px;
   color: var(--muted); font-size: 10.5px;
 }
+.decision-boundary-rail {
+  --rail-color: var(--low);
+  display: grid; grid-template-columns: minmax(160px, .72fr) minmax(170px, .8fr) minmax(260px, 1.8fr);
+  align-items: stretch; border-top: 1px solid color-mix(in srgb, var(--rail-color) 34%, var(--border));
+  border-bottom: 1px solid color-mix(in srgb, var(--rail-color) 34%, var(--border));
+  background: color-mix(in srgb, var(--rail-color) 5%, var(--panel));
+}
+.decision-boundary-rail.is-warn { --rail-color: var(--med); }
+.decision-boundary-rail.is-error { --rail-color: var(--high); }
+.boundary-cell {
+  --boundary-color: var(--low); min-width: 0; padding: 9px 14px;
+  border-left: 2px solid color-mix(in srgb, var(--boundary-color) 70%, var(--border));
+}
+.boundary-cell + .boundary-cell { border-left-width: 1px; }
+.boundary-cell.is-warn { --boundary-color: var(--med); }
+.boundary-cell.is-error { --boundary-color: var(--high); }
+.boundary-cell small, .boundary-cell strong { display: block; }
+.boundary-cell small {
+  color: var(--muted); font-family: var(--font-data); font-size: 8px;
+  font-weight: 700; letter-spacing: .1em;
+}
+.boundary-cell strong {
+  margin-top: 2px; color: var(--boundary-color); font-size: 11.5px;
+  line-height: 1.4;
+}
+.decision-boundary-rail > p {
+  align-self: center; margin: 0; padding: 9px 15px;
+  border-left: 1px solid var(--border); color: var(--text-2);
+  font-size: 10.5px; line-height: 1.55;
+}
 .transmission-ribbon {
   display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, .8fr) auto minmax(0, .9fr);
   align-items: stretch; gap: 8px; margin-top: 19px;
@@ -1422,6 +1478,26 @@ button:focus-visible, a:focus-visible, [tabindex]:focus-visible, input:focus-vis
   font-size: 11.5px; color: var(--text-2); line-height: 1.5;
   display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
 }
+.decision-card-boundary {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+  border-top: 1px solid var(--border); border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--bg-soft) 58%, transparent);
+}
+.decision-card-boundary > span {
+  --boundary-color: var(--low); min-width: 0; padding: 5px 7px;
+}
+.decision-card-boundary > span + span { border-left: 1px solid var(--border); }
+.decision-card-boundary .is-warn { --boundary-color: var(--med); }
+.decision-card-boundary .is-error { --boundary-color: var(--high); }
+.decision-card-boundary small, .decision-card-boundary strong { display: block; }
+.decision-card-boundary small {
+  color: var(--muted); font-family: var(--font-data); font-size: 7.5px;
+  letter-spacing: .08em;
+}
+.decision-card-boundary strong {
+  margin-top: 1px; overflow: hidden; color: var(--boundary-color);
+  font-size: 9.5px; line-height: 1.4; text-overflow: ellipsis; white-space: nowrap;
+}
 .decision-card-meta { font-size: 10.5px; color: var(--muted); }
 .decision-more {
   width: calc(100% - 24px); margin: 10px 12px 12px; padding: 8px 12px;
@@ -1429,6 +1505,12 @@ button:focus-visible, a:focus-visible, [tabindex]:focus-visible, input:focus-vis
   color: var(--text-2); font-size: 11px;
 }
 .decision-more:hover { border-color: var(--accent); color: var(--text); }
+.decision-inline-error {
+  margin: 9px 12px 0; padding: 7px 9px;
+  border-left: 2px solid var(--high);
+  background: color-mix(in srgb, var(--high) 6%, var(--panel-2));
+  color: var(--text-2); font-size: 10.5px; line-height: 1.5;
+}
 .matrix-more {
   display: block; margin: 9px auto 3px; padding: 7px 12px;
   border: 1px solid var(--border); border-radius: 8px; background: var(--panel-2);
@@ -1506,9 +1588,29 @@ button:focus-visible, a:focus-visible, [tabindex]:focus-visible, input:focus-vis
   white-space: nowrap;
 }
 .validation-table th, .position-table th { color: var(--muted); font-weight: 550; }
+.validation-boundary {
+  --validation-color: var(--low); margin: 0 0 2px; padding: 8px 10px;
+  border-left: 2px solid var(--validation-color);
+  background: color-mix(in srgb, var(--validation-color) 6%, var(--panel-2));
+  color: var(--text-2); font-size: 10.5px; line-height: 1.55;
+}
+.validation-boundary.is-warn { --validation-color: var(--med); }
+.validation-boundary.is-error { --validation-color: var(--high); }
 .decision-disclaimer {
   margin: 0; padding: 11px 18px; border-top: 1px solid var(--border);
   color: var(--muted); font-size: 10.5px; background: var(--bg-soft);
+}
+.decision-detail-conflict {
+  margin: 18px; padding: 16px; border: 1px solid color-mix(in srgb, var(--med) 42%, var(--border));
+  border-left: 3px solid var(--med); border-radius: 10px;
+  background: color-mix(in srgb, var(--med) 7%, var(--panel));
+}
+.decision-detail-conflict strong { color: var(--med); font-size: 13px; }
+.decision-detail-conflict p { margin: 5px 0 0; color: var(--text-2); font-size: 11.5px; }
+.decision-detail-conflict button {
+  min-height: 44px; margin-top: 11px; padding: 7px 12px;
+  border: 1px solid var(--med); border-radius: 8px;
+  background: transparent; color: var(--med); font-size: 11.5px; font-weight: 650;
 }
 
 .auth-modal {
@@ -1576,6 +1678,9 @@ button:focus-visible, a:focus-visible, [tabindex]:focus-visible, input:focus-vis
   .private-mode-btn { min-height: 44px; padding: 5px 10px; }
   .private-mode-btn #private-mode-label { display: none; }
 
+  .view-load-state { grid-template-columns: auto minmax(0, 1fr); }
+  .view-retry-btn { grid-column: 1 / -1; width: 100%; }
+
   .situation-brief { grid-template-columns: 1fr; }
   .brief-risk { border-right: 0; border-bottom: 1px solid var(--border); padding: 19px 18px 16px; }
   .brief-eyebrow { margin-bottom: 10px; }
@@ -1588,6 +1693,10 @@ button:focus-visible, a:focus-visible, [tabindex]:focus-visible, input:focus-vis
   .brief-narrative { max-width: none; margin-top: 8px; }
   .brief-lead { padding: 19px 18px 18px; }
   .brief-title { font-size: 25px; max-width: none; }
+  .decision-boundary-rail { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .decision-boundary-rail > p {
+    grid-column: 1 / -1; border-left: 0; border-top: 1px solid var(--border);
+  }
   .transmission-ribbon {
     display: grid; grid-template-columns: 1fr; overflow: visible; gap: 5px; margin-top: 15px;
   }

@@ -1205,6 +1205,10 @@ class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["summary"])
         self.assertEqual(payload["total_decisions"], 1)
         self.assertNotIn("evidence", payload["decisions"][0])
+        self.assertEqual(
+            payload["business_health"]["market_validation"]["status"],
+            "unavailable",
+        )
         self.assertIn("etag", summary.headers)
 
         not_modified = await self.client.get(
@@ -1222,6 +1226,36 @@ class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(weak_not_modified.status_code, 304)
 
+        generated = datetime.fromisoformat(payload["generated_at"])
+        fresh_time = generated + timedelta(
+            seconds=dashboard_app.decision_snapshot.STALE_AFTER_SECONDS - 1
+        )
+        stale_time = generated + timedelta(
+            seconds=dashboard_app.decision_snapshot.STALE_AFTER_SECONDS + 1
+        )
+        with patch.object(
+            dashboard_app,
+            "_decision_response_now",
+            return_value=fresh_time,
+        ):
+            fresh = await self.client.get("/api/decisions/summary")
+        self.assertFalse(fresh.json()["stale"])
+        with patch.object(
+            dashboard_app,
+            "_decision_response_now",
+            return_value=stale_time,
+        ):
+            crossed_threshold = await self.client.get(
+                "/api/decisions/summary",
+                headers={"If-None-Match": fresh.headers["etag"]},
+            )
+        self.assertEqual(crossed_threshold.status_code, 200)
+        self.assertTrue(crossed_threshold.json()["stale"])
+        self.assertNotEqual(
+            crossed_threshold.headers["etag"],
+            fresh.headers["etag"],
+        )
+
         card = payload["decisions"][0]
         detail = await self.client.get(
             "/api/decisions/detail",
@@ -1234,6 +1268,7 @@ class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(detail.status_code, 200)
         self.assertEqual(detail.json()["snapshot_id"], payload["snapshot_id"])
         self.assertIn("evidence", detail.json()["decision"])
+        self.assertIn("market_validation", detail.json()["business_health"])
         self.assertNotIn("must-never-be-public", detail.text.lower())
 
 

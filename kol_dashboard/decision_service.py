@@ -25,7 +25,8 @@ except ModuleNotFoundError:  # Flat production bundle in /opt/kol-dashboard.
 
 EVIDENCE_POLICY = (
     "KOL 信息仅用于发现待验证线索；统计相关不等于因果。"
-    "市场样本不完整或相互冲突时必须 abstain，所有结论均需人工复核。"
+    "尚无到期样本、技术不可用或样本冲突时必须 abstain；"
+    "未来窗口记为 pending，不视为反向证据。所有候选均需人工复核。"
 )
 PUBLIC_MACRO_SCHEMA_VERSION = 1
 
@@ -37,9 +38,10 @@ SCORE_WEIGHTS = {
     "market_confirmation": 0.20,
     "coverage": 0.10,
 }
-EVENT_RELATION_MAX_AGE_HOURS = 72
-DECISION_SNAPSHOT_SCHEMA_VERSION = 1
-DECISION_ENGINE_VERSION = "decision-v1"
+EVENT_RELATION_INGEST_MAX_AGE_HOURS = 72
+EVENT_RELATION_MAX_AGE_HOURS = 14 * 24
+DECISION_SNAPSHOT_SCHEMA_VERSION = 2
+DECISION_ENGINE_VERSION = "decision-v2"
 
 _PUBLIC_FORBIDDEN_TOKENS = (
     "shares",
@@ -93,6 +95,13 @@ _PUBLIC_REACTION_FIELDS = (
     "data_timestamps",
     "method_version",
     "observed_at",
+    "reason_code",
+    "provider",
+    "provider_symbol",
+    "proxy_for",
+    "asset_status",
+    "benchmark_status",
+    "next_due_at",
 )
 _PUBLIC_MACRO_SCENARIO_FIELDS = (
     "id",
@@ -263,6 +272,34 @@ _DIRECTION_ALIASES = {
     "unknown": "neutral",
 }
 _WINDOW_MINIMUM_SAMPLES = {"1D": 2, "3D": 4, "5D": 6}
+_MARKET_WINDOWS = ("1D", "3D", "5D")
+_MARKET_WINDOW_SCORE = {"1D": 0.55, "3D": 0.80, "5D": 1.0}
+_HORIZON_REQUIRED_WINDOW = {
+    "intraday": "1D",
+    "short": "1D",
+    "medium": "3D",
+    "long": "5D",
+    "mixed": "5D",
+    "unknown": "3D",
+}
+_HORIZON_MAX_AGE_HOURS = {
+    "intraday": 72,
+    "short": 72,
+    "medium": 7 * 24,
+    "unknown": 7 * 24,
+    "long": 14 * 24,
+    "mixed": 14 * 24,
+}
+_PUBLIC_REACTION_TEXT_LIMITS = {
+    "reason_code": 64,
+    "provider": 32,
+    "provider_symbol": 80,
+    "proxy_for": 80,
+    "asset_status": 64,
+    "benchmark_status": 64,
+    "next_due_at": 48,
+}
+_SAFE_REASON_CODE = re.compile(r"^[a-z0-9][a-z0-9_.:-]{0,63}$")
 
 
 def _finite_number(value: Any) -> float | None:
@@ -333,14 +370,19 @@ def _verified_event_time(value: Any) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-def _event_time_is_eligible(value: Any, now: datetime) -> bool:
+def _event_time_is_eligible(
+    value: Any,
+    now: datetime,
+    *,
+    maximum_age_hours: int = EVENT_RELATION_MAX_AGE_HOURS,
+) -> bool:
     published = _verified_event_time(value)
     if published is None:
         return False
     age_seconds = (now - published).total_seconds()
     return (
         age_seconds >= 0
-        and age_seconds <= EVENT_RELATION_MAX_AGE_HOURS * 3600
+        and age_seconds <= max(1, int(maximum_age_hours)) * 3600
     )
 
 
@@ -358,7 +400,13 @@ def _relation_is_decision_eligible(
         if isinstance(evidence, Mapping)
         else None
     )
-    return _event_time_is_eligible(published_at, now)
+    horizon = str(relation.get("horizon") or "unknown").strip().lower()
+    maximum_age_hours = _HORIZON_MAX_AGE_HOURS.get(horizon, 7 * 24)
+    return _event_time_is_eligible(
+        published_at,
+        now,
+        maximum_age_hours=maximum_age_hours,
+    )
 
 
 def _records(value: Any) -> list[dict[str, Any]]:
@@ -596,6 +644,17 @@ def _public_reaction(reaction: Mapping[str, Any]) -> dict[str, Any]:
                 if key in value
                 and _is_public_scalar(value[key])
             }
+        elif field in _PUBLIC_REACTION_TEXT_LIMITS:
+            if not isinstance(value, str):
+                continue
+            text = value.strip()
+            if not text or len(text) > _PUBLIC_REACTION_TEXT_LIMITS[field]:
+                continue
+            if field == "reason_code":
+                text = text.lower()
+                if _SAFE_REASON_CODE.fullmatch(text) is None:
+                    continue
+            result[field] = _public_sanitize(text)
         elif _is_public_scalar(value):
             result[field] = _public_sanitize(value)
     return result
@@ -1149,38 +1208,197 @@ def _effective_market_confirmation(
     return None
 
 
+def _required_market_window(horizon: str) -> str:
+    return _HORIZON_REQUIRED_WINDOW.get(
+        str(horizon or "unknown").strip().lower(),
+        "3D",
+    )
+
+
+def _reaction_is_pending(reaction: Mapping[str, Any]) -> bool:
+    status = str(reaction.get("status") or "").strip().lower()
+    if status == "pending":
+        return True
+    # Compatibility for snapshots written just before the pending status was
+    # introduced. A bounded reason code plus a due time identifies a future
+    # window; technical/data failures remain unavailable and conservative.
+    reason_code = str(reaction.get("reason_code") or "").strip().lower()
+    return (
+        status == "unavailable"
+        and reason_code == "window_not_due"
+        and isinstance(reaction.get("next_due_at"), str)
+        and bool(str(reaction.get("next_due_at") or "").strip())
+    )
+
+
+def _market_reason_counts(
+    reactions: Iterable[Mapping[str, Any]],
+    *,
+    unavailable_only: bool = False,
+) -> dict[str, int]:
+    counts: Counter[str] = Counter()
+    for reaction in reactions:
+        if unavailable_only and (
+            str(reaction.get("status") or "").strip().lower()
+            != "unavailable"
+            or _reaction_is_pending(reaction)
+        ):
+            continue
+        code = str(reaction.get("reason_code") or "").strip().lower()
+        if _SAFE_REASON_CODE.fullmatch(code) is not None:
+            counts[code] += 1
+        elif unavailable_only:
+            counts["unspecified"] += 1
+    return dict(sorted(counts.items()))
+
+
+def _market_business_health(
+    reactions: list[dict[str, Any]],
+    decisions: Iterable[Mapping[str, Any]] = (),
+) -> dict[str, Any]:
+    total = len(reactions)
+    complete = 0
+    preliminary = 0
+    pending = 0
+    unavailable = 0
+    observed: list[datetime] = []
+    assets: set[str] = set()
+    for reaction in reactions:
+        status = str(reaction.get("status") or "").strip().lower()
+        if _reaction_is_pending(reaction):
+            pending += 1
+        elif status == "complete":
+            complete += 1
+        elif status == "preliminary":
+            preliminary += 1
+        else:
+            unavailable += 1
+        asset_key = reaction.get("asset_key")
+        if isinstance(asset_key, str) and asset_key.strip():
+            assets.add(asset_key.strip())
+        timestamp = _utc_datetime(reaction.get("observed_at"))
+        if timestamp is not None:
+            observed.append(timestamp)
+
+    available = complete + preliminary
+    if total == 0:
+        status = "unavailable"
+        note = "尚无市场验证记录，决策仅可作为待核验候选。"
+    elif unavailable:
+        status = "degraded" if available or pending else "unavailable"
+        note = "部分市场验证因数据或技术原因不可用，相关候选必须降级复核。"
+    elif available == 0 and pending:
+        status = "pending"
+        note = "市场窗口尚未到期；未来窗口不会被误判为反向证据。"
+    else:
+        status = "healthy"
+        note = "市场验证链路有可用样本；统计相关仍不表示因果。"
+
+    decision_records = [
+        decision for decision in decisions if isinstance(decision, Mapping)
+    ]
+    covered_decisions = 0
+    pending_decisions = 0
+    unavailable_decisions = 0
+    for decision in decision_records:
+        validation = decision.get("market_validation")
+        validation_status = (
+            str(validation.get("status") or "").strip().lower()
+            if isinstance(validation, Mapping)
+            else "unavailable"
+        )
+        if validation_status in {"complete", "preliminary"}:
+            covered_decisions += 1
+        elif validation_status == "pending":
+            pending_decisions += 1
+        else:
+            unavailable_decisions += 1
+
+    total_decisions = len(decision_records)
+    if total_decisions and unavailable_decisions == total_decisions:
+        status = "unavailable"
+        note = "当前决策均缺少可用市场验证，全部只能作为待核验候选。"
+    elif unavailable_decisions:
+        status = "degraded"
+        note = "部分当前决策缺少市场验证，不得以其他卡片的样本掩盖。"
+    elif total_decisions and covered_decisions == 0 and pending_decisions:
+        status = "pending"
+        note = "当前市场窗口均尚未到期；pending 不构成数据故障。"
+    return {
+        "status": status,
+        "degraded": status in {"degraded", "unavailable"},
+        "total_records": total,
+        "available_records": available,
+        "complete_records": complete,
+        "preliminary_records": preliminary,
+        "pending_records": pending,
+        "unavailable_records": unavailable,
+        "coverage": round(available / total, 4) if total else 0.0,
+        "asset_count": len(assets),
+        "total_decisions": total_decisions,
+        "covered_decisions": covered_decisions,
+        "pending_decisions": pending_decisions,
+        "unavailable_decisions": unavailable_decisions,
+        "last_observed_at": (
+            max(observed).isoformat() if observed else None
+        ),
+        "reason_counts": _market_reason_counts(
+            reactions,
+            unavailable_only=True,
+        ),
+        "note": note,
+    }
+
+
 def _market_validation(
     reactions: list[dict[str, Any]],
     expected_direction: str,
+    horizon: str,
 ) -> tuple[dict[str, Any], float]:
+    required_window = _required_market_window(horizon)
     if not reactions:
         return (
             {
                 "status": "unavailable",
+                "phase": "unavailable",
                 "abstain": True,
+                "veto": True,
+                "degraded": True,
                 "direction_confirmed": None,
                 "sample_count": 0,
+                "required_window": required_window,
+                "required_window_complete": False,
+                "completed_windows": [],
+                "pending_windows": [],
+                "unavailable_windows": [],
+                "reason_counts": {"no_records": 1},
                 "note": "暂无可用市场样本，必须 abstain 并等待共同交易日数据。",
                 "records": [],
             },
             0.0,
         )
 
-    enough: list[bool] = []
-    confirmations: list[bool | None] = []
+    confirmations_by_window: dict[str, list[bool | None]] = defaultdict(list)
     sample_counts: list[int] = []
     public_records: list[dict[str, Any]] = []
+    completed_windows: set[str] = set()
+    pending_windows: set[str] = set()
+    unavailable_windows: set[str] = set()
     for reaction in reactions:
-        status = str(reaction.get("status") or "").lower()
+        status = str(reaction.get("status") or "").strip().lower()
+        window = str(reaction.get("window") or "").strip().upper()
         sample_number = _finite_number(reaction.get("sample_count"))
         sample_count = max(0, int(sample_number or 0))
         sample_counts.append(sample_count)
         minimum = _WINDOW_MINIMUM_SAMPLES.get(
-            str(reaction.get("window") or "").upper(),
+            window,
             2,
         )
-        complete = status == "complete" and sample_count >= minimum
-        enough.append(complete)
+        complete = (
+            window in _MARKET_WINDOWS
+            and status == "complete"
+            and sample_count >= minimum
+        )
         projected = _public_reaction(reaction)
         effective_confirmation = (
             _effective_market_confirmation(reaction, expected_direction)
@@ -1191,43 +1409,110 @@ def _market_validation(
         projected["evaluated_direction"] = expected_direction
         public_records.append(projected)
         if complete:
-            confirmations.append(effective_confirmation)
+            completed_windows.add(window)
+            confirmations_by_window[window].append(effective_confirmation)
+        elif window in _MARKET_WINDOWS and _reaction_is_pending(reaction):
+            pending_windows.add(window)
+        elif window in _MARKET_WINDOWS:
+            unavailable_windows.add(window)
 
-    abstain = (
-        not enough
-        or not all(enough)
-        or expected_direction not in {"positive", "negative"}
-        or len(confirmations) != len(reactions)
-        or not confirmations
-        or not all(value is True for value in confirmations)
+    confirmations = [
+        value
+        for window in _MARKET_WINDOWS
+        for value in confirmations_by_window.get(window, [])
+    ]
+    contrary = any(value is False for value in confirmations)
+    inconclusive = bool(confirmations) and any(
+        value is None for value in confirmations
     )
-    if not abstain:
-        status = "complete"
-        note = "完整共同交易日样本可用于方向核验；统计相关仍不表示因果。"
-    elif enough and all(enough):
-        status = "complete"
-        note = "完整市场样本未确认机制方向，必须 abstain 并复核相反证据。"
-    elif any(str(item.get("status") or "").lower() in {"complete", "preliminary"} for item in reactions):
-        status = "preliminary"
-        note = "市场样本尚不完整，必须 abstain，不能据此放大行动。"
+    confirming_windows = [
+        window
+        for window in _MARKET_WINDOWS
+        if confirmations_by_window.get(window)
+        and all(
+            value is True for value in confirmations_by_window[window]
+        )
+    ]
+    highest_confirmed = confirming_windows[-1] if confirming_windows else None
+    required_index = _MARKET_WINDOWS.index(required_window)
+    required_done = (
+        required_window in confirming_windows
+        and required_window not in pending_windows
+        and required_window not in unavailable_windows
+    )
+    unavailable_due = any(
+        _MARKET_WINDOWS.index(window) <= required_index
+        for window in unavailable_windows
+    )
+    invalid_direction = expected_direction not in {"positive", "negative"}
+    veto = contrary or inconclusive or unavailable_due or invalid_direction
+
+    if invalid_direction:
+        status = "unavailable"
+        phase = "direction_unavailable"
+        note = "机制方向尚不明确，市场样本不能形成方向确认。"
+    elif contrary:
+        status = "complete" if required_done else "preliminary"
+        phase = "contrary"
+        note = "已有共同交易日样本与机制方向相反，候选必须停止并复核。"
+    elif inconclusive:
+        status = "complete" if required_done else "preliminary"
+        phase = "inconclusive"
+        note = "已有样本方向中性或不一致，候选必须继续复核。"
+    elif highest_confirmed is not None:
+        status = "complete" if required_done else "preliminary"
+        phase = f"confirmed_{highest_confirmed.lower()}"
+        if unavailable_due:
+            note = "已有早期确认，但所需窗口因数据或技术原因不可用，必须降级复核。"
+        elif required_done:
+            note = "对应期限所需窗口已确认；更长窗口只用于增强，仍需人工复核。"
+        else:
+            note = "1D/3D 样本仅形成渐进评分；必需窗口到期前不得形成行动候选。"
+    elif pending_windows and not unavailable_due:
+        status = "pending"
+        phase = "awaiting_1d"
+        note = "共同交易日窗口尚未到期；pending 不构成反向证据。"
     else:
         status = "unavailable"
-        note = "市场样本不可用，必须 abstain 并等待重新验证。"
+        phase = "unavailable"
+        note = "市场样本因数据或技术原因不可用，必须等待重新验证。"
 
-    direction_confirmed: bool | None
-    if confirmations and all(value is True for value in confirmations):
+    abstain = veto or highest_confirmed is None or not required_done
+    if contrary:
+        direction_confirmed: bool | None = False
+    elif highest_confirmed is not None and not inconclusive:
         direction_confirmed = True
-    elif any(value is False for value in confirmations):
-        direction_confirmed = False
     else:
         direction_confirmed = None
-    score = 0.0 if abstain else 1.0
+    score = (
+        _MARKET_WINDOW_SCORE.get(highest_confirmed, 0.0)
+        if highest_confirmed is not None and not veto
+        else 0.0
+    )
     return (
         {
             "status": status,
+            "phase": phase,
             "abstain": abstain,
+            "veto": veto,
+            "degraded": unavailable_due,
             "direction_confirmed": direction_confirmed,
             "sample_count": max(sample_counts, default=0),
+            "required_window": required_window,
+            "required_window_complete": required_done,
+            "completed_windows": sorted(
+                completed_windows,
+                key=_MARKET_WINDOWS.index,
+            ),
+            "pending_windows": sorted(
+                pending_windows,
+                key=_MARKET_WINDOWS.index,
+            ),
+            "unavailable_windows": sorted(
+                unavailable_windows,
+                key=_MARKET_WINDOWS.index,
+            ),
+            "reason_counts": _market_reason_counts(reactions),
             "note": note,
             "records": public_records,
         },
@@ -1248,26 +1533,36 @@ def _action_stage(
     total_score: float,
     market_validation: Mapping[str, Any],
 ) -> str:
-    if classification == "conflict" or market_validation.get("abstain", True):
+    market_ready = (
+        market_validation.get("abstain", True) is False
+        and market_validation.get("veto", True) is False
+        and market_validation.get("required_window_complete") is True
+        and market_validation.get("direction_confirmed") is True
+    )
+    if classification == "conflict" or not market_ready:
         return "verify" if total_score >= 0.45 else "observe"
     if total_score < 0.70:
         return "verify" if total_score >= 0.45 else "observe"
-    return "scale_in" if classification == "opportunity" else "reduce_or_hedge"
+    return (
+        "candidate_scale_in"
+        if classification == "opportunity"
+        else "candidate_reduce_or_hedge"
+    )
 
 
 def _trigger_and_invalidation(classification: str) -> tuple[str, str]:
     if classification == "opportunity":
         trigger = (
-            "机制证据获独立来源支持，且完整共同交易日样本继续确认正向方向。"
+            "机制证据获独立来源支持，且对应期限的共同交易日窗口分阶段确认正向方向。"
         )
     elif classification == "risk":
         trigger = (
-            "风险机制获独立来源支持，且完整共同交易日样本继续确认负向方向。"
+            "风险机制获独立来源支持，且对应期限的共同交易日窗口分阶段确认负向方向。"
         )
     else:
-        trigger = "待冲突来源经新增机制证据和完整市场样本消解后再进入行动阶段。"
+        trigger = "待冲突来源经新增机制证据和到期市场窗口消解后再形成候选行动。"
     invalidation = (
-        "若新增机制证据反转，或完整共同交易日样本不再支持当前方向，则结论失效。"
+        "若新增机制证据反转，或后续到期市场窗口不再支持当前方向，则候选失效。"
     )
     return trigger, invalidation
 
@@ -1423,6 +1718,8 @@ def build_public_decisions(
             grouped[(topic_key, asset_key)].append(relation)
 
     decisions: list[dict[str, Any]] = []
+    used_reactions: list[dict[str, Any]] = []
+    used_reaction_keys: set[tuple[str, str, str, str]] = set()
     for topic_key, asset_key in sorted(grouped):
         group = grouped[(topic_key, asset_key)]
         source_pairs = {
@@ -1435,9 +1732,23 @@ def build_public_decisions(
             for reaction in clean_reactions
             if _matches_reaction(reaction, asset_key, source_pairs)
         ]
+        for reaction in matched_reactions:
+            reaction_key = (
+                str(reaction.get("source_type") or ""),
+                str(reaction.get("source_id") or ""),
+                str(reaction.get("asset_key") or ""),
+                str(reaction.get("window") or "").upper(),
+            )
+            if reaction_key in used_reaction_keys:
+                continue
+            used_reaction_keys.add(reaction_key)
+            used_reactions.append(reaction)
         classification, direction = _classification(group)
+        horizon = _group_horizon(group)
         market_validation, market_score = _market_validation(
-            matched_reactions, direction
+            matched_reactions,
+            direction,
+            horizon,
         )
         confidence_values: list[float] = []
         for relation in group:
@@ -1467,7 +1778,7 @@ def build_public_decisions(
             "asset_key": asset_key,
             "classification": classification,
             "direction": direction,
-            "horizon": _group_horizon(group),
+            "horizon": horizon,
             "data_as_of": _data_as_of(group, matched_reactions, current),
             "evidence": evidence,
             "source_count": len(source_pairs),
@@ -1490,6 +1801,7 @@ def build_public_decisions(
                 market_validation["records"],
             ),
             "human_review_required": True,
+            "decision_status": "candidate",
         }
         decisions.append(card)
 
@@ -1497,6 +1809,12 @@ def build_public_decisions(
         "decisions": decisions,
         "impact_matrix": _build_impact_matrix(decisions),
         "evidence_policy": EVIDENCE_POLICY,
+        "business_health": {
+            "market_validation": _market_business_health(
+                used_reactions,
+                decisions,
+            ),
+        },
     }
     return _public_sanitize(result)
 
@@ -1516,11 +1834,16 @@ _SUMMARY_CARD_FIELDS = (
     "trigger",
     "invalidation",
     "human_review_required",
+    "decision_status",
 )
 
 
 def _decision_sort_key(card: Mapping[str, Any]) -> tuple[int, float, str, str]:
     stage_rank = {
+        "candidate_reduce_or_hedge": 0,
+        "candidate_scale_in": 1,
+        # Legacy snapshots remain sortable during a rolling deployment, but
+        # the v2 engine never emits these imperative stage names.
         "reduce_or_hedge": 0,
         "scale_in": 1,
         "verify": 2,
@@ -1541,6 +1864,64 @@ def _decision_sort_key(card: Mapping[str, Any]) -> tuple[int, float, str, str]:
     )
 
 
+def _select_summary_cards(
+    cards: list[Mapping[str, Any]],
+    limit: int,
+) -> tuple[list[Mapping[str, Any]], dict[str, int | str]]:
+    """Keep global leaders while preventing one theme or asset taking over."""
+    if not cards:
+        return [], {
+            "name": "diversified_top_score_v1",
+            "global_reserve": 0,
+            "topic_quota": 0,
+            "asset_quota": 0,
+        }
+
+    global_reserve = min(2, limit, len(cards))
+    topic_quota = max(2, math.ceil(limit / 4))
+    asset_quota = max(1, math.ceil(limit / 6))
+    selected = list(cards[:global_reserve])
+    selected_ids = {id(card) for card in selected}
+    topic_counts = Counter(
+        str(card.get("topic_key") or "") for card in selected
+    )
+    asset_counts = Counter(
+        str(card.get("asset_key") or "") for card in selected
+    )
+
+    for card in cards[global_reserve:]:
+        if len(selected) >= limit:
+            break
+        topic = str(card.get("topic_key") or "")
+        asset = str(card.get("asset_key") or "")
+        if topic_counts[topic] >= topic_quota:
+            continue
+        if asset_counts[asset] >= asset_quota:
+            continue
+        selected.append(card)
+        selected_ids.add(id(card))
+        topic_counts[topic] += 1
+        asset_counts[asset] += 1
+
+    # Sparse datasets should still fill the screen. Quotas define the first
+    # pass, not a reason to hide otherwise valid candidates.
+    for card in cards:
+        if len(selected) >= limit:
+            break
+        if id(card) in selected_ids:
+            continue
+        selected.append(card)
+        selected_ids.add(id(card))
+
+    selected.sort(key=_decision_sort_key)
+    return selected, {
+        "name": "diversified_top_score_v1",
+        "global_reserve": global_reserve,
+        "topic_quota": topic_quota,
+        "asset_quota": asset_quota,
+    }
+
+
 def project_decision_summary(
     payload: Any,
     *,
@@ -1558,9 +1939,10 @@ def project_decision_summary(
     cards = [card for card in raw_cards or [] if isinstance(card, Mapping)]
     cards.sort(key=_decision_sort_key)
     limit = max(1, min(int(decision_limit), 50))
+    selected_cards, selection_policy = _select_summary_cards(cards, limit)
 
     projected: list[dict[str, Any]] = []
-    for card in cards[:limit]:
+    for card in selected_cards:
         item = {
             field: deepcopy(card[field])
             for field in _SUMMARY_CARD_FIELDS
@@ -1588,9 +1970,11 @@ def project_decision_summary(
             "decisions": projected,
             "impact_matrix": _build_impact_matrix(projected),
             "evidence_policy": payload.get("evidence_policy", EVIDENCE_POLICY),
+            "business_health": deepcopy(payload.get("business_health", {})),
             "summary": True,
             "total_decisions": len(cards),
             "total_assets": total_assets,
+            "selection_policy": selection_policy,
         }
     )
 

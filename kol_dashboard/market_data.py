@@ -36,6 +36,53 @@ _YAHOO_EXPLICIT = {
     "BOND:UST_10Y_YIELD": "^TNX",
 }
 
+# Themes are analytical concepts rather than directly traded instruments.  Keep
+# their price proxies separate from provider_symbol() so a bare symbol lookup can
+# never silently turn a theme into an ETF.  resolve_provider_asset() carries the
+# explicit ``proxy_for`` audit trail used by the collector and public API.
+_THEME_PRICE_PROXIES = {
+    "THEME:AI": "US:SOXX",
+    "THEME:SEMICONDUCTOR": "US:SOXX",
+    "THEME:CHINA_EQUITY": "US:MCHI",
+    "THEME:EMERGING_MARKETS": "US:EEM",
+    "THEME:GLOBAL_RISK_ASSETS": "US:ACWI",
+    "THEME:FINANCIALS": "US:XLF",
+    "THEME:CRYPTO": "CRYPTO:BTC",
+}
+
+_THEME_BENCHMARKS = {
+    "THEME:AI": "US:SPY",
+    "THEME:SEMICONDUCTOR": "US:SPY",
+    "THEME:CHINA_EQUITY": "US:SPY",
+    "THEME:EMERGING_MARKETS": "US:SPY",
+    "THEME:GLOBAL_RISK_ASSETS": "US:SPY",
+    "THEME:FINANCIALS": "US:SPY",
+    "THEME:CRYPTO": "US:SPY",
+}
+
+MARKET_REASON_CODES = frozenset(
+    {
+        "asset_unavailable",
+        "bad_payload",
+        "baseline_unavailable",
+        "benchmark_unavailable",
+        "follow_up_unavailable",
+        "insufficient_follow_up",
+        "invalid_event_time",
+        "invalid_interval",
+        "invalid_range",
+        "invalid_timeout",
+        "no_common_trading_dates",
+        "provider_error",
+        "request_failed",
+        "same_proxy_as_benchmark",
+        "unknown",
+        "unsupported_asset",
+        "unsupported_benchmark",
+        "window_not_due",
+    }
+)
+
 _BENCHMARK_PROXIES = {
     "COMMODITY:GOLD": "US:GLD",
     "COMMODITY:OIL": "US:USO",
@@ -50,13 +97,6 @@ _BENCHMARK_PROXIES = {
     "BOND:UST_LONG": "US:IEF",
     "BOND:UST_INTERMEDIATE": "US:SHY",
     "BOND:UST_10Y_YIELD": "US:IEF",
-    "THEME:AI": "US:SOXX",
-    "THEME:SEMICONDUCTOR": "US:SOXX",
-    "THEME:CHINA_EQUITY": "INDEX:CSI300",
-    "THEME:EMERGING_MARKETS": "US:EEM",
-    "THEME:GLOBAL_RISK_ASSETS": "US:SPY",
-    "THEME:FINANCIALS": "US:XLF",
-    "THEME:CRYPTO": "CRYPTO:BTC",
 }
 
 _US_SYMBOL_RE = re.compile(r"^[A-Z][A-Z0-9.-]{0,14}$")
@@ -136,6 +176,40 @@ def provider_symbol(asset_key: Any, provider: str = "yahoo") -> str | None:
     return None
 
 
+def normalize_reason_code(value: Any) -> str:
+    """Collapse provider details into a bounded, public-safe reason code."""
+    candidate = str(value or "").strip().lower().split(":", 1)[0]
+    return candidate if candidate in MARKET_REASON_CODES else "unknown"
+
+
+def resolve_provider_asset(
+    asset_key: Any,
+    provider: str = "yahoo",
+) -> dict[str, str | None]:
+    """Resolve an asset to an explicit provider instrument with proxy lineage."""
+    parts = _split_asset_key(asset_key)
+    provider_name = str(provider or "").strip().lower()
+    if parts is None:
+        requested = str(asset_key or "").strip() or None
+        return {
+            "requested_asset_key": requested,
+            "price_asset_key": None,
+            "provider": provider_name or None,
+            "provider_symbol": None,
+            "proxy_for": None,
+        }
+    requested = f"{parts[0]}:{parts[1]}"
+    price_asset = _THEME_PRICE_PROXIES.get(requested, requested)
+    proxy_for = requested if price_asset != requested else None
+    return {
+        "requested_asset_key": requested,
+        "price_asset_key": price_asset,
+        "provider": provider_name,
+        "provider_symbol": provider_symbol(price_asset, provider_name),
+        "proxy_for": proxy_for,
+    }
+
+
 def yahoo_symbol(asset_key: Any) -> str | None:
     return provider_symbol(asset_key, "yahoo")
 
@@ -155,6 +229,9 @@ def benchmark_for(asset_key: Any, topic: Any = None) -> str | None:
     prefix, body = parts
     canonical = f"{prefix}:{body}"
     topic_text = str(topic or "").strip().lower()
+
+    if canonical in _THEME_BENCHMARKS:
+        return _THEME_BENCHMARKS[canonical]
 
     if (
         any(token in topic_text for token in ("ai", "semiconductor", "chip", "半导体", "芯片"))
@@ -242,12 +319,14 @@ def _unavailable(
     reason: Any = "unavailable",
     bars: bool = False,
 ) -> dict[str, Any]:
+    reason_code = normalize_reason_code(reason)
     result: dict[str, Any] = {
         "status": "unavailable",
         "provider": provider,
         "asset_key": asset_key if isinstance(asset_key, str) else None,
         "symbol": symbol,
-        "reason": str(reason or "unavailable")[:240],
+        "reason": reason_code,
+        "reason_code": reason_code,
     }
     if bars:
         result["bars"] = []
@@ -442,30 +521,46 @@ def fetch_yahoo_history(
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     """Fetch Yahoo history through an injectable opener and fail closed."""
-    symbol = yahoo_symbol(asset_key)
+    resolution = resolve_provider_asset(asset_key, "yahoo")
+    requested_asset = resolution.get("requested_asset_key")
+    price_asset = resolution.get("price_asset_key")
+    symbol = resolution.get("provider_symbol")
+
+    def resolved(result: dict[str, Any]) -> dict[str, Any]:
+        result["asset_key"] = requested_asset
+        result["price_asset_key"] = price_asset
+        result["proxy_for"] = resolution.get("proxy_for")
+        return result
+
     if symbol is None:
-        return _unavailable(
-            "yahoo",
-            asset_key=asset_key,
-            reason="unsupported_asset",
-            bars=True,
+        return resolved(
+            _unavailable(
+                "yahoo",
+                asset_key=requested_asset,
+                reason="unsupported_asset",
+                bars=True,
+            )
         )
     timeout_value = _safe_float(timeout, minimum=0.001, maximum=60.0)
     if timeout_value is None:
-        return _unavailable(
-            "yahoo",
-            asset_key=asset_key,
-            symbol=symbol,
-            reason="invalid_timeout",
-            bars=True,
+        return resolved(
+            _unavailable(
+                "yahoo",
+                asset_key=requested_asset,
+                symbol=symbol,
+                reason="invalid_timeout",
+                bars=True,
+            )
         )
     if interval not in {"1d", "1wk", "1mo"}:
-        return _unavailable(
-            "yahoo",
-            asset_key=asset_key,
-            symbol=symbol,
-            reason="invalid_interval",
-            bars=True,
+        return resolved(
+            _unavailable(
+                "yahoo",
+                asset_key=requested_asset,
+                symbol=symbol,
+                reason="invalid_interval",
+                bars=True,
+            )
         )
 
     query: dict[str, Any] = {
@@ -478,13 +573,15 @@ def fetch_yahoo_history(
     if start is not None and end is not None and start < end:
         query.update({"period1": start, "period2": end})
     else:
-        if not re.fullmatch(r"(?:[1-9]\d*[dmy]|ytd|max)", str(range_)):
-            return _unavailable(
-                "yahoo",
-                asset_key=asset_key,
-                symbol=symbol,
-                reason="invalid_range",
-                bars=True,
+        if not re.fullmatch(r"(?:[1-9]\d*(?:d|mo|y)|ytd|max)", str(range_)):
+            return resolved(
+                _unavailable(
+                    "yahoo",
+                    asset_key=requested_asset,
+                    symbol=symbol,
+                    reason="invalid_range",
+                    bars=True,
+                )
             )
         query["range"] = range_
     url = (
@@ -502,19 +599,23 @@ def fetch_yahoo_history(
     )
     try:
         body = _call_opener(opener or urllib.request.urlopen, request, timeout_value)
-        return parse_yahoo_chart(
-            body,
-            asset_key=asset_key,
-            symbol=symbol,
-            interval=interval,
+        return resolved(
+            parse_yahoo_chart(
+                body,
+                asset_key=price_asset,
+                symbol=symbol,
+                interval=interval,
+            )
         )
     except Exception as exc:
-        return _unavailable(
-            "yahoo",
-            asset_key=asset_key,
-            symbol=symbol,
-            reason=f"request_failed:{type(exc).__name__}",
-            bars=True,
+        return resolved(
+            _unavailable(
+                "yahoo",
+                asset_key=requested_asset,
+                symbol=symbol,
+                reason=f"request_failed:{type(exc).__name__}",
+                bars=True,
+            )
         )
 
 
@@ -656,10 +757,12 @@ def _empty_window(window: str, sample_count: int = 0) -> dict[str, Any]:
 
 
 def _unavailable_reaction(reason: str, aligned_count: int = 0) -> dict[str, Any]:
+    reason_code = normalize_reason_code(reason)
     return {
         "status": "unavailable",
         "method_version": REACTION_METHOD_VERSION,
-        "reason": reason,
+        "reason": reason_code,
+        "reason_code": reason_code,
         "abstain": True,
         "aligned_sample_count": max(0, int(aligned_count)),
         "data_timestamps": [],
@@ -667,6 +770,14 @@ def _unavailable_reaction(reason: str, aligned_count: int = 0) -> dict[str, Any]
             window: _empty_window(window) for window in ("1D", "3D", "5D")
         },
     }
+
+
+def unavailable_event_reaction(
+    reason_code: str,
+    aligned_count: int = 0,
+) -> dict[str, Any]:
+    """Build a bounded unavailable result without exposing provider errors."""
+    return _unavailable_reaction(reason_code, aligned_count)
 
 
 def compute_event_reaction(
@@ -767,7 +878,8 @@ def compute_event_reaction(
         "status": status,
         "method_version": REACTION_METHOD_VERSION,
         "expected_direction": normalized_expected or None,
-        "reason": None if available else "insufficient_follow_up",
+        "reason": None if available == 3 else "insufficient_follow_up",
+        "reason_code": None if available == 3 else "insufficient_follow_up",
         "abstain": status != "complete",
         "event_time": datetime.fromtimestamp(
             event_timestamp, tz=timezone.utc

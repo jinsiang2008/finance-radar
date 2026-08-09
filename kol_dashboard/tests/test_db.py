@@ -78,6 +78,107 @@ class DatabaseTests(unittest.TestCase):
             ).fetchone()
         self.assertEqual(row["published_at"], published_at)
 
+    def test_market_reaction_diagnostics_are_bounded_and_public_safe(self) -> None:
+        db.upsert_market_reaction(
+            "event",
+            "diagnostic",
+            "THEME:AI",
+            {
+                "window": "1D",
+                "status": "unavailable",
+                "sample_count": 0,
+                "data_timestamps": {},
+                "method_version": "common_trading_days:test",
+                "provider": "Yahoo",
+                "provider_symbol": "SOXX",
+                "proxy_for": "THEME:AI",
+                "asset_status": "unavailable",
+                "benchmark_status": "available",
+                "reason_code": "request_failed:TimeoutError secret detail",
+                "next_due_at": "2026-08-09T09:00:00+08:00",
+            },
+            benchmark_asset_key="US:SPY",
+            observed_at="2026-08-09T00:00:00+00:00",
+        )
+
+        row = db.query_market_reactions(source_id="diagnostic")[0]
+
+        self.assertEqual(row["provider"], "yahoo")
+        self.assertEqual(row["provider_symbol"], "SOXX")
+        self.assertEqual(row["proxy_for"], "THEME:AI")
+        self.assertEqual(row["asset_status"], "unavailable")
+        self.assertEqual(row["benchmark_status"], "available")
+        self.assertEqual(row["reason_code"], "request_failed")
+        self.assertEqual(row["next_due_at"], "2026-08-09T01:00:00+00:00")
+        self.assertNotIn("TimeoutError", json.dumps(row))
+
+    def test_pending_market_reaction_requires_a_due_time(self) -> None:
+        with self.assertRaisesRegex(ValueError, "require next_due_at"):
+            db.upsert_market_reaction(
+                "event",
+                "pending",
+                "US:SPY",
+                {
+                    "window": "3D",
+                    "status": "pending",
+                    "sample_count": 0,
+                    "data_timestamps": {},
+                    "method_version": "common_trading_days:test",
+                    "reason_code": "window_not_due",
+                },
+            )
+
+    def test_equal_rank_market_reaction_rejects_stale_writer(self) -> None:
+        reaction = {
+            "window": "1D",
+            "status": "complete",
+            "asset_return": 0.1,
+            "benchmark_return": 0.03,
+            "abnormal_return": 0.07,
+            "sample_count": 2,
+            "data_timestamps": {"start": 1, "end": 2},
+            "method_version": "common_trading_days:test",
+        }
+        db.upsert_market_reaction(
+            "event",
+            "ordered-writer",
+            "US:SPY",
+            {**reaction, "abnormal_return": 0.08},
+            observed_at="2026-08-09T10:00:00+08:00",
+        )
+        db.upsert_market_reaction(
+            "event",
+            "ordered-writer",
+            "US:SPY",
+            {**reaction, "abnormal_return": 0.01},
+            observed_at="2026-08-09T01:00:00+00:00",
+        )
+
+        after_stale = db.query_market_reactions(
+            source_id="ordered-writer"
+        )[0]
+
+        self.assertEqual(after_stale["abnormal_return"], 0.08)
+        self.assertEqual(
+            after_stale["observed_at"], "2026-08-09T02:00:00+00:00"
+        )
+
+        db.upsert_market_reaction(
+            "event",
+            "ordered-writer",
+            "US:SPY",
+            {**reaction, "abnormal_return": 0.09},
+            observed_at="2026-08-09T03:00:00+00:00",
+        )
+        after_newer = db.query_market_reactions(
+            source_id="ordered-writer"
+        )[0]
+
+        self.assertEqual(after_newer["abnormal_return"], 0.09)
+        self.assertEqual(
+            after_newer["observed_at"], "2026-08-09T03:00:00+00:00"
+        )
+
     def test_macro_event_enrichment_cache_uses_an_independent_text_key(self) -> None:
         with db.conn() as connection:
             columns = {
@@ -2112,6 +2213,111 @@ class DatabaseTests(unittest.TestCase):
 
 
 class LegacyMigrationTests(unittest.TestCase):
+    def test_market_reaction_pending_migration_is_atomic_and_idempotent(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "legacy-market.sqlite3")
+            connection = sqlite3.connect(path)
+            connection.execute(
+                """
+                CREATE TABLE market_reactions (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  source_type TEXT NOT NULL,
+                  source_id TEXT NOT NULL,
+                  asset_key TEXT NOT NULL,
+                  window TEXT NOT NULL,
+                  benchmark_asset_key TEXT,
+                  asset_return REAL,
+                  benchmark_return REAL,
+                  abnormal_return REAL,
+                  expected_direction TEXT,
+                  observed_direction TEXT,
+                  direction_confirmed INTEGER,
+                  status TEXT NOT NULL CHECK(
+                    status IN ('preliminary', 'complete', 'unavailable')
+                  ),
+                  sample_count INTEGER NOT NULL DEFAULT 0,
+                  data_timestamps_json TEXT NOT NULL DEFAULT '{}',
+                  method_version TEXT NOT NULL,
+                  observed_at TEXT NOT NULL,
+                  UNIQUE(
+                    source_type, source_id, asset_key, window, method_version
+                  )
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX idx_market_reaction_source "
+                "ON market_reactions(source_type, source_id)"
+            )
+            connection.execute(
+                """
+                INSERT INTO market_reactions (
+                  source_type, source_id, asset_key, window, status,
+                  sample_count, method_version, observed_at
+                ) VALUES (
+                  'event', 'legacy', 'US:SPY', '3D', 'unavailable',
+                  0, 'common_trading_days:test', '2026-08-08T00:00:00+00:00'
+                )
+                """
+            )
+            connection.commit()
+            connection.close()
+
+            with mock.patch.object(db, "DB_PATH", path):
+                db.init()
+                db.init()
+                db.upsert_market_reaction(
+                    "event",
+                    "legacy",
+                    "US:SPY",
+                    {
+                        "window": "3D",
+                        "status": "pending",
+                        "sample_count": 0,
+                        "data_timestamps": {},
+                        "method_version": "common_trading_days:test",
+                        "provider": "yahoo",
+                        "provider_symbol": "SPY",
+                        "asset_status": "available",
+                        "benchmark_status": "available",
+                        "reason_code": "window_not_due",
+                        "next_due_at": "2026-08-10T00:00:00+00:00",
+                    },
+                )
+                with db.conn() as migrated:
+                    table_sql = migrated.execute(
+                        "SELECT sql FROM sqlite_master "
+                        "WHERE type='table' AND name='market_reactions'"
+                    ).fetchone()["sql"]
+                    columns = {
+                        row["name"]
+                        for row in migrated.execute(
+                            "PRAGMA table_info(market_reactions)"
+                        ).fetchall()
+                    }
+                    integrity = migrated.execute(
+                        "PRAGMA integrity_check"
+                    ).fetchone()[0]
+                row = db.query_market_reactions(source_id="legacy")[0]
+
+            self.assertIn("'pending'", table_sql)
+            self.assertTrue(
+                {
+                    "provider",
+                    "provider_symbol",
+                    "proxy_for",
+                    "asset_status",
+                    "benchmark_status",
+                    "reason_code",
+                    "next_due_at",
+                }.issubset(columns)
+            )
+            self.assertEqual(integrity, "ok")
+            self.assertEqual(row["status"], "pending")
+            self.assertEqual(row["reason_code"], "window_not_due")
+
     def test_duplicate_legacy_events_keep_both_kols_and_reliable_time(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = str(Path(tmp) / "legacy.sqlite3")

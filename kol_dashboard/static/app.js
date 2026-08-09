@@ -25,6 +25,7 @@
     decisionRequestGeneration: 0,
     decisionDetailRequestGeneration: 0,
     decisionDetailCache: new Map(),
+    fullDecisionLoadError: null,
     macroData: null,
     macroHistory: [],
     macroRequestGeneration: 0,
@@ -42,7 +43,11 @@
     feedRequestGeneration: 0,
     feedAbortController: null,
     viewLoadedAt: { decision: 0, macro: 0, kol: 0 },
+    viewLastGoodAt: { decision: 0, macro: 0, kol: 0 },
+    viewLastGoodDataAt: { decision: "", macro: "", kol: "" },
+    viewLoadErrors: {},
     viewLoadPromises: {},
+    systemSignals: { macro: null, decision: null },
     refreshTimer: null,
     supportFactsLoaded: false,
     drawerEventId: null,
@@ -194,6 +199,16 @@
   const ACTION_CN = {
     reduce_or_hedge: { label: "减仓 / 对冲", icon: "▼", color: "var(--high)" },
     scale_in: { label: "分批布局", icon: "▲", color: "var(--low)" },
+    candidate_reduce_or_hedge: {
+      label: "候选减仓 / 对冲",
+      icon: "▼",
+      color: "var(--high)",
+    },
+    candidate_scale_in: {
+      label: "候选分批布局",
+      icon: "▲",
+      color: "var(--low)",
+    },
     verify: { label: "验证", icon: "◆", color: "var(--med)" },
     observe: { label: "观察", icon: "○", color: "var(--neutral)" },
   };
@@ -375,6 +390,71 @@
     </div>`;
   }
 
+  function loadErrorCause(error) {
+    const message = (error && error.message) || String(error || "");
+    if (/abort/i.test((error && error.name) || message)) return "请求超时";
+    if (/failed to fetch|networkerror/i.test(message)) return "网络连接失败";
+    return message ? `加载失败：${message}` : "加载失败";
+  }
+
+  function recordViewLastGoodDataAt(view, payload) {
+    const candidates = [
+      payload?.generated_at,
+      payload?.source_as_of,
+      payload?.created_at,
+      payload?.timestamp,
+    ];
+    const value = candidates.find((candidate) => {
+      if (!candidate) return false;
+      return Number.isFinite(new Date(String(candidate)).getTime());
+    });
+    state.viewLastGoodDataAt[view] = value ? String(value) : "";
+  }
+
+  function renderViewLoadState(view) {
+    const main = $(`#view-${view}`);
+    const wrap = main?.querySelector(".wrap");
+    if (!wrap) return;
+    const existing = wrap.querySelector(`[data-view-load-state="${view}"]`);
+    const failure = state.viewLoadErrors[view];
+    if (!failure) {
+      existing?.remove();
+      return;
+    }
+    const host = existing || document.createElement("div");
+    host.className = "view-load-state is-error";
+    host.dataset.viewLoadState = view;
+    host.setAttribute("role", "alert");
+    host.setAttribute("aria-live", "assertive");
+    const lastGoodDataAt = state.viewLastGoodDataAt[view];
+    const hasLastGood = Number(state.viewLastGoodAt[view] || 0) > 0;
+    const lastGoodCopy = lastGoodDataAt
+      ? `继续显示数据截至 ${fmtAbsoluteTime(lastGoodDataAt)} 的上次成功结果，内容可能已过期。`
+      : hasLastGood
+        ? "继续显示上次成功结果；数据时间未提供，内容可能已过期。"
+        : "当前没有可继续显示的成功数据。";
+    host.innerHTML = `<span class="view-load-mark" aria-hidden="true">!</span>
+      <div class="view-load-copy">
+        <strong>当前视图刷新失败</strong>
+        <span>${esc(loadErrorCause(failure.error))}；${esc(lastGoodCopy)}</span>
+      </div>
+      <button type="button" class="view-retry-btn" data-view-retry="${esc(view)}">
+        重试当前视图
+      </button>`;
+    if (!existing) wrap.prepend(host);
+  }
+
+  function setViewLoadError(view, error, url = "") {
+    state.viewLoadedAt[view] = 0;
+    state.viewLoadErrors[view] = { error, url };
+    renderViewLoadState(view);
+  }
+
+  function clearViewLoadError(view) {
+    delete state.viewLoadErrors[view];
+    renderViewLoadState(view);
+  }
+
   // ─── Decision cockpit ──────────────────────
 
   const topicName = (key) =>
@@ -389,8 +469,334 @@
     return typeof value === "number" ? `${Math.round(value * 100)}%` : "—";
   };
 
+  const CANDIDATE_STAGE = {
+    reduce_or_hedge: "candidate_reduce_or_hedge",
+    scale_in: "candidate_scale_in",
+  };
+
   function actionInfo(card) {
-    return ACTION_CN[card.action_stage] || ACTION_CN.observe;
+    const stage = String(card?.action_stage || "observe");
+    const candidateStage =
+      card?.human_review_required === true ? CANDIDATE_STAGE[stage] : "";
+    return ACTION_CN[candidateStage || stage] || ACTION_CN.observe;
+  }
+
+  function isCandidateAction(card) {
+    return [
+      "reduce_or_hedge",
+      "scale_in",
+      "candidate_reduce_or_hedge",
+      "candidate_scale_in",
+    ].includes(String(card?.action_stage || ""));
+  }
+
+  function marketStatusInfo(card) {
+    const market = card?.market_validation || {};
+    const status = String(market.status || "").toLowerCase();
+    const phase = String(market.phase || "").toLowerCase();
+    const directionConfirmed = market.direction_confirmed;
+    if (phase === "contrary" || directionConfirmed === false) {
+      return {
+        tone: "warn",
+        state: "contrary",
+        label: "市场反向，候选停止并复核",
+        guidance:
+          "市场样本与机制方向相反；停止候选行动，先复核相反证据与失效条件。",
+      };
+    }
+    if (
+      ["inconclusive", "neutral"].includes(phase) ||
+      (status === "complete" && directionConfirmed !== true)
+    ) {
+      return {
+        tone: "warn",
+        state: "inconclusive",
+        label: "市场方向中性或不一致",
+        guidance:
+          "市场样本未形成一致方向；候选不能推进，需继续复核中性和相反证据。",
+      };
+    }
+    if (
+      market.degraded === true ||
+      ["degraded", "unavailable", "error", "failed"].includes(status)
+    ) {
+      return {
+        tone: "error",
+        state: "unavailable",
+        label: "市场验证暂不可用",
+        guidance:
+          "市场验证暂不可用；仅可核验证据，不能据此确认交易动作。请等待行情链路恢复后重试。",
+      };
+    }
+    if (
+      status === "complete" &&
+      market.abstain === false &&
+      market.veto === false &&
+      directionConfirmed === true
+    ) {
+      return {
+        tone: "ok",
+        state: "confirmed",
+        label: "已有同向市场样本",
+        guidance:
+          "已有同向市场样本；仍需人工确认仓位、风险预算与失效条件。",
+      };
+    }
+    if (market.veto === true || phase === "direction_unavailable") {
+      return {
+        tone: "warn",
+        state: "vetoed",
+        label: "市场否决，候选停止并复核",
+        guidance:
+          "市场验证未通过行动门槛；停止候选行动，先复核机制方向和数据完整性。",
+      };
+    }
+    const earlyConfirmation =
+      directionConfirmed === true && phase.startsWith("confirmed_");
+    return {
+      tone: "warn",
+      state: earlyConfirmation ? "preliminary" : "pending",
+      label: earlyConfirmation ? "市场初步同向，等待所需窗口" : "市场待确认",
+      guidance: earlyConfirmation
+        ? "早期窗口初步同向，但所需期限尚未完成；当前只形成候选行动。"
+        : "共同交易日窗口尚未完成；当前只形成影响假设，不能据此直接交易。",
+    };
+  }
+
+  const DECISION_SNAPSHOT_MAX_AGE_SECONDS = 90 * 60;
+
+  function decisionSnapshotFreshness(data) {
+    const nestedSummary =
+      data?.summary && typeof data.summary === "object" ? data.summary : null;
+    const metadata = nestedSummary || data || {};
+    const declaredStale = metadata.stale === true || data?.stale === true;
+    const rawAge = metadata.age_seconds ?? data?.age_seconds;
+    const parsedRawAge =
+      rawAge === null || rawAge === "" || typeof rawAge === "boolean"
+        ? Number.NaN
+        : Number(rawAge);
+    const rawAgeSeconds =
+      Number.isFinite(parsedRawAge) && parsedRawAge >= 0
+        ? parsedRawAge
+        : Number.NaN;
+    const generatedAt = metadata.generated_at || data?.generated_at;
+    const generatedEpoch = new Date(String(generatedAt || "")).getTime();
+    const computedAgeSeconds = Number.isFinite(generatedEpoch)
+      ? (Date.now() - generatedEpoch) / 1000
+      : Number.NaN;
+    const generatedTooFarFuture =
+      Number.isFinite(computedAgeSeconds) && computedAgeSeconds < -300;
+    const liveAgeSeconds =
+      Number.isFinite(computedAgeSeconds) && !generatedTooFarFuture
+        ? Math.max(0, computedAgeSeconds)
+        : Number.NaN;
+    const ageSeconds = generatedTooFarFuture
+      ? Number.NaN
+      : Number.isFinite(rawAgeSeconds) && Number.isFinite(liveAgeSeconds)
+        ? Math.max(rawAgeSeconds, liveAgeSeconds)
+        : Number.isFinite(liveAgeSeconds)
+          ? liveAgeSeconds
+          : rawAgeSeconds;
+    const verifiable = Number.isFinite(ageSeconds);
+    const stale =
+      declaredStale ||
+      (verifiable && ageSeconds > DECISION_SNAPSHOT_MAX_AGE_SECONDS);
+    return {
+      stale,
+      verifiable,
+      ageSeconds: verifiable ? Math.max(0, ageSeconds) : null,
+    };
+  }
+
+  function businessHealthSeverity(data) {
+    const healthObjects = [
+      data?.business_health,
+      data?.decision_health,
+      data?.health,
+    ].filter(Boolean);
+    let severity = "ok";
+    const promote = (next) => {
+      const rank = { ok: 0, warn: 1, error: 2 };
+      if (rank[next] > rank[severity]) severity = next;
+    };
+    healthObjects.forEach((health) => {
+      if (typeof health === "string") {
+        const status = health.toLowerCase();
+        promote(
+          ["error", "failed", "unavailable"].includes(status)
+            ? "error"
+            : status === "degraded"
+              ? "warn"
+              : "ok"
+        );
+        return;
+      }
+      if (typeof health !== "object") return;
+      const market = health.market_validation || health.market || {};
+      const rootStatus = String(health.status || health.state || "").toLowerCase();
+      const marketStatus = String(market.status || market.state || "").toLowerCase();
+      const rawAvailableRecords = market.available_records;
+      const availableRecords =
+        rawAvailableRecords === null ||
+        rawAvailableRecords === "" ||
+        typeof rawAvailableRecords === "boolean"
+          ? Number.NaN
+          : Number(rawAvailableRecords);
+      const declaredDegraded =
+        health.degraded === true ||
+        market.degraded === true ||
+        rootStatus === "degraded" ||
+        marketStatus === "degraded";
+      if (
+        [rootStatus, marketStatus].some((status) =>
+          ["error", "failed", "unavailable"].includes(status)
+        ) ||
+        (declaredDegraded &&
+          Number.isFinite(availableRecords) &&
+          availableRecords <= 0)
+      ) {
+        promote("error");
+      } else if (declaredDegraded) {
+        promote("warn");
+      }
+    });
+    return severity;
+  }
+
+  function declaredBusinessDegraded(data) {
+    const severity = businessHealthSeverity(data);
+    const declared = Boolean(
+      data?.business_health || data?.decision_health || data?.health
+    );
+    return {
+      declared,
+      severity,
+      partial: severity === "warn",
+      unavailable: severity === "error",
+    };
+  }
+
+  function decisionBoundaryState(data) {
+    const cards = Array.isArray(data?.decisions) ? data.decisions : [];
+    const marketStates = cards.map(marketStatusInfo);
+    const allUnavailable =
+      marketStates.length > 0 &&
+      marketStates.every((item) => item.tone === "error");
+    const anyUnavailable = marketStates.some((item) => item.tone === "error");
+    const allPending =
+      marketStates.length > 0 &&
+      marketStates.every((item) => item.tone !== "ok");
+    const businessHealth = declaredBusinessDegraded(data);
+    const businessUnavailable = businessHealth.unavailable;
+    const businessPartiallyDegraded = businessHealth.partial;
+    const fallbackAllUnavailable = allUnavailable && !businessHealth.declared;
+    const macroLoadFailed = state.systemSignals.macro?.kind === "error";
+    const snapshotFreshness = decisionSnapshotFreshness(data);
+    const needsReview = cards.some((card) => card.human_review_required === true);
+    const hasEvidence = cards.some((card) => Number(card.source_count || 0) > 0);
+    const contraryMarket = marketStates.find((item) => item.state === "contrary");
+    const inconclusiveMarket = marketStates.find(
+      (item) => item.state === "inconclusive" || item.state === "vetoed"
+    );
+    const aggregateMarket =
+      contraryMarket ||
+      inconclusiveMarket ||
+      marketStates.find((item) => item.tone === "error") ||
+      marketStates.find((item) => item.tone === "warn") ||
+      marketStates[0];
+
+    if (snapshotFreshness.stale) {
+      const hasMarketFailure = businessUnavailable || fallbackAllUnavailable;
+      return {
+        tone: hasMarketFailure ? "error" : "warn",
+        evidenceTone: "warn",
+        evidenceLabel: "决策快照延迟",
+        marketLabel: aggregateMarket?.label || "市场状态待核验",
+        guidance: hasMarketFailure
+          ? "决策快照已超过 90 分钟且市场验证链路降级；只可核验历史证据，请刷新快照后再评估。"
+          : "决策快照已超过 90 分钟；当前结论可能过期，请等待新快照后再评估候选行动。",
+        systemKind: hasMarketFailure ? "error" : "warn",
+        systemLabel: "决策快照延迟",
+      };
+    }
+
+    if (businessUnavailable || fallbackAllUnavailable) {
+      return {
+        tone: "error",
+        evidenceTone: hasEvidence ? "warn" : "error",
+        evidenceLabel: hasEvidence ? "有来源，待人工核验" : "证据不足",
+        marketLabel: "市场验证暂不可用",
+        guidance:
+          "仅可核验证据，不能据此确认交易动作。待行情验证恢复并补齐共同交易日样本后再评估。",
+        systemKind: "error",
+        systemLabel: "市场验证异常",
+      };
+    }
+    if (!snapshotFreshness.verifiable) {
+      return {
+        tone: "warn",
+        evidenceTone: "warn",
+        evidenceLabel: "快照时间待核验",
+        marketLabel: aggregateMarket?.label || "市场状态待核验",
+        guidance:
+          "决策快照缺少可核验的生成时间；当前只可检查证据，不能推进候选行动。",
+        systemKind: "warn",
+        systemLabel: "快照时间待核验",
+      };
+    }
+    if (contraryMarket || inconclusiveMarket) {
+      const marketState = contraryMarket || inconclusiveMarket;
+      return {
+        tone: "warn",
+        evidenceTone: "warn",
+        evidenceLabel: hasEvidence ? "待人工复核" : "证据不足",
+        marketLabel: marketState.label,
+        guidance: marketState.guidance,
+        systemKind: "warn",
+        systemLabel: contraryMarket ? "市场方向反向" : "市场方向待复核",
+      };
+    }
+    if (macroLoadFailed || businessPartiallyDegraded) {
+      return {
+        tone: "warn",
+        evidenceTone: "warn",
+        evidenceLabel: macroLoadFailed ? "宏观快照刷新失败" : "市场验证部分降级",
+        marketLabel:
+          aggregateMarket?.label ||
+          (businessPartiallyDegraded ? "部分市场验证可用" : "市场状态待核验"),
+        guidance:
+          macroLoadFailed && businessPartiallyDegraded
+            ? "宏观快照本轮刷新失败，且部分市场验证不可用；继续显示上次成功决策，请重试后再评估。"
+            : macroLoadFailed
+              ? "宏观快照本轮刷新失败；继续显示上次成功决策，请重试宏观数据后再评估。"
+              : "部分市场验证不可用，但仍有可用样本；相关候选保持降级并等待补齐。",
+        systemKind: "warn",
+        systemLabel: macroLoadFailed ? "宏观刷新失败" : "市场部分降级",
+      };
+    }
+    if (!cards.length || anyUnavailable || allPending) {
+      return {
+        tone: "warn",
+        evidenceTone: "warn",
+        evidenceLabel: hasEvidence ? "待人工核验" : "等待可核验证据",
+        marketLabel: anyUnavailable ? "部分验证不可用" : "市场尚未确认",
+        guidance:
+          "当前仅形成影响假设；先核验证据与相反证据，等待市场窗口完成后再考虑交易。",
+        systemKind: "warn",
+        systemLabel: anyUnavailable ? "市场部分异常" : "市场待确认",
+      };
+    }
+    return {
+      tone: needsReview ? "warn" : "ok",
+      evidenceTone: needsReview ? "warn" : "ok",
+      evidenceLabel: needsReview ? "待人工核验" : "证据已复核",
+      marketLabel: "已有同向市场样本",
+      guidance: needsReview
+        ? "市场样本支持当前方向，但只形成候选行动，仍需人工确认风险预算与失效条件。"
+        : "证据与市场样本已就绪；执行前仍需核对仓位、价格与风险预算。",
+      systemKind: "ok",
+      systemLabel: "验证链路正常",
+    };
   }
 
   function classInfo(card) {
@@ -424,9 +830,28 @@
     host.title = title;
   }
 
+  function applySystemStatus() {
+    const rank = { error: 3, warn: 2, ok: 1, unknown: 0 };
+    const signals = Object.values(state.systemSignals).filter(Boolean);
+    if (!signals.length) {
+      setSystemStatus("unknown", "状态待确认", "正在确认业务数据链路");
+      return;
+    }
+    const signal = signals.sort(
+      (a, b) => (rank[b.kind] || 0) - (rank[a.kind] || 0)
+    )[0];
+    setSystemStatus(signal.kind, signal.label, signal.title);
+  }
+
+  function setSystemSignal(scope, kind, label, title) {
+    state.systemSignals[scope] = { kind, label, title };
+    applySystemStatus();
+  }
+
   function updateMacroStatus(snapshot) {
     if (!snapshot?.available) {
-      setSystemStatus(
+      setSystemSignal(
+        "macro",
         "warn",
         "等待快照",
         snapshot?.reason || "尚未采集到宏观快照"
@@ -437,7 +862,12 @@
     const createdAt = snapshot.created_at || snapshot.timestamp;
     const createdDate = new Date(String(createdAt || ""));
     if (Number.isNaN(createdDate.getTime())) {
-      setSystemStatus("warn", "时间待核验", "宏观快照未提供可核验的生成时间");
+      setSystemSignal(
+        "macro",
+        "warn",
+        "时间待核验",
+        "宏观快照未提供可核验的生成时间"
+      );
       return;
     }
 
@@ -451,10 +881,10 @@
         : "";
     const title = `宏观快照 ${fmtAbsoluteTime(createdAt)}${coverageText}`;
     if (ageMs < -5 * 60_000 || ageMs > 150 * 60_000) {
-      setSystemStatus("warn", "快照延迟", title);
+      setSystemSignal("macro", "warn", "快照延迟", title);
       return;
     }
-    setSystemStatus("ok", "快照正常", title);
+    setSystemSignal("macro", "ok", "快照正常", title);
   }
 
   function normalizedMacroTrend(items) {
@@ -551,9 +981,8 @@
       },
       { risk: 0, opportunity: 0, conflict: 0 }
     );
-    const actionable = cards.filter((card) =>
-      ["reduce_or_hedge", "scale_in"].includes(card.action_stage)
-    ).length;
+    const candidateActions = cards.filter(isCandidateAction).length;
+    const boundary = decisionBoundaryState(data);
     const coverageValues = cards
       .map((card) => card.score_components?.coverage)
       .filter((value) => typeof value === "number" && isFinite(value));
@@ -617,9 +1046,8 @@
         </div>`;
 
     const leadAction = lead ? actionInfo(lead) : ACTION_CN.observe;
-    const leadIsActionable = Boolean(
-      lead && ["reduce_or_hedge", "scale_in"].includes(lead.action_stage)
-    );
+    const leadIsCandidate = Boolean(lead && isCandidateAction(lead));
+    const leadNeedsReview = lead?.human_review_required === true;
     const transmission = lead
       ? `<div class="transmission-ribbon" aria-label="首要信号传导路径">
           <span class="transmission-node" title="${esc(lead.trigger || "待补充触发条件")}">
@@ -656,12 +1084,16 @@
         </section>
         <section class="brief-lead">
           <p class="brief-kicker">当前首要传导 · ${
-            leadIsActionable ? "已进入分级行动" : "待验证影响假设"
+            leadNeedsReview
+              ? "候选行动 · 待人工确认"
+              : leadIsCandidate
+                ? "候选行动"
+                : "待验证影响假设"
           }</p>
           <h1 class="brief-title">${
             lead
               ? `${leadAction.icon} ${esc(
-                  leadIsActionable ? leadAction.label : "待验证影响假设"
+                  leadIsCandidate ? leadAction.label : "待验证影响假设"
                 )} · ${esc(assetLabel(lead.asset_key))}`
               : "等待重点信号"
           }</h1>
@@ -669,7 +1101,9 @@
           <div class="brief-statline">
             <span>风险 ${counts.risk}</span><span>机会 ${counts.opportunity}</span>
             <span>分歧 ${counts.conflict}</span><span>${
-              actionable ? `已确认行动 ${actionable}` : "本轮无已确认行动"
+              candidateActions
+                ? `候选行动 ${candidateActions} · 待人工确认`
+                : "本轮暂无候选行动"
             }</span>
             <span>宏观覆盖 ${coverage}%</span>
           </div>
@@ -679,11 +1113,31 @@
           )}</p>
         </section>
       </div>
+      <div class="decision-boundary-rail is-${esc(boundary.tone)}"
+           role="status" aria-live="polite"
+           aria-label="证据状态与市场状态">
+        <div class="boundary-cell is-${esc(boundary.evidenceTone)}">
+          <small>证据状态</small><strong>${esc(boundary.evidenceLabel)}</strong>
+        </div>
+        <div class="boundary-cell is-${
+          boundary.tone === "error" ? "error" : boundary.tone === "warn" ? "warn" : "ok"
+        }">
+          <small>市场状态</small><strong>${esc(boundary.marketLabel)}</strong>
+        </div>
+        <p>${esc(boundary.guidance)}</p>
+      </div>
       ${privateSummary}`;
   }
 
   function orderedDecisions(cards) {
-    const order = { reduce_or_hedge: 0, scale_in: 1, verify: 2, observe: 3 };
+    const order = {
+      candidate_reduce_or_hedge: 0,
+      reduce_or_hedge: 0,
+      candidate_scale_in: 1,
+      scale_in: 1,
+      verify: 2,
+      observe: 3,
+    };
     return cards.slice().sort(
       (a, b) =>
         (order[a.action_stage] ?? 9) - (order[b.action_stage] ?? 9) ||
@@ -707,7 +1161,12 @@
       .map((card) => {
         const action = actionInfo(card);
         const key = decisionKey(card);
-        const market = card.market_validation || {};
+        const marketInfo = marketStatusInfo(card);
+        const evidenceLabel = card.human_review_required
+          ? "待人工核验"
+          : Number(card.source_count || 0) > 0
+            ? "有来源可核验"
+            : "证据不足";
         const privateBadge = card.matched_positions?.length
           ? `<span class="status-badge private">私 · 匹配 ${card.matched_positions.length}</span>`
           : "";
@@ -724,12 +1183,22 @@
           </div>
           <div class="decision-topic">${esc(topicName(card.topic_key))}</div>
           <div class="decision-card-trigger">${esc(card.trigger || "")}</div>
+          <div class="decision-card-boundary" aria-label="证据状态与市场状态">
+            <span class="is-${card.human_review_required ? "warn" : "ok"}">
+              <small>证据状态</small><strong>${esc(evidenceLabel)}</strong>
+            </span>
+            <span class="is-${esc(marketInfo.tone)}">
+              <small>市场状态</small><strong>${esc(marketInfo.label)}</strong>
+            </span>
+          </div>
           <div class="decision-card-meta">
             <span>置信 ${confidencePct(card)}</span>
             <span>· ${card.source_count || 0} 个来源</span>
-            <span class="status-badge ${market.abstain ? "warn" : ""}">
-              ${market.abstain ? "⚠ 市场未确认" : "✓ 市场同向"}
-            </span>
+            ${
+              card.human_review_required
+                ? '<span class="status-badge warn">候选行动 · 待人工确认</span>'
+                : ""
+            }
             ${card.leverage_flag ? '<span class="status-badge warn">⚠ 杠杆</span>' : ""}
             ${card.stale ? '<span class="status-badge warn">⚠ 数据过期</span>' : ""}
             ${privateBadge}
@@ -833,6 +1302,7 @@
     const kind = classInfo(card);
     const evidence = distinctEvidence(card);
     const market = card.market_validation || {};
+    const marketInfo = marketStatusInfo(card);
     const records = market.records || [];
     const positions = card.matched_positions || [];
     const sourceNodes = evidence.slice(0, 3).map((item) => {
@@ -941,6 +1411,11 @@
               action.label
             }</span>
             <span class="pill" style="--lvl:${kind.color}">${kind.icon} ${kind.label}</span>
+            ${
+              card.human_review_required
+                ? '<span class="status-badge warn">候选行动 · 待人工确认</span>'
+                : ""
+            }
           </div>
           <h2 class="evidence-title" id="decision-detail-title" title="${esc(
             card.asset_key
@@ -964,7 +1439,10 @@
           <ul class="evidence-list">${contraryRows}</ul>
         </section>
         <section class="evidence-section wide">
-          <h3>市场验证 · ${market.abstain ? "⚠ 保持 abstain" : "✓ 方向已确认"}</h3>
+          <h3>市场验证 · ${esc(marketInfo.label)}</h3>
+          <p class="validation-boundary is-${esc(marketInfo.tone)}">${esc(
+            marketInfo.guidance
+          )}</p>
           <div class="impact-matrix-wrap"><table class="validation-table">
             <thead><tr><th>窗口</th><th>资产收益</th><th>超额收益</th><th>方向</th><th>样本</th></tr></thead>
             <tbody>${marketRows}</tbody>
@@ -980,11 +1458,24 @@
         ${positionSection}
       </div>
       <p class="decision-disclaimer">${esc(
-        policy || "统计相关不等于因果；所有行动建议均需人工复核。"
+        `${card.human_review_required ? "候选行动，待人工确认。" : ""}${
+          policy || "统计相关不等于因果；所有行动建议均需人工复核。"
+        }`
       )}</p>`;
   }
 
-  async function selectDecision(key, { focusDetail = false } = {}) {
+  function renderDecisionDetailConflict(key) {
+    $("#decision-detail").innerHTML = `<div class="decision-detail-conflict" role="alert">
+      <strong>证据链版本连续变化，已停止自动重试</strong>
+      <p>系统已自动刷新一次；为避免循环请求，请人工重试当前选择。</p>
+      <button type="button" data-decision-detail-retry="${esc(key)}">人工重试证据链</button>
+    </div>`;
+  }
+
+  async function selectDecision(
+    key,
+    { focusDetail = false, conflictRetryCount = 0 } = {}
+  ) {
     const cards = state.decisionData?.decisions || [];
     const card = cards.find((item) => decisionKey(item) === key);
     if (!card) return;
@@ -1027,7 +1518,19 @@
         } catch (error) {
           if (generation !== state.decisionDetailRequestGeneration) return;
           if (error.status === 409) {
-            await loadDecisions();
+            if (conflictRetryCount >= 1) {
+              renderDecisionDetailConflict(key);
+              return;
+            }
+            const refreshed = await loadDecisions({ autoSelect: false });
+            if (!refreshed || !state.selectedDecisionKey) {
+              renderDecisionDetailConflict(key);
+              return;
+            }
+            await selectDecision(state.selectedDecisionKey, {
+              focusDetail,
+              conflictRetryCount: 1,
+            });
             return;
           }
           $("#decision-detail").innerHTML = errorHTML(error, url);
@@ -1037,8 +1540,15 @@
     if (focusDetail) $("#decision-detail").scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
-  function renderDecisions(data) {
+  function renderDecisions(data, { autoSelect = true } = {}) {
     state.decisionData = data;
+    const boundary = decisionBoundaryState(data);
+    setSystemSignal(
+      "decision",
+      boundary.systemKind,
+      boundary.systemLabel,
+      boundary.guidance
+    );
     const cards = orderedDecisions(data.decisions || []);
     if (!cards.some((card) => decisionKey(card) === state.selectedDecisionKey)) {
       state.selectedDecisionKey = cards.length ? decisionKey(cards[0]) : "";
@@ -1046,9 +1556,9 @@
     renderDecisionHero(data);
     renderDecisionQueue(data);
     renderDecisionMatrix(data);
-    if (state.selectedDecisionKey) {
+    if (state.selectedDecisionKey && autoSelect) {
       void selectDecision(state.selectedDecisionKey);
-    } else {
+    } else if (!state.selectedDecisionKey) {
       $("#decision-detail").innerHTML = `<div class="empty">
         <span class="empty-icon">⛓</span>暂无可展开的证据链
       </div>`;
@@ -1061,6 +1571,8 @@
     state.decisionDetailCache.clear();
     state.decisionData = null;
     state.selectedDecisionKey = "";
+    state.decisionQueueExpanded = false;
+    state.matrixExpanded = false;
     $("#decision-hero").innerHTML = `<div class="empty">${esc(message)}</div>`;
     $("#decision-queue").innerHTML = "";
     $("#decision-matrix").innerHTML = "";
@@ -1069,7 +1581,7 @@
     </div>`;
   }
 
-  async function loadDecisions() {
+  async function loadDecisions({ autoSelect = true } = {}) {
     const requestedPrivate = state.authenticated;
     const requestGeneration = ++state.decisionRequestGeneration;
     const endpoint = requestedPrivate
@@ -1084,39 +1596,76 @@
         requestGeneration !== state.decisionRequestGeneration ||
         requestedPrivate !== state.authenticated
       ) {
-        return;
+        return false;
       }
-      renderDecisions(data || { decisions: [], impact_matrix: {} });
+      if (data?.summary === true) {
+        state.decisionQueueExpanded = false;
+        state.matrixExpanded = false;
+      }
+      recordViewLastGoodDataAt("decision", data);
+      clearViewLoadError("decision");
+      renderDecisions(data || { decisions: [], impact_matrix: {} }, { autoSelect });
+      return true;
     } catch (error) {
-      if (requestGeneration !== state.decisionRequestGeneration) return;
+      if (requestGeneration !== state.decisionRequestGeneration) return false;
       if (requestedPrivate && [401, 503].includes(error.status)) {
         state.authenticated = false;
         clearDecisionView();
         updatePrivateModeButton();
-        return loadDecisions();
+        return loadDecisions({ autoSelect });
       }
-      clearDecisionView("决策数据加载失败，已清除上一份页面数据");
-      $("#decision-hero").innerHTML = errorHTML(error, url);
+      setViewLoadError("decision", error, url);
+      setSystemSignal(
+        "decision",
+        "error",
+        "决策链路异常",
+        "重点信号刷新失败；继续显示上次成功数据并等待重试"
+      );
+      if (!state.decisionData) {
+        $("#decision-hero").innerHTML = `<div class="empty">
+          <span class="empty-icon">⚠️</span>今日态势暂时无法加载
+          <div class="empty-hint">请使用上方“重试当前视图”重新请求</div>
+        </div>`;
+      }
+      return false;
     }
   }
 
   async function loadFullDecisions() {
     if (!state.decisionData?.summary || state.authenticated) return true;
+    state.fullDecisionLoadError = null;
     const requestGeneration = ++state.decisionRequestGeneration;
     const url = api("api/decisions");
     try {
       const data = await fetchJSON(url, 15000);
       if (requestGeneration !== state.decisionRequestGeneration || state.authenticated) {
+        state.fullDecisionLoadError = new Error("决策状态已变化，请重新尝试");
         return false;
       }
       renderDecisions(data || { decisions: [], impact_matrix: {} });
       return true;
     } catch (error) {
       if (requestGeneration === state.decisionRequestGeneration) {
-        $("#decision-detail").innerHTML = errorHTML(error, url);
+        state.fullDecisionLoadError = error;
       }
       return false;
     }
+  }
+
+  function clearDecisionExpansionError(button) {
+    button?.parentElement?.querySelector(".decision-inline-error")?.remove();
+  }
+
+  function showDecisionExpansionError(button, scope) {
+    if (!button?.parentElement) return;
+    clearDecisionExpansionError(button);
+    const alert = document.createElement("div");
+    alert.className = "decision-inline-error";
+    alert.setAttribute("role", "alert");
+    alert.textContent = `${scope}加载失败（${loadErrorCause(
+      state.fullDecisionLoadError
+    )}）。当前仍显示重点内容，可重试。`;
+    button.parentElement.insertBefore(alert, button);
   }
 
   function updatePrivateModeButton() {
@@ -2111,26 +2660,37 @@
     const currentUrl = api("api/macro");
     const currentRequest = fetchJSON(currentUrl)
       .then((d) => {
-        if (generation !== state.macroRequestGeneration) return;
+        if (generation !== state.macroRequestGeneration) return false;
         state.macroData = d;
+        recordViewLastGoodDataAt("macro", d);
+        clearViewLoadError("macro");
         updateMacroStatus(d);
         renderMacroView();
         if (state.decisionData) renderDecisionHero(state.decisionData);
+        return true;
       })
       .catch((error) => {
-        if (generation !== state.macroRequestGeneration) return;
-        setSystemStatus(
+        if (generation !== state.macroRequestGeneration) return false;
+        setViewLoadError("macro", error, currentUrl);
+        setSystemSignal(
+          "macro",
           "error",
           "快照异常",
           `最新宏观快照加载失败：${error.message || error}`
         );
-        if (state.view === "macro") {
-          $("#macro-hero").innerHTML = errorHTML(error, currentUrl);
+        if (state.view === "macro" && !state.macroData) {
+          $("#macro-hero").innerHTML = `<div class="empty">
+            <span class="empty-icon">⚠️</span>宏观快照暂时无法加载
+            <div class="empty-hint">请使用上方“重试当前视图”重新请求</div>
+          </div>`;
         }
+        if (state.decisionData) renderDecisionHero(state.decisionData);
+        return false;
       });
     const requests = [currentRequest];
     if (includeHistory) requests.push(loadMacroHistory());
-    await Promise.allSettled(requests);
+    const [currentResult] = await Promise.allSettled(requests);
+    return currentResult.status === "fulfilled" && currentResult.value === true;
   }
 
   // ─── KOL view ─────────────────────────────
@@ -3098,18 +3658,32 @@
       const items = highPriorityLoaded
         ? mergePriorityEvents(priorityItems, regularItems)
         : regularItems;
-      if (generation !== state.feedRequestGeneration) return;
+      if (generation !== state.feedRequestGeneration) return false;
       state.feedLoadedCount = items.length;
       state.feedHighPriority = highPriorityLoaded;
       state.feedRegularCapped = regularItems.length >= 150;
+      recordViewLastGoodDataAt("kol", regularData);
+      clearViewLoadError("kol");
       renderEvents(items);
       updateFeedStatus();
+      return true;
     } catch (e) {
-      if (generation !== state.feedRequestGeneration) return;
-      if (e?.name === "AbortError") return;
-      $("#feed").innerHTML = errorHTML(e, url);
+      if (generation !== state.feedRequestGeneration) return false;
+      if (e?.name === "AbortError") return false;
+      setViewLoadError("kol", e, url);
+      if (!state.feedItems.length) {
+        $("#feed").innerHTML = `<div class="empty">
+          <span class="empty-icon">⚠️</span>信号流暂时无法加载
+          <div class="empty-hint">请使用上方“重试当前视图”重新请求</div>
+        </div>`;
+      }
       const host = $("#feed-status");
-      if (host) host.textContent = "动态加载失败";
+      if (host) {
+        host.textContent = state.feedItems.length
+          ? "刷新失败 · 继续显示上次成功信号"
+          : "动态加载失败";
+      }
+      return false;
     } finally {
       if (generation === state.feedRequestGeneration) {
         if (state.feedAbortController === requestController) {
@@ -3275,6 +3849,25 @@
         : "隔离区按首次抓取时间筛选";
   }
 
+  function bindViewRetries() {
+    document.addEventListener("click", async (event) => {
+      const retry = event.target.closest("[data-view-retry]");
+      if (!retry) return;
+      const view = retry.dataset.viewRetry;
+      if (!view || retry.disabled) return;
+      retry.disabled = true;
+      retry.textContent = "正在重试…";
+      try {
+        await ensureViewLoaded(view, { force: true });
+      } finally {
+        if (retry.isConnected) {
+          retry.disabled = false;
+          retry.textContent = "重试当前视图";
+        }
+      }
+    });
+  }
+
   const VIEW_REFRESH_MS = 300_000;
 
   function scheduleIdle(task) {
@@ -3289,28 +3882,53 @@
     const loadedAt = Number(state.viewLoadedAt[view] || 0);
     if (!force && loadedAt && Date.now() - loadedAt < VIEW_REFRESH_MS) {
       if (view === "macro") renderMacroView();
-      return;
+      return true;
     }
     if (!force && state.viewLoadPromises[view]) {
       return state.viewLoadPromises[view];
     }
     const promise = (async () => {
+      let criticalSucceeded = false;
       if (view === "decision") {
         const macroPromise = loadMacro({ includeHistory: false });
         if (!state.authStatusLoaded) await loadAuthStatus();
-        await Promise.allSettled([loadDecisions(), macroPromise]);
+        const [decisionResult] = await Promise.allSettled([
+          loadDecisions(),
+          macroPromise,
+        ]);
+        criticalSucceeded =
+          decisionResult.status === "fulfilled" &&
+          decisionResult.value === true;
         if (!state.macroHistory.length) scheduleIdle(() => void loadMacroHistory());
       } else if (view === "macro") {
-        await loadMacro({ includeHistory: true });
+        const [macroResult] = await Promise.allSettled([
+          loadMacro({ includeHistory: true }),
+        ]);
+        criticalSucceeded =
+          macroResult.status === "fulfilled" && macroResult.value === true;
       } else if (view === "kol") {
-        await Promise.allSettled([loadStats(), loadKols(), loadEvents()]);
+        const [, , eventsResult] = await Promise.allSettled([
+          loadStats(),
+          loadKols(),
+          loadEvents(),
+        ]);
+        criticalSucceeded =
+          eventsResult.status === "fulfilled" && eventsResult.value === true;
       }
-      state.viewLoadedAt[view] = Date.now();
-      updateRefreshTime();
+      if (criticalSucceeded) {
+        const loadedNow = Date.now();
+        state.viewLoadedAt[view] = loadedNow;
+        state.viewLastGoodAt[view] = loadedNow;
+        updateRefreshTime();
+      } else {
+        state.viewLoadedAt[view] = 0;
+        renderViewLoadState(view);
+      }
+      return criticalSucceeded;
     })();
     state.viewLoadPromises[view] = promise;
     try {
-      await promise;
+      return await promise;
     } finally {
       if (state.viewLoadPromises[view] === promise) {
         delete state.viewLoadPromises[view];
@@ -3384,15 +4002,36 @@
     bindKolChips();
     bindSupport();
     bindIntelDrawer();
+    bindViewRetries();
 
     $("#view-decision").addEventListener("click", async (event) => {
+      const detailRetry = event.target.closest("[data-decision-detail-retry]");
+      if (detailRetry) {
+        void selectDecision(detailRetry.dataset.decisionDetailRetry, {
+          focusDetail: true,
+          conflictRetryCount: 0,
+        });
+        return;
+      }
       const more = event.target.closest("#decision-show-all");
       if (more) {
         const nextExpanded = !state.decisionQueueExpanded;
         if (nextExpanded && state.decisionData?.summary) {
+          const originalLabel = more.textContent;
+          clearDecisionExpansionError(more);
           more.disabled = true;
           more.textContent = "正在加载完整决策集…";
-          if (!(await loadFullDecisions())) return;
+          try {
+            if (!(await loadFullDecisions())) {
+              showDecisionExpansionError(more, "完整决策集");
+              return;
+            }
+          } finally {
+            if (more.isConnected) {
+              more.disabled = false;
+              more.textContent = originalLabel;
+            }
+          }
         }
         state.decisionQueueExpanded = nextExpanded;
         renderDecisionQueue(state.decisionData || { decisions: [] });
@@ -3403,9 +4042,21 @@
       if (matrixMore) {
         const nextExpanded = !state.matrixExpanded;
         if (nextExpanded && state.decisionData?.summary) {
+          const originalLabel = matrixMore.textContent;
+          clearDecisionExpansionError(matrixMore);
           matrixMore.disabled = true;
           matrixMore.textContent = "正在加载完整矩阵…";
-          if (!(await loadFullDecisions())) return;
+          try {
+            if (!(await loadFullDecisions())) {
+              showDecisionExpansionError(matrixMore, "完整矩阵");
+              return;
+            }
+          } finally {
+            if (matrixMore.isConnected) {
+              matrixMore.disabled = false;
+              matrixMore.textContent = originalLabel;
+            }
+          }
         }
         state.matrixExpanded = nextExpanded;
         renderDecisionMatrix(state.decisionData || { decisions: [], impact_matrix: {} });
