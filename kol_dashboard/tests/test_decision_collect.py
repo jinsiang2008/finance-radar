@@ -231,6 +231,126 @@ class DecisionCollectorTests(unittest.TestCase):
             "2026-08-03T12:00:00+00:00",
         )
 
+    def test_market_collection_repairs_legacy_pre_due_unavailable_rows(
+        self,
+    ) -> None:
+        class LegacyRepository(FakeRepository):
+            def query_market_reactions(self, **kwargs):
+                return [
+                    {
+                        "source_type": "event",
+                        "source_id": "7",
+                        "asset_key": "US:NVDA",
+                        "window": window,
+                        "status": "unavailable",
+                        "sample_count": 0,
+                        "observed_at": "2026-08-02T18:00:00+00:00",
+                        "reason_code": None,
+                        "next_due_at": None,
+                    }
+                    for window in ("1D", "3D", "5D")
+                ]
+
+        repository = LegacyRepository()
+        summary = decision_collect.collect_market_reactions(
+            repository=repository,
+            history_fetcher=lambda *_a, **_k: self.fail("must not fetch"),
+            now="2026-08-03T00:00:00+00:00",
+            max_edges=10,
+        )
+
+        self.assertEqual(summary["eligible"], 0)
+        self.assertEqual(summary["skipped_not_due"], 1)
+        self.assertEqual(summary["pending_scheduled"], 1)
+        self.assertEqual(summary["business_status"], "pending")
+        self.assertEqual(len(repository.reaction_batches), 1)
+        persisted = repository.reaction_batches[0][3]
+        for window in ("1D", "3D", "5D"):
+            self.assertEqual(persisted["windows"][window]["status"], "pending")
+            self.assertEqual(
+                persisted["windows"][window]["reason_code"],
+                "window_not_due",
+            )
+
+    def test_pending_repair_preserves_existing_terminal_and_provider_failures(
+        self,
+    ) -> None:
+        class PartialRepository(FakeRepository):
+            def query_market_reactions(self, **kwargs):
+                return [
+                    {
+                        "source_type": "event",
+                        "source_id": "7",
+                        "asset_key": "US:NVDA",
+                        "window": "1D",
+                        "status": "unavailable",
+                        "sample_count": 0,
+                        "observed_at": "2026-08-03T12:00:00+00:00",
+                        "reason_code": "unsupported_benchmark",
+                        "benchmark_status": "unsupported",
+                        "next_due_at": None,
+                    }
+                ]
+
+        repository = PartialRepository()
+        summary = decision_collect.collect_market_reactions(
+            repository=repository,
+            history_fetcher=lambda *_a, **_k: self.fail("must not fetch"),
+            now="2026-08-03T00:00:00+00:00",
+            max_edges=10,
+        )
+
+        self.assertEqual(summary["pending_scheduled"], 1)
+        persisted = repository.reaction_batches[0][3]
+        self.assertNotIn("1D", persisted["windows"])
+        self.assertEqual(set(persisted["windows"]), {"3D", "5D"})
+
+        repository = PartialRepository()
+        repository.query_market_reactions = lambda **_kwargs: [
+            {
+                "source_type": "event",
+                "source_id": "7",
+                "asset_key": "US:NVDA",
+                "window": "1D",
+                "status": "unavailable",
+                "sample_count": 0,
+                "observed_at": "2026-08-03T12:00:00+00:00",
+                "reason_code": None,
+                "asset_status": "unavailable",
+                "next_due_at": None,
+            },
+            {
+                "source_type": "event",
+                "source_id": "7",
+                "asset_key": "US:NVDA",
+                "window": "3D",
+                "status": "pending",
+                "sample_count": 0,
+                "observed_at": "2026-08-03T12:00:00+00:00",
+                "reason_code": "window_not_due",
+                "next_due_at": "2026-08-05T12:00:00+00:00",
+            },
+            {
+                "source_type": "event",
+                "source_id": "7",
+                "asset_key": "US:NVDA",
+                "window": "5D",
+                "status": "pending",
+                "sample_count": 0,
+                "observed_at": "2026-08-03T12:00:00+00:00",
+                "reason_code": "window_not_due",
+                "next_due_at": "2026-08-07T12:00:00+00:00",
+            },
+        ]
+        summary = decision_collect.collect_market_reactions(
+            repository=repository,
+            history_fetcher=lambda *_a, **_k: self.fail("must not fetch"),
+            now="2026-08-03T00:00:00+00:00",
+            max_edges=10,
+        )
+        self.assertEqual(summary["pending_scheduled"], 0)
+        self.assertEqual(repository.reaction_batches, [])
+
     def test_fresh_neutral_relation_omits_expected_direction(self) -> None:
         class NeutralRepository(FakeRepository):
             def query_market_validation_relations(self, **kwargs):

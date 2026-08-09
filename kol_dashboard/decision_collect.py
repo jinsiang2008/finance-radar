@@ -181,6 +181,50 @@ def _edge_due_state(
     return (min(scheduled), failed_retry) if scheduled else (None, failed_retry)
 
 
+def _pending_repair_windows(
+    stored: list[dict[str, Any]],
+    event_time: datetime | None,
+    current: datetime,
+) -> set[str]:
+    """Identify incomplete pre-pending rows without hiding real failures.
+
+    Releases before the explicit pending state could persist unavailable rows
+    before a market window was due, without a reason or retry time. Repair only
+    those legacy rows (plus missing/pending-without-due rows). Explicit provider
+    and terminal failures remain unavailable and visible.
+    """
+    if event_time is None:
+        return set()
+    best = _best_reactions_by_window(stored)
+    repair: set[str] = set()
+    for window in _WINDOW_DUE_DAYS:
+        target_due = _window_due_at(event_time, window)
+        if target_due <= current:
+            continue
+        row = best.get(window)
+        if not row:
+            repair.add(window)
+            continue
+        status = str(row.get("status") or "").strip().lower()
+        if status == "pending":
+            if _optional_utc_datetime(row.get("next_due_at")) is None:
+                repair.add(window)
+            continue
+        series_statuses = {
+            str(row.get("asset_status") or "").strip().lower(),
+            str(row.get("benchmark_status") or "").strip().lower(),
+        }
+        if (
+            status == "unavailable"
+            and not str(row.get("reason_code") or "").strip()
+            and _optional_utc_datetime(row.get("next_due_at")) is None
+            and not series_statuses.intersection({"unavailable", "unsupported"})
+            and int(row.get("sample_count") or 0) == 0
+        ):
+            repair.add(window)
+    return repair
+
+
 def collect_market_reactions(
     *,
     repository: Any = db,
@@ -226,7 +270,7 @@ def collect_market_reactions(
         reactions_by_edge.setdefault(identity, []).append(reaction)
 
     candidates: list[dict[str, Any]] = []
-    future_new_candidates: list[dict[str, Any]] = []
+    pending_schedule_candidates: list[dict[str, Any]] = []
     seen_candidates: set[tuple[str, str]] = set()
     skipped_not_due = 0
     for relation in relations:
@@ -255,14 +299,20 @@ def collect_market_reactions(
             continue
         if due_at > current:
             skipped_not_due += 1
-            if not stored:
-                future_new_candidates.append(
+            repair_windows = _pending_repair_windows(
+                stored,
+                event_time,
+                current,
+            )
+            if repair_windows:
+                pending_schedule_candidates.append(
                     {
                         "relation": relation,
                         "event": event,
                         "identity": identity,
                         "event_time": event_time,
                         "due_at": due_at,
+                        "repair_windows": repair_windows,
                     }
                 )
             continue
@@ -429,7 +479,7 @@ def collect_market_reactions(
         return scheduled
 
     scheduled_pending_edges = 0
-    for candidate in future_new_candidates:
+    for candidate in pending_schedule_candidates:
         relation = candidate["relation"]
         event_time = candidate["event_time"]
         source_id, asset_key = candidate["identity"]
@@ -457,6 +507,12 @@ def collect_market_reactions(
             benchmark_status=None,
             fallback_reason="window_not_due",
         )
+        repair_windows = candidate["repair_windows"]
+        result["windows"] = {
+            window: item
+            for window, item in result["windows"].items()
+            if window in repair_windows
+        }
         reaction_rows += repository.upsert_market_reactions(
             "event",
             source_id,
