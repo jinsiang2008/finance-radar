@@ -69,15 +69,15 @@ run_capture() {
 case "${1:-kol}" in
   kol)
     OUT=$(run_capture python3 "$TRACKER" collect 6)
-    signal_enrichment
     RELATIONS=$(run_capture python3 "$DIR/decision_collect.py" relations)
+    signal_enrichment
     OUT="$OUT; $RELATIONS"
     echo "[$(stamp)] kol: $OUT" >> "$LOG_DIR/collect.log"
     ;;
   macro)
     OUT=$(run_capture python3 "$DIR/macro_collect.py")
-    signal_enrichment
     RELATIONS=$(run_capture python3 "$DIR/decision_collect.py" relations)
+    signal_enrichment
     OUT="$OUT; $RELATIONS"
     echo "[$(stamp)] macro: $OUT" >> "$LOG_DIR/collect.log"
     ;;

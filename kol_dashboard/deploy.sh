@@ -249,6 +249,16 @@ finally:
 PY
 }
 
+activate_nginx() {
+  nginx -t || return 1
+  if systemctl is-active --quiet nginx; then
+    systemctl reload nginx || return 1
+  else
+    systemctl start nginx || return 1
+  fi
+  systemctl is-active --quiet nginx
+}
+
 rollback_database() {
   [[ $DB_ROLLBACK_READY == 1 ]] || return 0
   if [[ -f "$ROLLBACK_DIR/database.before-release" ]]; then
@@ -323,11 +333,7 @@ cleanup_remote() {
     fi
     systemctl daemon-reload || rollback_failed=1
     restore_unit_states || rollback_failed=1
-    if nginx -t >/dev/null 2>&1; then
-      systemctl reload nginx >/dev/null 2>&1 || rollback_failed=1
-    else
-      rollback_failed=1
-    fi
+    activate_nginx >/dev/null 2>&1 || rollback_failed=1
     if unit_was_active kol-dashboard.service; then
       rollback_health=FAILED
       for _ in $(seq 1 15); do
@@ -371,6 +377,37 @@ chmod 700 "$REMOTE_STAGE"
 exec 9>"$BASE_DIR/.deploy.lock"
 flock -n 9 || {
   echo "已有 KOL Dashboard 部署正在执行" >&2
+  exit 1
+}
+
+# Fail before stopping any service when an old site-level include would load
+# the KOL locations a second time. The canonical route is aggregated through
+# /etc/nginx/snippets/aidao.locations.conf; this deploy intentionally never
+# edits the shared AiDao server block.
+NGINX_SITE=/etc/nginx/sites-enabled/aidao
+[[ -r "$NGINX_SITE" ]] || {
+  echo "nginx 站点配置不可读: $NGINX_SITE" >&2
+  exit 1
+}
+LEGACY_NGINX_INCLUDE=/root/kol-dashboard/deployment/nginx/kol.locations.conf
+LEGACY_INCLUDE_STATUS=0
+grep -Eq \
+  "^[[:space:]]*include[[:space:]]+['\"]?/root/kol-dashboard/deployment/nginx/kol\\.locations\\.conf['\"]?[[:space:]]*;([[:space:]]*#.*)?$" \
+  "$NGINX_SITE" || LEGACY_INCLUDE_STATUS=$?
+case "$LEGACY_INCLUDE_STATUS" in
+  0)
+    echo "检测到活动旧 KOL nginx include: $LEGACY_NGINX_INCLUDE" >&2
+    echo "请先迁移到 /etc/nginx/snippets/aidao.locations.conf" >&2
+    exit 1
+    ;;
+  1) ;;
+  *)
+    echo "无法核验 nginx 站点配置: $NGINX_SITE" >&2
+    exit 1
+    ;;
+esac
+nginx -t || {
+  echo "当前 nginx 配置无效，拒绝在停止服务前继续部署" >&2
   exit 1
 }
 
@@ -903,7 +940,7 @@ done
   exit 1
 }
 
-systemctl reload nginx
+activate_nginx
 PROXY_HEALTH=FAILED
 for _ in $(seq 1 10); do
   if curl -sf --max-time 5 --noproxy '*' \

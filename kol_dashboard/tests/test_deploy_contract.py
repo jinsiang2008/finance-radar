@@ -112,11 +112,11 @@ class DeploymentContractTests(unittest.TestCase):
         decision_start = self.collect.index("  decision)", macro_start)
         kol_job = self.collect[kol_start:macro_start]
         macro_job = self.collect[macro_start:decision_start]
-        self.assertLess(
+        self.assertGreater(
             kol_job.index("signal_enrichment"),
             kol_job.index('decision_collect.py" relations'),
         )
-        self.assertLess(
+        self.assertGreater(
             macro_job.index("signal_enrichment"),
             macro_job.index('decision_collect.py" relations'),
         )
@@ -203,6 +203,56 @@ class DeploymentContractTests(unittest.TestCase):
             "text/javascript text/css image/svg+xml;",
             dynamic_location,
         )
+
+    def test_nginx_preflight_rejects_legacy_include_before_service_stop(
+        self,
+    ) -> None:
+        preflight = self.deploy.index(
+            "NGINX_SITE=/etc/nginx/sites-enabled/aidao"
+        )
+        rollback_ready = self.deploy.index("\nROLLBACK_READY=1\n", preflight)
+        service_stop = self.deploy.index(
+            "systemctl stop kol-enrich-wakeup.path", preflight
+        )
+        gate = self.deploy[preflight:rollback_ready]
+
+        self.assertIn(
+            "/root/kol-dashboard/deployment/nginx/kol.locations.conf",
+            gate,
+        )
+        self.assertIn("LEGACY_INCLUDE_STATUS", gate)
+        self.assertIn("nginx -t", gate)
+        self.assertLess(preflight, rollback_ready)
+        self.assertLess(preflight, service_stop)
+
+    def test_nginx_activation_starts_inactive_service_and_is_verified(
+        self,
+    ) -> None:
+        helper_start = self.deploy.index("activate_nginx()")
+        helper_end = self.deploy.index("\n}\n", helper_start) + 3
+        helper = self.deploy[helper_start:helper_end]
+        self.assertIn("systemctl reload nginx", helper)
+        self.assertIn("systemctl start nginx", helper)
+        self.assertGreaterEqual(
+            helper.count("systemctl is-active --quiet nginx"),
+            2,
+        )
+
+        direct_health = self.deploy.index('[[ "$DIRECT_HEALTH" == ok ]]')
+        activation = self.deploy.index("\nactivate_nginx\n", direct_health)
+        proxy_health = self.deploy.index("PROXY_HEALTH=FAILED", activation)
+        self.assertLess(direct_health, activation)
+        self.assertLess(activation, proxy_health)
+
+        rollback = self.deploy.index("cleanup_remote()")
+        restore = self.deploy.index(
+            "rollback_configuration || rollback_failed=1", rollback
+        )
+        rollback_activation = self.deploy.index(
+            "activate_nginx >/dev/null 2>&1 || rollback_failed=1",
+            restore,
+        )
+        self.assertGreater(rollback_activation, restore)
 
     def test_existing_deepseek_secret_file_must_be_root_only(self) -> None:
         self.assertIn(

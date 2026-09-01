@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -877,6 +878,7 @@ class DatabaseTests(unittest.TestCase):
         db.insert_events([self.event()])
         with db.conn() as connection:
             connection.execute("UPDATE events SET source_count=99")
+            connection.execute("PRAGMA user_version=0")
 
         db.init()
 
@@ -916,6 +918,7 @@ class DatabaseTests(unittest.TestCase):
                     ),
                 )
             connection.execute("UPDATE events SET source_count=99")
+            connection.execute("PRAGMA user_version=0")
 
         db.init()
 
@@ -2449,6 +2452,168 @@ class LegacyMigrationTests(unittest.TestCase):
                     for statement in statements
                 )
             )
+            normalized = [statement.strip().upper() for statement in statements]
+            begin_at = normalized.index("BEGIN IMMEDIATE")
+            version_at = normalized.index(
+                f"PRAGMA USER_VERSION={db._DB_SCHEMA_VERSION}"
+            )
+            commit_at = normalized.index("COMMIT", version_at)
+            self.assertLess(begin_at, version_at)
+            self.assertLess(version_at, commit_at)
+
+    def test_current_schema_init_fast_path_is_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "current-schema.sqlite3")
+            with mock.patch.object(db, "DB_PATH", path):
+                db.init()
+                statements: list[str] = []
+                real_connect = sqlite3.connect
+
+                def traced_connect(*args, **kwargs):
+                    connection = real_connect(*args, **kwargs)
+                    connection.set_trace_callback(statements.append)
+                    return connection
+
+                with mock.patch.object(
+                    db, "_backfill_publication_metadata_in"
+                ) as publication_backfill, mock.patch.object(
+                    db, "_normalize_sighting_urls_in"
+                ) as sighting_normalization, mock.patch.object(
+                    db, "_backfill_sightings_in"
+                ) as sighting_backfill, mock.patch.object(
+                    db, "backfill_dedup"
+                ) as dedup_backfill, mock.patch.object(
+                    db.sqlite3, "connect", side_effect=traced_connect
+                ):
+                    db.init()
+
+            normalized = [statement.strip().upper() for statement in statements]
+            self.assertIn("PRAGMA USER_VERSION", normalized)
+            self.assertNotIn("BEGIN IMMEDIATE", normalized)
+            self.assertFalse(
+                any(
+                    statement.startswith(
+                        ("INSERT ", "UPDATE ", "DELETE ", "CREATE ", "ALTER ", "DROP ")
+                    )
+                    for statement in normalized
+                )
+            )
+            publication_backfill.assert_not_called()
+            sighting_normalization.assert_not_called()
+            sighting_backfill.assert_not_called()
+            dedup_backfill.assert_not_called()
+
+    def test_schema_marker_rolls_back_with_failed_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "atomic-schema.sqlite3")
+            with mock.patch.object(db, "DB_PATH", path):
+                with mock.patch.object(
+                    db, "backfill_dedup", side_effect=RuntimeError("injected")
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "injected"):
+                        db.init()
+
+                connection = sqlite3.connect(path)
+                try:
+                    version = connection.execute("PRAGMA user_version").fetchone()[0]
+                    events_table = connection.execute(
+                        "SELECT 1 FROM sqlite_master "
+                        "WHERE type='table' AND name='events'"
+                    ).fetchone()
+                finally:
+                    connection.close()
+
+                self.assertEqual(version, 0)
+                self.assertIsNone(events_table)
+                db.init()
+
+    def test_concurrent_initializers_wait_and_migrate_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "concurrent-schema.sqlite3")
+            entered = threading.Event()
+            release = threading.Event()
+            counter_lock = threading.Lock()
+            errors: list[BaseException] = []
+            calls = 0
+            real_backfill = db.backfill_dedup
+
+            def gated_backfill(*args, **kwargs):
+                nonlocal calls
+                with counter_lock:
+                    calls += 1
+                    first = calls == 1
+                if first:
+                    entered.set()
+                    if not release.wait(timeout=2):
+                        raise AssertionError("concurrent initializer did not start")
+                return real_backfill(*args, **kwargs)
+
+            def initialize() -> None:
+                try:
+                    db.init()
+                except BaseException as exc:  # Thread failures must reach the test.
+                    errors.append(exc)
+
+            with mock.patch.object(db, "DB_PATH", path), mock.patch.dict(
+                db.os.environ,
+                {db._BEGIN_RETRY_ENV: "2"},
+            ), mock.patch.object(
+                db, "backfill_dedup", side_effect=gated_backfill
+            ):
+                first = threading.Thread(target=initialize)
+                second = threading.Thread(target=initialize)
+                first.start()
+                self.assertTrue(entered.wait(timeout=1))
+                second.start()
+                threading.Event().wait(0.075)
+                self.assertTrue(second.is_alive())
+                release.set()
+                first.join(timeout=3)
+                second.join(timeout=3)
+
+                self.assertFalse(first.is_alive())
+                self.assertFalse(second.is_alive())
+                self.assertEqual(errors, [])
+                self.assertEqual(calls, 1)
+                with db.conn() as connection:
+                    self.assertEqual(
+                        connection.execute("PRAGMA user_version").fetchone()[0],
+                        db._DB_SCHEMA_VERSION,
+                    )
+
+    def test_begin_retry_budget_never_enters_or_replays_user_sql(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "bounded-busy.sqlite3")
+            with mock.patch.object(db, "DB_PATH", path):
+                db.init()
+                blocker = sqlite3.connect(path, timeout=0)
+                blocker.execute("BEGIN IMMEDIATE")
+                body_calls = 0
+                started_at = db.time.monotonic()
+                try:
+                    with mock.patch.dict(
+                        db.os.environ,
+                        {db._BEGIN_RETRY_ENV: "0.06"},
+                    ):
+                        with self.assertRaises(sqlite3.OperationalError):
+                            with db.conn(immediate=True):
+                                body_calls += 1
+                finally:
+                    blocker.rollback()
+                    blocker.close()
+
+                elapsed = db.time.monotonic() - started_at
+                self.assertEqual(body_calls, 0)
+                self.assertGreaterEqual(elapsed, 0.04)
+                self.assertLess(elapsed, 1.0)
+
+                with self.assertRaisesRegex(
+                    sqlite3.OperationalError, "body failure"
+                ):
+                    with db.conn(immediate=True):
+                        body_calls += 1
+                        raise sqlite3.OperationalError("body failure")
+                self.assertEqual(body_calls, 1)
 
     def test_decision_snapshot_round_trip_versioning_and_pruning(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

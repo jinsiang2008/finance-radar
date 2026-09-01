@@ -45,9 +45,10 @@ import os
 import re
 import secrets
 import sqlite3
+import time
 import unicodedata
 import urllib.parse
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -61,6 +62,17 @@ _DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "data"
 DB_PATH = os.environ.get(
     "KOL_DASHBOARD_DB", str(_DEFAULT_DATA_DIR / "kol_dashboard.db")
 )
+
+# ``PRAGMA user_version`` is the durable, transactionally updated schema marker.
+# Bump this whenever ``init`` gains a new migration that existing databases must
+# execute.  A current database takes the read-only fast path instead of scanning
+# and rewriting the event tables on every process start.
+_DB_SCHEMA_VERSION = 1
+_BEGIN_RETRY_ENV = "KOL_DB_BEGIN_RETRY_SECONDS"
+_DEFAULT_BEGIN_RETRY_SECONDS = 30.0
+_MAX_BEGIN_RETRY_SECONDS = 120.0
+_BEGIN_RETRY_INITIAL_DELAY_SECONDS = 0.025
+_BEGIN_RETRY_MAX_DELAY_SECONDS = 0.5
 
 RETENTION_DAYS = 14
 
@@ -134,6 +146,53 @@ def _event_ai_cache_current_sql(
     )
 
 
+def _begin_retry_budget_seconds() -> float:
+    raw = os.environ.get(_BEGIN_RETRY_ENV)
+    if raw is None:
+        return _DEFAULT_BEGIN_RETRY_SECONDS
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_BEGIN_RETRY_SECONDS
+    if not math.isfinite(value):
+        return _DEFAULT_BEGIN_RETRY_SECONDS
+    return min(max(value, 0.0), _MAX_BEGIN_RETRY_SECONDS)
+
+
+def _is_sqlite_lock_error(exc: sqlite3.OperationalError) -> bool:
+    error_code = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(error_code, int):
+        # Extended result codes preserve the primary code in the low byte.
+        if error_code & 0xFF in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+            return True
+    message = str(exc).lower()
+    return "locked" in message or "busy" in message
+
+
+def _begin_immediate(c: sqlite3.Connection) -> None:
+    """Acquire the SQLite writer slot with bounded begin-only retries.
+
+    The context body is entered only after this succeeds.  Operational errors
+    raised by user SQL or commit are deliberately propagated and never replayed.
+    """
+
+    budget = _begin_retry_budget_seconds()
+    deadline = time.monotonic() + budget
+    delay = _BEGIN_RETRY_INITIAL_DELAY_SECONDS
+    while True:
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            return
+        except sqlite3.OperationalError as exc:
+            if not _is_sqlite_lock_error(exc):
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            time.sleep(min(delay, remaining))
+            delay = min(delay * 2, _BEGIN_RETRY_MAX_DELAY_SECONDS)
+
+
 @contextmanager
 def conn(*, immediate: bool = False):
     c = sqlite3.connect(DB_PATH, timeout=10)
@@ -159,11 +218,19 @@ def conn(*, immediate: bool = False):
         _event_ai_cache_current_sql,
     )
     c.execute("PRAGMA foreign_keys=ON")
-    c.execute("PRAGMA journal_mode=WAL")
+    # Reissuing ``journal_mode=WAL`` can itself contend with a live writer.
+    # Current databases therefore take a read-only mode check; the transition
+    # is only needed once for a new or legacy non-WAL database.
+    journal_mode = str(c.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+    if journal_mode != "wal":
+        c.execute("PRAGMA journal_mode=WAL")
     c.execute("PRAGMA synchronous=NORMAL")
     try:
         if immediate:
-            c.execute("BEGIN IMMEDIATE")
+            # Disable the driver's separate opaque busy wait so the configured
+            # retry budget applies to BEGIN as a whole, not to every attempt.
+            c.execute("PRAGMA busy_timeout=0")
+            _begin_immediate(c)
         yield c
         c.commit()
     except Exception:
@@ -1071,11 +1138,40 @@ def _normalize_sighting_urls_in(c) -> None:
         c.execute("DELETE FROM event_sightings WHERE id=?", (row["id"],))
 
 
+def _schema_version_in(c: sqlite3.Connection) -> int:
+    return int(c.execute("PRAGMA user_version").fetchone()[0])
+
+
+def _ensure_supported_schema_version(version: int) -> None:
+    if version > _DB_SCHEMA_VERSION:
+        raise RuntimeError(
+            "database schema is newer than this application "
+            f"({version} > {_DB_SCHEMA_VERSION})"
+        )
+
+
 def init() -> None:
     parent = os.path.dirname(DB_PATH)
     if parent:
         os.makedirs(parent, exist_ok=True)
+
+    # The overwhelmingly common startup path performs one version read and no
+    # write transaction.  This also avoids repeating the publication, sighting
+    # and dedup full-table backfills while collectors are active.
+    with conn() as c:
+        version = _schema_version_in(c)
+        _ensure_supported_schema_version(version)
+        if version == _DB_SCHEMA_VERSION:
+            return
+
     with conn(immediate=True) as c:
+        # Another process may have completed the migration while this process
+        # was backing off for the writer slot.
+        version = _schema_version_in(c)
+        _ensure_supported_schema_version(version)
+        if version == _DB_SCHEMA_VERSION:
+            return
+
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS events (
@@ -1484,8 +1580,10 @@ def init() -> None:
         _backfill_publication_metadata_in(c)
         _normalize_sighting_urls_in(c)
         _backfill_sightings_in(c)
-
-    backfill_dedup()
+        backfill_dedup(connection=c)
+        # The marker is deliberately the final statement in the same migration
+        # transaction.  Any schema/backfill failure rolls it back as one unit.
+        c.execute(f"PRAGMA user_version={_DB_SCHEMA_VERSION}")
 
 
 def get_meta_in(c, key: str) -> str | None:
@@ -1505,14 +1603,23 @@ def set_meta_in(c, key: str, value: str) -> None:
 _DEDUP_ALGO_VERSION = "3"
 
 
-def backfill_dedup() -> dict[str, int]:
+def backfill_dedup(
+    *, connection: sqlite3.Connection | None = None
+) -> dict[str, int]:
     """Populate dedup_key/canonical_url, collapse duplicate rows, enforce uniqueness.
 
-    Idempotent — safe to run on every startup. When the fingerprint algorithm
-    changes, every row is re-keyed so newly-matching stories merge.
+    Idempotent and available as an explicit repair operation. ``init`` passes
+    its migration transaction so the first schema version marker is atomic.
+    When the fingerprint algorithm changes, every row is re-keyed so
+    newly-matching stories merge.
     """
     stats = {"rekeyed": 0, "merged": 0}
-    with conn(immediate=True) as c:
+    transaction = (
+        nullcontext(connection)
+        if connection is not None
+        else conn(immediate=True)
+    )
+    with transaction as c:
         rekey_all = get_meta_in(c, "dedup_algo_version") != _DEDUP_ALGO_VERSION
         # A re-key moves rows onto colliding keys, so uniqueness can't hold mid-flight.
         if rekey_all:
