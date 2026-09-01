@@ -33,7 +33,13 @@ class DeploymentContractTests(unittest.TestCase):
             self.assertIn(filename, self.deploy)
 
     def test_deploy_bundle_omits_macos_appledouble_metadata(self) -> None:
-        self.assertIn("COPYFILE_DISABLE=1 tar czf", self.deploy)
+        self.assertIn("COPYFILE_DISABLE=1 tar --no-xattrs czf", self.deploy)
+
+    def test_deploy_defaults_to_a_production_sized_remote_timeout(self) -> None:
+        self.assertIn(
+            'export RSH_TIMEOUT="${RSH_TIMEOUT:-1200}"',
+            self.deploy,
+        )
 
     def test_systemd_uses_root_only_environment_file(self) -> None:
         self.assertIn("EnvironmentFile=-/etc/kol-dashboard.env", self.deploy)

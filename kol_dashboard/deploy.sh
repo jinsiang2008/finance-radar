@@ -10,6 +10,10 @@
 set -euo pipefail
 umask 077
 
+# A production-size SQLite backup plus decision snapshot prewarm can exceed the
+# helper's generic 60-second SSH ceiling. Callers may raise this further.
+export RSH_TIMEOUT="${RSH_TIMEOUT:-1200}"
+
 VPS="${VPS_HELPER:-$HOME/.cursor/skills/aliyun-ops/scripts/vps.sh}"
 [[ -x "$VPS" ]] || { echo "缺少远程操作 helper: $VPS" >&2; exit 1; }
 
@@ -56,7 +60,7 @@ cp "$LIB_DIR"/{kol_tracker.py,macro_fetcher.py,risk_radar.py} "$WORK/pkg/lib/"
 cp "$LIB_DIR/serenity_tracker.py" "$WORK/pkg/lib/"
 # macOS tar otherwise serializes extended attributes as AppleDouble `._*`
 # files, which Linux compileall mistakes for Python source files.
-COPYFILE_DISABLE=1 tar czf "$WORK/app.tgz" \
+COPYFILE_DISABLE=1 tar --no-xattrs czf "$WORK/app.tgz" \
   --exclude='__pycache__' --exclude='*.pyc' -C "$WORK/pkg" .
 
 echo "→ 创建远端私有暂存区"
