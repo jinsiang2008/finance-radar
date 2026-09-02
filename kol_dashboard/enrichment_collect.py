@@ -101,6 +101,115 @@ def _response_parts(value: Any) -> tuple[dict[str, Any], Any, int | None]:
     )
 
 
+def _manual_request_task(request: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Resolve a queued identity against current canonical public evidence."""
+    kind = str(request.get("subject_type") or "")
+    subject_key = str(request.get("subject_key") or "")
+    event: Mapping[str, Any] | None = None
+    if kind == "event":
+        try:
+            event = db.get_event_enrichment_subject(int(subject_key))
+        except (TypeError, ValueError):
+            event = None
+        if event is None or not llm_enrichment.is_event_enrichment_eligible(event):
+            db.complete_ai_enrichment_request(
+                int(request["id"]),
+                subject_type=kind,
+                subject_key=subject_key,
+                input_hash=str(request.get("input_hash") or ""),
+                prompt_version=str(request.get("prompt_version") or ""),
+                superseded=True,
+            )
+            return None
+        event_input, input_hash = llm_enrichment.build_event_input(event)
+        prompt_version = llm_enrichment.PROMPT_VERSION
+    elif kind == "macro_event":
+        snapshot = db.latest_macro()
+        monitored = (
+            snapshot.get("monitored_events")
+            if isinstance(snapshot, Mapping)
+            else None
+        )
+        if isinstance(monitored, list):
+            for candidate in monitored[:24]:
+                if (
+                    isinstance(candidate, Mapping)
+                    and llm_enrichment.macro_event_key(candidate) == subject_key
+                ):
+                    event = candidate
+                    break
+        if event is None:
+            db.complete_ai_enrichment_request(
+                int(request["id"]),
+                subject_type=kind,
+                subject_key=subject_key,
+                input_hash=str(request.get("input_hash") or ""),
+                prompt_version=str(request.get("prompt_version") or ""),
+                superseded=True,
+            )
+            return None
+        event_input, input_hash = llm_enrichment.build_macro_event_input(event)
+        prompt_version = llm_enrichment.MACRO_PROMPT_VERSION
+    else:
+        return None
+
+    if (
+        input_hash != request.get("input_hash")
+        or prompt_version != request.get("prompt_version")
+    ):
+        db.complete_ai_enrichment_request(
+            int(request["id"]),
+            subject_type=kind,
+            subject_key=subject_key,
+            input_hash=str(request.get("input_hash") or ""),
+            prompt_version=str(request.get("prompt_version") or ""),
+            superseded=True,
+        )
+        return None
+    return {
+        "kind": kind,
+        "subject_key": subject_key,
+        "input": event_input,
+        "input_hash": input_hash,
+        "prompt_version": prompt_version,
+        "event": event,
+        "manual_request_id": int(request["id"]),
+    }
+
+
+def _event_task_is_current(
+    event: Mapping[str, Any],
+    task: Mapping[str, Any],
+) -> bool:
+    if not llm_enrichment.is_event_enrichment_eligible(event):
+        return False
+    _, input_hash = llm_enrichment.build_event_input(event)
+    return (
+        input_hash == task.get("input_hash")
+        and task.get("prompt_version") == llm_enrichment.PROMPT_VERSION
+    )
+
+
+def _macro_task_is_current(
+    snapshot: Mapping[str, Any],
+    task: Mapping[str, Any],
+) -> bool:
+    monitored = snapshot.get("monitored_events")
+    if not isinstance(monitored, list):
+        return False
+    for candidate in monitored[:24]:
+        if not isinstance(candidate, Mapping):
+            continue
+        if llm_enrichment.macro_event_key(candidate) != task.get("subject_key"):
+            continue
+        _, input_hash = llm_enrichment.build_macro_event_input(candidate)
+        return (
+            input_hash == task.get("input_hash")
+            and task.get("prompt_version") == llm_enrichment.MACRO_PROMPT_VERSION
+        )
+    return False
+
+
 def run(
     *,
     limit: int,
@@ -140,6 +249,12 @@ def run(
 
     counts: Counter[str] = Counter()
     stopped = False
+
+    manual_tasks: list[dict[str, Any]] = []
+    for request in db.query_pending_ai_enrichment_requests(limit=200):
+        task = _manual_request_task(request)
+        if task is not None:
+            manual_tasks.append(task)
 
     snapshot = db.latest_macro()
     monitored_events = (
@@ -186,9 +301,23 @@ def run(
             }
         )
 
+    manual_subjects = {
+        (task["kind"], task["subject_key"]) for task in manual_tasks
+    }
+    macro_tasks = [
+        task
+        for task in macro_tasks
+        if (task["kind"], task["subject_key"]) not in manual_subjects
+    ]
+    event_tasks = [
+        task
+        for task in event_tasks
+        if (task["kind"], task["subject_key"]) not in manual_subjects
+    ]
+
     # Alternate task kinds so a full macro batch cannot block a time-sensitive
     # KOL event. Warm cache rows do not consume either processing quota.
-    pending: list[dict[str, Any]] = []
+    pending: list[dict[str, Any]] = list(manual_tasks)
     for index in range(max(len(macro_tasks), len(event_tasks))):
         if index < len(macro_tasks):
             pending.append(macro_tasks[index])
@@ -197,37 +326,92 @@ def run(
     pending_index = 0
     active: dict[Future[Any], dict[str, Any]] = {}
 
+    def complete_manual(task: Mapping[str, Any], *, superseded: bool = False) -> None:
+        request_id = task.get("manual_request_id")
+        if request_id is None:
+            return
+        db.complete_ai_enrichment_request(
+            int(request_id),
+            subject_type=str(task["kind"]),
+            subject_key=str(task["subject_key"]),
+            input_hash=str(task["input_hash"]),
+            prompt_version=str(task["prompt_version"]),
+            superseded=superseded,
+        )
+
+    def settle_manual_without_claim(task: Mapping[str, Any]) -> None:
+        if task.get("manual_request_id") is None:
+            return
+        status = db.get_ai_enrichment_request_status(
+            subject_type=str(task["kind"]),
+            subject_key=str(task["subject_key"]),
+            input_hash=str(task["input_hash"]),
+            prompt_version=str(task["prompt_version"]),
+            model=config.model,
+        )
+        # A live claim or retry keeps an old, manually selected event reachable
+        # even when it is outside the normal 72-hour candidate window.
+        if status.get("state") in {"ready", "failed"}:
+            complete_manual(task)
+
     def claim_and_submit(executor: ThreadPoolExecutor, task: dict[str, Any]) -> None:
         nonlocal stopped
         kind = task["kind"]
+        identity_current = [True]
         if kind == "macro_event":
+
+            def current_snapshot_check(snapshot: Mapping[str, Any]) -> bool:
+                identity_current[0] = _macro_task_is_current(snapshot, task)
+                return identity_current[0]
+
             claim = db.claim_macro_event_enrichment(
                 task["subject_key"],
                 input_hash=task["input_hash"],
                 prompt_version=task["prompt_version"],
                 model=config.model,
                 evidence_basis=task["input"]["evidence_basis"],
+                current_snapshot_check=current_snapshot_check,
             )
             if claim is None:
+                if identity_current[0]:
+                    settle_manual_without_claim(task)
+                else:
+                    complete_manual(task, superseded=True)
                 return
             claim_token, attempt_count = claim
             counts["macro_processed"] += 1
         else:
             event = task["event"]
-            claim_token = db.claim_event_enrichment(
+
+            def current_event_check(current_event: Mapping[str, Any]) -> bool:
+                identity_current[0] = _event_task_is_current(current_event, task)
+                return identity_current[0]
+
+            claim = db.claim_event_enrichment(
                 int(event["id"]),
                 input_hash=task["input_hash"],
                 prompt_version=task["prompt_version"],
                 model=config.model,
                 evidence_basis=task["input"]["evidence_basis"],
+                current_event_check=current_event_check,
+                return_attempt_count=True,
             )
-            if claim_token is None:
+            if claim is None:
+                if identity_current[0]:
+                    settle_manual_without_claim(task)
+                else:
+                    complete_manual(task, superseded=True)
                 return
-            attempt_count = _event_attempt_count(
-                event,
-                input_hash=task["input_hash"],
-                model=config.model,
-            )
+            if isinstance(claim, tuple):
+                claim_token, attempt_count = claim
+            else:
+                # Preserve compatibility with simple test doubles and wrappers.
+                claim_token = claim
+                attempt_count = _event_attempt_count(
+                    event,
+                    input_hash=task["input_hash"],
+                    model=config.model,
+                )
             counts["processed"] += 1
         task["claim_token"] = claim_token
         task["attempt_count"] = attempt_count
@@ -335,6 +519,10 @@ def run(
                 latency_ms=latency_ms,
                 usage=exc.usage,
             )
+            if not persisted:
+                complete_manual(task, superseded=True)
+            elif retry_after is None:
+                complete_manual(task)
             if exc.code in _PROVIDER_WIDE_ERRORS:
                 stopped = True
             return
@@ -368,6 +556,7 @@ def run(
             latency_ms=latency_ms,
             usage=usage,
         )
+        complete_manual(task, superseded=not saved)
 
     with ThreadPoolExecutor(
         max_workers=safe_concurrency,
@@ -407,6 +596,7 @@ def run(
         "macro_retry": counts["macro_retry"],
         "macro_failed": counts["macro_failed"],
         "macro_superseded": counts["macro_superseded"],
+        "manual_requests": len(manual_tasks),
         "concurrency": safe_concurrency,
     }, stopped
 

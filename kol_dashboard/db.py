@@ -51,7 +51,7 @@ import urllib.parse
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 try:
     from kol_dashboard.content_quality import is_event_content_eligible
@@ -67,12 +67,18 @@ DB_PATH = os.environ.get(
 # Bump this whenever ``init`` gains a new migration that existing databases must
 # execute.  A current database takes the read-only fast path instead of scanning
 # and rewriting the event tables on every process start.
-_DB_SCHEMA_VERSION = 1
+_DB_SCHEMA_VERSION = 2
 _BEGIN_RETRY_ENV = "KOL_DB_BEGIN_RETRY_SECONDS"
 _DEFAULT_BEGIN_RETRY_SECONDS = 30.0
 _MAX_BEGIN_RETRY_SECONDS = 120.0
 _BEGIN_RETRY_INITIAL_DELAY_SECONDS = 0.025
 _BEGIN_RETRY_MAX_DELAY_SECONDS = 0.5
+
+_AI_REQUEST_COOLDOWN_ENV = "KOL_AI_REQUEST_COOLDOWN_SECONDS"
+_AI_REQUEST_HOURLY_ENV = "KOL_AI_REQUEST_HOURLY_LIMIT"
+_AI_REQUEST_DAILY_ENV = "KOL_AI_REQUEST_DAILY_LIMIT"
+_AI_REQUEST_PENDING_ENV = "KOL_AI_REQUEST_PENDING_LIMIT"
+_AI_REQUEST_RETENTION_ENV = "KOL_AI_REQUEST_RETENTION_DAYS"
 
 RETENTION_DAYS = 14
 MACRO_RETENTION_DAYS = 90
@@ -1409,6 +1415,43 @@ def init() -> None:
             "ON llm_call_attempts(model, outcome, started_at DESC)"
         )
 
+        # Authenticated users may ask the background worker to prioritize one
+        # current public subject.  This queue stores only a bounded content
+        # identity and lifecycle timestamps: never session/account data,
+        # prompts, source bodies, provider responses, or credentials.
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ai_enrichment_requests (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              subject_type TEXT NOT NULL
+                CHECK(subject_type IN ('event', 'macro_event')),
+              subject_key TEXT NOT NULL,
+              input_hash TEXT NOT NULL,
+              prompt_version TEXT NOT NULL,
+              model TEXT NOT NULL,
+              status TEXT NOT NULL
+                CHECK(status IN ('pending', 'completed', 'superseded')),
+              accepted_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              completed_at TEXT
+            )
+            """
+        )
+        c.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_ai_request_pending_identity "
+            "ON ai_enrichment_requests("
+            "subject_type, subject_key, input_hash, prompt_version"
+            ") WHERE status='pending'"
+        )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ai_request_queue "
+            "ON ai_enrichment_requests(status, id)"
+        )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ai_request_accepted "
+            "ON ai_enrichment_requests(accepted_at DESC)"
+        )
+
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS relations (
@@ -2108,11 +2151,21 @@ def claim_event_enrichment(
     evidence_basis: str,
     now: datetime | None = None,
     processing_lease_seconds: int = 20 * 60,
-) -> str | None:
+    current_event_check: Callable[[Mapping[str, Any]], bool] | None = None,
+    return_attempt_count: bool = False,
+) -> str | tuple[str, int] | None:
     """Atomically claim an event unless its cache is fresh or lease is live."""
     current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     now_iso = current.replace(microsecond=0).isoformat()
     with conn(immediate=True) as c:
+        if current_event_check is not None:
+            event_row = c.execute(
+                "SELECT id, title, snippet, source, url, canonical_url, "
+                "kol_name, kol_name_cn, tickers FROM events WHERE id=?",
+                (int(event_id),),
+            ).fetchone()
+            if event_row is None or not current_event_check(dict(event_row)):
+                return None
         row = c.execute(
             "SELECT input_hash, prompt_version, status, model, updated_at, "
             "next_attempt_at, attempt_count FROM event_enrichments "
@@ -2177,7 +2230,7 @@ def claim_event_enrichment(
                 claim_token,
             ),
         )
-    return claim_token
+    return (claim_token, attempts) if return_attempt_count else claim_token
 
 
 def save_event_enrichment(
@@ -2391,6 +2444,7 @@ def claim_macro_event_enrichment(
     evidence_basis: str,
     now: datetime | None = None,
     processing_lease_seconds: int = 20 * 60,
+    current_snapshot_check: Callable[[Mapping[str, Any]], bool] | None = None,
 ) -> tuple[str, int] | None:
     """Atomically claim one current macro-event cache and return its attempt."""
     safe_key = str(event_key or "").strip()[:160]
@@ -2399,6 +2453,20 @@ def claim_macro_event_enrichment(
     current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     now_iso = current.replace(microsecond=0).isoformat()
     with conn(immediate=True) as c:
+        if current_snapshot_check is not None:
+            snapshot_row = c.execute(
+                "SELECT payload FROM macro_snapshots ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            try:
+                snapshot = (
+                    json.loads(snapshot_row["payload"])
+                    if snapshot_row is not None
+                    else None
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                snapshot = None
+            if not isinstance(snapshot, Mapping) or not current_snapshot_check(snapshot):
+                return None
         row = c.execute(
             "SELECT input_hash, prompt_version, status, model, updated_at, "
             "next_attempt_at, attempt_count FROM macro_event_enrichments "
@@ -2558,6 +2626,395 @@ def fail_macro_event_enrichment(
             ),
         )
     return cur.rowcount == 1
+
+
+# ─── Authenticated manual enrichment priority queue ───
+
+def _bounded_env_integer(
+    name: str,
+    default: int,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+def _ai_request_limits() -> dict[str, int]:
+    hourly = _bounded_env_integer(
+        _AI_REQUEST_HOURLY_ENV, 20, minimum=1, maximum=200
+    )
+    daily = _bounded_env_integer(
+        _AI_REQUEST_DAILY_ENV, 50, minimum=hourly, maximum=500
+    )
+    return {
+        "cooldown": _bounded_env_integer(
+            _AI_REQUEST_COOLDOWN_ENV, 10, minimum=1, maximum=300
+        ),
+        "hourly": hourly,
+        "daily": daily,
+        "pending": _bounded_env_integer(
+            _AI_REQUEST_PENDING_ENV, 50, minimum=1, maximum=200
+        ),
+        "retention_days": _bounded_env_integer(
+            _AI_REQUEST_RETENTION_ENV, 7, minimum=1, maximum=90
+        ),
+    }
+
+
+def _ai_request_identity(
+    subject_type: str,
+    subject_key: str,
+    input_hash: str,
+    prompt_version: str,
+    model: str,
+) -> tuple[str, str, str, str, str]:
+    kind = str(subject_type or "").strip()
+    if kind not in {"event", "macro_event"}:
+        raise ValueError("unsupported ai request subject_type")
+    key = _required_text(subject_key, "subject_key", maximum=160)
+    digest = _required_text(input_hash, "input_hash", maximum=128)
+    prompt = _required_text(prompt_version, "prompt_version", maximum=100)
+    clean_model = _required_text(model, "model", maximum=100)
+    return kind, key, digest, prompt, clean_model
+
+
+def _ai_cache_request_state_in(
+    c: sqlite3.Connection,
+    *,
+    subject_type: str,
+    subject_key: str,
+    input_hash: str,
+    prompt_version: str,
+    now: datetime,
+    ready_state: str,
+    processing_lease_seconds: int = 20 * 60,
+) -> dict[str, Any] | None:
+    if subject_type == "event":
+        row = c.execute(
+            "SELECT input_hash, prompt_version, status, updated_at, "
+            "next_attempt_at, generated_at FROM event_enrichments "
+            "WHERE event_id=?",
+            (int(subject_key),),
+        ).fetchone()
+    else:
+        row = c.execute(
+            "SELECT input_hash, prompt_version, status, updated_at, "
+            "next_attempt_at, generated_at FROM macro_event_enrichments "
+            "WHERE event_key=?",
+            (subject_key,),
+        ).fetchone()
+    if (
+        row is None
+        or row["input_hash"] != input_hash
+        or row["prompt_version"] != prompt_version
+    ):
+        return None
+
+    status = str(row["status"] or "")
+    if status == "ready":
+        return {
+            "state": ready_state,
+            "can_request": False,
+            "generated_at": row["generated_at"],
+        }
+    if status == "failed":
+        return {"state": "failed", "can_request": False}
+    if status == "retry":
+        retry_at = _parse_utc_datetime(row["next_attempt_at"])
+        if retry_at is not None and retry_at > now:
+            retry_after = max(1, math.ceil((retry_at - now).total_seconds()))
+            return {
+                "state": "retry_wait",
+                "can_request": False,
+                "retry_after_seconds": retry_after,
+                "next_attempt_at": retry_at.replace(microsecond=0).isoformat(),
+            }
+        return None
+    if status == "processing":
+        updated = _parse_utc_datetime(row["updated_at"])
+        if updated is not None and (
+            now - updated
+        ).total_seconds() < max(60, int(processing_lease_seconds)):
+            return {"state": "processing", "can_request": False}
+        return None
+    return None
+
+
+def _prune_ai_requests_in(
+    c: sqlite3.Connection,
+    *,
+    now: datetime,
+    retention_days: int,
+) -> None:
+    cutoff = (now - timedelta(days=retention_days)).replace(
+        microsecond=0
+    ).isoformat()
+    c.execute(
+        "DELETE FROM ai_enrichment_requests "
+        "WHERE status<>'pending' AND accepted_at<?",
+        (cutoff,),
+    )
+    # Keep storage bounded even when a custom retention window is generous.
+    c.execute(
+        "DELETE FROM ai_enrichment_requests "
+        "WHERE status<>'pending' AND id NOT IN ("
+        "SELECT id FROM ai_enrichment_requests WHERE status<>'pending' "
+        "ORDER BY id DESC LIMIT 2000)"
+    )
+
+
+def request_ai_enrichment(
+    *,
+    subject_type: str,
+    subject_key: str,
+    input_hash: str,
+    prompt_version: str,
+    model: str,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Cache-aware, quota-bound enqueue for one current public identity."""
+    kind, key, digest, prompt, clean_model = _ai_request_identity(
+        subject_type, subject_key, input_hash, prompt_version, model
+    )
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    now_iso = current.replace(microsecond=0).isoformat()
+    limits = _ai_request_limits()
+    with conn(immediate=True) as c:
+        cache_state = _ai_cache_request_state_in(
+            c,
+            subject_type=kind,
+            subject_key=key,
+            input_hash=digest,
+            prompt_version=prompt,
+            now=current,
+            ready_state="cached",
+        )
+        if cache_state is not None:
+            return cache_state
+
+        duplicate = c.execute(
+            "SELECT id, accepted_at FROM ai_enrichment_requests "
+            "WHERE subject_type=? AND subject_key=? AND input_hash=? "
+            "AND prompt_version=? AND status='pending' ORDER BY id DESC LIMIT 1",
+            (kind, key, digest, prompt),
+        ).fetchone()
+        if duplicate is not None:
+            return {
+                "state": "already_queued",
+                "can_request": False,
+                "accepted_at": duplicate["accepted_at"],
+            }
+
+        _prune_ai_requests_in(
+            c,
+            now=current,
+            retention_days=limits["retention_days"],
+        )
+        latest = c.execute(
+            "SELECT accepted_at FROM ai_enrichment_requests "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if latest is not None:
+            latest_at = _parse_utc_datetime(latest["accepted_at"])
+            if latest_at is not None:
+                elapsed = (current - latest_at).total_seconds()
+                if elapsed < limits["cooldown"]:
+                    return {
+                        "state": "rate_limited",
+                        "can_request": False,
+                        "retry_after_seconds": max(
+                            1, math.ceil(limits["cooldown"] - elapsed)
+                        ),
+                    }
+
+        for window_seconds, limit in (
+            (3600, limits["hourly"]),
+            (24 * 3600, limits["daily"]),
+        ):
+            cutoff = (current - timedelta(seconds=window_seconds)).replace(
+                microsecond=0
+            ).isoformat()
+            rows = c.execute(
+                "SELECT accepted_at FROM ai_enrichment_requests "
+                "WHERE accepted_at>? ORDER BY accepted_at",
+                (cutoff,),
+            ).fetchall()
+            if len(rows) >= limit:
+                oldest = _parse_utc_datetime(rows[0]["accepted_at"])
+                retry_after = window_seconds
+                if oldest is not None:
+                    retry_after = max(
+                        1,
+                        math.ceil(
+                            (oldest + timedelta(seconds=window_seconds) - current)
+                            .total_seconds()
+                        ),
+                    )
+                return {
+                    "state": "rate_limited",
+                    "can_request": False,
+                    "retry_after_seconds": retry_after,
+                }
+
+        replaceable = int(
+            c.execute(
+                "SELECT COUNT(*) FROM ai_enrichment_requests "
+                "WHERE status='pending' AND subject_type=? AND subject_key=?",
+                (kind, key),
+            ).fetchone()[0]
+        )
+        pending = int(
+            c.execute(
+                "SELECT COUNT(*) FROM ai_enrichment_requests "
+                "WHERE status='pending'"
+            ).fetchone()[0]
+        )
+        if pending - replaceable >= limits["pending"]:
+            return {
+                "state": "rate_limited",
+                "can_request": False,
+                "retry_after_seconds": 60,
+            }
+
+        # A changed source/prompt supersedes an older unclaimed request for the
+        # same subject.  A worker completing that older row cannot touch this
+        # new identity because completion is id-and-identity scoped below.
+        c.execute(
+            "UPDATE ai_enrichment_requests "
+            "SET status='superseded', updated_at=?, completed_at=? "
+            "WHERE status='pending' AND subject_type=? AND subject_key=?",
+            (now_iso, now_iso, kind, key),
+        )
+        cur = c.execute(
+            """
+            INSERT INTO ai_enrichment_requests (
+              subject_type, subject_key, input_hash, prompt_version, model,
+              status, accepted_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+            """,
+            (kind, key, digest, prompt, clean_model, now_iso, now_iso),
+        )
+        request_id = cur.lastrowid
+    if request_id is None:
+        raise sqlite3.IntegrityError("ai request insert returned no id")
+    return {
+        "state": "queued",
+        "can_request": False,
+        "accepted_at": now_iso,
+        "request_id": int(request_id),
+    }
+
+
+def get_ai_enrichment_request_status(
+    *,
+    subject_type: str,
+    subject_key: str,
+    input_hash: str,
+    prompt_version: str,
+    model: str,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    kind, key, digest, prompt, _ = _ai_request_identity(
+        subject_type, subject_key, input_hash, prompt_version, model
+    )
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    with conn() as c:
+        cache_state = _ai_cache_request_state_in(
+            c,
+            subject_type=kind,
+            subject_key=key,
+            input_hash=digest,
+            prompt_version=prompt,
+            now=current,
+            ready_state="ready",
+        )
+        if cache_state is not None:
+            return cache_state
+        queued = c.execute(
+            "SELECT accepted_at FROM ai_enrichment_requests "
+            "WHERE subject_type=? AND subject_key=? AND input_hash=? "
+            "AND prompt_version=? AND status='pending' ORDER BY id DESC LIMIT 1",
+            (kind, key, digest, prompt),
+        ).fetchone()
+    if queued is not None:
+        return {
+            "state": "queued",
+            "can_request": False,
+            "accepted_at": queued["accepted_at"],
+        }
+    return {"state": "pending", "can_request": True}
+
+
+def query_pending_ai_enrichment_requests(
+    *,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    safe_limit = max(1, min(int(limit), 200))
+    with conn() as c:
+        rows = c.execute(
+            "SELECT id, subject_type, subject_key, input_hash, prompt_version, "
+            "model, accepted_at FROM ai_enrichment_requests "
+            "WHERE status='pending' ORDER BY id LIMIT ?",
+            (safe_limit,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def complete_ai_enrichment_request(
+    request_id: int,
+    *,
+    subject_type: str,
+    subject_key: str,
+    input_hash: str,
+    prompt_version: str,
+    superseded: bool = False,
+    now: datetime | None = None,
+) -> bool:
+    kind, key, digest, prompt, _ = _ai_request_identity(
+        subject_type,
+        subject_key,
+        input_hash,
+        prompt_version,
+        "internal",
+    )
+    completed = (now or datetime.now(timezone.utc)).astimezone(
+        timezone.utc
+    ).replace(microsecond=0).isoformat()
+    with conn(immediate=True) as c:
+        cur = c.execute(
+            "UPDATE ai_enrichment_requests SET status=?, updated_at=?, "
+            "completed_at=? WHERE id=? AND subject_type=? AND subject_key=? "
+            "AND input_hash=? AND prompt_version=? AND status='pending'",
+            (
+                "superseded" if superseded else "completed",
+                completed,
+                completed,
+                int(request_id),
+                kind,
+                key,
+                digest,
+                prompt,
+            ),
+        )
+    return cur.rowcount == 1
+
+
+def get_event_enrichment_subject(event_id: int) -> dict[str, Any] | None:
+    """Load one event for a manual request, without the normal age window."""
+    with conn() as c:
+        row = c.execute(
+            "SELECT id, title, snippet, source, url, canonical_url, kol_name, "
+            "kol_name_cn, tickers, impact, has_market_kw, source_count, "
+            "fetched_at, published_at, published_at_status "
+            "FROM events WHERE id=?",
+            (int(event_id),),
+        ).fetchone()
+    return dict(row) if row is not None else None
 
 
 def save_macro_snapshot(report: dict[str, Any]) -> int:

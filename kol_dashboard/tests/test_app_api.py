@@ -64,6 +64,9 @@ class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
                 "KOL_DASHBOARD_SESSION_TTL_SECONDS": "3600",
                 "KOL_DASHBOARD_COOKIE_SECURE": "false",
                 "KOL_DASHBOARD_COOKIE_PATH": "/",
+                "KOL_ENRICHMENT_PENDING_PATH": str(
+                    Path(self.temp_dir.name) / "enrichment.pending"
+                ),
             },
         )
         self.environment.start()
@@ -86,6 +89,30 @@ class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
             "/api/auth/login",
             json={"passcode": "open-sesame"},
         )
+
+    def _seed_ai_event(self, *, title: str = "AI demand remains strong") -> int:
+        db.insert_events(
+            [
+                {
+                    "title": title,
+                    "url": f"https://example.com/{title.replace(' ', '-').lower()}",
+                    "snippet": "Public evidence with enough content for analysis.",
+                    "source": "Test News",
+                    "kol_key": "tester",
+                    "kol_name": "Tester",
+                    "kol_name_cn": "测试者",
+                    "impact": "medium",
+                    "has_market_kw": True,
+                    "published_at": datetime.now(timezone.utc).isoformat(),
+                }
+            ]
+        )
+        with db.conn() as connection:
+            return int(
+                connection.execute(
+                    "SELECT id FROM events ORDER BY id DESC LIMIT 1"
+                ).fetchone()[0]
+            )
 
     def _seed_decision_and_portfolio(self) -> None:
         published_at = (
@@ -193,6 +220,184 @@ class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
 
         prune = await self.client.post("/api/prune")
         self.assertEqual(prune.status_code, 401)
+
+    async def test_manual_ai_request_requires_session_header_and_exact_body(
+        self,
+    ) -> None:
+        event_id = self._seed_ai_event()
+        body = {"subject_type": "event", "subject_id": str(event_id)}
+        denied = await self.client.post(
+            "/api/private/ai-requests",
+            json=body,
+            headers={
+                "X-Finance-Radar-Action": "request-ai-enrichment"
+            },
+        )
+        self.assertEqual(denied.status_code, 401)
+        self.assertEqual(denied.headers["cache-control"], "no-store")
+
+        await self._login()
+        missing_header = await self.client.post(
+            "/api/private/ai-requests", json=body
+        )
+        self.assertEqual(missing_header.status_code, 403)
+        self.assertEqual(missing_header.headers["cache-control"], "no-store")
+        wrong_header = await self.client.post(
+            "/api/private/ai-requests",
+            json=body,
+            headers={"X-Finance-Radar-Action": "refresh"},
+        )
+        self.assertEqual(wrong_header.status_code, 403)
+        hostile_origin = await self.client.post(
+            "/api/private/ai-requests",
+            json=body,
+            headers={
+                "Origin": "https://attacker.example",
+                "X-Finance-Radar-Action": "request-ai-enrichment",
+            },
+        )
+        self.assertEqual(hostile_origin.status_code, 403)
+        self.assertEqual(hostile_origin.headers["cache-control"], "no-store")
+        preflight = await self.client.options(
+            "/api/private/ai-requests",
+            headers={
+                "Origin": "https://attacker.example",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "x-finance-radar-action",
+            },
+        )
+        self.assertNotIn("access-control-allow-origin", preflight.headers)
+        force = await self.client.post(
+            "/api/private/ai-requests",
+            json={**body, "force": True},
+            headers={
+                "X-Finance-Radar-Action": "request-ai-enrichment"
+            },
+        )
+        self.assertEqual(force.status_code, 422)
+        self.assertEqual(force.headers["cache-control"], "no-store")
+        oversized_id = await self.client.post(
+            "/api/private/ai-requests",
+            json={
+                "subject_type": "event",
+                "subject_id": "9999999999999999999",
+            },
+            headers={
+                "X-Finance-Radar-Action": "request-ai-enrichment"
+            },
+        )
+        self.assertEqual(oversized_id.status_code, 422)
+        self.assertEqual(oversized_id.headers["cache-control"], "no-store")
+
+    async def test_manual_ai_request_queues_deduplicates_and_never_leaks_identity(
+        self,
+    ) -> None:
+        event_id = self._seed_ai_event()
+        await self._login()
+        body = {"subject_type": "event", "subject_id": str(event_id)}
+        headers = {
+            "X-Finance-Radar-Action": "request-ai-enrichment"
+        }
+        queued = await self.client.post(
+            "/api/private/ai-requests", json=body, headers=headers
+        )
+        duplicate = await self.client.post(
+            "/api/private/ai-requests", json=body, headers=headers
+        )
+        status = await self.client.get(
+            "/api/private/ai-requests/status", params=body
+        )
+
+        self.assertEqual(queued.status_code, 200)
+        self.assertEqual(queued.json()["state"], "queued")
+        self.assertEqual(queued.json()["wake_up"], "immediate")
+        self.assertFalse(queued.json()["can_request"])
+        self.assertTrue(
+            (Path(self.temp_dir.name) / "enrichment.pending").exists()
+        )
+        self.assertEqual(duplicate.json()["state"], "already_queued")
+        self.assertEqual(status.json()["state"], "queued")
+        for response in (queued, duplicate, status):
+            self.assertEqual(response.headers["cache-control"], "no-store")
+            for private_name in (
+                "input_hash",
+                "prompt_version",
+                "model",
+                "claim_token",
+                "request_id",
+            ):
+                self.assertNotIn(private_name, response.text)
+
+    async def test_manual_ai_request_cached_and_latest_macro_subject(self) -> None:
+        event_id = self._seed_ai_event()
+        event = db.get_event_enrichment_subject(event_id)
+        assert event is not None
+        event_input, input_hash = llm_enrichment.build_event_input(event)
+        token = db.claim_event_enrichment(
+            event_id,
+            input_hash=input_hash,
+            prompt_version=llm_enrichment.PROMPT_VERSION,
+            model=llm_enrichment.DEFAULT_MODEL,
+            evidence_basis=event_input["evidence_basis"],
+        )
+        assert isinstance(token, str)
+        db.save_event_enrichment(
+            event_id,
+            input_hash=input_hash,
+            prompt_version=llm_enrichment.PROMPT_VERSION,
+            model=llm_enrichment.DEFAULT_MODEL,
+            claim_token=token,
+            evidence_basis=event_input["evidence_basis"],
+            result=api_enrichment_result(),
+        )
+        macro_event = {
+            "id": "ind_policy_rate",
+            "kind": "indicator",
+            "title": "Policy rate changed",
+            "source": "Official indicator",
+            "previous_value": 4.0,
+            "current_value": 4.25,
+            "unit": "%",
+            "severity": "high",
+        }
+        db.save_macro_snapshot(
+            {
+                "composite_risk": {"score": 50, "level": "medium"},
+                "monitored_events": [macro_event],
+            }
+        )
+
+        await self._login()
+        headers = {
+            "X-Finance-Radar-Action": "request-ai-enrichment"
+        }
+        event_body = {"subject_type": "event", "subject_id": str(event_id)}
+        cached = await self.client.post(
+            "/api/private/ai-requests", json=event_body, headers=headers
+        )
+        ready = await self.client.get(
+            "/api/private/ai-requests/status", params=event_body
+        )
+        macro_body = {
+            "subject_type": "macro_event",
+            "subject_id": "ind_policy_rate",
+        }
+        macro = await self.client.post(
+            "/api/private/ai-requests", json=macro_body, headers=headers
+        )
+        stale_macro = await self.client.get(
+            "/api/private/ai-requests/status",
+            params={
+                "subject_type": "macro_event",
+                "subject_id": "not-in-latest-snapshot",
+            },
+        )
+
+        self.assertEqual(cached.json()["state"], "cached")
+        self.assertEqual(ready.json()["state"], "ready")
+        self.assertEqual(macro.json()["state"], "queued")
+        self.assertEqual(stale_macro.status_code, 404)
+        self.assertEqual(stale_macro.headers["cache-control"], "no-store")
 
     async def test_missing_config_and_tampered_cookie_fail_closed(self) -> None:
         with patch.dict(os.environ, {}, clear=True):

@@ -28,11 +28,14 @@ Environment:
 
 from __future__ import annotations
 
+import json
 import os
+import re
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, Optional
+from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Path as ApiPath, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -60,6 +63,23 @@ _PUBLIC_CACHE_HEADERS = {"Cache-Control": "public, max-age=30"}
 
 class LoginBody(BaseModel):
     passcode: str = Field(min_length=1, max_length=256)
+
+
+_AI_ACTION_HEADER = "X-Finance-Radar-Action"
+_AI_ACTION_VALUE = "request-ai-enrichment"
+_AI_SUBJECT_TYPES = {"event", "macro_event"}
+_EVENT_SUBJECT_ID = re.compile(r"^[1-9][0-9]{0,18}$")
+_SQLITE_MAX_INTEGER = (1 << 63) - 1
+_AI_PUBLIC_RESPONSE_FIELDS = frozenset(
+    {
+        "state",
+        "can_request",
+        "accepted_at",
+        "generated_at",
+        "retry_after_seconds",
+        "next_attempt_at",
+    }
+)
 
 
 def _auth_config() -> auth.AuthConfig:
@@ -117,11 +137,16 @@ def require_private_session(request: Request) -> dict[str, Any]:
     return claims
 
 
-def _private_response(payload: Any, *, status_code: int = 200) -> JSONResponse:
+def _private_response(
+    payload: Any,
+    *,
+    status_code: int = 200,
+    headers: Mapping[str, str] | None = None,
+) -> JSONResponse:
     return JSONResponse(
         payload,
         status_code=status_code,
-        headers=_NO_STORE_HEADERS,
+        headers={**_NO_STORE_HEADERS, **dict(headers or {})},
     )
 
 
@@ -612,6 +637,218 @@ def _build_private_decisions() -> tuple[dict[str, Any], dict[str, Any] | None]:
             "staleness": snapshot.get("staleness"),
         }
     return overlay, snapshot
+
+
+def _ai_request_error(status_code: int, detail: str) -> None:
+    raise HTTPException(
+        status_code=status_code,
+        detail=detail,
+        headers=_NO_STORE_HEADERS,
+    )
+
+
+def _require_ai_same_origin(request: Request) -> None:
+    origin = request.headers.get("origin")
+    if origin is None:
+        return
+    try:
+        parsed = urlsplit(origin)
+    except ValueError:
+        _ai_request_error(403, "ai_same_origin_required")
+    request_host = request.headers.get("host", "").strip().casefold()
+    if (
+        parsed.scheme not in {"http", "https"}
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+        or parsed.netloc.casefold() != request_host
+    ):
+        _ai_request_error(403, "ai_same_origin_required")
+
+
+def _resolve_ai_request_subject(
+    subject_type: Any,
+    subject_id: Any,
+) -> dict[str, Any]:
+    if not isinstance(subject_type, str) or subject_type not in _AI_SUBJECT_TYPES:
+        _ai_request_error(422, "invalid_ai_subject")
+    if not isinstance(subject_id, str):
+        _ai_request_error(422, "invalid_ai_subject")
+    public_id = subject_id.strip()
+    if not public_id or len(public_id) > 160 or public_id != subject_id:
+        _ai_request_error(422, "invalid_ai_subject")
+
+    model = llm_enrichment.configured_model()
+    if subject_type == "event":
+        if not _EVENT_SUBJECT_ID.fullmatch(public_id):
+            _ai_request_error(422, "invalid_ai_subject")
+        event_id = int(public_id)
+        if event_id > _SQLITE_MAX_INTEGER:
+            _ai_request_error(422, "invalid_ai_subject")
+        event = db.get_event_enrichment_subject(event_id)
+        if event is None or not llm_enrichment.is_event_enrichment_eligible(event):
+            _ai_request_error(404, "ai_subject_not_found")
+        event_input, input_hash = llm_enrichment.build_event_input(event)
+        return {
+            "subject_type": "event",
+            "subject_id": public_id,
+            "subject_key": public_id,
+            "input_hash": input_hash,
+            "prompt_version": llm_enrichment.PROMPT_VERSION,
+            "model": model,
+            "event_input": event_input,
+        }
+
+    snapshot = db.latest_macro()
+    monitored = (
+        snapshot.get("monitored_events")
+        if isinstance(snapshot, Mapping)
+        else None
+    )
+    if not isinstance(monitored, list):
+        _ai_request_error(404, "ai_subject_not_found")
+    macro_event: Mapping[str, Any] | None = None
+    for candidate in monitored[:24]:
+        if not isinstance(candidate, Mapping):
+            continue
+        if str(candidate.get("id") or "").strip() == public_id:
+            macro_event = candidate
+            break
+    if macro_event is None:
+        _ai_request_error(404, "ai_subject_not_found")
+    event_input, input_hash = llm_enrichment.build_macro_event_input(macro_event)
+    return {
+        "subject_type": "macro_event",
+        "subject_id": public_id,
+        "subject_key": llm_enrichment.macro_event_key(macro_event),
+        "input_hash": input_hash,
+        "prompt_version": llm_enrichment.MACRO_PROMPT_VERSION,
+        "model": model,
+        "event_input": event_input,
+    }
+
+
+def _touch_enrichment_pending() -> bool:
+    """Wake the oneshot worker without allowing an env path to escape data/."""
+    db_path = Path(db.DB_PATH).resolve()
+    configured = os.environ.get("KOL_ENRICHMENT_PENDING_PATH", "").strip()
+    marker = (
+        Path(configured).expanduser()
+        if configured
+        else db_path.parent / "enrichment.pending"
+    )
+    if (
+        marker.name != "enrichment.pending"
+        or marker.parent.resolve() != db_path.parent
+    ):
+        return False
+    flags = os.O_WRONLY | os.O_CREAT
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(marker, flags, 0o600)
+        try:
+            os.utime(fd, None)
+        finally:
+            os.close(fd)
+    except OSError:
+        return False
+    return True
+
+
+def _ai_status_response(
+    subject: Mapping[str, Any],
+    result: Mapping[str, Any],
+    *,
+    status_code: int = 200,
+    wake_up: str | None = None,
+) -> JSONResponse:
+    payload = {
+        key: value
+        for key, value in result.items()
+        if key in _AI_PUBLIC_RESPONSE_FIELDS and value is not None
+    }
+    payload["subject_type"] = subject["subject_type"]
+    payload["subject_id"] = subject["subject_id"]
+    if wake_up is not None:
+        payload["wake_up"] = wake_up
+    retry_after = payload.get("retry_after_seconds")
+    headers = (
+        {"Retry-After": str(int(retry_after))}
+        if isinstance(retry_after, int) and retry_after > 0
+        else None
+    )
+    return _private_response(
+        payload,
+        status_code=status_code,
+        headers=headers,
+    )
+
+
+@app.post("/api/private/ai-requests")
+async def api_request_ai_enrichment(
+    request: Request,
+    _: dict[str, Any] = Depends(require_private_session),
+) -> JSONResponse:
+    _require_ai_same_origin(request)
+    if request.headers.get(_AI_ACTION_HEADER) != _AI_ACTION_VALUE:
+        _ai_request_error(403, "ai_action_header_required")
+    content_type = request.headers.get("content-type", "").split(";", 1)[0]
+    if content_type.strip().lower() != "application/json":
+        _ai_request_error(415, "json_body_required")
+    declared_length = request.headers.get("content-length")
+    if declared_length:
+        try:
+            if int(declared_length) > 2048:
+                _ai_request_error(413, "ai_request_too_large")
+        except ValueError:
+            _ai_request_error(400, "invalid_content_length")
+    raw = await request.body()
+    if len(raw) > 2048:
+        _ai_request_error(413, "ai_request_too_large")
+    try:
+        body = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        _ai_request_error(422, "invalid_ai_request")
+    if not isinstance(body, Mapping) or set(body) != {"subject_type", "subject_id"}:
+        _ai_request_error(422, "invalid_ai_request")
+    subject = _resolve_ai_request_subject(
+        body.get("subject_type"),
+        body.get("subject_id"),
+    )
+    result = db.request_ai_enrichment(
+        subject_type=subject["subject_type"],
+        subject_key=subject["subject_key"],
+        input_hash=subject["input_hash"],
+        prompt_version=subject["prompt_version"],
+        model=subject["model"],
+    )
+    if result["state"] == "rate_limited":
+        return _ai_status_response(subject, result, status_code=429)
+    wake_up = None
+    if result["state"] == "queued":
+        wake_up = "immediate" if _touch_enrichment_pending() else "timer"
+    return _ai_status_response(subject, result, wake_up=wake_up)
+
+
+@app.get("/api/private/ai-requests/status")
+def api_ai_enrichment_request_status(
+    request: Request,
+    _: dict[str, Any] = Depends(require_private_session),
+) -> JSONResponse:
+    subject = _resolve_ai_request_subject(
+        request.query_params.get("subject_type"),
+        request.query_params.get("subject_id"),
+    )
+    result = db.get_ai_enrichment_request_status(
+        subject_type=subject["subject_type"],
+        subject_key=subject["subject_key"],
+        input_hash=subject["input_hash"],
+        prompt_version=subject["prompt_version"],
+        model=subject["model"],
+    )
+    return _ai_status_response(subject, result)
 
 
 @app.get("/api/private/decisions")

@@ -63,6 +63,11 @@
     drawerReturnFocus: null,
     drawerPreviousOverflow: "",
     drawerInertNodes: [],
+    aiRequestStates: new Map(),
+    aiRequestSubjects: new Map(),
+    aiRequestInFlight: new Map(),
+    aiRequestPollTimers: new Map(),
+    authReturnFocus: null,
   };
 
   // ─── Helpers ──────────────────────────────
@@ -374,12 +379,431 @@
         const err = new Error((payload && payload.detail) || `HTTP ${r.status}`);
         err.status = r.status;
         err.payload = payload;
+        err.retryAfter = Number(r.headers.get("Retry-After")) || 0;
         throw err;
       }
       return payload;
     } finally {
       clearTimeout(t);
     }
+  }
+
+  const AI_REQUEST_POLL_DELAYS = [2_000, 4_000, 8_000, 15_000, 30_000, 30_000];
+  const AI_REQUEST_ACTION_HEADER = "request-ai-enrichment";
+
+  function aiRequestKey(subjectType, subjectId) {
+    return `${String(subjectType || "")}:${String(subjectId || "")}`;
+  }
+
+  function aiRequestPresentation(item, requestState = null) {
+    const rawStatus = String(item?.ai_status || "pending").toLowerCase();
+    const status = String(requestState?.state || "").toLowerCase();
+    const nextAttempt = requestState?.next_attempt_at || item?.ai_next_attempt_at;
+    const nextAttemptLabel = nextAttempt ? fmtBeijingDateTime(nextAttempt) : "";
+    const retrySeconds = Number(requestState?.retry_after_seconds || 0);
+    const retryMinutes = retrySeconds > 0 ? Math.max(1, Math.ceil(retrySeconds / 60)) : 0;
+
+    if (status === "requesting") {
+      return {
+        label: "正在加入队列…",
+        note: "正在确认缓存和后台状态。",
+        disabled: true,
+        busy: true,
+        tone: "pending",
+      };
+    }
+    if (["queued", "already_queued"].includes(status)) {
+      return {
+        label: "已加入优先队列",
+        note: "相同证据只会处理一次；页面会自动检查进度。",
+        disabled: true,
+        busy: true,
+        tone: "pending",
+      };
+    }
+    if (status === "processing") {
+      return {
+        label: "AI 解读生成中",
+        note: "当前已有任务在运行，本次没有重复提交。",
+        disabled: true,
+        busy: true,
+        tone: "pending",
+      };
+    }
+    if (["ready", "cached"].includes(status)) {
+      return {
+        label: "解读已是最新",
+        note: "已复用当前缓存，本次没有额外消耗 Token。",
+        disabled: true,
+        busy: false,
+        tone: "ready",
+      };
+    }
+    if (["retry", "retry_wait"].includes(status)) {
+      return {
+        label: "等待自动重试",
+        note: nextAttemptLabel
+          ? `系统将在 ${nextAttemptLabel}（北京时间）后重试，不能提前绕过退避。`
+          : retryMinutes
+            ? `系统约在 ${retryMinutes} 分钟后重试，不能提前绕过退避。`
+            : "系统会按服务端退避计划重试，不会重复消耗调用。",
+        disabled: true,
+        busy: false,
+        tone: "waiting",
+      };
+    }
+    if (["failed", "unavailable", "ineligible"].includes(status)) {
+      return {
+        label: "本轮不可重试",
+        note:
+          requestState?.message ||
+          "当前证据或服务状态不允许再次调用；内容更新后系统会重新评估。",
+        disabled: true,
+        busy: false,
+        tone: "blocked",
+      };
+    }
+    if (["rate_limited", "quota_exceeded"].includes(status)) {
+      return {
+        label: "请求额度稍后恢复",
+        note: retryMinutes
+          ? `为控制 Token 成本，请约 ${retryMinutes} 分钟后再试。`
+          : "为控制 Token 成本，人工优先队列暂时停止接收新请求。",
+        disabled: true,
+        busy: false,
+        tone: "waiting",
+      };
+    }
+    if (status === "error") {
+      return {
+        label: "重试请求",
+        note: requestState?.message || "请求状态未确认；不会因此触发重复调用。",
+        disabled: false,
+        busy: false,
+        tone: "blocked",
+      };
+    }
+    if (!state.authenticated) {
+      return {
+        label: "解锁后请求 AI 解读",
+        note: "仅处理当前公开证据；相同内容会复用缓存。",
+        disabled: !state.authConfigured,
+        busy: false,
+        tone: "locked",
+      };
+    }
+    if (status === "pending" && requestState?.can_request === true) {
+      return {
+        label: "优先 AI 解读",
+        note: "当前可以再次加入优先队列；提交前仍会由服务端复核缓存。",
+        disabled: false,
+        busy: false,
+        tone: "idle",
+      };
+    }
+    if (rawStatus === "processing") {
+      return {
+        label: "AI 解读生成中",
+        note: "后台已经在处理，无需再次提交。",
+        disabled: true,
+        busy: true,
+        tone: "pending",
+      };
+    }
+    if (rawStatus === "retry") {
+      return {
+        label: "等待自动重试",
+        note: "服务端退避仍在生效；刷新后会显示最新处理状态。",
+        disabled: true,
+        busy: false,
+        tone: "waiting",
+      };
+    }
+    if (rawStatus === "failed") {
+      return {
+        label: "本轮不可重试",
+        note: "相同证据不会再次调用；内容变化后系统会重新评估。",
+        disabled: true,
+        busy: false,
+        tone: "blocked",
+      };
+    }
+    return {
+      label: "优先 AI 解读",
+      note: "只提高当前证据的处理优先级；已有最新结果时不调用模型。",
+      disabled: false,
+      busy: false,
+      tone: "idle",
+    };
+  }
+
+  function aiRequestControl(subjectType, subjectId, item, placement = "inline") {
+    const normalizedType = String(subjectType || "");
+    const normalizedId = String(subjectId || "").trim();
+    if (!normalizedId || !["event", "macro_event"].includes(normalizedType)) return "";
+    const key = aiRequestKey(normalizedType, normalizedId);
+    state.aiRequestSubjects.set(key, {
+      subjectType: normalizedType,
+      subjectId: normalizedId,
+      item,
+      placement,
+    });
+    const requestState = state.aiRequestStates.get(key) || null;
+    if (String(item?.ai_status || "pending").toLowerCase() === "ready") return "";
+    const view = aiRequestPresentation(item, requestState);
+    const statusId = `ai-request-status-${encodeURIComponent(key)}-${encodeURIComponent(
+      placement
+    )}`;
+    return `<div class="ai-request-rail is-${esc(view.tone)} is-${esc(
+      placement
+    )}" data-ai-request-key="${esc(key)}" data-ai-request-placement="${esc(
+      placement
+    )}">
+      <button type="button" class="ai-request-btn" data-ai-request
+              data-ai-subject-type="${esc(normalizedType)}"
+              data-ai-subject-id="${esc(normalizedId)}"
+              aria-describedby="${esc(statusId)}" aria-busy="${
+                view.busy ? "true" : "false"
+              }" ${view.disabled ? "disabled" : ""}>
+        <span aria-hidden="true">↑</span>${esc(view.label)}
+      </button>
+      <span class="ai-request-note" id="${esc(statusId)}" role="status" aria-live="polite">${esc(
+        view.note
+      )}</span>
+    </div>`;
+  }
+
+  function updateAiRequestControls(key) {
+    const subject = state.aiRequestSubjects.get(key);
+    if (!subject) return;
+    const view = aiRequestPresentation(
+      subject.item,
+      state.aiRequestStates.get(key) || null
+    );
+    $$('[data-ai-request-key]').forEach((rail) => {
+      if (rail.dataset.aiRequestKey !== key) return;
+      rail.className = `ai-request-rail is-${view.tone} is-${
+        rail.dataset.aiRequestPlacement || subject.placement || "inline"
+      }`;
+      const button = rail.querySelector("[data-ai-request]");
+      if (button) {
+        button.disabled = view.disabled;
+        button.setAttribute("aria-busy", String(view.busy));
+        button.innerHTML = `<span aria-hidden="true">↑</span>${esc(view.label)}`;
+      }
+      const note = rail.querySelector(".ai-request-note");
+      if (note) note.textContent = view.note;
+    });
+  }
+
+  function clearAiRequestPoll(key) {
+    const timer = state.aiRequestPollTimers.get(key);
+    if (timer) clearTimeout(timer);
+    state.aiRequestPollTimers.delete(key);
+  }
+
+  function clearAllAiRequestPolls() {
+    Array.from(state.aiRequestPollTimers.keys()).forEach(clearAiRequestPoll);
+  }
+
+  function resumeAiRequestPolls() {
+    if (document.hidden || !state.authenticated) return;
+    state.aiRequestStates.forEach((requestState, key) => {
+      const status = String(requestState?.state || "").toLowerCase();
+      if (["queued", "already_queued", "processing"].includes(status)) {
+        scheduleAiRequestPoll(key);
+      } else if (["retry", "retry_wait", "rate_limited", "quota_exceeded"].includes(status)) {
+        scheduleAiRequestStatusCheck(key, aiRequestRetryDelay(requestState));
+      }
+    });
+  }
+
+  function aiRequestRetryDelay(requestState) {
+    const nextAttemptMs = Date.parse(String(requestState?.next_attempt_at || ""));
+    const localRetryAt = Number(requestState?.retry_at_ms || 0);
+    const retrySeconds = Number(requestState?.retry_after_seconds || 0);
+    const targetMs = Number.isFinite(nextAttemptMs)
+      ? nextAttemptMs
+      : localRetryAt > 0
+        ? localRetryAt
+        : Date.now() + Math.max(30, retrySeconds) * 1000;
+    return Math.max(2_000, Math.min(86_400_000, targetMs - Date.now() + 1_000));
+  }
+
+  function aiRequestStillVisible(key) {
+    return $$('[data-ai-request-key]').some(
+      (rail) => rail.dataset.aiRequestKey === key && rail.offsetParent !== null
+    );
+  }
+
+  async function refreshAiSubject(key) {
+    const subject = state.aiRequestSubjects.get(key);
+    if (!subject) return;
+    if (subject.subjectType === "macro_event") {
+      if (state.view === "macro") await loadMacro({ includeHistory: false });
+      return;
+    }
+    if (
+      state.drawerEventId !== null &&
+      String(state.drawerEventId) === subject.subjectId &&
+      !$("#intel-drawer-shell")?.hidden
+    ) {
+      await loadIntelDetail(subject.subjectId);
+      if (state.view === "kol") await loadEvents();
+      return;
+    }
+    if (state.view === "kol") await loadEvents();
+  }
+
+  async function pollAiRequest(key, pollIndex = 0) {
+    clearAiRequestPoll(key);
+    const subject = state.aiRequestSubjects.get(key);
+    if (!subject || document.hidden || !state.authenticated || !aiRequestStillVisible(key)) {
+      return;
+    }
+    const params = new URLSearchParams({
+      subject_type: subject.subjectType,
+      subject_id: subject.subjectId,
+    });
+    try {
+      const payload = await requestJSON(
+        `${api("api/private/ai-requests/status")}?${params}`,
+        {},
+        8_000
+      );
+      const nextState = String(payload?.state || payload?.status || "pending").toLowerCase();
+      state.aiRequestStates.set(key, { ...payload, state: nextState });
+      updateAiRequestControls(key);
+      if (["ready", "cached"].includes(nextState)) {
+        await refreshAiSubject(key);
+        return;
+      }
+      if (["retry", "retry_wait"].includes(nextState)) {
+        scheduleAiRequestStatusCheck(key, aiRequestRetryDelay(payload));
+        return;
+      }
+      if (nextState === "pending" && payload?.can_request === true) {
+        return;
+      }
+      if (["failed", "unavailable", "ineligible"].includes(nextState)) {
+        return;
+      }
+    } catch (error) {
+      if (error?.status === 401) {
+        handlePrivateSessionExpired();
+        return;
+      }
+      state.aiRequestStates.set(key, {
+        state: "error",
+        message: "进度暂时无法确认；后台请求不会因此重复提交。",
+      });
+      updateAiRequestControls(key);
+      return;
+    }
+    if (pollIndex >= AI_REQUEST_POLL_DELAYS.length) {
+      const current = state.aiRequestStates.get(key) || {};
+      state.aiRequestStates.set(key, {
+        ...current,
+        message: "后台仍在处理；稍后刷新当前视图即可查看结果。",
+      });
+      updateAiRequestControls(key);
+      return;
+    }
+    const timer = setTimeout(
+      () => void pollAiRequest(key, pollIndex + 1),
+      AI_REQUEST_POLL_DELAYS[pollIndex]
+    );
+    state.aiRequestPollTimers.set(key, timer);
+  }
+
+  function scheduleAiRequestPoll(key) {
+    scheduleAiRequestStatusCheck(key, AI_REQUEST_POLL_DELAYS[0], 1);
+  }
+
+  function scheduleAiRequestStatusCheck(key, delayMs, pollIndex = 0) {
+    clearAiRequestPoll(key);
+    const timer = setTimeout(
+      () => void pollAiRequest(key, pollIndex),
+      Math.max(1_000, Number(delayMs) || AI_REQUEST_POLL_DELAYS[0])
+    );
+    state.aiRequestPollTimers.set(key, timer);
+  }
+
+  async function requestAiEnrichment(button) {
+    const subjectType = String(button?.dataset?.aiSubjectType || "");
+    const subjectId = String(button?.dataset?.aiSubjectId || "").trim();
+    const key = aiRequestKey(subjectType, subjectId);
+    if (!subjectId || !state.aiRequestSubjects.has(key)) return;
+    if (!state.authenticated) {
+      if (state.authConfigured) {
+        const drawerShell = $("#intel-drawer-shell");
+        const openedFromDrawer =
+          Boolean(button?.closest("#intel-drawer")) && !drawerShell?.hidden;
+        const returnFocus = openedFromDrawer
+          ? state.drawerReturnFocus || $("#private-mode-btn")
+          : button;
+        if (openedFromDrawer) closeIntelDrawer({ restoreFocus: false });
+        openAuth(returnFocus, { purpose: "ai" });
+      }
+      return;
+    }
+    if (state.aiRequestInFlight.has(key)) return state.aiRequestInFlight.get(key);
+    state.aiRequestStates.set(key, { state: "requesting" });
+    updateAiRequestControls(key);
+    const promise = (async () => {
+      try {
+        const payload = await requestJSON(
+          api("api/private/ai-requests"),
+          {
+            method: "POST",
+            headers: { "X-Finance-Radar-Action": AI_REQUEST_ACTION_HEADER },
+            body: JSON.stringify({
+              subject_type: subjectType,
+              subject_id: subjectId,
+            }),
+          },
+          10_000
+        );
+        const nextState = String(payload?.state || payload?.status || "queued").toLowerCase();
+        state.aiRequestStates.set(key, { ...payload, state: nextState });
+        updateAiRequestControls(key);
+        if (["ready", "cached"].includes(nextState)) {
+          await refreshAiSubject(key);
+        } else if (["queued", "already_queued", "processing", "pending"].includes(nextState)) {
+          scheduleAiRequestPoll(key);
+        }
+      } catch (error) {
+        if (error?.status === 401) {
+          handlePrivateSessionExpired();
+          return;
+        }
+        const rateLimited = error?.status === 429;
+        const unavailable = [403, 404, 409, 503].includes(Number(error?.status));
+        const retrySeconds =
+          Number(error?.payload?.retry_after_seconds || error?.retryAfter || 0) || 0;
+        state.aiRequestStates.set(key, {
+          state: rateLimited ? "rate_limited" : unavailable ? "unavailable" : "error",
+          retry_after_seconds: retrySeconds,
+          retry_at_ms: retrySeconds > 0 ? Date.now() + retrySeconds * 1000 : 0,
+          message: rateLimited
+            ? "人工优先队列已达到成本上限。"
+            : unavailable
+              ? "当前证据或服务状态不允许人工触发；自动分析仍会继续工作。"
+              : "请求未确认；现有自动分析和缓存仍会继续工作。",
+        });
+        updateAiRequestControls(key);
+        if (rateLimited) {
+          scheduleAiRequestStatusCheck(
+            key,
+            aiRequestRetryDelay(state.aiRequestStates.get(key))
+          );
+        }
+      } finally {
+        state.aiRequestInFlight.delete(key);
+      }
+    })();
+    state.aiRequestInFlight.set(key, promise);
+    return promise;
   }
 
   function errorHTML(err, url) {
@@ -2578,6 +3002,23 @@
     </div>`;
   }
 
+  function handlePrivateSessionExpired() {
+    const wasAuthenticated = state.authenticated;
+    state.authenticated = false;
+    state.logoutPending = false;
+    state.decisionRequestGeneration += 1;
+    state.viewLoadedAt.decision = 0;
+    state.fullDecisionLoadError = null;
+    state.fullDecisionLoadPromise = null;
+    delete state.viewLoadPromises.decision;
+    state.aiRequestStates.clear();
+    clearAllAiRequestPolls();
+    clearDecisionView("私人会话已过期；已切换到公开视图");
+    updatePrivateModeButton();
+    Array.from(state.aiRequestSubjects.keys()).forEach(updateAiRequestControls);
+    if (wasAuthenticated && state.view === "decision") void loadDecisions();
+  }
+
   async function loadDecisions({ autoSelect = true } = {}) {
     const requestedPrivate = state.authenticated;
     const requestGeneration = ++state.decisionRequestGeneration;
@@ -2749,12 +3190,28 @@
     }
     state.authStatusLoaded = true;
     updatePrivateModeButton();
+    Array.from(state.aiRequestSubjects.keys()).forEach(updateAiRequestControls);
   }
 
-  function openAuth() {
+  function openAuth(returnFocus = null, { purpose = "private" } = {}) {
     const modal = $("#auth-modal");
+    const aiPurpose = purpose === "ai";
+    state.authReturnFocus = returnFocus || document.activeElement;
     $("#auth-error").textContent = "";
     $("#auth-passcode").value = "";
+    modal.querySelector(".support-kicker").textContent = aiPurpose
+      ? "AI 解读权限"
+      : "私人持仓覆盖层";
+    $("#auth-modal-title").textContent = aiPurpose
+      ? "解锁后请求 AI 解读"
+      : "解锁私人模式";
+    modal.querySelector(".auth-desc").textContent = aiPurpose
+      ? "解锁后返回当前证据；系统不会自动提交 AI 请求，需由你再次确认。"
+      : "口令只用于服务端验证。解锁后，具体持仓与个性化影响通过安全 Cookie 临时显示。";
+    modal.querySelector(".auth-submit").textContent = aiPurpose
+      ? "解锁并返回证据"
+      : "解锁私人模式";
+    modal.inert = false;
     modal.hidden = false;
     document.body.style.overflow = "hidden";
     setTimeout(() => $("#auth-passcode").focus(), 0);
@@ -2763,7 +3220,9 @@
   function closeAuth() {
     $("#auth-modal").hidden = true;
     document.body.style.overflow = "";
-    $("#private-mode-btn").focus();
+    const returnFocus = state.authReturnFocus;
+    state.authReturnFocus = null;
+    (returnFocus?.isConnected ? returnFocus : $("#private-mode-btn"))?.focus();
   }
 
   async function lockPrivateMode() {
@@ -2775,6 +3234,7 @@
     state.decisionRequestGeneration += 1;
     clearDecisionView();
     updatePrivateModeButton();
+    Array.from(state.aiRequestSubjects.keys()).forEach(updateAiRequestControls);
     try {
       await requestJSON(api("api/auth/logout"), { method: "POST" });
       state.logoutPending = false;
@@ -2803,6 +3263,7 @@
       state.authenticated = true;
       state.selectedDecisionKey = "";
       updatePrivateModeButton();
+      Array.from(state.aiRequestSubjects.keys()).forEach(updateAiRequestControls);
       closeAuth();
       await loadDecisions();
     } catch (error) {
@@ -3636,6 +4097,7 @@
               ${originalTitle}
               ${move}
               ${renderOfficialEvidence(e)}
+              ${aiRequestControl("macro_event", e.id, e, "macro")}
               ${renderMacroEventInsight(e, copy)}
             </article>`;
           })
@@ -4122,6 +4584,7 @@
                 : `<span class="card-link-unavailable">原文链接不可用</span>`
             }
           </div>
+          ${aiRequestControl("event", it.id, it, "card")}
         </article>`;
       })
       .join("");
@@ -4428,7 +4891,8 @@
       </div>
       <h2 class="intel-headline">${esc(copy.headline)}</h2>
       <p class="intel-summary">${esc(copy.summary)}</p>
-      ${caveat}`;
+      ${caveat}
+      ${aiRequestControl("event", event.id, event, "drawer")}`;
 
     const why = enrichment?.why_it_matters_zh
       ? `<p class="intel-prose">${esc(enrichment.why_it_matters_zh)}</p>`
@@ -4569,7 +5033,7 @@
     loadIntelDetail(eventId);
   }
 
-  function closeIntelDrawer() {
+  function closeIntelDrawer({ restoreFocus = true } = {}) {
     const shell = $("#intel-drawer-shell");
     if (!shell || shell.hidden) return;
     state.drawerRequestGeneration += 1;
@@ -4583,6 +5047,10 @@
     state.drawerInertNodes = [];
     const returnFocus = state.drawerReturnFocus;
     const closedEventId = state.drawerEventId;
+    if (closedEventId !== null) {
+      const requestKey = aiRequestKey("event", closedEventId);
+      if (!aiRequestStillVisible(requestKey)) clearAiRequestPoll(requestKey);
+    }
     state.drawerReturnFocus = null;
     state.drawerEventId = null;
     state.drawerKol = "";
@@ -4591,7 +5059,7 @@
       ? returnFocus
       : document.querySelector(`[data-event-detail="${Number(closedEventId)}"]`) ||
         $("#tab-kol");
-    if (focusTarget) {
+    if (restoreFocus && focusTarget) {
       requestAnimationFrame(() => focusTarget.focus({ preventScroll: true }));
     }
   }
@@ -4992,6 +5460,7 @@
 
   function switchView(view, { load = true } = {}) {
     if (!["decision", "macro", "kol"].includes(view)) return;
+    if (state.view !== view) clearAllAiRequestPolls();
     if (state.view === "kol" && view !== "kol") {
       state.feedAbortController?.abort();
     }
@@ -5009,7 +5478,11 @@
       history.replaceState(null, "", `#${view}`);
     } catch (e) {}
     if (view === "macro") renderMacroView();
-    if (load) void ensureViewLoaded(view);
+    if (load) {
+      void ensureViewLoaded(view).finally(resumeAiRequestPolls);
+    } else {
+      requestAnimationFrame(resumeAiRequestPolls);
+    }
   }
 
   function updateRefreshTime() {
@@ -5058,6 +5531,11 @@
     bindSupport();
     bindIntelDrawer();
     bindViewRetries();
+    document.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-ai-request]");
+      if (!button || button.disabled) return;
+      void requestAiEnrichment(button);
+    });
 
     $("#view-decision").addEventListener("click", async (event) => {
       const watchButton = event.target.closest("[data-watch-asset]");
@@ -5224,14 +5702,17 @@
       if (document.hidden) {
         clearTimeout(state.refreshTimer);
         state.refreshTimer = null;
+        clearAllAiRequestPolls();
         return;
       }
       const age = Date.now() - Number(state.viewLoadedAt[state.view] || 0);
       if (age >= VIEW_REFRESH_MS) void refreshCurrentView();
+      resumeAiRequestPolls();
       scheduleRefresh();
     });
     window.addEventListener("pagehide", () => {
       clearTimeout(state.refreshTimer);
+      clearAllAiRequestPolls();
       state.feedAbortController?.abort();
       state.drawerAbortController?.abort();
     });

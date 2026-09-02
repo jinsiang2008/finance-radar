@@ -3121,6 +3121,352 @@ class LegacyMigrationTests(unittest.TestCase):
                     )
                 )
 
+class ManualAiRequestDatabaseTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db_path_patch = mock.patch.object(
+            db, "DB_PATH", str(Path(self.tmp.name) / "manual-ai.sqlite3")
+        )
+        self.db_path_patch.start()
+        db.init()
+
+    def tearDown(self) -> None:
+        self.db_path_patch.stop()
+        self.tmp.cleanup()
+
+    @staticmethod
+    def event(**overrides):
+        item = {
+            "title": "NVIDIA launches a new AI platform",
+            "url": "https://example.com/nvidia-platform",
+            "snippet": "NVIDIA described its new platform.",
+            "source": "Bing News",
+            "kol_key": "huangrenxun",
+            "kol_name": "Jensen Huang",
+            "kol_name_cn": "黄仁勋",
+            "impact": "medium",
+            "has_market_kw": True,
+            "tickers": ["NVDA"],
+        }
+        item.update(overrides)
+        return item
+
+    def test_manual_ai_request_is_cache_aware_and_identity_scoped(self) -> None:
+        now = datetime(2026, 9, 2, 12, 0, tzinfo=timezone.utc)
+        db.insert_events(
+            [self.event(published_at=(now - timedelta(days=30)).isoformat())]
+        )
+        with db.conn() as connection:
+            event_id = int(connection.execute("SELECT id FROM events").fetchone()[0])
+        event = db.get_event_enrichment_subject(event_id)
+        self.assertIsNotNone(event)
+        assert event is not None
+        _, input_hash = llm_enrichment.build_event_input(event)
+        identity = {
+            "subject_type": "event",
+            "subject_key": str(event_id),
+            "input_hash": input_hash,
+            "prompt_version": llm_enrichment.PROMPT_VERSION,
+            "model": llm_enrichment.DEFAULT_MODEL,
+        }
+
+        queued = db.request_ai_enrichment(**identity, now=now)
+        duplicate = db.request_ai_enrichment(
+            **identity, now=now + timedelta(seconds=1)
+        )
+        self.assertEqual(queued["state"], "queued")
+        self.assertEqual(duplicate["state"], "already_queued")
+        self.assertEqual(
+            db.get_ai_enrichment_request_status(**identity, now=now)["state"],
+            "queued",
+        )
+
+        request = db.query_pending_ai_enrichment_requests()[0]
+        claim = db.claim_event_enrichment(
+            event_id,
+            input_hash=input_hash,
+            prompt_version=llm_enrichment.PROMPT_VERSION,
+            model=llm_enrichment.DEFAULT_MODEL,
+            evidence_basis="title_and_snippet",
+            now=now + timedelta(seconds=2),
+        )
+        self.assertIsInstance(claim, str)
+        self.assertEqual(
+            db.request_ai_enrichment(
+                **identity, now=now + timedelta(seconds=3)
+            )["state"],
+            "processing",
+        )
+        self.assertTrue(
+            db.complete_ai_enrichment_request(
+                request["id"],
+                subject_type=request["subject_type"],
+                subject_key=request["subject_key"],
+                input_hash=request["input_hash"],
+                prompt_version=request["prompt_version"],
+            )
+        )
+        assert isinstance(claim, str)
+        self.assertTrue(
+            db.save_event_enrichment(
+                event_id,
+                input_hash=input_hash,
+                prompt_version=llm_enrichment.PROMPT_VERSION,
+                model=llm_enrichment.DEFAULT_MODEL,
+                claim_token=claim,
+                evidence_basis="title_and_snippet",
+                result=ready_enrichment(),
+                generated_at=(now + timedelta(seconds=4)).isoformat(),
+            )
+        )
+        self.assertEqual(
+            db.request_ai_enrichment(
+                **identity, now=now + timedelta(seconds=5)
+            )["state"],
+            "cached",
+        )
+        self.assertEqual(
+            db.get_ai_enrichment_request_status(
+                **identity, now=now + timedelta(seconds=5)
+            )["state"],
+            "ready",
+        )
+
+        # A stale worker/request identity cannot complete a newer request.
+        changed = {**identity, "input_hash": "f" * 64}
+        with mock.patch.dict(
+            db.os.environ, {db._AI_REQUEST_COOLDOWN_ENV: "1"}
+        ):
+            replacement = db.request_ai_enrichment(
+                **changed, now=now + timedelta(seconds=6)
+            )
+        self.assertEqual(replacement["state"], "queued")
+        self.assertFalse(
+            db.complete_ai_enrichment_request(
+                replacement["request_id"],
+                subject_type="event",
+                subject_key=str(event_id),
+                input_hash=input_hash,
+                prompt_version=llm_enrichment.PROMPT_VERSION,
+            )
+        )
+        self.assertEqual(len(db.query_pending_ai_enrichment_requests()), 1)
+
+    def test_atomic_claim_rejects_changed_event_and_macro_identity(self) -> None:
+        now = datetime(2026, 9, 2, 12, 0, tzinfo=timezone.utc)
+        db.insert_events([self.event(published_at=now.isoformat())])
+        with db.conn() as connection:
+            event_id = int(connection.execute("SELECT id FROM events").fetchone()[0])
+        event = db.get_event_enrichment_subject(event_id)
+        assert event is not None
+        event_input, old_event_hash = llm_enrichment.build_event_input(event)
+        with db.conn(immediate=True) as connection:
+            connection.execute(
+                "UPDATE events SET snippet=? WHERE id=?",
+                ("Richer canonical evidence arrived before claim.", event_id),
+            )
+
+        event_claim = db.claim_event_enrichment(
+            event_id,
+            input_hash=old_event_hash,
+            prompt_version=llm_enrichment.PROMPT_VERSION,
+            model=llm_enrichment.DEFAULT_MODEL,
+            evidence_basis=event_input["evidence_basis"],
+            current_event_check=lambda current: (
+                llm_enrichment.build_event_input(current)[1] == old_event_hash
+            ),
+            return_attempt_count=True,
+            now=now,
+        )
+        self.assertIsNone(event_claim)
+
+        old_macro = {
+            "id": "ind_policy_rate",
+            "kind": "indicator",
+            "title": "Policy rate changed",
+            "source": "Official indicator",
+            "previous_value": 4.0,
+            "current_value": 4.25,
+            "unit": "%",
+            "severity": "high",
+        }
+        macro_key = llm_enrichment.macro_event_key(old_macro)
+        macro_input, old_macro_hash = llm_enrichment.build_macro_event_input(old_macro)
+        db.save_macro_snapshot(
+            {
+                "composite_risk": {"score": 50, "level": "medium"},
+                "monitored_events": [old_macro],
+            }
+        )
+        db.save_macro_snapshot(
+            {
+                "composite_risk": {"score": 55, "level": "medium"},
+                "monitored_events": [{**old_macro, "current_value": 4.5}],
+            }
+        )
+
+        def current_macro_matches(snapshot):
+            monitored = snapshot.get("monitored_events") or []
+            return any(
+                llm_enrichment.macro_event_key(candidate) == macro_key
+                and llm_enrichment.build_macro_event_input(candidate)[1]
+                == old_macro_hash
+                for candidate in monitored
+            )
+
+        macro_claim = db.claim_macro_event_enrichment(
+            macro_key,
+            input_hash=old_macro_hash,
+            prompt_version=llm_enrichment.MACRO_PROMPT_VERSION,
+            model=llm_enrichment.DEFAULT_MODEL,
+            evidence_basis=macro_input["evidence_basis"],
+            current_snapshot_check=current_macro_matches,
+            now=now,
+        )
+        self.assertIsNone(macro_claim)
+
+    def test_event_claim_can_return_the_persisted_attempt_count(self) -> None:
+        now = datetime(2026, 9, 2, 12, 0, tzinfo=timezone.utc)
+        db.insert_events([self.event(published_at=now.isoformat())])
+        with db.conn() as connection:
+            event_id = int(connection.execute("SELECT id FROM events").fetchone()[0])
+        claim = {
+            "event_id": event_id,
+            "input_hash": "a" * 64,
+            "prompt_version": llm_enrichment.PROMPT_VERSION,
+            "model": llm_enrichment.DEFAULT_MODEL,
+            "evidence_basis": "title_and_snippet",
+            "return_attempt_count": True,
+        }
+        first = db.claim_event_enrichment(**claim, now=now)
+        self.assertIsInstance(first, tuple)
+        assert isinstance(first, tuple)
+        first_token, first_attempt = first
+        self.assertEqual(first_attempt, 1)
+        db.fail_event_enrichment(
+            event_id,
+            input_hash=claim["input_hash"],
+            prompt_version=claim["prompt_version"],
+            model=claim["model"],
+            claim_token=first_token,
+            error_code="invalid_output",
+            retry_after_seconds=60,
+            now=now,
+        )
+        second = db.claim_event_enrichment(
+            **claim,
+            now=now + timedelta(seconds=61),
+        )
+        self.assertIsInstance(second, tuple)
+        assert isinstance(second, tuple)
+        self.assertEqual(second[1], 2)
+
+    def test_manual_ai_request_respects_retry_failed_and_global_quota(self) -> None:
+        now = datetime(2026, 9, 2, 13, 0, tzinfo=timezone.utc)
+        identities = []
+        for index in range(3):
+            db.insert_events(
+                [
+                    self.event(
+                        title=f"Eligible market event {index}",
+                        url=f"https://example.com/manual-{index}",
+                        published_at=now.isoformat(),
+                    )
+                ]
+            )
+        with db.conn() as connection:
+            rows = connection.execute("SELECT id FROM events ORDER BY id").fetchall()
+        for row in rows:
+            event = db.get_event_enrichment_subject(int(row["id"]))
+            assert event is not None
+            _, digest = llm_enrichment.build_event_input(event)
+            identities.append(
+                {
+                    "subject_type": "event",
+                    "subject_key": str(row["id"]),
+                    "input_hash": digest,
+                    "prompt_version": llm_enrichment.PROMPT_VERSION,
+                    "model": llm_enrichment.DEFAULT_MODEL,
+                }
+            )
+
+        limits = {
+            db._AI_REQUEST_COOLDOWN_ENV: "1",
+            db._AI_REQUEST_HOURLY_ENV: "2",
+            db._AI_REQUEST_DAILY_ENV: "3",
+        }
+        with mock.patch.dict(db.os.environ, limits):
+            for index in range(2):
+                result = db.request_ai_enrichment(
+                    **identities[index], now=now + timedelta(seconds=index)
+                )
+                self.assertEqual(result["state"], "queued")
+                request = db.query_pending_ai_enrichment_requests()[-1]
+                db.complete_ai_enrichment_request(
+                    request["id"],
+                    subject_type=request["subject_type"],
+                    subject_key=request["subject_key"],
+                    input_hash=request["input_hash"],
+                    prompt_version=request["prompt_version"],
+                )
+            limited = db.request_ai_enrichment(
+                **identities[2], now=now + timedelta(seconds=2)
+            )
+        self.assertEqual(limited["state"], "rate_limited")
+        self.assertGreater(limited["retry_after_seconds"], 0)
+
+        retry_identity = identities[2]
+        claim = db.claim_event_enrichment(
+            int(retry_identity["subject_key"]),
+            input_hash=retry_identity["input_hash"],
+            prompt_version=retry_identity["prompt_version"],
+            model=retry_identity["model"],
+            evidence_basis="title_and_snippet",
+            now=now,
+        )
+        assert isinstance(claim, str)
+        db.fail_event_enrichment(
+            int(retry_identity["subject_key"]),
+            input_hash=retry_identity["input_hash"],
+            prompt_version=retry_identity["prompt_version"],
+            model=retry_identity["model"],
+            claim_token=claim,
+            error_code="rate_limit",
+            retry_after_seconds=900,
+            now=now,
+        )
+        retry = db.request_ai_enrichment(
+            **retry_identity, now=now + timedelta(minutes=1)
+        )
+        self.assertEqual(retry["state"], "retry_wait")
+        self.assertEqual(retry["retry_after_seconds"], 14 * 60)
+        with db.conn(immediate=True) as connection:
+            connection.execute(
+                "UPDATE event_enrichments SET status='failed', "
+                "next_attempt_at=NULL WHERE event_id=?",
+                (int(retry_identity["subject_key"]),),
+            )
+        failed = db.request_ai_enrichment(
+            **retry_identity, now=now + timedelta(minutes=2)
+        )
+        self.assertEqual(failed, {"state": "failed", "can_request": False})
+
+        with db.conn() as connection:
+            columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(ai_enrichment_requests)"
+                ).fetchall()
+            }
+        for forbidden in (
+            "cookie",
+            "account",
+            "prompt_body",
+            "raw_response",
+            "position",
+        ):
+            self.assertFalse(any(forbidden in column for column in columns))
+
 
 if __name__ == "__main__":
     unittest.main()

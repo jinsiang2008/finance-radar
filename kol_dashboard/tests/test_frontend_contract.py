@@ -114,9 +114,9 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn('stale ? "数据延迟" : ""', self.javascript)
         self.assertIn('"高收益债利差"', self.javascript)
         self.assertIn("cs.hy_oas", self.javascript)
-        self.assertIn('static/app.js?v=19', self.html)
-        self.assertIn('static/style.css?v=19', self.html)
-        self.assertNotIn('?v=18', self.html)
+        self.assertIn('static/app.js?v=20', self.html)
+        self.assertIn('static/style.css?v=20', self.html)
+        self.assertNotIn('?v=19', self.html)
         self.assertIn(".metric.is-stale", self.css)
 
     def test_macro_events_render_compact_ai_digest_and_bounded_highlights(self) -> None:
@@ -883,6 +883,48 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn("function renderIntelSources", self.javascript)
         self.assertIn("function renderIntelRelated", self.javascript)
         self.assertIn("规则关联用于发现线索；市场相关不等于因果", self.javascript)
+
+    def test_manual_ai_requests_are_scoped_idempotent_and_accessible(self) -> None:
+        self.assertIn('api("api/private/ai-requests")', self.javascript)
+        self.assertIn('api("api/private/ai-requests/status")', self.javascript)
+        self.assertIn('"X-Finance-Radar-Action": AI_REQUEST_ACTION_HEADER', self.javascript)
+        self.assertIn('subject_type: subjectType', self.javascript)
+        self.assertIn('subject_id: subjectId', self.javascript)
+        self.assertIn("aiRequestInFlight: new Map()", self.javascript)
+        self.assertIn("if (state.aiRequestInFlight.has(key))", self.javascript)
+        self.assertIn('aiRequestControl("event", it.id, it, "card")', self.javascript)
+        self.assertIn('aiRequestControl("event", event.id, event, "drawer")', self.javascript)
+        self.assertIn('aiRequestControl("macro_event", e.id, e, "macro")', self.javascript)
+        self.assertIn('String(item?.ai_status || "pending")', self.javascript)
+        self.assertIn('=== "ready") return ""', self.javascript)
+        self.assertIn("相同证据只会处理一次", self.javascript)
+        self.assertIn("本次没有额外消耗 Token", self.javascript)
+        self.assertIn("不能提前绕过退避", self.javascript)
+        self.assertIn('role="status" aria-live="polite"', self.javascript)
+        self.assertIn('aria-describedby="${esc(statusId)}"', self.javascript)
+        self.assertIn("clearAllAiRequestPolls", self.javascript)
+        self.assertIn("AI_REQUEST_POLL_DELAYS", self.javascript)
+        self.assertIn('rawStatus === "retry"', self.javascript)
+        self.assertIn("scheduleAiRequestStatusCheck", self.javascript)
+        self.assertIn("aiRequestRetryDelay", self.javascript)
+        self.assertIn("handlePrivateSessionExpired();", self.javascript)
+        self.assertIn(
+            'closeIntelDrawer({ restoreFocus: false })',
+            self.javascript,
+        )
+        self.assertIn(
+            'openAuth(returnFocus, { purpose: "ai" })',
+            self.javascript,
+        )
+        self.assertIn(
+            'function closeIntelDrawer({ restoreFocus = true } = {})',
+            self.javascript,
+        )
+        self.assertIn("placement", self.javascript)
+        self.assertIn('button.setAttribute("aria-busy"', self.javascript)
+        self.assertIn(".ai-request-rail", self.css)
+        self.assertIn("min-height: 44px", self.css)
+        self.assertNotIn("重新解析", self.javascript)
 
     def test_event_clusters_keep_unverified_items_separate_and_expand_in_place(
         self,

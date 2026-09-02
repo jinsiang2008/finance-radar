@@ -474,6 +474,11 @@ class EnrichmentWorkerQuotaTests(unittest.TestCase):
 
         with (
             mock.patch.object(enrichment_collect.db, "init"),
+            mock.patch.object(
+                enrichment_collect.db,
+                "query_pending_ai_enrichment_requests",
+                return_value=[],
+            ),
             mock.patch.object(enrichment_collect.db, "abandon_stale_llm_calls"),
             mock.patch.object(enrichment_collect.db, "begin_llm_call", return_value=1),
             mock.patch.object(enrichment_collect.db, "finish_llm_call", return_value=True),
@@ -556,6 +561,11 @@ class EnrichmentWorkerQuotaTests(unittest.TestCase):
 
         with (
             mock.patch.object(enrichment_collect.db, "init"),
+            mock.patch.object(
+                enrichment_collect.db,
+                "query_pending_ai_enrichment_requests",
+                return_value=[],
+            ),
             mock.patch.object(enrichment_collect.db, "abandon_stale_llm_calls"),
             mock.patch.object(enrichment_collect.db, "begin_llm_call", return_value=1),
             mock.patch.object(enrichment_collect.db, "finish_llm_call", return_value=True),
@@ -611,6 +621,11 @@ class EnrichmentWorkerQuotaTests(unittest.TestCase):
 
         with (
             mock.patch.object(enrichment_collect.db, "init"),
+            mock.patch.object(
+                enrichment_collect.db,
+                "query_pending_ai_enrichment_requests",
+                return_value=[],
+            ),
             mock.patch.object(enrichment_collect.db, "abandon_stale_llm_calls"),
             mock.patch.object(enrichment_collect.db, "begin_llm_call", return_value=1),
             mock.patch.object(enrichment_collect.db, "finish_llm_call", return_value=True),
@@ -692,6 +707,11 @@ class EnrichmentWorkerQuotaTests(unittest.TestCase):
 
         with (
             mock.patch.object(enrichment_collect.db, "init"),
+            mock.patch.object(
+                enrichment_collect.db,
+                "query_pending_ai_enrichment_requests",
+                return_value=[],
+            ),
             mock.patch.object(enrichment_collect.db, "abandon_stale_llm_calls"),
             mock.patch.object(
                 enrichment_collect.db, "begin_llm_call", return_value=1
@@ -738,6 +758,306 @@ class EnrichmentWorkerQuotaTests(unittest.TestCase):
         self.assertEqual(counts["ready"], 4)
         self.assertEqual(counts["concurrency"], 2)
         self.assertEqual(max_active, 2)
+
+    def test_manual_request_precedes_normal_candidate_and_is_completed(self) -> None:
+        manual_event = {
+            "id": 99,
+            "title": "Manual priority market evidence",
+            "snippet": "A complete public evidence body for the priority request.",
+            "source": "Test News",
+            "url": "https://example.com/manual-priority",
+            "kol_name": "Tester",
+            "kol_name_cn": "测试者",
+            "tickers": "SPY",
+        }
+        normal_event = {
+            "id": 1,
+            "title": "Normal market evidence",
+            "snippet": "A complete public evidence body for the normal queue.",
+            "source": "Test News",
+            "url": "https://example.com/normal",
+        }
+        _, digest = llm_enrichment.build_event_input(manual_event)
+        request = {
+            "id": 7,
+            "subject_type": "event",
+            "subject_key": "99",
+            "input_hash": digest,
+            "prompt_version": llm_enrichment.PROMPT_VERSION,
+            "model": llm_enrichment.DEFAULT_MODEL,
+            "accepted_at": "2026-09-02T12:00:00+00:00",
+        }
+        claimed: list[int] = []
+
+        def claim(event_id: int, **kwargs):
+            claimed.append(event_id)
+            return f"claim-{event_id}"
+
+        config = llm_enrichment.DeepSeekConfig(api_key="test-secret")
+        with (
+            mock.patch.object(enrichment_collect.db, "init"),
+            mock.patch.object(enrichment_collect.db, "abandon_stale_llm_calls"),
+            mock.patch.object(
+                enrichment_collect.db,
+                "query_pending_ai_enrichment_requests",
+                return_value=[request],
+            ),
+            mock.patch.object(
+                enrichment_collect.db,
+                "get_event_enrichment_subject",
+                return_value=manual_event,
+            ),
+            mock.patch.object(
+                enrichment_collect.llm_enrichment,
+                "load_config",
+                return_value=config,
+            ),
+            mock.patch.object(enrichment_collect.db, "latest_macro", return_value={}),
+            mock.patch.object(
+                enrichment_collect.db,
+                "query_enrichment_candidates",
+                return_value=[normal_event],
+            ),
+            mock.patch.object(
+                enrichment_collect.db,
+                "claim_event_enrichment",
+                side_effect=claim,
+            ),
+            mock.patch.object(enrichment_collect.db, "begin_llm_call", return_value=1),
+            mock.patch.object(enrichment_collect.db, "finish_llm_call", return_value=True),
+            mock.patch.object(
+                enrichment_collect.llm_enrichment,
+                "enrich_event",
+                return_value=valid_result(),
+            ),
+            mock.patch.object(
+                enrichment_collect.db,
+                "save_event_enrichment",
+                return_value=True,
+            ),
+            mock.patch.object(
+                enrichment_collect.db,
+                "complete_ai_enrichment_request",
+                return_value=True,
+            ) as complete,
+        ):
+            counts, stopped = enrichment_collect.run(
+                limit=2,
+                macro_limit=0,
+                max_age_hours=72,
+                concurrency=1,
+            )
+
+        self.assertFalse(stopped)
+        self.assertEqual(claimed, [99, 1])
+        self.assertEqual(counts["manual_requests"], 1)
+        complete.assert_called_once_with(
+            7,
+            subject_type="event",
+            subject_key="99",
+            input_hash=digest,
+            prompt_version=llm_enrichment.PROMPT_VERSION,
+            superseded=False,
+        )
+
+    def test_manual_retry_stays_pending_until_cache_is_terminal(self) -> None:
+        manual_event = {
+            "id": 99,
+            "title": "Manual priority market evidence",
+            "snippet": "A complete public evidence body for a retained retry.",
+            "source": "Test News",
+            "url": "https://example.com/manual-retry",
+        }
+        _, digest = llm_enrichment.build_event_input(manual_event)
+        request = {
+            "id": 7,
+            "subject_type": "event",
+            "subject_key": "99",
+            "input_hash": digest,
+            "prompt_version": llm_enrichment.PROMPT_VERSION,
+            "model": llm_enrichment.DEFAULT_MODEL,
+            "accepted_at": "2026-09-02T12:00:00+00:00",
+        }
+        config = llm_enrichment.DeepSeekConfig(api_key="test-secret")
+
+        with (
+            mock.patch.object(enrichment_collect.db, "init"),
+            mock.patch.object(enrichment_collect.db, "abandon_stale_llm_calls"),
+            mock.patch.object(
+                enrichment_collect.db,
+                "query_pending_ai_enrichment_requests",
+                return_value=[request],
+            ),
+            mock.patch.object(
+                enrichment_collect.db,
+                "get_event_enrichment_subject",
+                return_value=manual_event,
+            ),
+            mock.patch.object(
+                enrichment_collect.llm_enrichment,
+                "load_config",
+                return_value=config,
+            ),
+            mock.patch.object(enrichment_collect.db, "latest_macro", return_value={}),
+            mock.patch.object(
+                enrichment_collect.db,
+                "query_enrichment_candidates",
+                return_value=[],
+            ),
+            mock.patch.object(
+                enrichment_collect.db,
+                "claim_event_enrichment",
+                return_value="claim-99",
+            ),
+            mock.patch.object(enrichment_collect.db, "begin_llm_call", return_value=1),
+            mock.patch.object(enrichment_collect.db, "finish_llm_call", return_value=True),
+            mock.patch.object(
+                enrichment_collect.llm_enrichment,
+                "enrich_event",
+                side_effect=enrichment_collect.llm_enrichment.EnrichmentError(
+                    "rate_limit",
+                    retry_after_seconds=900,
+                    http_status=429,
+                ),
+            ),
+            mock.patch.object(
+                enrichment_collect.db,
+                "fail_event_enrichment",
+                return_value=True,
+            ),
+            mock.patch.object(
+                enrichment_collect.db,
+                "complete_ai_enrichment_request",
+                return_value=True,
+            ) as complete,
+        ):
+            counts, stopped = enrichment_collect.run(
+                limit=1,
+                macro_limit=0,
+                max_age_hours=72,
+                concurrency=1,
+            )
+
+        self.assertTrue(stopped)
+        self.assertEqual(counts["retry"], 1)
+        complete.assert_not_called()
+
+        with (
+            mock.patch.object(enrichment_collect.db, "init"),
+            mock.patch.object(enrichment_collect.db, "abandon_stale_llm_calls"),
+            mock.patch.object(
+                enrichment_collect.db,
+                "query_pending_ai_enrichment_requests",
+                return_value=[request],
+            ),
+            mock.patch.object(
+                enrichment_collect.db,
+                "get_event_enrichment_subject",
+                return_value=manual_event,
+            ),
+            mock.patch.object(
+                enrichment_collect.llm_enrichment,
+                "load_config",
+                return_value=config,
+            ),
+            mock.patch.object(enrichment_collect.db, "latest_macro", return_value={}),
+            mock.patch.object(
+                enrichment_collect.db,
+                "query_enrichment_candidates",
+                return_value=[],
+            ),
+            mock.patch.object(
+                enrichment_collect.db,
+                "claim_event_enrichment",
+                return_value=None,
+            ),
+            mock.patch.object(
+                enrichment_collect.db,
+                "get_ai_enrichment_request_status",
+                return_value={
+                    "state": "retry_wait",
+                    "can_request": False,
+                    "retry_after_seconds": 600,
+                },
+            ),
+            mock.patch.object(
+                enrichment_collect.db,
+                "complete_ai_enrichment_request",
+                return_value=True,
+            ) as complete,
+        ):
+            counts, stopped = enrichment_collect.run(
+                limit=1,
+                macro_limit=0,
+                max_age_hours=72,
+                concurrency=1,
+            )
+
+        self.assertFalse(stopped)
+        self.assertEqual(counts["processed"], 0)
+        complete.assert_not_called()
+
+        with (
+            mock.patch.object(enrichment_collect.db, "init"),
+            mock.patch.object(enrichment_collect.db, "abandon_stale_llm_calls"),
+            mock.patch.object(
+                enrichment_collect.db,
+                "query_pending_ai_enrichment_requests",
+                return_value=[request],
+            ),
+            mock.patch.object(
+                enrichment_collect.db,
+                "get_event_enrichment_subject",
+                return_value=manual_event,
+            ),
+            mock.patch.object(
+                enrichment_collect.llm_enrichment,
+                "load_config",
+                return_value=config,
+            ),
+            mock.patch.object(enrichment_collect.db, "latest_macro", return_value={}),
+            mock.patch.object(
+                enrichment_collect.db,
+                "query_enrichment_candidates",
+                return_value=[],
+            ),
+            mock.patch.object(
+                enrichment_collect.db,
+                "claim_event_enrichment",
+                return_value=("claim-99", 3),
+            ),
+            mock.patch.object(enrichment_collect.db, "begin_llm_call", return_value=1),
+            mock.patch.object(enrichment_collect.db, "finish_llm_call", return_value=True),
+            mock.patch.object(
+                enrichment_collect.llm_enrichment,
+                "enrich_event",
+                side_effect=enrichment_collect.llm_enrichment.EnrichmentError(
+                    "invalid_output",
+                    retry_after_seconds=900,
+                ),
+            ),
+            mock.patch.object(
+                enrichment_collect.db,
+                "fail_event_enrichment",
+                return_value=True,
+            ) as fail,
+            mock.patch.object(
+                enrichment_collect.db,
+                "complete_ai_enrichment_request",
+                return_value=True,
+            ) as complete,
+        ):
+            counts, stopped = enrichment_collect.run(
+                limit=1,
+                macro_limit=0,
+                max_age_hours=72,
+                concurrency=1,
+            )
+
+        self.assertFalse(stopped)
+        self.assertEqual(counts["failed"], 1)
+        self.assertIsNone(fail.call_args.kwargs["retry_after_seconds"])
+        complete.assert_called_once()
 
 
 class ResultValidationTests(unittest.TestCase):
