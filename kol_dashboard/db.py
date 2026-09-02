@@ -75,6 +75,7 @@ _BEGIN_RETRY_INITIAL_DELAY_SECONDS = 0.025
 _BEGIN_RETRY_MAX_DELAY_SECONDS = 0.5
 
 RETENTION_DAYS = 14
+MACRO_RETENTION_DAYS = 90
 
 _MARKET_REACTION_STATUSES = {
     "pending",
@@ -3004,15 +3005,27 @@ def query_market_reactions(
     eligible_events_only: bool = False,
 ) -> list[dict[str, Any]]:
     where: list[str] = []
+    eligible_sources_sql = ""
     if eligible_events_only:
+        eligible_sources_sql = """
+            WITH eligible_events AS MATERIALIZED (
+              SELECT e.id, e.dedup_key
+              FROM events e
+              WHERE event_content_eligible(
+                e.title, e.snippet, e.source,
+                COALESCE(NULLIF(e.canonical_url,''), e.url)
+              )=1
+            ),
+            event_source_ids(source_id) AS MATERIALIZED (
+              SELECT CAST(id AS TEXT) FROM eligible_events
+              UNION
+              SELECT dedup_key FROM eligible_events
+              WHERE NULLIF(TRIM(dedup_key), '') IS NOT NULL
+            )
+        """
         where.append(
-            "(LOWER(TRIM(mr.source_type))<>'event' OR EXISTS ("
-            "SELECT 1 FROM events e WHERE "
-            "(mr.source_id=CAST(e.id AS TEXT) OR mr.source_id=e.dedup_key) "
-            "AND event_content_eligible("
-            "e.title, e.snippet, e.source, "
-            "COALESCE(NULLIF(e.canonical_url,''), e.url)"
-            ")=1))"
+            "(LOWER(TRIM(mr.source_type))<>'event' OR mr.source_id IN ("
+            "SELECT source_id FROM event_source_ids))"
         )
     params: list[Any] = []
     for column, value in (
@@ -3028,7 +3041,8 @@ def query_market_reactions(
     params.append(max(1, min(int(limit), 5000)))
     with conn() as c:
         rows = c.execute(
-            "SELECT mr.source_type, mr.source_id, mr.asset_key, mr.window, "
+            eligible_sources_sql
+            + "SELECT mr.source_type, mr.source_id, mr.asset_key, mr.window, "
             "mr.benchmark_asset_key, mr.asset_return, mr.benchmark_return, "
             "mr.abnormal_return, mr.expected_direction, mr.observed_direction, "
             "mr.direction_confirmed, mr.status, mr.sample_count, "
@@ -3341,15 +3355,27 @@ def query_relations(
     eligible_events_only: bool = False,
 ) -> list[dict[str, Any]]:
     where: list[str] = []
+    eligible_sources_sql = ""
     if eligible_events_only:
+        eligible_sources_sql = """
+            WITH eligible_events AS MATERIALIZED (
+              SELECT e.id, e.dedup_key
+              FROM events e
+              WHERE event_content_eligible(
+                e.title, e.snippet, e.source,
+                COALESCE(NULLIF(e.canonical_url,''), e.url)
+              )=1
+            ),
+            event_source_ids(source_id) AS MATERIALIZED (
+              SELECT CAST(id AS TEXT) FROM eligible_events
+              UNION
+              SELECT dedup_key FROM eligible_events
+              WHERE NULLIF(TRIM(dedup_key), '') IS NOT NULL
+            )
+        """
         where.append(
-            "(LOWER(TRIM(r.source_type))<>'event' OR EXISTS ("
-            "SELECT 1 FROM events e WHERE "
-            "(r.source_id=CAST(e.id AS TEXT) OR r.source_id=e.dedup_key) "
-            "AND event_content_eligible("
-            "e.title, e.snippet, e.source, "
-            "COALESCE(NULLIF(e.canonical_url,''), e.url)"
-            ")=1))"
+            "(LOWER(TRIM(r.source_type))<>'event' OR r.source_id IN ("
+            "SELECT source_id FROM event_source_ids))"
         )
     params: list[Any] = []
     for column, value in (
@@ -3366,7 +3392,8 @@ def query_relations(
     params.append(max(1, min(int(limit), 1000)))
     with conn() as c:
         rows = c.execute(
-            "SELECT r.source_type, r.source_id, r.topic_key, r.asset_key, "
+            eligible_sources_sql
+            + "SELECT r.source_type, r.source_id, r.topic_key, r.asset_key, "
             "r.relation_type, r.direction, r.strength, r.confidence, "
             "r.horizon, r.method, r.rationale, r.evidence_json, r.created_at "
             f"FROM relations r{where_sql} "
@@ -3374,6 +3401,62 @@ def query_relations(
             params,
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+_DECISION_RELATIONS_SQL = """
+    WITH eligible_events AS MATERIALIZED (
+      SELECT e.id, e.dedup_key
+      FROM events e
+      WHERE event_content_eligible(
+              e.title, e.snippet, e.source,
+              COALESCE(NULLIF(e.canonical_url,''), e.url)
+            )=1
+        AND e.published_at_status='verified'
+        AND e.published_at_epoch BETWEEN ? AND ?
+    ),
+    event_source_ids(source_id) AS MATERIALIZED (
+      SELECT CAST(id AS TEXT) FROM eligible_events
+      UNION
+      SELECT dedup_key FROM eligible_events
+      WHERE NULLIF(TRIM(dedup_key), '') IS NOT NULL
+    ),
+    event_relation_types(source_type) AS MATERIALIZED (
+      SELECT DISTINCT r.source_type
+      FROM relations r
+      WHERE LOWER(TRIM(r.source_type))='event'
+    ),
+    latest_macro(source_id) AS MATERIALIZED (
+      SELECT CAST(MAX(id) AS TEXT) FROM macro_snapshots
+    )
+    SELECT source_type, source_id, topic_key, asset_key, relation_type,
+           direction, strength, confidence, horizon, method, rationale,
+           evidence_json, created_at
+    FROM (
+      SELECT r.id AS relation_id, r.source_type, r.source_id, r.topic_key,
+             r.asset_key, r.relation_type, r.direction, r.strength,
+             r.confidence, r.horizon, r.method, r.rationale,
+             r.evidence_json, r.created_at
+      FROM event_relation_types rt
+      CROSS JOIN event_source_ids esi
+      CROSS JOIN relations AS r INDEXED BY idx_relation_source
+      WHERE r.source_type=rt.source_type AND r.source_id=esi.source_id
+
+      UNION ALL
+
+      SELECT r.id AS relation_id, r.source_type, r.source_id, r.topic_key,
+             r.asset_key, r.relation_type, r.direction, r.strength,
+             r.confidence, r.horizon, r.method, r.rationale,
+             r.evidence_json, r.created_at
+      FROM latest_macro lm
+      CROSS JOIN relations r
+      WHERE LOWER(TRIM(r.source_type))='macro_snapshot'
+        AND (
+          r.source_id=lm.source_id
+          OR r.source_id LIKE (lm.source_id || ':%')
+        )
+    ) selected
+    ORDER BY created_at DESC, relation_id DESC
+"""
 
 
 def query_decision_relations(
@@ -3393,45 +3476,43 @@ def query_decision_relations(
     cutoff_epoch = current_epoch - maximum_age * 3600
     with conn() as c:
         rows = c.execute(
-            """
-            SELECT r.source_type, r.source_id, r.topic_key, r.asset_key,
-                   r.relation_type, r.direction, r.strength, r.confidence,
-                   r.horizon, r.method, r.rationale, r.evidence_json,
-                   r.created_at
-            FROM relations r
-            LEFT JOIN events e
-              ON LOWER(TRIM(r.source_type))='event'
-             AND (
-               r.source_id=CAST(e.id AS TEXT)
-               OR r.source_id=e.dedup_key
-             )
-            WHERE (
-                 LOWER(TRIM(r.source_type))='macro_snapshot'
-                 AND (
-                   r.source_id=CAST(
-                     (SELECT MAX(id) FROM macro_snapshots) AS TEXT
-                   )
-                   OR r.source_id LIKE (
-                     CAST((SELECT MAX(id) FROM macro_snapshots) AS TEXT)
-                     || ':%'
-                   )
-                 )
-               )
-               OR (
-                 LOWER(TRIM(r.source_type))='event'
-                 AND e.id IS NOT NULL
-                 AND event_content_eligible(
-                   e.title, e.snippet, e.source,
-                   COALESCE(NULLIF(e.canonical_url,''), e.url)
-                 )=1
-                 AND e.published_at_status='verified'
-                 AND e.published_at_epoch BETWEEN ? AND ?
-               )
-            ORDER BY r.created_at DESC, r.id DESC
-            """,
-            (cutoff_epoch, current_epoch),
+            _DECISION_RELATIONS_SQL, (cutoff_epoch, current_epoch)
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+_MARKET_VALIDATION_RELATIONS_SQL = """
+    WITH eligible_events AS MATERIALIZED (
+      SELECT e.id, e.dedup_key
+      FROM events e
+      WHERE e.published_at_status='verified'
+        AND event_content_eligible(
+              e.title, e.snippet, e.source,
+              COALESCE(NULLIF(e.canonical_url,''), e.url)
+            )=1
+        AND e.published_at_epoch BETWEEN ? AND ?
+    ),
+    event_source_ids(source_id) AS MATERIALIZED (
+      SELECT CAST(id AS TEXT) FROM eligible_events
+      UNION
+      SELECT dedup_key FROM eligible_events
+      WHERE NULLIF(TRIM(dedup_key), '') IS NOT NULL
+    ),
+    event_relation_types(source_type) AS MATERIALIZED (
+      SELECT DISTINCT r.source_type
+      FROM relations r
+      WHERE LOWER(TRIM(r.source_type))='event'
+    )
+    SELECT r.source_type, r.source_id, r.topic_key, r.asset_key,
+           r.relation_type, r.direction, r.strength, r.confidence,
+           r.horizon, r.method, r.rationale, r.evidence_json,
+           r.created_at
+    FROM event_relation_types rt
+    CROSS JOIN event_source_ids esi
+    CROSS JOIN relations AS r INDEXED BY idx_relation_source
+    WHERE r.source_type=rt.source_type AND r.source_id=esi.source_id
+    ORDER BY r.created_at DESC, r.id DESC
+"""
 
 
 def query_market_validation_relations(
@@ -3451,26 +3532,7 @@ def query_market_validation_relations(
     cutoff_epoch = current_epoch - maximum_age * 3600
     with conn() as c:
         rows = c.execute(
-            """
-            SELECT r.source_type, r.source_id, r.topic_key, r.asset_key,
-                   r.relation_type, r.direction, r.strength, r.confidence,
-                   r.horizon, r.method, r.rationale, r.evidence_json,
-                   r.created_at
-            FROM relations r
-            JOIN events e
-              ON LOWER(TRIM(r.source_type))='event'
-             AND (
-               r.source_id=CAST(e.id AS TEXT)
-               OR r.source_id=e.dedup_key
-             )
-            WHERE e.published_at_status='verified'
-              AND event_content_eligible(
-                e.title, e.snippet, e.source,
-                COALESCE(NULLIF(e.canonical_url,''), e.url)
-              )=1
-              AND e.published_at_epoch BETWEEN ? AND ?
-            ORDER BY r.created_at DESC, r.id DESC
-            """,
+            _MARKET_VALIDATION_RELATIONS_SQL,
             (cutoff_epoch, current_epoch),
         ).fetchall()
     return [dict(row) for row in rows]
@@ -4274,15 +4336,90 @@ def query_llm_usage_summary(
     }
 
 
+def _prune_macro_history_in(
+    c: sqlite3.Connection,
+    *,
+    cutoff_epoch: int,
+) -> dict[str, int]:
+    expired = int(
+        c.execute(
+            """
+            SELECT COUNT(*)
+            FROM macro_snapshots
+            WHERE CAST(strftime('%s', created_at) AS INTEGER) < ?
+            """,
+            (cutoff_epoch,),
+        ).fetchone()[0]
+    )
+    if not expired:
+        return {"snapshots": 0, "relations": 0}
+
+    # ``relations`` has a polymorphic source key rather than a foreign key.
+    # Remove every edge owned by an expiring macro snapshot before deleting
+    # its parent so retention cannot create permanent orphans.  Extracting the
+    # prefix handles both the direct id and ``<snapshot-id>:...`` source forms
+    # without confusing snapshot 12 with 120.
+    c.execute(
+        """
+        WITH expired_macro_sources(source_id) AS MATERIALIZED (
+          SELECT CAST(id AS TEXT)
+          FROM macro_snapshots
+          WHERE CAST(strftime('%s', created_at) AS INTEGER) < ?
+        )
+        DELETE FROM relations
+        WHERE LOWER(TRIM(source_type))='macro_snapshot'
+          AND CASE
+                WHEN INSTR(source_id, ':') > 0
+                THEN SUBSTR(source_id, 1, INSTR(source_id, ':') - 1)
+                ELSE source_id
+              END IN (SELECT source_id FROM expired_macro_sources)
+        """,
+        (cutoff_epoch,),
+    )
+    relations_deleted = int(c.execute("SELECT changes()").fetchone()[0])
+    snapshots = c.execute(
+        """
+        DELETE FROM macro_snapshots
+        WHERE CAST(strftime('%s', created_at) AS INTEGER) < ?
+        """,
+        (cutoff_epoch,),
+    ).rowcount
+    return {
+        "snapshots": max(0, int(snapshots)),
+        "relations": relations_deleted,
+    }
+
+
+def prune_macro_history(
+    *,
+    now: datetime | str | None = None,
+    retention_days: int = MACRO_RETENTION_DAYS,
+) -> dict[str, int]:
+    current = (
+        _parse_utc_datetime(now)
+        if now is not None
+        else datetime.now(timezone.utc)
+    )
+    if current is None:
+        raise ValueError("now must include a timezone")
+    days = max(1, min(int(retention_days), 24 * 365))
+    cutoff_epoch = int((current - timedelta(days=days)).timestamp())
+    with conn(immediate=True) as c:
+        return _prune_macro_history_in(c, cutoff_epoch=cutoff_epoch)
+
+
 def prune_old() -> int:
-    with conn() as c:
+    current = datetime.now(timezone.utc)
+    with conn(immediate=True) as c:
         cur = c.execute(
             "DELETE FROM events WHERE strftime('%s', substr(COALESCE(last_seen_at, fetched_at),1,19)) < "
             f"strftime('%s','now','-{RETENTION_DAYS} days')"
         )
-        c.execute(
-            "DELETE FROM macro_snapshots WHERE strftime('%s', substr(created_at,1,19)) < "
-            "strftime('%s','now','-90 days')"
+        _prune_macro_history_in(
+            c,
+            cutoff_epoch=int(
+                (current - timedelta(days=MACRO_RETENTION_DAYS)).timestamp()
+            ),
         )
         c.execute(
             "DELETE FROM llm_call_attempts "

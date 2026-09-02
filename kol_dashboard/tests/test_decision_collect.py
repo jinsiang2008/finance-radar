@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import unittest
+from datetime import datetime, timezone
 from unittest import mock
 
 
@@ -19,6 +20,7 @@ class FakeRepository:
         self.saved_snapshots = []
         self.query_kwargs = None
         self.decision_relation_kwargs = None
+        self.prune_calls = []
 
     def query_events(self, **kwargs):
         self.query_kwargs = kwargs
@@ -52,6 +54,10 @@ class FakeRepository:
     def replace_relations(self, source_type, source_id, edges):
         self.replacements.append((source_type, str(source_id), edges))
         return len(edges)
+
+    def prune_macro_history(self, **kwargs):
+        self.prune_calls.append(kwargs)
+        return {"snapshots": 2, "relations": 7}
 
     def query_market_validation_relations(self, **kwargs):
         self.decision_relation_kwargs = kwargs
@@ -109,6 +115,12 @@ class DecisionCollectorTests(unittest.TestCase):
         self.assertEqual(repository.query_kwargs["limit"], 1_000)
         self.assertGreaterEqual(summary["event_relations"], 1)
         self.assertGreaterEqual(summary["macro_relations"], 1)
+        self.assertEqual(summary["macro_snapshots_pruned"], 2)
+        self.assertEqual(summary["macro_relations_pruned"], 7)
+        self.assertEqual(
+            repository.prune_calls,
+            [{"now": datetime(2026, 8, 3, tzinfo=timezone.utc)}],
+        )
         self.assertTrue(repository.replacements)
 
     def test_market_collection_fetches_assets_and_persists_reactions(self) -> None:

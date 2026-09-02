@@ -96,10 +96,13 @@ def collect_relations(
         if isinstance(macro, dict)
         else []
     )
+    pruned = repository.prune_macro_history(now=current)
     return {
         "events": len(events),
         "event_relations": len(event_relations),
         "macro_relations": len(macro_relations),
+        "macro_snapshots_pruned": int(pruned.get("snapshots") or 0),
+        "macro_relations_pruned": int(pruned.get("relations") or 0),
     }
 
 

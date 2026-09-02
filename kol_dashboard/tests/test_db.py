@@ -363,6 +363,171 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(rows[live]["outcome"], "started")
         self.assertNotIn(expired, rows)
 
+    def test_macro_history_prune_removes_expired_relations_with_their_snapshot(
+        self,
+    ) -> None:
+        current = datetime.now(timezone.utc).replace(microsecond=0)
+        old_created_at = (current - timedelta(days=91)).isoformat()
+        current_created_at = current.isoformat()
+        payload = json.dumps(
+            {
+                "public_schema_version": 1,
+                "timestamp": current_created_at,
+                "composite_risk": {"score": 50, "level": "medium"},
+            }
+        )
+        with db.conn(immediate=True) as connection:
+            old_id = connection.execute(
+                """
+                INSERT INTO macro_snapshots (
+                  created_at, composite_score, composite_level, payload
+                ) VALUES (?, 50, 'medium', ?)
+                """,
+                (old_created_at, payload),
+            ).lastrowid
+            current_id = connection.execute(
+                """
+                INSERT INTO macro_snapshots (
+                  created_at, composite_score, composite_level, payload
+                ) VALUES (?, 50, 'medium', ?)
+                """,
+                (current_created_at, payload),
+            ).lastrowid
+
+        def edge(topic: str, asset: str) -> dict:
+            return {
+                "topic_key": topic,
+                "asset_key": asset,
+                "relation_type": "structural_risk",
+                "direction": "negative",
+                "strength": 0.7,
+                "confidence": 0.8,
+                "horizon": "medium",
+                "method": "test",
+            }
+
+        db.replace_relations(
+            " MACRO_SNAPSHOT ", old_id, [edge("old-direct", "US:OLD")]
+        )
+        db.replace_relations(
+            "macro_snapshot",
+            f"{old_id}:gray_rhino:credit",
+            [edge("old-scenario", "US:HYG")],
+        )
+        db.replace_relations(
+            "macro_snapshot",
+            current_id,
+            [edge("current-direct", "US:CURRENT")],
+        )
+        db.replace_relations(
+            "macro_snapshot",
+            f"{current_id}:gray_rhino:growth",
+            [edge("current-scenario", "US:QQQ")],
+        )
+        db.replace_relations(
+            "macro_snapshot", "999999:orphan", [edge("orphan", "US:ORPHAN")]
+        )
+        db.replace_relations(
+            "macro_snapshot",
+            f"{old_id}0:similar-prefix",
+            [edge("similar-prefix", "US:SIMILAR")],
+        )
+        db.replace_relations("event", old_id, [edge("event", "US:EVENT")])
+
+        pruned = db.prune_macro_history(now=current)
+
+        self.assertEqual(pruned, {"snapshots": 1, "relations": 2})
+
+        with db.conn() as connection:
+            snapshot_ids = {
+                row["id"]
+                for row in connection.execute(
+                    "SELECT id FROM macro_snapshots"
+                ).fetchall()
+            }
+            topics = {
+                row["topic_key"]
+                for row in connection.execute(
+                    "SELECT topic_key FROM relations"
+                ).fetchall()
+            }
+        self.assertEqual(snapshot_ids, {current_id})
+        self.assertEqual(
+            topics,
+            {
+                "current-direct",
+                "current-scenario",
+                "orphan",
+                "similar-prefix",
+                "event",
+            },
+        )
+
+    def test_macro_history_prune_is_atomic_if_parent_delete_fails(self) -> None:
+        current = datetime(2026, 9, 2, tzinfo=timezone.utc)
+        old_created_at = (current - timedelta(days=91)).isoformat()
+        payload = json.dumps(
+            {
+                "public_schema_version": 1,
+                "timestamp": old_created_at,
+                "composite_risk": {"score": 50, "level": "medium"},
+            }
+        )
+        with db.conn(immediate=True) as connection:
+            old_id = connection.execute(
+                """
+                INSERT INTO macro_snapshots (
+                  created_at, composite_score, composite_level, payload
+                ) VALUES (?, 50, 'medium', ?)
+                """,
+                (old_created_at, payload),
+            ).lastrowid
+        db.replace_relations(
+            "macro_snapshot",
+            f"{old_id}:black_swan:test",
+            [
+                {
+                    "topic_key": "atomic",
+                    "asset_key": "US:TEST",
+                    "relation_type": "structural_risk",
+                    "direction": "negative",
+                    "strength": 0.7,
+                    "confidence": 0.8,
+                    "horizon": "medium",
+                    "method": "test",
+                }
+            ],
+        )
+        with db.conn(immediate=True) as connection:
+            connection.execute(
+                """
+                CREATE TRIGGER fail_macro_snapshot_delete
+                BEFORE DELETE ON macro_snapshots
+                BEGIN
+                  SELECT RAISE(ABORT, 'injected snapshot delete failure');
+                END
+                """
+            )
+
+        with self.assertRaisesRegex(
+            sqlite3.IntegrityError, "injected snapshot delete failure"
+        ):
+            db.prune_macro_history(now=current)
+
+        with db.conn() as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM macro_snapshots WHERE id=?", (old_id,)
+                ).fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM relations WHERE topic_key='atomic'"
+                ).fetchone()[0],
+                1,
+            )
+
     def test_merge_fills_missing_published_at_then_preserves_it(self) -> None:
         reliable = "2026-07-31T10:34:56+00:00"
         later_claim = "2026-08-01T10:34:56+00:00"
@@ -2089,6 +2254,300 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(decisions, [])
         self.assertEqual(len(validation), 1)
         self.assertEqual(validation[0]["source_id"], event_id)
+
+    def test_decision_relation_queries_cover_source_ids_age_and_order(
+        self,
+    ) -> None:
+        now = datetime(2026, 9, 2, 12, 0, tzinfo=timezone.utc)
+        events = [
+            self.event(
+                title="Fresh eligible event",
+                url="https://example.com/fresh-eligible",
+                published_at=(now - timedelta(hours=1)).isoformat(),
+            ),
+            self.event(
+                title="Expired eligible event",
+                url="https://example.com/expired-eligible",
+                published_at=(now - timedelta(hours=80)).isoformat(),
+            ),
+            self.event(
+                title="Future eligible event",
+                url="https://example.com/future-eligible",
+                published_at=(now + timedelta(hours=1)).isoformat(),
+            ),
+            self.event(
+                title="https://truthsocial.com/@example/posts/123",
+                url="https://truthsocial.com/@example/posts/123",
+                snippet="",
+                source="Truth Social",
+                published_at=(now - timedelta(hours=1)).isoformat(),
+            ),
+        ]
+        db.insert_events(events)
+
+        with db.conn() as connection:
+            event_rows = {
+                row["url"]: dict(row)
+                for row in connection.execute(
+                    "SELECT id, dedup_key, url FROM events"
+                ).fetchall()
+            }
+
+        fresh = event_rows["https://example.com/fresh-eligible"]
+        expired = event_rows["https://example.com/expired-eligible"]
+        future = event_rows["https://example.com/future-eligible"]
+        ineligible = event_rows[
+            "https://truthsocial.com/@example/posts/123"
+        ]
+
+        first_macro = db.save_macro_snapshot(
+            {
+                "public_schema_version": 1,
+                "timestamp": "2026-09-01T00:00:00+00:00",
+                "composite_risk": {"score": 40, "level": "medium"},
+            }
+        )
+        latest_macro = db.save_macro_snapshot(
+            {
+                "public_schema_version": 1,
+                "timestamp": "2026-09-02T00:00:00+00:00",
+                "composite_risk": {"score": 50, "level": "medium"},
+            }
+        )
+
+        relation_rows = [
+            (
+                " EVENT ",
+                str(fresh["id"]),
+                "fresh-id",
+                "US:ID",
+                "2026-09-02T09:00:00+00:00",
+            ),
+            (
+                "event",
+                fresh["dedup_key"],
+                "fresh-key",
+                "US:KEY",
+                "2026-09-02T10:00:00+00:00",
+            ),
+            (
+                "event",
+                str(expired["id"]),
+                "expired",
+                "US:OLD",
+                "2026-09-02T11:00:00+00:00",
+            ),
+            (
+                "event",
+                str(future["id"]),
+                "future",
+                "US:FUTURE",
+                "2026-09-02T11:01:00+00:00",
+            ),
+            (
+                "event",
+                str(ineligible["id"]),
+                "ineligible",
+                "US:BAD",
+                "2026-09-02T11:02:00+00:00",
+            ),
+            (
+                "Event",
+                "missing-event",
+                "orphan",
+                "US:ORPHAN",
+                "2026-09-02T11:03:00+00:00",
+            ),
+            (
+                "macro_snapshot",
+                f"{first_macro}:gray_rhino:old",
+                "old-macro",
+                "US:OLD-MACRO",
+                "2026-09-02T11:04:00+00:00",
+            ),
+            (
+                "macro_snapshot",
+                f"{latest_macro}:gray_rhino:new",
+                "latest-macro",
+                "US:NEW-MACRO",
+                "2026-09-02T11:00:00+00:00",
+            ),
+        ]
+        with db.conn(immediate=True) as connection:
+            connection.executemany(
+                """
+                INSERT INTO relations (
+                  source_type, source_id, topic_key, asset_key, relation_type,
+                  direction, strength, confidence, horizon, method, rationale,
+                  evidence_json, created_at
+                ) VALUES (?, ?, ?, ?, 'view', 'positive', 0.8, 0.8,
+                          'medium', 'test', '', '{}', ?)
+                """,
+                relation_rows,
+            )
+
+        decisions = db.query_decision_relations(now=now)
+        validation = db.query_market_validation_relations(
+            now=now, event_max_age_hours=72
+        )
+
+        self.assertEqual(
+            [row["topic_key"] for row in decisions],
+            ["latest-macro", "fresh-key", "fresh-id"],
+        )
+        self.assertEqual(
+            [row["topic_key"] for row in validation],
+            ["fresh-key", "fresh-id"],
+        )
+        self.assertEqual(decisions[-1]["source_type"], " EVENT ")
+        self.assertEqual(
+            set(decisions[0]),
+            {
+                "source_type",
+                "source_id",
+                "topic_key",
+                "asset_key",
+                "relation_type",
+                "direction",
+                "strength",
+                "confidence",
+                "horizon",
+                "method",
+                "rationale",
+                "evidence_json",
+                "created_at",
+            },
+        )
+
+    def test_eligible_only_relation_readers_filter_event_type_variants(
+        self,
+    ) -> None:
+        db.insert_events(
+            [
+                self.event(
+                    title="Eligible event source",
+                    url="https://example.com/eligible-source",
+                ),
+                self.event(
+                    title="https://truthsocial.com/@example/posts/456",
+                    url="https://truthsocial.com/@example/posts/456",
+                    snippet="",
+                    source="Truth Social",
+                ),
+            ]
+        )
+        with db.conn() as connection:
+            rows = {
+                row["url"]: dict(row)
+                for row in connection.execute(
+                    "SELECT id, dedup_key, url FROM events"
+                ).fetchall()
+            }
+        eligible = rows["https://example.com/eligible-source"]
+        ineligible = rows[
+            "https://truthsocial.com/@example/posts/456"
+        ]
+
+        def edge(topic: str, asset: str) -> dict:
+            return {
+                "topic_key": topic,
+                "asset_key": asset,
+                "relation_type": "view",
+                "direction": "positive",
+                "strength": 0.7,
+                "confidence": 0.8,
+                "horizon": "medium",
+                "method": "test",
+            }
+
+        db.replace_relations("EVENT", eligible["id"], [edge("id", "US:ID")])
+        db.replace_relations(
+            "event", eligible["dedup_key"], [edge("key", "US:KEY")]
+        )
+        db.replace_relations(
+            "Event", ineligible["id"], [edge("bad", "US:BAD")]
+        )
+        db.replace_relations(
+            "event", "missing-event", [edge("orphan", "US:ORPHAN")]
+        )
+        db.replace_relations(
+            "macro_snapshot", "1", [edge("macro", "US:MACRO")]
+        )
+        with db.conn(immediate=True) as connection:
+            connection.execute(
+                "UPDATE relations SET source_type=' EVENT ' "
+                "WHERE source_type='Event' AND source_id=?",
+                (str(ineligible["id"]),),
+            )
+
+        reaction = {
+            "window": "1D",
+            "status": "unavailable",
+            "sample_count": 0,
+            "data_timestamps": {},
+            "method_version": "test",
+        }
+        db.upsert_market_reaction(
+            "EVENT", eligible["id"], "US:ID", reaction
+        )
+        db.upsert_market_reaction(
+            "event", eligible["dedup_key"], "US:KEY", reaction
+        )
+        db.upsert_market_reaction(
+            "Event", ineligible["id"], "US:BAD", reaction
+        )
+        db.upsert_market_reaction(
+            "event", "missing-event", "US:ORPHAN", reaction
+        )
+        db.upsert_market_reaction(
+            "macro_snapshot", "1", "US:MACRO", reaction
+        )
+        with db.conn(immediate=True) as connection:
+            connection.execute(
+                "UPDATE market_reactions SET source_type=' EVENT ' "
+                "WHERE source_type='Event' AND source_id=?",
+                (str(ineligible["id"]),),
+            )
+
+        relations = db.query_relations(
+            eligible_events_only=True, limit=20
+        )
+        reactions = db.query_market_reactions(
+            eligible_events_only=True, limit=20
+        )
+
+        self.assertEqual(
+            {row["topic_key"] for row in relations},
+            {"id", "key", "macro"},
+        )
+        self.assertEqual(
+            {row["asset_key"] for row in reactions},
+            {"US:ID", "US:KEY", "US:MACRO"},
+        )
+        self.assertEqual(len(db.query_relations(limit=20)), 5)
+        self.assertEqual(len(db.query_market_reactions(limit=20)), 5)
+
+    def test_relation_query_plan_uses_source_lookup_without_event_join_scan(
+        self,
+    ) -> None:
+        with db.conn() as connection:
+            for sql in (
+                db._DECISION_RELATIONS_SQL,
+                db._MARKET_VALIDATION_RELATIONS_SQL,
+            ):
+                details = [
+                    row["detail"]
+                    for row in connection.execute(
+                        "EXPLAIN QUERY PLAN " + sql, (0, 9_999_999_999)
+                    ).fetchall()
+                ]
+                plan = "\n".join(details)
+                self.assertIn(
+                    "SEARCH r USING INDEX idx_relation_source "
+                    "(source_type=? AND source_id=?)",
+                    plan,
+                )
+                self.assertNotIn("SCAN e LEFT-JOIN", plan)
 
     def test_macro_relations_round_trip_preserves_each_edge_source_group(self) -> None:
         payload = {
