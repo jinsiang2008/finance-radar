@@ -18,7 +18,7 @@
     } catch (e) {}
   })();
 </script>
-  <link rel="stylesheet" href="static/style.css?v=18" />
+  <link rel="stylesheet" href="static/style.css?v=19" />
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ccircle cx='50' cy='50' r='42' fill='%230b1720' stroke='%2331d69b' stroke-width='6'/%3E%3Ccircle cx='50' cy='50' r='20' fill='none' stroke='%234ab8d8' stroke-width='5'/%3E%3Cpath d='M50 50L82 24' stroke='%23f4b942' stroke-width='6' stroke-linecap='round'/%3E%3Ccircle cx='50' cy='50' r='7' fill='%23eef4f2'/%3E%3C/svg%3E" />
 </head>
 <body>
@@ -72,7 +72,7 @@
 <!-- ══════════════ 今日态势 ══════════════ -->
 <main class="view active" id="view-decision" role="tabpanel" aria-labelledby="tab-decision">
   <div class="wrap decision-wrap">
-    <section class="decision-hero" id="decision-hero" aria-live="polite">
+    <section class="decision-hero" id="decision-hero">
       <div class="skeleton skeleton-hero"></div>
     </section>
 
@@ -101,13 +101,13 @@
             aria-live="polite"></span>
     </section>
 
-    <div class="decision-layout">
+    <div class="decision-layout decision-master-detail">
       <section class="decision-panel action-panel" aria-labelledby="action-queue-title">
         <div class="block-head decision-panel-head">
           <div>
-            <p class="section-kicker">PRIORITY SIGNALS</p>
-            <h2 id="action-queue-title">重点信号</h2>
-            <p class="block-sub">按关注优先级排序；点击查看传导路径与证据</p>
+            <p class="section-kicker">REVIEW QUEUE</p>
+            <h2 id="action-queue-title">重点队列</h2>
+            <p class="block-sub">按关注优先级排序；选择后在右侧核验证据脊柱</p>
           </div>
           <span class="decision-count" id="decision-count">—</span>
         </div>
@@ -117,27 +117,29 @@
         </div>
       </section>
 
-      <section class="decision-panel matrix-panel" aria-labelledby="impact-matrix-title">
-        <div class="block-head decision-panel-head">
-          <div>
-            <p class="section-kicker">EXPOSURE MAP</p>
-            <h2 id="impact-matrix-title">主题 × 资产暴露</h2>
-            <p class="block-sub">条件性方向，不是交易结论；点击单元格核验证据</p>
-          </div>
-          <div class="matrix-legend" aria-label="方向图例">
-            <span class="is-up">▲ 正向</span><span class="is-down">▼ 负向</span><span class="is-conflict">◆ 分歧</span>
-          </div>
-        </div>
-        <div class="impact-matrix-wrap" id="decision-matrix" tabindex="0">
-          <div class="skeleton skeleton-card"></div>
+      <section class="decision-panel evidence-panel" id="decision-detail"
+               aria-label="当前决策详情">
+        <div class="empty">
+          <span class="empty-icon">│</span>
+          <h2 id="decision-detail-title" tabindex="-1">证据脊柱</h2>
+          <p>选择重点队列或资产单元格，查看六段可核验依据。</p>
         </div>
       </section>
     </div>
 
-    <section class="decision-panel evidence-panel" id="decision-detail"
-             aria-labelledby="decision-detail-title" aria-live="polite">
-      <div class="empty">
-        <span class="empty-icon">⛓</span>选择重点信号或资产单元格，查看局部证据链
+    <section class="decision-panel matrix-panel" aria-labelledby="impact-matrix-title">
+      <div class="block-head decision-panel-head">
+        <div>
+          <p class="section-kicker">EXPOSURE MAP</p>
+          <h2 id="impact-matrix-title">主题 × 资产暴露</h2>
+          <p class="block-sub">次级扫描区；仅表示条件性关联方向，不是交易结论</p>
+        </div>
+        <div class="matrix-legend" aria-label="方向图例">
+          <span class="is-up">▲ 正向</span><span class="is-down">▼ 负向</span><span class="is-conflict">◆ 分歧</span>
+        </div>
+      </div>
+      <div class="impact-matrix-wrap" id="decision-matrix" tabindex="0">
+        <div class="skeleton skeleton-card"></div>
       </div>
     </section>
 
@@ -226,7 +228,7 @@
         <p class="section-kicker">SOURCE INTELLIGENCE</p>
         <h1>KOL 信号流</h1>
       </div>
-      <p>按发布时间、影响和独立来源降噪；转载不会增加确认度。</p>
+      <p>按发布时间、影响和关联记录降噪；重复转载不等于独立确认。</p>
     </header>
 
     <section class="statstrip" id="stats">
@@ -364,6 +366,6 @@
   </div>
 </div>
 
-<script src="static/app.js?v=18"></script>
+<script src="static/app.js?v=19"></script>
 </body>
 </html>

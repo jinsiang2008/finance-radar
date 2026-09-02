@@ -474,6 +474,78 @@
     return typeof value === "number" ? `${Math.round(value * 100)}%` : "—";
   };
 
+  const DECISION_SOURCE_CN = {
+    event: "事件记录",
+    macro_snapshot: "宏观快照",
+  };
+  const DECISION_RELATION_CN = {
+    view: "观点关联",
+    opportunity: "机会关联",
+    risk: "风险关联",
+    exposure: "暴露关联",
+    mention: "提及关联",
+  };
+  const DECISION_DIRECTION_CN = {
+    positive: "正向",
+    negative: "负向",
+    neutral: "中性",
+    mixed: "方向分歧",
+    unclear: "方向待核验",
+    unknown: "方向未知",
+  };
+  const DECISION_HORIZON_CN = {
+    immediate: "即时",
+    short: "短期",
+    medium: "中期",
+    long: "长期",
+    mixed: "期限混合",
+    unknown: "期限未知",
+  };
+
+  const decisionSourceLabel = (value) =>
+    DECISION_SOURCE_CN[String(value || "").toLowerCase()] || "关联记录";
+  const decisionRelationLabel = (value) =>
+    DECISION_RELATION_CN[String(value || "").toLowerCase()] || "条件性关联";
+  const decisionDirectionLabel = (value) =>
+    DECISION_DIRECTION_CN[String(value || "").toLowerCase()] || "方向待核验";
+  const decisionHorizonLabel = (value) =>
+    DECISION_HORIZON_CN[String(value || "").toLowerCase()] || "期限待核验";
+
+  function decisionMethodLabel(value) {
+    const raw = String(value || "").trim();
+    if (!raw) return "方法未标识";
+    const [method, version] = raw.split(":", 2);
+    const label = {
+      deterministic_rules: "确定性规则",
+      keyword_rules: "关键词规则",
+      llm: "结构化模型输出",
+    }[method] || method.replaceAll("_", " ");
+    return version ? `${label} · ${version}` : label;
+  }
+
+  function structuredModelSteps(card) {
+    const raw =
+      card?.model_transmission_path ??
+      card?.model_path ??
+      card?.transmission_path ??
+      card?.model_transmission;
+    const candidates = Array.isArray(raw)
+      ? raw
+      : Array.isArray(raw?.steps)
+        ? raw.steps
+        : [];
+    return candidates
+      .slice(0, 6)
+      .map((item) => {
+        if (typeof item === "string") return item.trim();
+        if (!item || typeof item !== "object") return "";
+        return String(
+          item.hypothesis || item.label || item.description || item.step || ""
+        ).trim();
+      })
+      .filter(Boolean);
+  }
+
   const CANDIDATE_STAGE = {
     reduce_or_hedge: "candidate_reduce_or_hedge",
     scale_in: "candidate_scale_in",
@@ -605,19 +677,19 @@
     const sourceCount = Math.max(0, Number(card?.source_count || 0));
     if (sourceCount >= 2) {
       return {
-        tone: "ok",
-        state: "multi_source",
-        label: `多源证据 · ${sourceCount} 个独立来源`,
+        tone: "warn",
+        state: "related_records",
+        label: `关联记录 ${sourceCount} 条 · 独立性待核验`,
       };
     }
     if (sourceCount === 1) {
       return {
         tone: "warn",
-        state: "single_source",
-        label: "单一来源 · 待交叉核验",
+        state: "related_record",
+        label: "关联记录 1 条 · 待交叉核验",
       };
     }
-    return { tone: "error", state: "no_source", label: "暂无可核验来源" };
+    return { tone: "error", state: "no_record", label: "关联记录 0 条" };
   }
 
   function marketReasonCount(market, key) {
@@ -801,9 +873,9 @@
       return {
         tone: "warn",
         state: "contrary",
-        label: "市场反向，候选停止并复核",
+        label: "区间样本相对基准与规则方向反向",
         guidance:
-          "市场样本与机制方向相反；停止候选行动，先复核相反证据与失效条件。",
+          "区间样本的相对基准方向与规则方向相反；停止候选行动，先复核相反证据与失效条件。",
       };
     }
     if (
@@ -813,9 +885,9 @@
       return {
         tone: "warn",
         state: "inconclusive",
-        label: "市场方向中性或不一致",
+        label: "区间样本相对基准方向中性或不一致",
         guidance:
-          "市场样本未形成一致方向；候选不能推进，需继续复核中性和相反证据。",
+          "区间样本的相对基准方向未形成一致结果；候选不能推进，需继续复核中性和相反证据。",
       };
     }
     if (
@@ -828,7 +900,7 @@
         state: "pending",
         label: "等待共同交易日窗口",
         guidance:
-          "所需窗口尚未到期；未来窗口不构成数据故障，也不能提前视为市场确认。",
+          "所需窗口尚未到期；未来窗口不构成数据故障，也不能提前视为市场观察完成。",
       };
     }
     if (
@@ -861,7 +933,7 @@
           : followUpUnavailable
             ? "事件与方向均已具备，但所需共同交易日数据不足；当前保持降级核验。"
             : noRecords
-              ? "暂无事件级验证记录；请核验事件锚点与采集状态，不能把缺失记录视为市场确认。"
+              ? "暂无事件级观察记录；请核验事件锚点与采集状态，不能把缺失记录视为市场观察完成。"
               : "市场验证暂不可用：所需行情或基准数据缺失；仅可核验证据，等待数据链路补齐。";
       return {
         tone: "error",
@@ -879,9 +951,9 @@
       return {
         tone: "ok",
         state: "confirmed",
-        label: "已有同向市场样本",
+        label: "区间样本相对基准与规则方向同向",
         guidance:
-          "已有同向市场样本；仍需人工确认仓位、风险预算与失效条件。",
+          "区间样本的相对基准方向与规则方向同向；仍需人工确认仓位、风险预算与失效条件。",
       };
     }
     if (market.veto === true) {
@@ -898,7 +970,9 @@
     return {
       tone: "warn",
       state: earlyConfirmation ? "preliminary" : "pending",
-      label: earlyConfirmation ? "市场初步同向，等待所需窗口" : "市场待确认",
+      label: earlyConfirmation
+        ? "早期区间相对基准同向，等待所需窗口"
+        : "等待市场观察窗口",
       guidance: earlyConfirmation
         ? "早期窗口初步同向，但所需期限尚未完成；当前只形成候选行动。"
         : "共同交易日窗口尚未完成；当前只形成影响假设，不能据此直接交易。",
@@ -1058,7 +1132,7 @@
         tone: hasMarketFailure ? "error" : "warn",
         evidenceTone: "warn",
         evidenceLabel: "决策快照延迟",
-        marketLabel: aggregateMarket?.label || "市场状态待核验",
+        marketLabel: aggregateMarket?.label || "市场观察待核验",
         guidance: hasMarketFailure
           ? "决策快照已超过 90 分钟且市场验证链路降级；只可核验历史证据，请刷新快照后再评估。"
           : "决策快照已超过 90 分钟；当前结论可能过期，请等待新快照后再评估候选行动。",
@@ -1084,7 +1158,7 @@
         tone: "warn",
         evidenceTone: "warn",
         evidenceLabel: "快照时间待核验",
-        marketLabel: aggregateMarket?.label || "市场状态待核验",
+        marketLabel: aggregateMarket?.label || "市场观察待核验",
         guidance:
           "决策快照缺少可核验的生成时间；当前只可检查证据，不能推进候选行动。",
         systemKind: "warn",
@@ -1117,7 +1191,7 @@
         marketLabel: marketState.label,
         guidance: marketState.guidance,
         systemKind: "warn",
-        systemLabel: contraryMarket ? "市场方向反向" : "市场方向待复核",
+        systemLabel: contraryMarket ? "相对基准方向反向" : "市场观察待复核",
       };
     }
     if (macroLoadFailed || businessPartiallyDegraded) {
@@ -1127,7 +1201,7 @@
         evidenceLabel: macroLoadFailed ? "宏观快照刷新失败" : "市场验证部分降级",
         marketLabel:
           aggregateMarket?.label ||
-          (businessPartiallyDegraded ? "部分市场验证可用" : "市场状态待核验"),
+          (businessPartiallyDegraded ? "部分市场观察可用" : "市场观察待核验"),
         guidance:
           macroLoadFailed && businessPartiallyDegraded
             ? "宏观快照本轮刷新失败，且部分市场验证不可用；继续显示上次成功决策，请重试后再评估。"
@@ -1143,7 +1217,7 @@
         tone: "warn",
         evidenceTone: "warn",
         evidenceLabel: hasEvidence ? "待人工核验" : "等待可核验证据",
-        marketLabel: anyUnavailable ? "部分验证不可用" : "市场尚未确认",
+        marketLabel: anyUnavailable ? "部分观察不可用" : "市场观察未完成",
         guidance:
           "当前仅形成影响假设；先核验证据与相反证据，等待市场窗口完成后再考虑交易。",
         systemKind: "warn",
@@ -1154,10 +1228,10 @@
       tone: needsReview ? "warn" : "ok",
       evidenceTone: needsReview ? "warn" : "ok",
       evidenceLabel: needsReview ? "待人工核验" : "证据已复核",
-      marketLabel: "已有同向市场样本",
+      marketLabel: "区间样本相对基准与规则方向同向",
       guidance: needsReview
-        ? "市场样本支持当前方向，但只形成候选行动，仍需人工确认风险预算与失效条件。"
-        : "证据与市场样本已就绪；执行前仍需核对仓位、价格与风险预算。",
+        ? "区间样本的相对基准方向支持当前规则方向，但只形成候选行动，仍需人工确认风险预算与失效条件。"
+        : "关联记录与区间市场观察已就绪；执行前仍需核对仓位、价格与风险预算。",
       systemKind: "ok",
       systemLabel: "验证链路正常",
     };
@@ -1170,6 +1244,12 @@
   function shortText(value, limit = 52) {
     const text = String(value || "").trim();
     return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
+  }
+
+  function localizeDecisionTerms(value) {
+    return String(value || "")
+      .replace(/\babstain\b/gi, "保持观察")
+      .replace(/\bpending\b/gi, "等待中");
   }
 
   function fmtAbsoluteTime(value) {
@@ -1474,7 +1554,7 @@
       }
       ${
         snapshotStale || stalePositions
-          ? `<span class="status-badge warn">⚠ 过期 ${Math.max(stalePositions, 1)} 项，置信度已降级</span>`
+          ? `<span class="status-badge warn">⚠ 过期 ${Math.max(stalePositions, 1)} 项，关注优先级已降级</span>`
           : ""
       }
       <span>仅直接匹配；间接暴露未计算。</span>
@@ -1499,7 +1579,7 @@
       Number.isFinite(coveredCount);
     const marketCoverageLabel = hasSemanticCoverage
       ? applicableCount > 0
-        ? `市场样本 ${coveredCount}/${applicableCount}`
+        ? `市场观察 ${coveredCount}/${applicableCount}`
         : "无适用事件窗口"
       : "覆盖口径待更新";
     const marketCoverageDetail = hasSemanticCoverage
@@ -1553,16 +1633,6 @@
     );
     const candidateActions = cards.filter(isCandidateAction).length;
     const boundary = decisionBoundaryState(data);
-    const coverageValues = cards
-      .map((card) => card.score_components?.coverage)
-      .filter((value) => typeof value === "number" && isFinite(value));
-    const coverage = coverageValues.length
-      ? Math.round(
-          (coverageValues.reduce((sum, value) => sum + value, 0) /
-            coverageValues.length) *
-            100
-        )
-      : 0;
     const sortedTimes = cards
       .map((card) => card.data_as_of)
       .filter(Boolean)
@@ -1587,32 +1657,38 @@
     const narrative = Number.isFinite(delta)
       ? `综合风险关注优先级较约 24 小时前${direction === "持平" ? "基本持平" : `${direction} ${Math.abs(delta).toFixed(0)} 分`}。${
           lead
-            ? `当前先核验“${shortText(lead.trigger || topicName(lead.topic_key), 34)}”及其资产传导。`
+            ? `当前先核验“${shortText(lead.trigger || topicName(lead.topic_key), 34)}”及其资产关联。`
             : "当前没有进入重点队列的资产信号。"
         }`
       : lead
-        ? "历史快照仍在积累，先按当前重点信号核验证据链与市场确认。"
+        ? "历史快照仍在积累，先按当前重点队列核验关联记录与市场观察。"
         : "历史快照仍在积累，当前以观察和补充证据为主。";
     const privateSummary = privatePortfolioSummaryHTML(data);
 
     const leadAction = lead ? actionInfo(lead) : ACTION_CN.observe;
     const leadIsCandidate = Boolean(lead && isCandidateAction(lead));
     const leadNeedsReview = lead?.human_review_required === true;
-    const transmission = lead
-      ? `<div class="transmission-ribbon" aria-label="首要信号传导路径">
-          <span class="transmission-node" title="${esc(lead.trigger || "待补充触发条件")}">
-            <small>信号</small><strong>${esc(shortText(lead.trigger || leadAction.label, 38))}</strong>
+    const evidencePolicy = localizeDecisionTerms(
+      data.evidence_policy ||
+        "机制关系与统计伴随分开展示；数据不足、方向冲突或过期时保持观察 / 验证，所有结论需人工复核。"
+    );
+    const leadContext = lead
+      ? `<div class="lead-context-grid" aria-label="当前首要核验上下文">
+          <span class="lead-context-item is-threshold" title="${esc(
+            lead.trigger || "待补充验证门槛"
+          )}">
+            <small>验证门槛</small><strong>${esc(
+              shortText(lead.trigger || "待补充", 54)
+            )}</strong>
           </span>
-          <span class="transmission-arrow" aria-hidden="true">→</span>
-          <span class="transmission-node" title="${esc(lead.topic_key || "")}">
-            <small>主题</small><strong>${esc(topicName(lead.topic_key))}</strong>
+          <span class="lead-context-item" title="${esc(lead.topic_key || "")}">
+            <small>关联主题</small><strong>${esc(topicName(lead.topic_key))}</strong>
           </span>
-          <span class="transmission-arrow" aria-hidden="true">→</span>
-          <span class="transmission-node" title="${esc(lead.asset_key || "")}">
-            <small>资产</small><strong>${esc(assetLabel(lead.asset_key))}</strong>
+          <span class="lead-context-item" title="${esc(lead.asset_key || "")}">
+            <small>资产暴露</small><strong>${esc(assetLabel(lead.asset_key))}</strong>
           </span>
         </div>`
-      : `<div class="transmission-ribbon is-empty">等待形成可核验的信号 → 主题 → 资产传导</div>`;
+      : `<div class="lead-context-grid is-empty">等待形成可核验的关联记录、主题与资产暴露。</div>`;
 
     $("#decision-hero").innerHTML = `
       <div class="situation-brief">
@@ -1633,7 +1709,7 @@
           <p class="brief-narrative">${esc(narrative)}</p>
         </section>
         <section class="brief-lead">
-          <p class="brief-kicker">${esc(DECISION_LENS_LABEL[state.decisionLens] || "全部")}视角 · 当前首要传导 · ${
+          <p class="brief-kicker">${esc(DECISION_LENS_LABEL[state.decisionLens] || "全部")}视角 · 当前首要核验 · ${
             leadNeedsReview
               ? "候选行动 · 待人工确认"
               : leadIsCandidate
@@ -1647,7 +1723,7 @@
                 )} · ${esc(assetLabel(lead.asset_key))}`
               : "等待重点信号"
           }</h1>
-          ${transmission}
+          ${leadContext}
           <div class="brief-statline">
             <span>风险 ${counts.risk}</span><span>机会 ${counts.opportunity}</span>
             <span>分歧 ${counts.conflict}</span><span>${
@@ -1655,12 +1731,8 @@
                 ? `候选行动 ${candidateActions} · 待人工确认`
                 : "本轮暂无候选行动"
             }</span>
-            <span>宏观覆盖 ${coverage}%</span>
           </div>
-          <p class="brief-policy">${esc(
-            data.evidence_policy ||
-              "机制关系与统计伴随分开展示；数据不足、方向冲突或过期时保持观察 / 验证，所有结论需人工复核。"
-          )}</p>
+          <p class="brief-policy">${esc(evidencePolicy)}</p>
         </section>
       </div>
       <div class="decision-boundary-rail is-${esc(boundary.tone)}"
@@ -1766,6 +1838,8 @@
         } ${cardHasPortfolioMatch(card) ? "is-owned" : ""} ${
           watched ? "is-watched" : ""
         }" type="button" data-decision-key="${esc(key)}"
+          aria-controls="decision-detail"
+          aria-pressed="${String(key === state.selectedDecisionKey)}"
           aria-label="${esc(
             `${assetLabel(card.asset_key)}，${action.label}，${evidenceInfo.label}，${marketInfo.label}，下一复核 ${nextReview.label}`
           )}"
@@ -1775,10 +1849,14 @@
             <span class="decision-asset" title="${esc(card.asset_key)}">${esc(
               assetLabel(card.asset_key)
             )}</span>
-            <span class="decision-card-score">${Math.round((card.total_score || 0) * 100)} 分</span>
+            <span class="decision-card-score">关注优先级 ${Math.round(
+              (card.total_score || 0) * 100
+            )}</span>
           </div>
           <div class="decision-topic">${esc(topicName(card.topic_key))}</div>
-          <div class="decision-card-trigger">${esc(card.trigger || "")}</div>
+          <div class="decision-card-trigger"><span>验证门槛</span>${esc(
+            card.trigger || "待补充"
+          )}</div>
           <div class="decision-card-boundary" aria-label="证据状态、市场状态与下一复核">
             <span class="is-${esc(evidenceInfo.tone)}">
               <small>证据状态</small><strong>${esc(evidenceInfo.label)}</strong>
@@ -1791,7 +1869,7 @@
             </span>
           </div>
           <div class="decision-card-meta">
-            <span>置信 ${confidencePct(card)}</span>
+            <span>规则匹配度 ${confidencePct(card)} · 不是概率</span>
             <span>· ${esc(marketSourceScopeLabel(card))}</span>
             ${
               card.human_review_required
@@ -1878,11 +1956,15 @@
                 return `<td><button type="button" class="matrix-cell ${
                   key === state.selectedDecisionKey ? "is-selected" : ""
                 }" data-decision-key="${esc(key)}" style="--cell-color:${info.color}"
+                  aria-controls="decision-detail"
+                  aria-pressed="${String(key === state.selectedDecisionKey)}"
                   aria-label="${esc(topicName(row.topic_key))} ${esc(assetLabel(asset))} ${
                     info.label
-                  }">
+                  }，关注优先级 ${Math.round((cell.total_score || 0) * 100)}">
                   <span class="matrix-symbol">${info.icon}</span>
-                  <span>${info.label} · ${Math.round((cell.total_score || 0) * 100)}</span>
+                  <span>${info.label} · 优先级 ${Math.round(
+                    (cell.total_score || 0) * 100
+                  )}</span>
                 </button></td>`;
               })
               .join("")}
@@ -1915,11 +1997,69 @@
     });
   }
 
+  function returnDirection(value) {
+    const number = Number(value);
+    if (!Number.isFinite(number) || Math.abs(number) < 1e-12) return "neutral";
+    return number > 0 ? "positive" : "negative";
+  }
+
+  function marketComparisonLabel(row) {
+    if (row?.direction_confirmed === true) return "相对基准与规则方向同向";
+    if (row?.direction_confirmed === false) return "相对基准与规则方向反向";
+    return "相对基准方向中性或样本不足";
+  }
+
+  function marketDivergenceLabel(row) {
+    const absolute = returnDirection(row?.asset_return);
+    const relative = returnDirection(row?.abnormal_return);
+    if (
+      absolute === "neutral" ||
+      relative === "neutral" ||
+      absolute === relative
+    ) {
+      return "";
+    }
+    const comparison =
+      row?.direction_confirmed === true
+        ? "相对同向"
+        : row?.direction_confirmed === false
+          ? "相对反向"
+          : relative === "positive"
+            ? "相对上涨"
+            : "相对下跌";
+    return `${comparison}但绝对${absolute === "positive" ? "上涨" : "下跌"}`;
+  }
+
+  function marketTimestampRange(row) {
+    const timestamps = row?.data_timestamps || {};
+    const formatTimestamp = (value) => {
+      const raw = String(value ?? "").trim();
+      if (!raw) return "";
+      const numeric = Number(raw);
+      if (Number.isFinite(numeric)) {
+        const milliseconds = Math.abs(numeric) < 1e12 ? numeric * 1000 : numeric;
+        const parsed = new Date(milliseconds);
+        return Number.isNaN(parsed.getTime())
+          ? "时间待核验"
+          : fmtAbsoluteTime(parsed.toISOString());
+      }
+      return fmtAbsoluteTime(raw);
+    };
+    const start = timestamps.start ? formatTimestamp(timestamps.start) : "起点待核验";
+    const end = timestamps.end ? formatTimestamp(timestamps.end) : "终点待核验";
+    return `${start} — ${end}`;
+  }
+
   function renderDecisionDetail(card, policy) {
     if (!card) return;
     const action = actionInfo(card);
     const kind = classInfo(card);
     const evidence = distinctEvidence(card);
+    const sourceCount = Math.max(0, Number(card.source_count || 0));
+    const relations = Array.isArray(card.mechanism_relations)
+      ? card.mechanism_relations
+      : [];
+    const modelSteps = structuredModelSteps(card);
     const market = card.market_validation || {};
     const marketInfo = marketStatusInfo(card);
     const evidenceInfo = evidenceStatusInfo(card);
@@ -1927,75 +2067,208 @@
     const watched = isWatchedAsset(card.asset_key);
     const records = market.records || [];
     const positions = card.matched_positions || [];
-    const sourceNodes = evidence.slice(0, 3).map((item) => {
+    const evidencePreviewLimit = 4;
+    const relationPreviewLimit = 3;
+    const contraryPreviewLimit = 3;
+    const marketPreviewLimit = 3;
+    const renderSourceRecord = (item) => {
       const detail = item.detail || {};
-      return `<div class="chain-node"><small>${esc(item.source_type || "来源")}</small>
-        <strong>${esc(detail.title || detail.name || item.source_id || "机制证据")}</strong></div>`;
-    });
-    if (evidence.length > 3) {
-      sourceNodes.push(`<div class="chain-node"><small>更多来源</small><strong>+${evidence.length - 3}</strong></div>`);
-    }
-    const chain = [
-      ...sourceNodes,
-      '<span class="chain-arrow" aria-hidden="true">→</span>',
-      `<div class="chain-node"><small>主题</small><strong>${esc(topicName(card.topic_key))}</strong></div>`,
-      '<span class="chain-arrow" aria-hidden="true">→</span>',
-      `<div class="chain-node" title="${esc(card.asset_key)}"><small>资产</small><strong>${esc(
-        assetLabel(card.asset_key)
-      )}</strong></div>`,
-    ];
-    if (positions.length) {
-      chain.push(
-        '<span class="chain-arrow" aria-hidden="true">→</span>',
-        `<div class="chain-node"><small>私人持仓</small><strong>${positions.length} 个直接匹配${
-          card.leverage_flag ? " · 含杠杆" : ""
-        }</strong></div>`
-      );
-    }
-    const evidenceRows = evidence.length
-      ? evidence
-          .map((item) => {
-            const detail = item.detail || {};
-            return `<li>
-              ${esc(detail.title || detail.name || item.rationale || "规则关联")}
-              <div class="evidence-source">${esc(item.source_type || "")} · ${esc(
-                item.source_id || "来源未标识"
-              )} · ${esc(item.direction || "neutral")}</div>
-            </li>`;
-          })
-          .join("")
-      : "<li>暂无可公开展示的机制摘录</li>";
+      const title = detail.title || detail.name || item.source_id || "记录标题未提供";
+      const url = safeExternalUrl(detail.url);
+      const publishedAt = detail.published_at || detail.generated_at;
+      const titleHTML = url
+        ? `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(
+            title
+          )}<span aria-hidden="true">↗</span></a>`
+        : `<strong>${esc(title)}</strong>`;
+      return `<article class="source-record-card">
+        <div class="source-record-head">
+          <span>${esc(decisionSourceLabel(item.source_type))}</span>
+          <span>${esc(decisionDirectionLabel(item.direction))}</span>
+        </div>
+        <h4>${titleHTML}</h4>
+        <p>${esc(detail.snippet || "当前关联记录未提供可公开摘要，请核对原始标题与时间。")}</p>
+        <div class="evidence-source">
+          <span>${publishedAt ? `发布 ${esc(fmtAbsoluteTime(publishedAt))}` : "发布时间待核验"}</span>
+          <span>${esc(item.source_id || "记录标识未提供")}</span>
+          ${url ? "" : "<span>原始链接不可用</span>"}
+        </div>
+      </article>`;
+    };
+    const sourceRecordsHTML = evidence.length
+      ? evidence.slice(0, evidencePreviewLimit).map(renderSourceRecord).join("")
+      : `<div class="spine-empty-state">当前没有可公开展开的原始记录；接口报告关联记录 ${sourceCount} 条，需等待详情补齐。</div>`;
+    const sourceRecordsMoreHTML =
+      evidence.length > evidencePreviewLimit
+        ? `<details class="spine-disclosure">
+            <summary>查看其余 ${evidence.length - evidencePreviewLimit} 条关联记录</summary>
+            <div class="source-record-grid">${evidence
+              .slice(evidencePreviewLimit)
+              .map(renderSourceRecord)
+              .join("")}</div>
+          </details>`
+        : "";
+    const renderRelationRow = (relation) => {
+      const confidence = Number(relation.confidence);
+      const evidenceTitle = relation.evidence?.title || relation.evidence?.name;
+      return `<article class="rule-relation-card">
+        <div class="rule-relation-tags">
+          <span>${esc(decisionRelationLabel(relation.relation_type))}</span>
+          <span>${esc(decisionDirectionLabel(relation.direction))}</span>
+          <span>${esc(decisionHorizonLabel(relation.horizon))}</span>
+        </div>
+        <p>${esc(
+          relation.rationale || "规则识别到条件性关联，具体机制仍需人工复核。"
+        )}</p>
+        <dl class="spine-meta-grid">
+          <div><dt>关联方法</dt><dd title="${esc(relation.method || "")}">${esc(
+            decisionMethodLabel(relation.method)
+          )}</dd></div>
+          <div><dt>规则匹配度</dt><dd>${
+            Number.isFinite(confidence) ? `${Math.round(confidence * 100)}%` : "未提供"
+          } · 不是概率</dd></div>
+          <div><dt>关联记录</dt><dd>${esc(
+            evidenceTitle || relation.source_id || "未标识"
+          )}</dd></div>
+        </dl>
+      </article>`;
+    };
+    const relationRowsHTML = relations.length
+      ? relations.slice(0, relationPreviewLimit).map(renderRelationRow).join("")
+      : '<div class="spine-empty-state">当前未提供结构化规则关联；不能从主题与资产并列展示中推断因果。</div>';
+    const relationRowsMoreHTML =
+      relations.length > relationPreviewLimit
+        ? `<details class="spine-disclosure">
+            <summary>查看其余 ${relations.length - relationPreviewLimit} 条规则关联</summary>
+            <div class="rule-relation-list">${relations
+              .slice(relationPreviewLimit)
+              .map(renderRelationRow)
+              .join("")}</div>
+          </details>`
+        : "";
+    const contraryEvidence = Array.isArray(card.contrary_evidence)
+      ? card.contrary_evidence
+      : [];
+    const renderContraryRow = (item) => {
+      const detail = item.detail;
+      const structuredDetail =
+        detail && typeof detail === "object" && !Array.isArray(detail) ? detail : {};
+      const readableDetail =
+        typeof detail === "string"
+          ? detail
+          : structuredDetail.snippet || structuredDetail.title || structuredDetail.name;
+      return `<li>${esc(
+        item.rationale || readableDetail || "存在方向相反或方向尚不明确的记录"
+      )}
+        <span>${esc(decisionDirectionLabel(item.direction))} · ${esc(
+          decisionSourceLabel(item.source_type)
+        )} · ${esc(structuredDetail.title || item.source_id || "记录标识未提供")}</span></li>`;
+    };
+    const contraryRows = contraryEvidence.length
+      ? contraryEvidence.slice(0, contraryPreviewLimit).map(renderContraryRow).join("")
+      : "<li>当前未记录单列的相反证据；这不表示反例不存在。</li>";
+    const contraryRowsMoreHTML =
+      contraryEvidence.length > contraryPreviewLimit
+        ? `<details class="spine-disclosure contrary-disclosure">
+            <summary>查看其余 ${contraryEvidence.length - contraryPreviewLimit} 条反证或不确定记录</summary>
+            <ul>${contraryEvidence
+              .slice(contraryPreviewLimit)
+              .map(renderContraryRow)
+              .join("")}</ul>
+          </details>`
+        : "";
+    const modelPathHTML = modelSteps.length
+      ? `<ol class="model-path-list">${modelSteps
+          .map((step) => `<li>${esc(step)}</li>`)
+          .join("")}</ol>`
+      : `<div class="spine-empty-state is-explicit">
+          <strong>当前未提供结构化模型路径</strong>
+          <p>上方规则关联只能作为条件性映射，不能替代模型传导假设，也不是模型隐藏思维过程。</p>
+        </div>`;
     const noMarketRows =
       marketInfo.state === "scenario_monitoring"
         ? "宏观情景不适用事件后市场窗口；请改用触发指标监控。"
         : marketInfo.state === "direction_missing"
-          ? "机制方向未明确，当前样本不能判断同向或反向。"
-          : "暂无可用共同交易日样本。";
-    const marketRows = records.length
-      ? records
-          .map(
-            (row) => `<tr>
-              <td>${esc(row.window || "—")}</td>
-              <td>${pct(row.asset_return)}</td>
-              <td>${pct(row.abnormal_return)}</td>
-              <td>${
-                row.direction_confirmed === true
-                  ? "✓ 同向"
-                  : row.direction_confirmed === false
-                    ? "✕ 反向"
-                    : "— 中性 / 不足"
-              }</td>
-              <td>${esc(row.sample_count ?? "—")}</td>
-            </tr>`
-          )
-          .join("")
-      : `<tr><td colspan="5">${esc(noMarketRows)}</td></tr>`;
-    const positionSection = positions.length
-      ? `<section class="evidence-section wide">
-          <h3>私人持仓影响 ${
-            card.stale ? '<span class="status-badge warn">⚠ 数据已降级</span>' : ""
-          }</h3>
-          <div class="impact-matrix-wrap"><table class="position-table">
+          ? "规则方向未明确，当前区间观察不能判断同向或反向。"
+          : "暂无可用共同交易日区间观察。";
+    const marketObservationScore = (row) => {
+      const returns = [row.asset_return, row.benchmark_return, row.abnormal_return].filter(
+        (value) => value !== null && value !== "" && Number.isFinite(Number(value))
+      ).length;
+      const timestamps = row.data_timestamps || {};
+      return returns * 10 + (timestamps.start ? 1 : 0) + (timestamps.end ? 1 : 0);
+    };
+    const orderedMarketRecords = records
+      .map((row, index) => ({ row, index }))
+      .sort(
+        (left, right) =>
+          marketObservationScore(right.row) - marketObservationScore(left.row) ||
+          left.index - right.index
+      )
+      .map(({ row }) => row);
+    const completedMarketCount = records.filter(
+      (row) =>
+        row.abnormal_return !== null &&
+        row.abnormal_return !== "" &&
+        Number.isFinite(Number(row.abnormal_return))
+    ).length;
+    const renderMarketRow = (row) => {
+      const divergence = marketDivergenceLabel(row);
+      const comparison = marketComparisonLabel(row);
+      const comparisonTone =
+        row.direction_confirmed === true
+          ? "same"
+          : row.direction_confirmed === false
+            ? "opposite"
+            : "neutral";
+      return `<article class="market-observation-card is-${comparisonTone}">
+        <div class="market-observation-head">
+          <strong>${esc(row.window || "窗口待标识")}</strong>
+          <span>${esc(comparison)}</span>
+        </div>
+        ${divergence ? `<p class="return-divergence">${esc(divergence)}</p>` : ""}
+        <div class="return-grid" aria-label="绝对收益、基准收益与相对基准超额">
+          <div><small>资产绝对收益</small><strong>${pct(row.asset_return)}</strong></div>
+          <div><small>基准收益</small><strong>${pct(row.benchmark_return)}</strong></div>
+          <div><small>相对基准超额</small><strong>${pct(row.abnormal_return)}</strong></div>
+        </div>
+        <dl class="spine-meta-grid market-meta-grid">
+          <div><dt>观察锚点</dt><dd>${esc(decisionSourceLabel(row.source_type))} · ${esc(
+            row.source_id || "记录标识未提供"
+          )}</dd></div>
+          <div><dt>基准</dt><dd>${esc(
+            row.benchmark_asset_key
+              ? assetLabel(row.benchmark_asset_key)
+              : "未提供独立基准"
+          )}</dd></div>
+          <div><dt>行情提供方</dt><dd>${esc(row.provider || "未标识")}</dd></div>
+          <div><dt>价格观察点</dt><dd>${esc(row.sample_count ?? "未提供")}</dd></div>
+          <div><dt>观察区间</dt><dd>${esc(marketTimestampRange(row))}</dd></div>
+          <div><dt>观察方法</dt><dd title="${esc(row.method_version || "")}">${esc(
+            row.method_version || "未标识"
+          )}</dd></div>
+        </dl>
+      </article>`;
+    };
+    const marketRowsHTML = orderedMarketRecords.length
+      ? orderedMarketRecords.slice(0, marketPreviewLimit).map(renderMarketRow).join("")
+      : `<div class="spine-empty-state">${esc(noMarketRows)}</div>`;
+    const marketRowsMoreHTML =
+      orderedMarketRecords.length > marketPreviewLimit
+        ? `<details class="spine-disclosure">
+            <summary>查看其余 ${orderedMarketRecords.length - marketPreviewLimit} 条市场窗口</summary>
+            <div class="market-observation-list">${orderedMarketRecords
+              .slice(marketPreviewLimit)
+              .map(renderMarketRow)
+              .join("")}</div>
+          </details>`
+        : "";
+    const positionRowsHTML = positions.length
+      ? `<div class="position-match-summary">
+          <strong>私人直接命中 ${positions.length} 项${card.leverage_flag ? " · 含杠杆" : ""}</strong>
+          <span>仅为 asset_key 精确匹配；间接暴露未计算。</span>
+        </div>
+        <div class="spine-table-wrap"><table class="position-table">
             <thead><tr><th>账户</th><th>资产</th><th>数量</th><th>成本</th><th>日期</th></tr></thead>
             <tbody>${positions
               .map(
@@ -2012,27 +2285,19 @@
           </table></div>
           ${
             card.estimated_exposure
-              ? `<p class="block-sub">按最新可用行情估算敞口：${esc(
+              ? `<p class="exposure-estimate">按最新可用行情估算敞口：${esc(
                   card.estimated_exposure.value
                 )} ${esc(card.estimated_exposure.currency || "")}</p>`
-              : '<p class="block-sub">行情不足，未估算当前敞口。</p>'
-          }
-        </section>`
-      : "";
-    const contraryRows = (card.contrary_evidence || []).length
-      ? (card.contrary_evidence || [])
-          .map(
-            (item) =>
-              `<li>${esc(item.detail || item.rationale || "存在方向相反的证据")}
-                <div class="evidence-source">${esc(item.source_type || "")} ${esc(
-                  item.source_id || ""
-                )}</div></li>`
-          )
-          .join("")
-      : "<li>当前未记录独立的相反证据；这不表示反例不存在。</li>";
+              : '<p class="exposure-estimate">行情不足，未估算当前敞口。</p>'
+          }`
+      : '<div class="position-match-summary is-empty"><strong>无私人直接命中</strong><span>公开资产暴露仍需结合你的实际组合人工复核。</span></div>';
     const nextReviewHTML = nextReview.datetime
       ? `<time datetime="${esc(nextReview.datetime)}">${esc(nextReview.label)}</time>`
       : `<span>${esc(nextReview.label)}</span>`;
+    const marketNote = localizeDecisionTerms(market.note);
+    const localizedPolicy = localizeDecisionTerms(
+      policy || "统计相关不等于因果；所有候选均需人工复核。"
+    );
 
     $("#decision-detail").innerHTML = `
       <div class="evidence-head">
@@ -2052,12 +2317,12 @@
                 : ""
             }
           </div>
-          <h2 class="evidence-title" id="decision-detail-title" title="${esc(
+          <h2 class="evidence-title" id="decision-detail-title" tabindex="-1" title="${esc(
             card.asset_key
           )}">${esc(assetLabel(card.asset_key))} · ${esc(topicName(card.topic_key))}</h2>
           <div class="evidence-subtitle">数据截至 ${esc(
             card.data_as_of ? fmtTime(card.data_as_of) : "未知"
-          )} · 期限 ${esc(card.horizon || "未知")} · 下一复核 ${nextReviewHTML}</div>
+          )} · ${esc(decisionHorizonLabel(card.horizon))} · 关联记录 ${sourceCount} 条</div>
         </div>
         <div class="evidence-head-actions">
           <button class="decision-watch-btn ${watched ? "is-watched" : ""}" type="button"
@@ -2070,45 +2335,100 @@
           </button>
           <div class="evidence-score"><strong>${Math.round(
             (card.total_score || 0) * 100
-          )}</strong><span>决策分 · 置信 ${confidencePct(card)}</span></div>
+          )}</strong><span>关注优先级</span><small>规则匹配度 ${confidencePct(
+            card
+          )} · 不是概率</small></div>
         </div>
       </div>
-      <div class="relation-chain">${chain.join("")}</div>
-      <div class="evidence-grid">
-        <section class="evidence-section">
-          <h3>机制证据（不是因果证明）</h3>
-          <ul class="evidence-list">${evidenceRows}</ul>
+      <div class="evidence-spine" aria-label="六段证据脊柱">
+        <section class="evidence-spine-step" data-spine-step="facts" aria-labelledby="spine-facts-title">
+          <header class="spine-step-head">
+            <span class="spine-index">01</span>
+            <div><h3 id="spine-facts-title">原始事实 / 关联记录</h3>
+              <p>记录并列展示；数量不代表来源彼此独立。</p></div>
+            <span class="spine-count">关联记录 ${sourceCount} 条</span>
+          </header>
+          <div class="source-record-grid">${sourceRecordsHTML}</div>
+          ${sourceRecordsMoreHTML}
         </section>
-        <section class="evidence-section">
-          <h3>相反证据与不确定性</h3>
-          <ul class="evidence-list">${contraryRows}</ul>
+        <section class="evidence-spine-step" data-spine-step="rules" aria-labelledby="spine-rules-title">
+          <header class="spine-step-head">
+            <span class="spine-index">02</span>
+            <div><h3 id="spine-rules-title">规则关联</h3>
+              <p>展示规则为何把记录、主题与资产连在一起；条件性关联不是因果证明。</p></div>
+          </header>
+          <div class="rule-relation-list">${relationRowsHTML}</div>
+          ${relationRowsMoreHTML}
+          <div class="contrary-evidence">
+            <h4>相反证据与不确定性</h4>
+            <ul>${contraryRows}</ul>
+            ${contraryRowsMoreHTML}
+          </div>
         </section>
-        <section class="evidence-section wide">
-          <h3>市场验证 · ${esc(marketInfo.label)}</h3>
+        <section class="evidence-spine-step" data-spine-step="model" aria-labelledby="spine-model-title">
+          <header class="spine-step-head">
+            <span class="spine-index">03</span>
+            <div><h3 id="spine-model-title">模型传导假设</h3>
+              <p>只展示接口明确提供的结构化假设，不展示或臆造隐藏推理。</p></div>
+          </header>
+          ${modelPathHTML}
+        </section>
+        <section class="evidence-spine-step" data-spine-step="exposure" aria-labelledby="spine-exposure-title">
+          <header class="spine-step-head">
+            <span class="spine-index">04</span>
+            <div><h3 id="spine-exposure-title">资产暴露</h3>
+              <p>区分规则映射的公开资产与私人模式下的直接命中。</p></div>
+          </header>
+          <div class="exposure-route" aria-label="主题、资产与方向">
+            <div><small>关联主题</small><strong>${esc(topicName(card.topic_key))}</strong></div>
+            <div title="${esc(card.asset_key)}"><small>公开资产</small><strong>${esc(
+              assetLabel(card.asset_key)
+            )}</strong></div>
+            <div><small>规则方向</small><strong>${esc(
+              decisionDirectionLabel(card.direction)
+            )}</strong></div>
+          </div>
+          ${positionRowsHTML}
+        </section>
+        <section class="evidence-spine-step" data-spine-step="market" aria-labelledby="spine-market-title">
+          <header class="spine-step-head">
+            <span class="spine-index">05</span>
+            <div><h3 id="spine-market-title">市场观察</h3>
+              <p>绝对收益与相对基准超额分开展示；区间同向不等于交易确认。</p></div>
+            <span class="status-badge is-${esc(marketInfo.tone)}">${esc(
+              marketInfo.label
+            )}</span>
+            <span class="spine-count">可计算 ${completedMarketCount} / ${records.length}</span>
+          </header>
           <p class="validation-boundary is-${esc(marketInfo.tone)}">${esc(
             marketInfo.guidance
           )}</p>
-          <p class="decision-next-review">
-            <strong>下一复核</strong>${nextReviewHTML}<span>${esc(nextReview.detail)}</span>
-          </p>
-          <div class="impact-matrix-wrap"><table class="validation-table">
-            <thead><tr><th>窗口</th><th>资产收益</th><th>超额收益</th><th>方向</th><th>样本</th></tr></thead>
-            <tbody>${marketRows}</tbody>
-          </table></div>
-          <p class="block-sub">${esc(market.note || "")}</p>
+          <div class="market-observation-list">${marketRowsHTML}</div>
+          ${marketRowsMoreHTML}
+          ${marketNote ? `<p class="market-note">${esc(marketNote)}</p>` : ""}
         </section>
-        <section class="evidence-section">
-          <h3>进入条件</h3><p class="block-sub">${esc(card.trigger || "待补充")}</p>
+        <section class="evidence-spine-step" data-spine-step="review" aria-labelledby="spine-review-title">
+          <header class="spine-step-head">
+            <span class="spine-index">06</span>
+            <div><h3 id="spine-review-title">复核门槛</h3>
+              <p>候选只进入人工核验队列，不会自动执行。</p></div>
+          </header>
+          <div class="review-gates">
+            <div class="decision-next-review">
+              <strong>下一复核</strong>${nextReviewHTML}<span>${esc(nextReview.detail)}</span>
+            </div>
+            <div><small>进入条件</small><p>${esc(card.trigger || "待补充")}</p></div>
+            <div><small>失效条件</small><p>${esc(card.invalidation || "待补充")}</p></div>
+            <div><small>人工复核状态</small><p>${
+              card.human_review_required === true
+                ? "待人工复核 · 未执行"
+                : "仍需人工复核 · 未提供自动执行能力"
+            }</p></div>
+          </div>
         </section>
-        <section class="evidence-section">
-          <h3>失效条件</h3><p class="block-sub">${esc(card.invalidation || "待补充")}</p>
-        </section>
-        ${positionSection}
       </div>
       <p class="decision-disclaimer">${esc(
-        `${card.human_review_required ? "候选行动，待人工确认。" : ""}${
-          policy || "统计相关不等于因果；所有行动建议均需人工复核。"
-        }`
+        `${card.human_review_required ? "候选行动，待人工确认。" : ""}${localizedPolicy} 页面展示可审计记录、规则关联和明确提供的结构化假设；不展示模型隐藏思维过程。`
       )}</p>`;
   }
 
@@ -2128,9 +2448,11 @@
     const card = cards.find((item) => decisionKey(item) === key);
     if (!card) return;
     state.selectedDecisionKey = key;
-    $$(".decision-card, .matrix-cell").forEach((node) =>
-      node.classList.toggle("is-selected", node.dataset.decisionKey === key)
-    );
+    $$(".decision-card, .matrix-cell").forEach((node) => {
+      const selected = node.dataset.decisionKey === key;
+      node.classList.toggle("is-selected", selected);
+      node.setAttribute("aria-pressed", String(selected));
+    });
     const hasInlineDetail = Array.isArray(card.evidence) || Array.isArray(card.mechanism_relations);
     if (hasInlineDetail || !card.detail_available) {
       renderDecisionDetail(card, state.decisionData.evidence_policy);
@@ -2142,7 +2464,7 @@
         renderDecisionDetail(cached.decision, cached.evidence_policy);
       } else {
         const generation = ++state.decisionDetailRequestGeneration;
-        $("#decision-detail").innerHTML = `<div class="decision-detail-loading" aria-busy="true">
+        $("#decision-detail").innerHTML = `<div class="decision-detail-loading" role="status" aria-live="polite" aria-busy="true">
           <div class="skeleton skeleton-card"></div>
           <p class="empty-hint">正在按需加载这条信号的证据链…</p>
         </div>`;
@@ -2192,6 +2514,7 @@
         behavior: reduceMotion ? "auto" : "smooth",
         block: "start",
       });
+      $("#decision-detail-title")?.focus({ preventScroll: true });
     }
   }
 
@@ -2216,7 +2539,8 @@
       void selectDecision(state.selectedDecisionKey);
     } else if (!state.selectedDecisionKey) {
       $("#decision-detail").innerHTML = `<div class="empty">
-        <span class="empty-icon">⛓</span>暂无可展开的证据链
+        <span class="empty-icon">│</span><h2 id="decision-detail-title" tabindex="-1">证据脊柱</h2>
+        <p>暂无可展开的决策依据。</p>
       </div>`;
     }
     renderSupportCard("decision");
@@ -2249,7 +2573,8 @@
     $("#decision-queue").innerHTML = "";
     $("#decision-matrix").innerHTML = "";
     $("#decision-detail").innerHTML = `<div class="empty">
-      <span class="empty-icon">⛓</span>${esc(message)}
+      <span class="empty-icon">│</span><h2 id="decision-detail-title" tabindex="-1">证据脊柱</h2>
+      <p>${esc(message)}</p>
     </div>`;
   }
 
@@ -3205,8 +3530,8 @@
             </div>
             ${asset?.reason_zh ? `<p>${esc(asset.reason_zh)}</p>` : ""}
             <small>${esc(HORIZON_CN[horizon] || horizon)}${
-              confidenceLabel(asset?.confidence)
-                ? ` · ${esc(confidenceLabel(asset.confidence))}`
+              evidenceConfidenceLabel(asset?.confidence)
+                ? ` · ${esc(evidenceConfidenceLabel(asset.confidence))}`
                 : ""
             }</small>
           </li>`;
@@ -3226,7 +3551,7 @@
       ? enrichment.tags.filter(Boolean).slice(0, 8)
       : [];
     const meta = [
-      confidenceLabel(enrichment.confidence),
+      evidenceConfidenceLabel(enrichment.confidence),
       enrichment.model ? `模型 ${enrichment.model}` : "",
       enrichment.generated_at ? `生成 ${fmtTime(enrichment.generated_at)}` : "",
     ].filter(Boolean);
@@ -3817,10 +4142,12 @@
     long: "长期",
   };
 
-  function confidenceLabel(value) {
+  function evidenceConfidenceLabel(value) {
     if (value === null || value === undefined || value === "") return "";
     const number = Number(value);
-    return Number.isFinite(number) ? `置信 ${Math.round(number * 100)}%` : "";
+    return Number.isFinite(number)
+      ? `证据充分度 ${Math.round(number * 100)}% · 非概率`
+      : "";
   }
 
   function intelSection(index, title, content, extraClass = "") {
@@ -3835,29 +4162,29 @@
 
   function marketReactionHTML(reaction) {
     if (!reaction) return "";
-    const abnormal =
-      typeof reaction.abnormal_return === "number"
-        ? `异常收益 ${pct(reaction.abnormal_return)}`
-        : "";
-    const confirmation =
-      reaction.direction_confirmed === true
-        ? "方向已确认"
-        : reaction.direction_confirmed === false
-          ? "方向未确认"
-          : reaction.status === "complete"
-            ? "方向不明确"
-            : "样本尚不完整";
+    const comparison = marketComparisonLabel(reaction);
+    const divergence = marketDivergenceLabel(reaction);
     const windowLabel = reaction.window ? String(reaction.window).toUpperCase() : "";
     return `<div class="market-check ${
       reaction.direction_confirmed === true ? "is-confirmed" : ""
     }">
-      <span>市场核验</span>
-      <strong>${esc(confirmation)}</strong>
+      <span>市场观察</span>
+      <strong>${esc(comparison)}</strong>
       ${windowLabel ? `<span>${esc(windowLabel)}</span>` : ""}
-      ${abnormal ? `<span>${esc(abnormal)}</span>` : ""}
+      ${
+        typeof reaction.asset_return === "number"
+          ? `<span>绝对收益 ${pct(reaction.asset_return)}</span>`
+          : ""
+      }
+      ${
+        typeof reaction.abnormal_return === "number"
+          ? `<span>相对基准超额 ${pct(reaction.abnormal_return)}</span>`
+          : ""
+      }
+      ${divergence ? `<span>${esc(divergence)}</span>` : ""}
       ${
         typeof reaction.sample_count === "number"
-          ? `<span>${reaction.sample_count} 个样本</span>`
+          ? `<span>价格观察点 ${reaction.sample_count}</span>`
           : ""
       }
     </div>`;
@@ -3889,8 +4216,8 @@
           <div class="intel-asset-meta">
             <span>${esc(HORIZON_CN[horizon] || horizon)}</span>
             ${
-              confidenceLabel(asset.confidence)
-                ? `<span>${esc(confidenceLabel(asset.confidence))}</span>`
+              evidenceConfidenceLabel(asset.confidence)
+                ? `<span>${esc(evidenceConfidenceLabel(asset.confidence))}</span>`
                 : ""
             }
           </div>
@@ -4008,7 +4335,7 @@
             </li>`;
           })
           .join("")
-      : `<li class="source-record is-empty"><span>暂无独立来源记录，请直接核对原文。</span></li>`;
+      : `<li class="source-record is-empty"><span>暂无可展开的来源记录，请直接核对原文。</span></li>`;
 
     return `<article class="original-document">
         <p class="original-document-label">抓取原文</p>
@@ -4094,8 +4421,8 @@
         <span class="impact-badge is-${esc(impact)}">${esc(impactLabel)}</span>
         ${aiStateHTML(event)}
         ${
-          enrichment && confidenceLabel(enrichment.confidence)
-            ? `<span>${esc(confidenceLabel(enrichment.confidence))}</span>`
+          enrichment && evidenceConfidenceLabel(enrichment.confidence)
+            ? `<span>${esc(evidenceConfidenceLabel(enrichment.confidence))}</span>`
             : ""
         }
       </div>

@@ -23,6 +23,12 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn('data-view="decision"', self.html)
         self.assertIn('class="view active" id="view-decision"', self.html)
         self.assertIn('aria-labelledby="impact-matrix-title"', self.html)
+        self.assertIn('class="decision-layout decision-master-detail"', self.html)
+        queue = self.html.index('class="decision-panel action-panel"')
+        detail = self.html.index('id="decision-detail"')
+        matrix = self.html.index('class="decision-panel matrix-panel"')
+        self.assertLess(queue, detail)
+        self.assertLess(detail, matrix)
         self.assertIn("data-decision-key", self.javascript)
         self.assertIn("matrix-symbol", self.css)
 
@@ -57,7 +63,7 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn("it.published_at", self.javascript)
         self.assertIn("发布时间未知", self.javascript)
         self.assertIn("抓取", self.javascript)
-        self.assertIn("个独立来源", self.javascript)
+        self.assertIn("关联记录", self.javascript)
         self.assertIn('id="time-window-basis"', self.html)
         self.assertIn("按发布时间筛选", self.javascript)
         self.assertIn("隔离区按首次抓取时间筛选", self.javascript)
@@ -108,9 +114,9 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn('stale ? "数据延迟" : ""', self.javascript)
         self.assertIn('"高收益债利差"', self.javascript)
         self.assertIn("cs.hy_oas", self.javascript)
-        self.assertIn('static/app.js?v=18', self.html)
-        self.assertIn('static/style.css?v=18', self.html)
-        self.assertNotIn('?v=17', self.html)
+        self.assertIn('static/app.js?v=19', self.html)
+        self.assertIn('static/style.css?v=19', self.html)
+        self.assertNotIn('?v=18', self.html)
         self.assertIn(".metric.is-stale", self.css)
 
     def test_macro_events_render_compact_ai_digest_and_bounded_highlights(self) -> None:
@@ -215,17 +221,182 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn(".cov-pill.off", self.css)
 
     def test_evidence_and_market_validation_are_visually_separated(self) -> None:
-        self.assertIn("机制证据（不是因果证明）", self.javascript)
-        self.assertIn("市场验证", self.javascript)
+        self.assertIn("原始事实 / 关联记录", self.javascript)
+        self.assertIn("规则关联", self.javascript)
+        self.assertIn("条件性关联不是因果证明", self.javascript)
+        self.assertIn("市场观察", self.javascript)
         self.assertIn("相反证据与不确定性", self.javascript)
         self.assertIn("失效条件", self.javascript)
+
+    def test_decision_detail_is_a_six_step_evidence_spine(self) -> None:
+        start = self.javascript.index("function renderDecisionDetail(card, policy)")
+        end = self.javascript.index("function renderDecisionDetailConflict", start)
+        contract = self.javascript[start:end]
+        for key in ("facts", "rules", "model", "exposure", "market", "review"):
+            self.assertIn(f'data-spine-step="{key}"', contract)
+        for index in range(1, 7):
+            self.assertIn(f'<span class="spine-index">{index:02d}</span>', contract)
+        for heading in (
+            "原始事实 / 关联记录",
+            "规则关联",
+            "模型传导假设",
+            "资产暴露",
+            "市场观察",
+            "复核门槛",
+        ):
+            self.assertIn(heading, contract)
+        for field in (
+            "relation.rationale",
+            "relation.relation_type",
+            "relation.direction",
+            "relation.horizon",
+            "relation.method",
+        ):
+            self.assertIn(field, contract)
+        self.assertIn("structuredModelSteps(card)", contract)
+        self.assertIn("当前未提供结构化模型路径", contract)
+        self.assertIn("不展示模型隐藏思维过程", contract)
+        self.assertIn('class="source-record-grid"', contract)
+        self.assertIn("detail.snippet", contract)
+        self.assertIn("detail.published_at", contract)
+        self.assertIn("safeExternalUrl(detail.url)", contract)
+        self.assertIn('target="_blank" rel="noopener noreferrer"', contract)
+        self.assertIn('class="evidence-spine"', contract)
+        self.assertIn(".evidence-spine::before", self.css)
+        self.assertNotIn("relation-chain", self.javascript)
+        self.assertNotIn("relation-chain", self.css)
+
+    def test_evidence_spine_uses_counted_progressive_disclosure(self) -> None:
+        start = self.javascript.index("function renderDecisionDetail(card, policy)")
+        end = self.javascript.index("function renderDecisionDetailConflict", start)
+        contract = self.javascript[start:end]
+        self.assertIn("const evidencePreviewLimit = 4", contract)
+        self.assertIn("const relationPreviewLimit = 3", contract)
+        self.assertIn("const contraryPreviewLimit = 3", contract)
+        self.assertIn("const marketPreviewLimit = 3", contract)
+        self.assertIn("查看其余 ${evidence.length - evidencePreviewLimit} 条关联记录", contract)
+        self.assertIn("查看其余 ${relations.length - relationPreviewLimit} 条规则关联", contract)
+        self.assertIn("条反证或不确定记录", contract)
+        self.assertIn("条市场窗口", contract)
+        self.assertIn("marketObservationScore(right.row)", contract)
+        self.assertIn("可计算 ${completedMarketCount} / ${records.length}", contract)
+        self.assertIn('class="spine-disclosure"', contract)
+        self.assertIn(".spine-disclosure > summary", self.css)
+        self.assertIn("min-height: 44px", self.css)
+
+    def test_contrary_evidence_uses_readable_structured_fields(self) -> None:
+        start = self.javascript.index("const renderContraryRow")
+        end = self.javascript.index("const modelPathHTML", start)
+        contract = self.javascript[start:end]
+        self.assertIn('typeof detail === "object"', contract)
+        self.assertIn("structuredDetail.snippet || structuredDetail.title", contract)
+        self.assertIn("item.rationale || readableDetail", contract)
+        self.assertIn("decisionDirectionLabel(item.direction)", contract)
+
+    def test_ai_evidence_confidence_is_not_labeled_as_rule_matching(self) -> None:
+        start = self.javascript.index("function evidenceConfidenceLabel")
+        end = self.javascript.index("function intelSection", start)
+        contract = self.javascript[start:end]
+        self.assertIn("证据充分度", contract)
+        self.assertIn("非概率", contract)
+        self.assertNotIn("匹配度", contract)
+
+    def test_decision_copy_distinguishes_counts_scores_and_market_observations(self) -> None:
+        evidence_start = self.javascript.index("function evidenceStatusInfo")
+        evidence_end = self.javascript.index("function marketReasonCount", evidence_start)
+        evidence_contract = self.javascript[evidence_start:evidence_end]
+        self.assertIn("关联记录 ${sourceCount} 条", evidence_contract)
+        self.assertNotIn("个独立来源", evidence_contract)
+        self.assertNotIn("多源证据", evidence_contract)
+
+        detail_start = self.javascript.index("function renderDecisionDetail(card, policy)")
+        detail_end = self.javascript.index("function renderDecisionDetailConflict", detail_start)
+        detail_contract = self.javascript[detail_start:detail_end]
+        self.assertIn("关注优先级", detail_contract)
+        self.assertIn("规则匹配度", detail_contract)
+        self.assertIn("不是概率", detail_contract)
+        self.assertNotIn("决策分", detail_contract)
+        self.assertNotIn("<span>置信", detail_contract)
+        self.assertIn("价格观察点", detail_contract)
+        self.assertIn("资产绝对收益", detail_contract)
+        self.assertIn("基准收益", detail_contract)
+        self.assertIn("相对基准超额", detail_contract)
+        self.assertIn("row.benchmark_asset_key", detail_contract)
+        self.assertIn("row.provider", detail_contract)
+        self.assertIn("row.window", detail_contract)
+        self.assertIn("观察锚点", detail_contract)
+        self.assertIn("row.source_id", detail_contract)
+        self.assertIn("function localizeDecisionTerms", self.javascript)
+        self.assertIn('replace(/\\babstain\\b/gi, "保持观察")', self.javascript)
+        self.assertIn('replace(/\\bpending\\b/gi, "等待中")', self.javascript)
+        self.assertIn("const evidencePolicy = localizeDecisionTerms", self.javascript)
+        self.assertIn("重复转载不等于独立确认", self.html)
+
+    def test_market_observation_calls_out_absolute_relative_divergence(self) -> None:
+        start = self.javascript.index("function marketDivergenceLabel")
+        end = self.javascript.index("function marketTimestampRange", start)
+        contract = self.javascript[start:end]
+        self.assertIn('row?.asset_return', contract)
+        self.assertIn('row?.abnormal_return', contract)
+        self.assertIn('row?.direction_confirmed === true', contract)
+        self.assertIn('"相对同向"', contract)
+        self.assertIn('absolute === "positive" ? "上涨" : "下跌"', contract)
+        self.assertIn("return-divergence", self.javascript)
+        self.assertIn(".return-divergence", self.css)
+
+    def test_market_observation_formats_unix_second_timestamps(self) -> None:
+        start = self.javascript.index("function marketTimestampRange")
+        end = self.javascript.index("function renderDecisionDetail", start)
+        contract = self.javascript[start:end]
+        self.assertIn("const numeric = Number(raw)", contract)
+        self.assertIn("Math.abs(numeric) < 1e12 ? numeric * 1000 : numeric", contract)
+        self.assertIn("const parsed = new Date(milliseconds)", contract)
+        self.assertIn("Number.isNaN(parsed.getTime())", contract)
+        self.assertIn('"时间待核验"', contract)
+        self.assertIn("fmtAbsoluteTime(parsed.toISOString())", contract)
+        self.assertIn("formatTimestamp(timestamps.start)", contract)
+        self.assertIn("formatTimestamp(timestamps.end)", contract)
+
+    def test_decision_labels_are_legible_and_mobile_fab_does_not_cover_evidence(
+        self,
+    ) -> None:
+        self.assertIn("--muted: #566f73", self.css)
+        self.assertIn(".boundary-cell small {", self.css)
+        self.assertIn(".decision-card-boundary small {", self.css)
+        self.assertIn("font-size: 10.5px", self.css)
+        mobile = self.css.index("@media (max-width: 700px)")
+        mobile_contract = self.css[mobile:]
+        fab = mobile_contract.index(".support-fab {")
+        self.assertIn("display: none", mobile_contract[fab : fab + 80])
+        self.assertIn('class="footer-support" data-support-open', self.html)
+
+    def test_master_detail_selection_and_detail_updates_are_accessible(self) -> None:
+        self.assertIn('aria-label="当前决策详情"', self.html)
+        detail_tag = self.html[
+            self.html.index('id="decision-detail"') : self.html.index(">", self.html.index('id="decision-detail"'))
+        ]
+        self.assertNotIn("aria-live", detail_tag)
+        self.assertIn('id="decision-detail-title"', self.html)
+        self.assertIn('aria-pressed="${String(key === state.selectedDecisionKey)}"', self.javascript)
+        self.assertIn('aria-controls="decision-detail"', self.javascript)
+        self.assertIn('node.setAttribute("aria-pressed", String(selected))', self.javascript)
+        self.assertIn('id="decision-detail-title" tabindex="-1"', self.html)
+        self.assertIn('$("#decision-detail-title")?.focus({ preventScroll: true })', self.javascript)
+        self.assertIn('role="status" aria-live="polite" aria-busy="true"', self.javascript)
+        self.assertIn(".action-panel { position: sticky", self.css)
+        self.assertIn(".action-panel { position: static", self.css)
+        self.assertIn("body { font-size: 14px; overflow-x: hidden; }", self.css)
+        self.assertIn(".source-record-card p, .rule-relation-card > p", self.css)
+        self.assertIn("font-size: 14px; line-height: 1.72", self.css)
+        tablet = self.css.index("@media (max-width: 960px)")
+        self.assertIn(".action-queue { max-height: none; overflow: visible; }", self.css[tablet:])
 
     def test_decision_lenses_filter_queue_and_matrix_with_bounded_full_load(
         self,
     ) -> None:
         hero = self.html.index('id="decision-hero"')
         lenses = self.html.index('id="decision-lenses"')
-        layout = self.html.index('class="decision-layout"')
+        layout = self.html.index('class="decision-layout decision-master-detail"')
         self.assertLess(hero, lenses)
         self.assertLess(lenses, layout)
         for lens in ("all", "candidate", "portfolio", "watchlist"):
@@ -359,8 +530,8 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn('<time datetime="${esc(nextReview.datetime)}">', self.javascript)
         self.assertIn("尚无持仓快照", self.javascript)
         self.assertIn("间接暴露尚未计算，不代表组合无风险", self.javascript)
-        self.assertIn("多源证据", self.javascript)
-        self.assertIn("单一来源 · 待交叉核验", self.javascript)
+        self.assertIn("关联记录 ${sourceCount} 条 · 独立性待核验", self.javascript)
+        self.assertIn("关联记录 1 条 · 待交叉核验", self.javascript)
         self.assertIn(".decision-runway", self.css)
         self.assertIn(".decision-next-review", self.css)
         self.assertIn(".decision-watch-btn", self.css)
@@ -450,8 +621,8 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn("market.veto === false", self.javascript)
         self.assertIn("directionConfirmed === true", self.javascript)
         self.assertIn('phase === "contrary"', self.javascript)
-        self.assertIn("市场反向，候选停止并复核", self.javascript)
-        self.assertIn("市场方向中性或不一致", self.javascript)
+        self.assertIn("区间样本相对基准与规则方向反向", self.javascript)
+        self.assertIn("区间样本相对基准方向中性或不一致", self.javascript)
 
     def test_partial_business_degradation_and_macro_failure_remain_visible(
         self,
@@ -530,8 +701,13 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn("关注优先级约 24 小时上涨", self.javascript)
         self.assertIn('class="situation-brief"', self.javascript)
         self.assertIn('class="brief-score"', self.javascript)
-        self.assertIn('class="transmission-ribbon"', self.javascript)
-        self.assertIn("信号 → 主题 → 资产", self.javascript)
+        self.assertIn('class="lead-context-grid"', self.javascript)
+        self.assertIn("验证门槛", self.javascript)
+        self.assertNotIn('class="transmission-ribbon"', self.javascript)
+        self.assertNotIn("信号 → 主题 → 资产", self.javascript)
+        self.assertNotIn("当前首要传导", self.javascript)
+        self.assertNotIn("资产传导", self.javascript)
+        self.assertNotIn("宏观覆盖 ${coverage}%", self.javascript)
         self.assertIn("本轮暂无候选行动", self.javascript)
         self.assertIn(
             "if (state.decisionData) renderDecisionHero(state.decisionData)",
@@ -661,10 +837,14 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn("right: 28px; bottom: clamp(84px, 10vh, 112px)", self.css)
         self.assertIn(".support-fab::after", self.css)
         self.assertIn("right: -28px", self.css)
-        self.assertIn(
-            "bottom: calc(14px + env(safe-area-inset-bottom, 0px))",
-            self.css,
-        )
+        responsive = self.css.index("@media (max-width: 1680px)")
+        responsive_contract = self.css[responsive:]
+        self.assertIn(".support-fab { display: none; }", responsive_contract)
+        self.assertIn(".support-topbar { display: grid; }", responsive_contract)
+        mobile = self.css.index("@media (max-width: 700px)")
+        mobile_contract = self.css[mobile:]
+        fab = mobile_contract.index(".support-fab {")
+        self.assertIn("display: none", mobile_contract[fab : fab + 80])
 
     def test_feed_prioritizes_high_impact_and_labels_source_nature(self) -> None:
         self.assertIn("stats: null", self.javascript)
