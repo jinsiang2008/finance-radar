@@ -319,6 +319,71 @@ class DeploymentContractTests(unittest.TestCase):
             self.deploy,
         )
 
+    def test_noninteractive_passcode_is_unexported_before_child_processes(
+        self,
+    ) -> None:
+        capture = self.deploy.index(
+            'CAPTURED_PASSCODE="${KOL_DASHBOARD_PASSCODE-}"'
+        )
+        unexport = self.deploy.index("export -n CAPTURED_PASSCODE", capture)
+        remove_environment = self.deploy.index(
+            "unset KOL_DASHBOARD_PASSCODE", unexport
+        )
+        early_cleanup_trap = self.deploy.index(
+            "trap cleanup_auth_only EXIT INT TERM",
+            remove_environment,
+        )
+        first_external_command = min(
+            self.deploy.index('LOCAL_DIR="$(cd "$(dirname "$0")" && pwd)"'),
+            self.deploy.index('WORK="$(mktemp -d)"'),
+            self.deploy.index('"$VPS" run'),
+        )
+
+        self.assertLess(capture, unexport)
+        self.assertLess(unexport, remove_environment)
+        self.assertLess(remove_environment, early_cleanup_trap)
+        self.assertLess(early_cleanup_trap, first_external_command)
+        self.assertNotIn(
+            "${KOL_DASHBOARD_PASSCODE",
+            self.deploy[remove_environment:],
+        )
+
+        auth_start = self.deploy.index(
+            "if [[ $CONFIGURE_AUTH == 1 ]]; then"
+        )
+        auth_end = self.deploy.index("\nelse\n", auth_start)
+        auth_block = self.deploy[auth_start:auth_end]
+        self.assertIn('PASSCODE="$CAPTURED_PASSCODE"', auth_block)
+        self.assertIn('if [[ -z "$PASSCODE" ]]; then', auth_block)
+        self.assertIn(
+            'read -r -s -p "私人模式新口令: " PASSCODE',
+            auth_block,
+        )
+        self.assertIn(
+            'read -r -s -p "再次输入口令: " PASSCODE_CONFIRM',
+            auth_block,
+        )
+
+        secret_cleanup = self.deploy.index("clear_auth_material()")
+        secret_cleanup_end = self.deploy.index("\n}", secret_cleanup)
+        self.assertIn(
+            "unset CAPTURED_PASSCODE PASSCODE PASSCODE_CONFIRM "
+            "PASSCODE_HASH SESSION_SECRET",
+            self.deploy[secret_cleanup:secret_cleanup_end],
+        )
+        cleanup_auth_only = self.deploy.index("cleanup_auth_only()")
+        cleanup_auth_only_end = self.deploy.index("\n}", cleanup_auth_only)
+        self.assertIn(
+            "clear_auth_material",
+            self.deploy[cleanup_auth_only:cleanup_auth_only_end],
+        )
+        cleanup_local = self.deploy.index("cleanup_local()")
+        cleanup_local_end = self.deploy.index("\n}", cleanup_local)
+        self.assertIn(
+            "clear_auth_material",
+            self.deploy[cleanup_local:cleanup_local_end],
+        )
+
     def test_remote_staging_and_release_switch_are_atomic(self) -> None:
         self.assertIn("REMOTE_STAGE=", self.deploy)
         self.assertIn("install -d -m 700", self.deploy)

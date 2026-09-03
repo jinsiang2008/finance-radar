@@ -10,6 +10,25 @@
 set -euo pipefail
 umask 077
 
+# Non-interactive auth may supply the passcode through this shell's environment.
+# Capture it before any child process can inherit it, make the copy explicitly
+# non-exported, then remove the original environment entry immediately.
+CAPTURED_PASSCODE="${KOL_DASHBOARD_PASSCODE-}"
+export -n CAPTURED_PASSCODE
+unset KOL_DASHBOARD_PASSCODE
+
+clear_auth_material() {
+  unset CAPTURED_PASSCODE PASSCODE PASSCODE_CONFIRM PASSCODE_HASH SESSION_SECRET
+}
+
+cleanup_auth_only() {
+  local rc=$?
+  trap - EXIT INT TERM
+  clear_auth_material
+  exit "$rc"
+}
+trap cleanup_auth_only EXIT INT TERM
+
 # A production-size SQLite backup plus decision snapshot prewarm can exceed the
 # helper's generic 60-second SSH ceiling. Callers may raise this further.
 export RSH_TIMEOUT="${RSH_TIMEOUT:-1200}"
@@ -42,6 +61,7 @@ REMOTE_STAGE_CREATED=0
 cleanup_local() {
   local rc=$?
   trap - EXIT INT TERM
+  clear_auth_material
   rm -rf "$WORK"
   if [[ $REMOTE_STAGE_CREATED == 1 ]]; then
     "$VPS" run \
@@ -68,12 +88,12 @@ echo "→ 创建远端私有暂存区"
 REMOTE_STAGE_CREATED=1
 "$VPS" put "$WORK/app.tgz" "$REMOTE_STAGE/app.tgz"
 
-if [[ $CONFIGURE_AUTH == 0 && -n "${KOL_DASHBOARD_PASSCODE:-}" ]]; then
+if [[ $CONFIGURE_AUTH == 0 && -n "$CAPTURED_PASSCODE" ]]; then
   echo "⚠ 已忽略 KOL_DASHBOARD_PASSCODE；轮换认证必须显式传入 --auth" >&2
 fi
 
 if [[ $CONFIGURE_AUTH == 1 ]]; then
-  PASSCODE="${KOL_DASHBOARD_PASSCODE:-}"
+  PASSCODE="$CAPTURED_PASSCODE"
   if [[ -z "$PASSCODE" ]]; then
     read -r -s -p "私人模式新口令: " PASSCODE
     echo
@@ -89,7 +109,7 @@ if [[ $CONFIGURE_AUTH == 1 ]]; then
       PYTHONPATH="$LOCAL_DIR" python3 -c \
         'import sys, auth; print(auth.hash_passcode(sys.stdin.read()))'
   )"
-  unset PASSCODE PASSCODE_CONFIRM
+  unset CAPTURED_PASSCODE PASSCODE PASSCODE_CONFIRM
   SESSION_SECRET="${KOL_DASHBOARD_SESSION_SECRET:-$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')}"
   [[ "$SESSION_SECRET" =~ ^[A-Za-z0-9_-]{32,}$ ]] || {
     echo "KOL_DASHBOARD_SESSION_SECRET 必须是至少 32 位 URL-safe 字符" >&2
@@ -104,7 +124,10 @@ KOL_DASHBOARD_COOKIE_SECURE=true
 KOL_DASHBOARD_HOLDINGS_FILE=/opt/kol-dashboard/private/holdings.md
 AUTH
   chmod 600 "$WORK/auth.env"
+  unset PASSCODE_HASH SESSION_SECRET
   "$VPS" put-secret "$WORK/auth.env" "$REMOTE_STAGE/auth.env"
+else
+  unset CAPTURED_PASSCODE
 fi
 
 if [[ $SEND_DB == 1 ]]; then
