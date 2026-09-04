@@ -1880,6 +1880,20 @@ button:focus-visible, a:focus-visible, [tabindex]:focus-visible, input:focus-vis
 .market-observation-head span {
   color: var(--text-2); font-size: 11.5px; line-height: 1.45; text-align: right;
 }
+.market-direction-summary {
+  display: flex; flex-wrap: wrap; gap: 7px 24px;
+  margin-top: 10px; padding: 9px 0;
+  border-block: 1px solid var(--border);
+}
+.market-direction-summary > span { flex: 1 1 180px; min-width: 0; }
+.market-direction-summary small,
+.market-direction-summary strong { display: block; }
+.market-direction-summary small {
+  color: var(--muted); font-size: 10.5px; line-height: 1.4;
+}
+.market-direction-summary strong {
+  margin-top: 3px; color: var(--text-1); font-size: 13px; line-height: 1.45;
+}
 .return-divergence {
   margin: 10px 0 0; padding: 7px 9px; border: 1px solid color-mix(in srgb, var(--med) 45%, var(--border));
   border-radius: 7px; background: color-mix(in srgb, var(--med) 9%, var(--panel));

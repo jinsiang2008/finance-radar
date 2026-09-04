@@ -121,9 +121,9 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn('stale ? "数据延迟" : ""', self.javascript)
         self.assertIn('"高收益债利差"', self.javascript)
         self.assertIn("cs.hy_oas", self.javascript)
-        self.assertIn('static/app.js?v=23', self.html)
-        self.assertIn('static/style.css?v=23', self.html)
-        self.assertNotIn('?v=21', self.html)
+        self.assertIn('static/app.js?v=24', self.html)
+        self.assertIn('static/style.css?v=24', self.html)
+        self.assertNotIn('?v=23', self.html)
         self.assertIn(".metric.is-stale", self.css)
 
     def test_macro_events_render_compact_ai_digest_and_bounded_highlights(self) -> None:
@@ -328,6 +328,10 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn("资产绝对收益", detail_contract)
         self.assertIn("基准收益", detail_contract)
         self.assertIn("相对基准超额", detail_contract)
+        self.assertIn("market-direction-summary", detail_contract)
+        self.assertIn("marketExpectedPerformanceLabel(row)", detail_contract)
+        self.assertIn("marketObservedPerformanceLabel(row)", detail_contract)
+        self.assertIn("事件预期与实际相对表现", detail_contract)
         self.assertIn("row.benchmark_asset_key", detail_contract)
         self.assertIn("row.provider", detail_contract)
         self.assertIn("row.window", detail_contract)
@@ -340,16 +344,36 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn("重复转载不等于独立确认", self.html)
 
     def test_market_observation_calls_out_absolute_relative_divergence(self) -> None:
-        start = self.javascript.index("function marketDivergenceLabel")
+        start = self.javascript.index("function marketBenchmarkLabel")
         end = self.javascript.index("function marketTimestampRange", start)
         contract = self.javascript[start:end]
+        self.assertIn("function expectedRelativePerformanceLabel", contract)
+        self.assertIn("row?.evaluated_direction || row?.expected_direction", contract)
+        self.assertIn("row?.benchmark_asset_key", contract)
         self.assertIn('row?.asset_return', contract)
         self.assertIn('row?.abnormal_return', contract)
         self.assertIn('row?.direction_confirmed === true', contract)
-        self.assertIn('"相对同向"', contract)
-        self.assertIn('absolute === "positive" ? "上涨" : "下跌"', contract)
+        self.assertIn('"市场表现支持事件预期"', contract)
+        self.assertIn('"市场表现未验证事件预期"', contract)
+        self.assertIn('`跑赢 ${benchmark} ${pct(value)}`', contract)
+        self.assertIn('`跑输 ${benchmark} ${pct(value)}`', contract)
+        self.assertIn('`资产虽上涨，但仍跑输 ${benchmark}`', contract)
+        self.assertIn('`资产虽下跌，但仍跑赢 ${benchmark}`', contract)
         self.assertIn("return-divergence", self.javascript)
         self.assertIn(".return-divergence", self.css)
+        self.assertIn(".market-direction-summary", self.css)
+
+    def test_market_observation_uses_plain_language_in_every_surface(self) -> None:
+        self.assertIn("市场表现未验证事件预期", self.javascript)
+        self.assertIn("市场表现支持事件预期", self.javascript)
+        self.assertIn("市场表现尚无一致结论", self.javascript)
+        self.assertIn("这不是反向交易信号", self.javascript)
+        self.assertIn("预期 ${esc(expectedPerformance)}", self.javascript)
+        self.assertIn("实际 ${esc(observedPerformance)}", self.javascript)
+        self.assertNotIn("相对基准与规则方向反向", self.javascript)
+        self.assertNotIn("相对基准方向反向", self.javascript)
+        self.assertNotIn("相对同向", self.javascript)
+        self.assertNotIn("相对反向", self.javascript)
 
     def test_market_observation_formats_unix_second_timestamps(self) -> None:
         start = self.javascript.index("function marketTimestampRange")
@@ -803,8 +827,14 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn("market.veto === false", self.javascript)
         self.assertIn("directionConfirmed === true", self.javascript)
         self.assertIn('phase === "contrary"', self.javascript)
-        self.assertIn("区间样本相对基准与规则方向反向", self.javascript)
-        self.assertIn("区间样本相对基准方向中性或不一致", self.javascript)
+        self.assertIn("const hasPendingWindow", self.javascript)
+        self.assertIn("const hasAlternativeValidation", self.javascript)
+        self.assertIn("部分市场观察未完成", self.javascript)
+        self.assertIn("部分项目需补充验证条件", self.javascript)
+        self.assertIn("不适用事件后市场窗口", self.javascript)
+        self.assertIn("不能代表全部事件", self.javascript)
+        self.assertIn("市场表现未验证事件预期", self.javascript)
+        self.assertIn("市场表现尚无一致结论", self.javascript)
 
     def test_partial_business_degradation_and_macro_failure_remain_visible(
         self,

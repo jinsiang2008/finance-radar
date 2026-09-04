@@ -1320,18 +1320,18 @@
       return {
         tone: "warn",
         state: "direction_missing",
-        label: "机制方向未明确",
+        label: "事件预期未明确",
         guidance:
-          "当前仅有提及或多空分歧，无法判断同向或反向；请先补方向证据，重试行情无法解决此问题。",
+          "当前只有提及或多空分歧，无法设定资产应跑赢还是跑输基准；请先补充方向证据，重试行情无法解决此问题。",
       };
     }
     if (phase === "contrary" || directionConfirmed === false) {
       return {
         tone: "warn",
         state: "contrary",
-        label: "区间样本相对基准与规则方向反向",
+        label: "市场表现未验证事件预期",
         guidance:
-          "区间样本的相对基准方向与规则方向相反；停止候选行动，先复核相反证据与失效条件。",
+          "观察窗口内，资产相对基准的实际表现与事件预期相反；这不是反向交易信号。暂停候选行动，先复核相反证据与失效条件。",
       };
     }
     if (
@@ -1341,9 +1341,9 @@
       return {
         tone: "warn",
         state: "inconclusive",
-        label: "区间样本相对基准方向中性或不一致",
+        label: "市场表现尚无一致结论",
         guidance:
-          "区间样本的相对基准方向未形成一致结果；候选不能推进，需继续复核中性和相反证据。",
+          "不同观察窗口的相对表现中性或不一致，暂时无法验证事件预期；候选不能推进，需继续复核。",
       };
     }
     if (
@@ -1407,9 +1407,9 @@
       return {
         tone: "ok",
         state: "confirmed",
-        label: "区间样本相对基准与规则方向同向",
+        label: "市场表现支持事件预期",
         guidance:
-          "区间样本的相对基准方向与规则方向同向；仍需人工确认仓位、风险预算与失效条件。",
+          "完整观察窗口内，资产相对基准的表现符合事件预期；这只完成市场验证，仍需人工确认仓位、风险预算与失效条件。",
       };
     }
     if (market.veto === true) {
@@ -1418,7 +1418,7 @@
         state: "vetoed",
         label: "验证门禁未通过",
         guidance:
-          "市场验证未通过候选门槛；先复核机制方向、相反证据和数据完整性。",
+          "市场验证未通过候选门槛；先复核事件预期、相反证据和数据完整性。",
       };
     }
     const earlyConfirmation =
@@ -1427,10 +1427,10 @@
       tone: "warn",
       state: earlyConfirmation ? "preliminary" : "pending",
       label: earlyConfirmation
-        ? "早期区间相对基准同向，等待所需窗口"
+        ? "早期市场表现支持预期，等待完整窗口"
         : "等待市场观察窗口",
       guidance: earlyConfirmation
-        ? "早期窗口初步同向，但所需期限尚未完成；当前只形成候选行动。"
+        ? "早期窗口的相对表现暂时支持事件预期，但所需期限尚未完成；当前只形成候选行动。"
         : "共同交易日窗口尚未完成；当前只形成影响假设，不能据此直接交易。",
     };
   }
@@ -1558,6 +1558,12 @@
     const allPending =
       marketStates.length > 0 &&
       marketStates.every((item) => item.tone !== "ok");
+    const hasPendingWindow = marketStates.some((item) =>
+      ["pending", "preliminary"].includes(item.state)
+    );
+    const hasAlternativeValidation = marketStates.some((item) =>
+      ["scenario_monitoring", "direction_missing"].includes(item.state)
+    );
     const allNotApplicable =
       marketStates.length > 0 &&
       marketStates.every((item) =>
@@ -1633,7 +1639,7 @@
         evidenceTone: hasEvidence ? "warn" : "error",
         evidenceLabel: hasEvidence ? "有来源，待补验证条件" : "证据不足",
         marketLabel: "当前无适用事件窗口",
-        guidance: `当前卡片中 ${scenarioCount} 项为宏观情景监控，${directionCount} 项需先明确机制方向；这不表示行情链路故障。`,
+        guidance: `当前卡片中 ${scenarioCount} 项为宏观情景监控，${directionCount} 项需先明确事件预期；这不表示行情链路故障。`,
         systemKind: "warn",
         systemLabel: "事件窗口不适用",
       };
@@ -1647,7 +1653,7 @@
         marketLabel: marketState.label,
         guidance: marketState.guidance,
         systemKind: "warn",
-        systemLabel: contraryMarket ? "相对基准方向反向" : "市场观察待复核",
+        systemLabel: contraryMarket ? "市场未验证事件预期" : "市场观察待复核",
       };
     }
     if (macroLoadFailed || businessPartiallyDegraded) {
@@ -1668,7 +1674,7 @@
         systemLabel: macroLoadFailed ? "宏观刷新失败" : "市场部分降级",
       };
     }
-    if (!cards.length || anyUnavailable || allPending) {
+    if (!cards.length || anyUnavailable) {
       return {
         tone: "warn",
         evidenceTone: "warn",
@@ -1680,13 +1686,38 @@
         systemLabel: anyUnavailable ? "市场部分异常" : "市场待确认",
       };
     }
+    if (hasAlternativeValidation) {
+      return {
+        tone: "warn",
+        evidenceTone: "warn",
+        evidenceLabel: hasEvidence ? "待补验证条件" : "等待可核验证据",
+        marketLabel: "部分项目需补充验证条件",
+        guidance:
+          "部分项目不适用事件后市场窗口，或尚未明确应跑赢还是跑输基准；请检查触发指标或补充方向证据。已完成样本不能代表全部项目。",
+        systemKind: "warn",
+        systemLabel: "验证条件待补充",
+      };
+    }
+    if (hasPendingWindow || allPending) {
+      return {
+        tone: "warn",
+        evidenceTone: "warn",
+        evidenceLabel: hasEvidence ? "待人工核验" : "等待可核验证据",
+        marketLabel: allPending ? "市场观察未完成" : "部分市场观察未完成",
+        guidance: allPending
+          ? "当前仅形成影响假设；先核验证据与相反证据，等待市场窗口完成后再考虑交易。"
+          : "部分事件的观察窗口尚未完成；已完成样本只支持对应事件预期，不能代表全部事件。",
+        systemKind: "warn",
+        systemLabel: "市场待确认",
+      };
+    }
     return {
       tone: needsReview ? "warn" : "ok",
       evidenceTone: needsReview ? "warn" : "ok",
       evidenceLabel: needsReview ? "待人工核验" : "证据已复核",
-      marketLabel: "区间样本相对基准与规则方向同向",
+      marketLabel: "市场表现支持事件预期",
       guidance: needsReview
-        ? "区间样本的相对基准方向支持当前规则方向，但只形成候选行动，仍需人工确认风险预算与失效条件。"
+        ? "完整观察窗口内，资产相对基准的表现支持事件预期，但只形成候选行动，仍需人工确认风险预算与失效条件。"
         : "关联记录与区间市场观察已就绪；执行前仍需核对仓位、价格与风险预算。",
       systemKind: "ok",
       systemLabel: "验证链路正常",
@@ -2459,10 +2490,44 @@
     return number > 0 ? "positive" : "negative";
   }
 
+  function marketBenchmarkLabel(row) {
+    return row?.benchmark_asset_key
+      ? assetLabel(row.benchmark_asset_key)
+      : "基准";
+  }
+
+  function expectedRelativePerformanceLabel(direction, benchmark = "基准") {
+    const normalized = String(direction || "").trim().toLowerCase();
+    if (normalized === "positive") return `跑赢 ${benchmark}`;
+    if (normalized === "negative") return `跑输 ${benchmark}`;
+    return "方向待明确";
+  }
+
+  function marketExpectedPerformanceLabel(row) {
+    return expectedRelativePerformanceLabel(
+      row?.evaluated_direction || row?.expected_direction,
+      marketBenchmarkLabel(row)
+    );
+  }
+
+  function marketObservedPerformanceLabel(row) {
+    const raw = row?.abnormal_return;
+    const benchmark = marketBenchmarkLabel(row);
+    if (raw === null || raw === undefined || raw === "") {
+      return `等待 ${benchmark} 对比数据`;
+    }
+    const value = Number(raw);
+    if (!Number.isFinite(value)) return `等待 ${benchmark} 对比数据`;
+    const direction = returnDirection(value);
+    if (direction === "positive") return `跑赢 ${benchmark} ${pct(value)}`;
+    if (direction === "negative") return `跑输 ${benchmark} ${pct(value)}`;
+    return `与 ${benchmark} 基本持平 ${pct(value)}`;
+  }
+
   function marketComparisonLabel(row) {
-    if (row?.direction_confirmed === true) return "相对基准与规则方向同向";
-    if (row?.direction_confirmed === false) return "相对基准与规则方向反向";
-    return "相对基准方向中性或样本不足";
+    if (row?.direction_confirmed === true) return "市场表现支持事件预期";
+    if (row?.direction_confirmed === false) return "市场表现未验证事件预期";
+    return "市场表现尚不足以判断";
   }
 
   function marketDivergenceLabel(row) {
@@ -2475,15 +2540,10 @@
     ) {
       return "";
     }
-    const comparison =
-      row?.direction_confirmed === true
-        ? "相对同向"
-        : row?.direction_confirmed === false
-          ? "相对反向"
-          : relative === "positive"
-            ? "相对上涨"
-            : "相对下跌";
-    return `${comparison}但绝对${absolute === "positive" ? "上涨" : "下跌"}`;
+    const benchmark = marketBenchmarkLabel(row);
+    return absolute === "positive"
+      ? `资产虽上涨，但仍跑输 ${benchmark}`
+      : `资产虽下跌，但仍跑赢 ${benchmark}`;
   }
 
   function marketTimestampRange(row) {
@@ -2645,7 +2705,7 @@
       marketInfo.state === "scenario_monitoring"
         ? "宏观情景不适用事件后市场窗口；请改用触发指标监控。"
         : marketInfo.state === "direction_missing"
-          ? "规则方向未明确，当前区间观察不能判断同向或反向。"
+          ? "事件预期未明确，当前区间观察无法判断市场是否支持该预期。"
           : "暂无可用共同交易日区间观察。";
     const marketObservationScore = (row) => {
       const returns = [row.asset_return, row.benchmark_return, row.abnormal_return].filter(
@@ -2671,6 +2731,8 @@
     const renderMarketRow = (row) => {
       const divergence = marketDivergenceLabel(row);
       const comparison = marketComparisonLabel(row);
+      const expectedPerformance = marketExpectedPerformanceLabel(row);
+      const observedPerformance = marketObservedPerformanceLabel(row);
       const comparisonTone =
         row.direction_confirmed === true
           ? "same"
@@ -2681,6 +2743,10 @@
         <div class="market-observation-head">
           <strong>${esc(row.window || "窗口待标识")}</strong>
           <span>${esc(comparison)}</span>
+        </div>
+        <div class="market-direction-summary" aria-label="事件预期与实际相对表现">
+          <span><small>事件预期</small><strong>${esc(expectedPerformance)}</strong></span>
+          <span><small>实际相对表现</small><strong>${esc(observedPerformance)}</strong></span>
         </div>
         ${divergence ? `<p class="return-divergence">${esc(divergence)}</p>` : ""}
         <div class="return-grid" aria-label="绝对收益、基准收益与相对基准超额">
@@ -2840,8 +2906,8 @@
             <div title="${esc(card.asset_key)}"><small>公开资产</small><strong>${esc(
               assetLabel(card.asset_key)
             )}</strong></div>
-            <div><small>规则方向</small><strong>${esc(
-              decisionDirectionLabel(card.direction)
+            <div><small>事件预期</small><strong>${esc(
+              expectedRelativePerformanceLabel(card.direction)
             )}</strong></div>
           </div>
           ${positionRowsHTML}
@@ -2850,7 +2916,7 @@
           <header class="spine-step-head">
             <span class="spine-index">05</span>
             <div><h3 id="spine-market-title">市场观察</h3>
-              <p>绝对收益与相对基准超额分开展示；区间同向不等于交易确认。</p></div>
+              <p>直接对比事件预期与实际相对表现；市场支持预期也不等于交易确认。</p></div>
             <span class="status-badge is-${esc(marketInfo.tone)}">${esc(
               marketInfo.label
             )}</span>
@@ -4853,6 +4919,8 @@
     if (!reaction) return "";
     const comparison = marketComparisonLabel(reaction);
     const divergence = marketDivergenceLabel(reaction);
+    const expectedPerformance = marketExpectedPerformanceLabel(reaction);
+    const observedPerformance = marketObservedPerformanceLabel(reaction);
     const windowLabel = reaction.window ? String(reaction.window).toUpperCase() : "";
     return `<div class="market-check ${
       reaction.direction_confirmed === true ? "is-confirmed" : ""
@@ -4860,6 +4928,7 @@
       <span>市场观察</span>
       <strong>${esc(comparison)}</strong>
       ${windowLabel ? `<span>${esc(windowLabel)}</span>` : ""}
+      <span>预期 ${esc(expectedPerformance)}</span>
       ${
         typeof reaction.asset_return === "number"
           ? `<span>绝对收益 ${pct(reaction.asset_return)}</span>`
@@ -4867,7 +4936,7 @@
       }
       ${
         typeof reaction.abnormal_return === "number"
-          ? `<span>相对基准超额 ${pct(reaction.abnormal_return)}</span>`
+          ? `<span>实际 ${esc(observedPerformance)}</span>`
           : ""
       }
       ${divergence ? `<span>${esc(divergence)}</span>` : ""}

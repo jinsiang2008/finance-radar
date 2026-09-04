@@ -27,7 +27,7 @@ except ModuleNotFoundError:  # Flat production bundle in /opt/kol-dashboard.
 EVIDENCE_POLICY = (
     "KOL 信息仅用于发现待验证线索；统计相关不等于因果。"
     "尚无到期样本、技术不可用或样本冲突时必须 abstain；"
-    "未来窗口记为 pending，不视为反向证据。所有候选均需人工复核。"
+    "未来窗口记为 pending，不能用来否定事件预期。所有候选均需人工复核。"
 )
 PUBLIC_MACRO_SCHEMA_VERSION = 1
 
@@ -1471,7 +1471,7 @@ def _market_business_health(
         note = "部分市场验证因数据或技术原因不可用，相关候选必须降级复核。"
     elif available == 0 and pending:
         status = "pending"
-        note = "市场窗口尚未到期；未来窗口不会被误判为反向证据。"
+        note = "市场窗口尚未到期；未来窗口不会被当作事件预期失效。"
     else:
         status = "healthy"
         note = "市场验证链路有可用样本；统计相关仍不表示因果。"
@@ -1544,7 +1544,7 @@ def _market_business_health(
             note = "当前市场窗口均尚未到期；pending 不构成数据故障。"
         elif applicable_decisions == 0 and not_applicable_decisions:
             status = "not_applicable"
-            note = "当前决策需采用情景触发或先明确机制方向，不适用事件窗口确认。"
+            note = "当前决策需采用情景触发或先明确事件预期，不适用事件窗口确认。"
         else:
             status = "healthy"
             note = "适用事件窗口已有市场样本；统计相关仍不表示因果。"
@@ -1646,7 +1646,7 @@ def _market_validation(
                     "next_review_at": None,
                     "reason_counts": {"direction_missing": 1},
                     "note": (
-                        "机制方向尚未明确，无法判断市场同向或反向；"
+                        "事件预期尚未明确，无法判断资产应跑赢还是跑输基准；"
                         "先补充方向证据。"
                     ),
                     "records": [],
@@ -1757,11 +1757,11 @@ def _market_validation(
     if invalid_direction:
         status = "unavailable"
         phase = "direction_unavailable"
-        note = "机制方向尚未明确，现有市场样本不能判断同向或反向。"
+        note = "事件预期尚未明确，现有市场样本无法完成验证。"
     elif contrary:
         status = "complete" if required_done else "preliminary"
         phase = "contrary"
-        note = "已有共同交易日样本与机制方向相反，候选必须停止并复核。"
+        note = "已有共同交易日样本未支持事件预期，候选必须停止并复核。"
     elif inconclusive:
         status = "complete" if required_done else "preliminary"
         phase = "inconclusive"
@@ -1778,7 +1778,7 @@ def _market_validation(
     elif pending_windows and not unavailable_due:
         status = "pending"
         phase = "awaiting_1d"
-        note = "共同交易日窗口尚未到期；pending 不构成反向证据。"
+        note = "共同交易日窗口尚未到期；pending 不能用来否定事件预期。"
     else:
         status = "unavailable"
         phase = "unavailable"
@@ -1971,7 +1971,7 @@ def _contrary_evidence(
             continue
         item: dict[str, Any] = {
             "direction": "contrary",
-            "detail": "完整市场样本未确认机制方向。",
+            "detail": "完整观察窗口内，资产相对基准的表现未支持事件预期。",
         }
         for field in ("source_type", "source_id"):
             if _is_public_scalar(reaction.get(field)):

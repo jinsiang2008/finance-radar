@@ -759,6 +759,8 @@ class PublicDecisionTests(unittest.TestCase):
         self.assertTrue(market["abstain"])
         self.assertTrue(market["veto"])
         self.assertFalse(market["degraded"])
+        self.assertIn("事件预期尚未明确", market["note"])
+        self.assertNotIn("机制方向", market["note"])
         self.assertIn(card["action_stage"], {"observe", "verify"})
 
         health = result["business_health"]["market_validation"]
@@ -1044,6 +1046,18 @@ class PublicDecisionTests(unittest.TestCase):
 
         self.assertTrue(card["market_validation"]["abstain"])
         self.assertFalse(card["market_validation"]["direction_confirmed"])
+        self.assertEqual(
+            card["market_validation"]["note"],
+            "已有共同交易日样本未支持事件预期，候选必须停止并复核。",
+        )
+        self.assertIn(
+            "完整观察窗口内，资产相对基准的表现未支持事件预期。",
+            [item["detail"] for item in card["contrary_evidence"]],
+        )
+        self.assertNotIn(
+            "机制方向",
+            " ".join(item["detail"] for item in card["contrary_evidence"]),
+        )
         self.assertIn(card["action_stage"], {"observe", "verify"})
 
     def test_stored_confirmation_is_rebound_to_current_relation_direction(
@@ -1372,6 +1386,8 @@ class PublicDecisionTests(unittest.TestCase):
         self.assertIn("KOL", policy)
         self.assertIn("发现", policy)
         self.assertIn("abstain", policy)
+        self.assertIn("不能用来否定事件预期", policy)
+        self.assertNotIn("反向证据", policy)
 
     def test_unversioned_macro_snapshot_drops_all_free_text(self) -> None:
         snapshot = {
