@@ -9,6 +9,7 @@ Routes:
   GET  /api/events/{id}     — event intelligence, evidence and related stories
   GET  /api/macro           — latest macro risk snapshot
   GET  /api/macro/history   — composite risk score over time
+  GET  /api/briefings/latest — read-only persisted Daily Briefing
   GET  /api/decisions       — complete public decision snapshot
   GET  /api/decisions/summary — small first-screen decision projection
   GET  /api/decisions/detail — one decision's evidence chain
@@ -43,6 +44,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 import auth
+import briefing_service
 import db
 import decision_snapshot
 import decision_service
@@ -59,6 +61,7 @@ _NO_STORE_HEADERS = {
     "Pragma": "no-cache",
 }
 _PUBLIC_CACHE_HEADERS = {"Cache-Control": "public, max-age=30"}
+_BRIEFING_CACHE_HEADERS = {"Cache-Control": "public, max-age=60"}
 
 
 class LoginBody(BaseModel):
@@ -451,14 +454,18 @@ def api_event_detail(
         headers=_PUBLIC_CACHE_HEADERS,
     )
 
-@app.get("/api/macro")
-def api_macro() -> JSONResponse:
-    snap = db.latest_macro()
+def _public_macro_snapshot(
+    snapshot: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Return the latest evidence-bound public macro projection.
+
+    The helper performs only SQLite reads and pure validation.  Keeping it
+    shared prevents the Daily route from bypassing the same public/privacy and
+    stale-AI checks used by ``/api/macro``.
+    """
+    snap = snapshot if snapshot is not None else db.latest_macro()
     if not snap:
-        return JSONResponse(
-            {"available": False, "reason": "尚未采集到宏观快照，请运行 macro_collect.py"},
-            status_code=200,
-        )
+        return None
     expected: list[tuple[str, str, str]] = []
     monitored_events = snap.get("monitored_events")
     if isinstance(monitored_events, list):
@@ -490,10 +497,20 @@ def api_macro() -> JSONResponse:
             continue
         matching[event_id] = dict(value)
 
-    public_snapshot = decision_service.project_public_macro(
+    return decision_service.project_public_macro(
         snap,
         macro_event_enrichments=matching,
     )
+
+
+@app.get("/api/macro")
+def api_macro() -> JSONResponse:
+    public_snapshot = _public_macro_snapshot()
+    if public_snapshot is None:
+        return JSONResponse(
+            {"available": False, "reason": "尚未采集到宏观快照，请运行 macro_collect.py"},
+            status_code=200,
+        )
     public_snapshot["available"] = True
     return JSONResponse(public_snapshot)
 
@@ -501,6 +518,19 @@ def api_macro() -> JSONResponse:
 @app.get("/api/macro/history")
 def api_macro_history(limit: int = Query(60, ge=2, le=500)) -> dict:
     return {"items": db.macro_history(limit=limit)}
+
+
+@app.get("/api/briefings/latest")
+def api_latest_briefing() -> JSONResponse:
+    # ``load_public_snapshot`` is intentionally used instead of
+    # ``ensure_public_snapshot``: an HTTP read must not rebuild decisions.
+    decision_record = decision_snapshot.load_public_snapshot()
+    payload = briefing_service.build_latest_briefing(
+        repository=db,
+        public_macro=_public_macro_snapshot(),
+        decision_record=decision_record,
+    )
+    return JSONResponse(payload, headers=_BRIEFING_CACHE_HEADERS)
 
 
 def _macro_coverage() -> float:

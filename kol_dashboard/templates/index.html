@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
 <meta name="color-scheme" content="dark light" />
-<title>全球风险雷达 · 宏观与 KOL 情报</title>
+<title>全球风险雷达 · 每日情报与 KOL 信号</title>
 <script>
   // Deployments live at "/" locally and "/kol/" behind nginx.
   (function () {
@@ -18,7 +18,7 @@
     } catch (e) {}
   })();
 </script>
-  <link rel="stylesheet" href="static/style.css?v=24" />
+  <link rel="stylesheet" href="static/style.css?v=25" />
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ccircle cx='50' cy='50' r='42' fill='%230b1720' stroke='%2331d69b' stroke-width='6'/%3E%3Ccircle cx='50' cy='50' r='20' fill='none' stroke='%234ab8d8' stroke-width='5'/%3E%3Cpath d='M50 50L82 24' stroke='%23f4b942' stroke-width='6' stroke-linecap='round'/%3E%3Ccircle cx='50' cy='50' r='7' fill='%23eef4f2'/%3E%3C/svg%3E" />
 </head>
 <body>
@@ -37,6 +37,10 @@
       <button class="tab active" id="tab-decision" data-view="decision" role="tab"
               aria-selected="true" aria-controls="view-decision" tabindex="0">
         今日态势
+      </button>
+      <button class="tab" id="tab-daily" data-view="daily" role="tab"
+              aria-selected="false" aria-controls="view-daily" tabindex="-1">
+        每日简报
       </button>
       <button class="tab" id="tab-macro" data-view="macro" role="tab"
               aria-selected="false" aria-controls="view-macro" tabindex="-1">
@@ -139,6 +143,44 @@
         </div>
       </div>
       <div class="impact-matrix-wrap" id="decision-matrix" tabindex="0">
+        <div class="skeleton skeleton-card"></div>
+      </div>
+    </section>
+
+    <div class="support-slot" data-support-slot></div>
+  </div>
+</main>
+
+<!-- ══════════════ 每日简报 ══════════════ -->
+<main class="view" id="view-daily" role="tabpanel" aria-labelledby="tab-daily">
+  <div class="wrap daily-wrap">
+    <header class="daily-masthead">
+      <div class="daily-masthead-copy">
+        <p class="section-kicker">DAILY INTELLIGENCE</p>
+        <h1>每日市场情报</h1>
+        <p>先看事实，再看影响；两次点击内回到原始来源。</p>
+      </div>
+      <div class="daily-clock" aria-live="polite">
+        <time class="daily-date" id="daily-date">—</time>
+        <span class="daily-edition" id="daily-edition">正在确认版本</span>
+        <span class="daily-as-of" id="daily-as-of">数据时间待确认</span>
+      </div>
+    </header>
+
+    <nav class="daily-jump-nav" aria-label="简报章节">
+      <a href="#daily-highlights-title">60 秒读完</a>
+      <a href="#daily-firsthand-title">一手速递</a>
+      <a href="#daily-watchpoints-title">下一复核</a>
+    </nav>
+
+    <section class="daily-stage" id="daily-stage" aria-busy="true"
+             aria-live="polite" aria-labelledby="daily-highlights-title">
+      <div class="daily-stage-loading">
+        <h2 class="sr-only" id="daily-highlights-title">每日简报加载中</h2>
+        <h2 class="sr-only" id="daily-firsthand-title">一手速递加载中</h2>
+        <h2 class="sr-only" id="daily-watchpoints-title">复核点加载中</h2>
+        <div class="skeleton skeleton-hero"></div>
+        <div class="skeleton skeleton-card"></div>
         <div class="skeleton skeleton-card"></div>
       </div>
     </section>
@@ -294,7 +336,7 @@
   <div class="wrap footer-inner">
     <span>研究辅助 · 风险分值不等于事件概率 · 条件性方向不构成投资建议</span>
     <span class="footer-right">
-      <span>KOL 约 30 分钟采集 · 宏观/决策每小时计算 · 当前视图可见时每 5 分钟检查更新</span>
+      <span>KOL 约 30 分钟采集 · 宏观/决策每小时计算 · Daily 可见时每 5 分钟检查更新</span>
       <span id="footer-meta"></span>
       <button type="button" class="footer-support" data-support-open>☕ 支持服务器运行</button>
     </span>
@@ -371,6 +413,6 @@
   </div>
 </div>
 
-<script src="static/app.js?v=24"></script>
+<script src="static/app.js?v=25"></script>
 </body>
 </html>

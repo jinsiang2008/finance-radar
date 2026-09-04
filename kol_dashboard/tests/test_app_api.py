@@ -1162,6 +1162,151 @@ class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["decisions"], [])
 
+    async def test_daily_briefing_is_read_only_cached_and_public_safe(self) -> None:
+        generated_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+        db.insert_events(
+            [
+                {
+                    "title": "Elon Musk discusses Tesla shares and AI investment",
+                    "url": "https://x.com/elonmusk/status/123456",
+                    "snippet": (
+                        "Elon Musk discusses Tesla shares and AI investment in "
+                        "this sufficiently substantive original social post."
+                    ),
+                    "source": "X @elonmusk",
+                    "kol_key": "musk",
+                    "kol_name": "Elon Musk",
+                    "kol_name_cn": "马斯克",
+                    "impact": "medium",
+                    "has_market_kw": True,
+                    "published_at": generated_at,
+                    "account": "PRIVATE-EVENT-ACCOUNT",
+                }
+            ]
+        )
+        official_url = (
+            "https://www.federalreserve.gov/newsevents/pressreleases/"
+            "monetary20260904a.htm"
+        )
+        db.save_macro_snapshot(
+            {
+                "public_schema_version": 1,
+                "timestamp": generated_at,
+                "composite_risk": {"score": 61, "level": "high"},
+                "monitored_events": [
+                    {
+                        "id": "fed-daily",
+                        "kind": "policy",
+                        "title": "Federal Reserve issues FOMC statement",
+                        "url": official_url,
+                        "source": "Federal Reserve",
+                        "published_at": generated_at,
+                        "time_status": "verified",
+                        "severity": "high",
+                        "category": "fomc_statement",
+                        "content_status": "ready",
+                        "content_excerpt": "The Committee published its decision.",
+                        "content_source_url": official_url,
+                        "evidence_sections": [],
+                        "account": "PRIVATE-MACRO-ACCOUNT",
+                    }
+                ],
+                "data_coverage": {"available": 1, "total": 1, "pct": 100},
+                "market_data": {},
+                "sub_scores": {},
+                "portfolio": {"positions": ["PRIVATE-MACRO-POSITION"]},
+            }
+        )
+        db.save_decision_snapshot(
+            schema_version=dashboard_app.decision_service.DECISION_SNAPSHOT_SCHEMA_VERSION,
+            engine_version=dashboard_app.decision_service.DECISION_ENGINE_VERSION,
+            source_hash="daily-public-safe",
+            source_as_of=generated_at,
+            generated_at=generated_at,
+            summary={
+                "decisions": [
+                    {
+                        "topic_key": "ai_semiconductors",
+                        "asset_key": "US:NVDA",
+                        "direction": "negative",
+                        "action_stage": "verify",
+                        "total_score": 0.7,
+                        "source_count": 1,
+                        "market_validation": {
+                            "status": "pending",
+                            "applicability_reason": "window_not_due",
+                            "account": "PRIVATE-DECISION-ACCOUNT",
+                        },
+                        "positions": ["PRIVATE-DECISION-POSITION"],
+                    }
+                ]
+            },
+            full={
+                "decisions": [],
+                "portfolio": "PRIVATE-FULL-PORTFOLIO",
+            },
+        )
+
+        with (
+            patch.object(
+                dashboard_app.decision_snapshot,
+                "ensure_public_snapshot",
+                side_effect=AssertionError("must not rebuild a decision snapshot"),
+            ),
+            patch.object(
+                dashboard_app.db,
+                "request_ai_enrichment",
+                side_effect=AssertionError("must not queue AI work"),
+            ),
+            patch.object(
+                dashboard_app.llm_enrichment,
+                "load_config",
+                side_effect=AssertionError("must not load an LLM provider"),
+            ),
+        ):
+            response = await self.client.get("/api/briefings/latest")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["cache-control"], "public, max-age=60")
+        body = response.json()
+        self.assertEqual(
+            set(body),
+            {
+                "available",
+                "date",
+                "edition",
+                "edition_label",
+                "generated_at",
+                "source_as_of",
+                "stale",
+                "coverage",
+                "lead",
+                "highlights",
+                "firsthand",
+                "watchpoints",
+                "disclaimer",
+            },
+        )
+        self.assertTrue(body["available"])
+        self.assertTrue(body["firsthand"])
+        self.assertEqual(body["firsthand"][0]["source_tier"], "official")
+        self.assertTrue(
+            any(item["source_tier"] == "first_party" for item in body["firsthand"])
+        )
+        self.assertLessEqual(len(body["highlights"]), 5)
+        self.assertLessEqual(len(body["firsthand"]), 6)
+        self.assertLessEqual(len(body["watchpoints"]), 5)
+        encoded = response.text.lower()
+        for forbidden in (
+            "private-event-account",
+            "private-macro-account",
+            "private-macro-position",
+            "private-decision-account",
+            "private-decision-position",
+            "private-full-portfolio",
+        ):
+            self.assertNotIn(forbidden, encoded)
+
     async def test_macro_coverage_uses_collector_accounting(self) -> None:
         db.save_macro_snapshot(
             {

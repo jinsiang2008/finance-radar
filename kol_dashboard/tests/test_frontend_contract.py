@@ -32,6 +32,54 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn("data-decision-key", self.javascript)
         self.assertIn("matrix-symbol", self.css)
 
+    def test_daily_briefing_is_a_separate_lazy_loaded_evidence_view(self) -> None:
+        self.assertIn('id="tab-daily"', self.html)
+        self.assertIn('data-view="daily"', self.html)
+        self.assertIn('id="view-daily"', self.html)
+        self.assertIn('aria-labelledby="tab-daily"', self.html)
+        self.assertIn('id="daily-highlights-title"', self.html)
+        self.assertIn('id="daily-firsthand-title"', self.html)
+        self.assertIn('id="daily-watchpoints-title"', self.html)
+        self.assertIn("dailyData: null", self.javascript)
+        self.assertIn('view === "daily"', self.javascript)
+        self.assertIn('api("api/briefings/latest")', self.javascript)
+        self.assertIn("function renderDaily(data)", self.javascript)
+        self.assertIn("function loadDaily()", self.javascript)
+        self.assertIn('location.hash === "#daily"', self.javascript)
+
+    def test_daily_briefing_keeps_source_directness_and_verification_explicit(self) -> None:
+        for label in (
+            "官方正文",
+            "本人原文",
+            "媒体报道",
+            "聚合线索",
+            "发布时间待核验",
+            "仅标题证据",
+            "AI 摘要已绑定当前证据",
+            "关联记录，不代表独立确认",
+        ):
+            self.assertIn(label, self.javascript)
+        self.assertIn("source_tier", self.javascript)
+        self.assertIn("related_records", self.javascript)
+        self.assertIn("evidence_basis", self.javascript)
+        self.assertIn("item?.ai_summary_used === true", self.javascript)
+        self.assertIn("data-daily-event-detail", self.javascript)
+        self.assertIn("safeExternalUrl", self.javascript)
+        self.assertIn('target="_blank"', self.javascript)
+        self.assertIn('rel="noopener noreferrer"', self.javascript)
+
+    def test_daily_briefing_uses_responsive_editorial_hierarchy(self) -> None:
+        for selector in (
+            ".daily-lead-band",
+            ".daily-signal-axis",
+            ".daily-firsthand",
+            ".daily-coverage-grid",
+            ".daily-watch-grid",
+        ):
+            self.assertIn(selector, self.css)
+        self.assertIn("grid-template-columns: 1fr", self.css)
+        self.assertIn("min-height: 44px", self.css)
+
     def test_private_mode_uses_password_form_and_private_endpoint(self) -> None:
         self.assertIn('type="password"', self.html)
         self.assertIn('autocomplete="current-password"', self.html)
@@ -121,9 +169,9 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn('stale ? "数据延迟" : ""', self.javascript)
         self.assertIn('"高收益债利差"', self.javascript)
         self.assertIn("cs.hy_oas", self.javascript)
-        self.assertIn('static/app.js?v=24', self.html)
-        self.assertIn('static/style.css?v=24', self.html)
-        self.assertNotIn('?v=23', self.html)
+        self.assertIn('static/app.js?v=25', self.html)
+        self.assertIn('static/style.css?v=25', self.html)
+        self.assertNotIn('?v=24', self.html)
         self.assertIn(".metric.is-stale", self.css)
 
     def test_macro_events_render_compact_ai_digest_and_bounded_highlights(self) -> None:
@@ -519,7 +567,7 @@ class FrontendContractTests(unittest.TestCase):
             'loadedKolFilterSignature: ""',
             "kolSelectionPersisted: true",
             "kolCatalogLoaded: false",
-            "viewLoadGeneration: { decision: 0, macro: 0, kol: 0 }",
+            "viewLoadGeneration: { decision: 0, daily: 0, macro: 0, kol: 0 }",
             "已选 ${selectedCount} 位 · 仅看所选 KOL",
             "最多选择 ${KOL_SELECTION_LIMIT} 位 KOL",
         ):
