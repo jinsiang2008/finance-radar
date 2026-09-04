@@ -5,6 +5,7 @@ import sqlite3
 import tempfile
 import threading
 import unittest
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
@@ -752,6 +753,57 @@ class DatabaseTests(unittest.TestCase):
             )
         with self.assertRaisesRegex(ValueError, "at most 20 KOL filters"):
             db.query_events(kols=[f"kol_{index}" for index in range(21)])
+
+    def test_query_events_correlated_sighting_uses_event_id_index(self) -> None:
+        now = datetime(2026, 8, 1, 12, tzinfo=timezone.utc)
+        db.insert_events(
+            [
+                self.event(
+                    title="Mark Zuckerberg discusses Meta AI investment",
+                    url="https://example.com/zuckerberg-ai-investment",
+                    kol_key="zuckerberg",
+                    kol_name="Mark Zuckerberg",
+                    kol_name_cn="扎克伯格",
+                    published_at=(now - timedelta(hours=1)).isoformat(),
+                )
+            ]
+        )
+        statements: list[str] = []
+        original_conn = db.conn
+
+        @contextmanager
+        def tracing_conn(*, immediate: bool = False):
+            with original_conn(immediate=immediate) as connection:
+                connection.set_trace_callback(statements.append)
+                yield connection
+
+        with mock.patch.object(db, "conn", tracing_conn):
+            items = db.query_events(
+                kols=["zuckerberg"], hours=720, limit=500, now=now
+            )
+
+        self.assertEqual(len(items), 1)
+        query = next(
+            statement
+            for statement in statements
+            if "FROM events e JOIN event_sightings m ON m.id=(" in statement
+        )
+        self.assertIn(
+            "event_sightings s INDEXED BY idx_sighting_event", query
+        )
+        with original_conn() as connection:
+            plan = "\n".join(
+                row["detail"]
+                for row in connection.execute(
+                    "EXPLAIN QUERY PLAN " + query
+                ).fetchall()
+            )
+        self.assertIn(
+            "SEARCH s USING INDEX idx_sighting_event (event_id=?)", plan
+        )
+        self.assertNotIn(
+            "SEARCH s USING INDEX idx_sighting_publication", plan
+        )
 
     def test_query_events_uses_each_kol_sighting_time_for_filter_and_order(self) -> None:
         recent = (datetime.now(timezone.utc) - timedelta(hours=1)).replace(

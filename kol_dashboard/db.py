@@ -4619,7 +4619,7 @@ def query_events(
         params.append(cutoff)
     from_sql = (
         "events e JOIN event_sightings m ON m.id=("
-        "SELECT s.id FROM event_sightings s "
+        "SELECT s.id FROM event_sightings s INDEXED BY idx_sighting_event "
         f"WHERE s.event_id=e.id {selected_sighting_filter}"
         f"AND {sighting_status} {sighting_window_filter}"
         f"AND {_event_intelligence_sql('s')} "
