@@ -766,8 +766,6 @@ class EnrichmentWorkerQuotaTests(unittest.TestCase):
             "snippet": "A complete public evidence body for the priority request.",
             "source": "Test News",
             "url": "https://example.com/manual-priority",
-            "kol_name": "Tester",
-            "kol_name_cn": "测试者",
             "tickers": "SPY",
         }
         normal_event = {

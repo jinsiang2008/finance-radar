@@ -581,11 +581,48 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(event_count, 1)
         self.assertEqual([row["kol_key"] for row in sightings], ["huangrenxun", "musk"])
 
-    def test_query_events_for_second_kol_returns_matching_sighting_fields(self) -> None:
-        db.insert_events([self.event(published_at="2026-07-30T10:00:00+00:00")])
+    def test_list_kols_includes_the_configured_directory_without_sightings(
+        self,
+    ) -> None:
+        by_key = {item["kol_key"]: item for item in db.list_kols()}
+
+        self.assertIn("serenity", by_key)
+        self.assertEqual(by_key["serenity"]["kol_name"], "Serenity")
+        self.assertEqual(by_key["serenity"]["category"], "trader")
+        self.assertTrue(by_key["serenity"]["configured"])
+        self.assertEqual(by_key["serenity"]["total"], 0)
+        self.assertEqual(by_key["serenity"]["total_24h"], 0)
+        self.assertIsNone(by_key["serenity"]["last_published"])
+
+    def test_list_kols_marks_observed_unknown_keys_as_unconfigured(self) -> None:
         db.insert_events(
             [
                 self.event(
+                    kol_key="legacy_observer",
+                    kol_name="Legacy Observer",
+                    kol_name_cn="旧观察者",
+                )
+            ]
+        )
+
+        by_key = {item["kol_key"]: item for item in db.list_kols()}
+
+        self.assertFalse(by_key["legacy_observer"]["configured"])
+        self.assertEqual(by_key["legacy_observer"]["category"], "other")
+        self.assertTrue(by_key["huangrenxun"]["configured"])
+
+    def test_query_events_for_second_kol_returns_matching_sighting_fields(self) -> None:
+        shared_title = "Jensen Huang and Elon Musk discuss AI investment"
+        db.insert_events([
+            self.event(
+                title=shared_title,
+                published_at="2026-07-30T10:00:00+00:00",
+            )
+        ])
+        db.insert_events(
+            [
+                self.event(
+                    title=shared_title,
                     url="https://x.com/elonmusk/status/123",
                     source="X @elonmusk",
                     kol_key="musk",
@@ -610,6 +647,112 @@ class DatabaseTests(unittest.TestCase):
             items[0]["published_at"], "2026-07-31T08:00:00+00:00"
         )
 
+    def test_query_events_multi_kol_selects_latest_sighting_without_duplicates(
+        self,
+    ) -> None:
+        shared_title = "Elon Musk and Donald Trump discuss AI investment"
+        db.insert_events(
+            [
+                self.event(
+                    title=shared_title,
+                    url="https://example.com/shared/huang",
+                    kol_key="huangrenxun",
+                    published_at="2026-07-31T07:00:00+00:00",
+                ),
+                self.event(
+                    title="Elon Musk outlines a separate AI investment plan",
+                    url="https://x.com/elonmusk/status/separate",
+                    source="X @elonmusk",
+                    kol_key="musk",
+                    kol_name="Elon Musk",
+                    kol_name_cn="马斯克",
+                    published_at="2026-07-31T09:00:00+00:00",
+                ),
+            ]
+        )
+        db.insert_events(
+            [
+                self.event(
+                    title=shared_title,
+                    url="https://x.com/elonmusk/status/shared",
+                    source="X @elonmusk",
+                    kol_key="musk",
+                    kol_name="Elon Musk",
+                    kol_name_cn="马斯克",
+                    published_at="2026-07-31T08:00:00+00:00",
+                ),
+                self.event(
+                    title=shared_title,
+                    url="https://truthsocial.com/@realDonaldTrump/shared",
+                    source="Truth Social @realDonaldTrump",
+                    kol_key="trump",
+                    kol_name="Donald Trump",
+                    kol_name_cn="特朗普",
+                    published_at="2026-07-31T10:00:00+00:00",
+                ),
+            ]
+        )
+
+        items = db.query_events(kols=["musk", "trump", "musk"])
+        union = db.query_events(kol="trump", kols=["musk", "trump"])
+        second_page = db.query_events(
+            kols=["musk", "trump"], limit=1, offset=1
+        )
+
+        self.assertEqual(
+            [item["title"] for item in items],
+            [
+                shared_title,
+                "Elon Musk outlines a separate AI investment plan",
+            ],
+        )
+        self.assertEqual(len({item["id"] for item in items}), 2)
+        self.assertEqual(items[0]["kol_key"], "trump")
+        self.assertEqual(items[0]["kol_name"], "Donald Trump")
+        self.assertEqual(items[0]["kol_name_cn"], "特朗普")
+        self.assertEqual(
+            items[0]["source"], "Truth Social @realDonaldTrump"
+        )
+        self.assertEqual(
+            items[0]["source_url"],
+            "https://truthsocial.com/@realDonaldTrump/shared",
+        )
+        self.assertEqual(
+            items[0]["published_at"], "2026-07-31T10:00:00+00:00"
+        )
+        self.assertEqual([item["id"] for item in union], [item["id"] for item in items])
+        self.assertEqual(second_page[0]["id"], items[1]["id"])
+
+    def test_query_events_multi_kol_empty_unknown_and_injection_are_safe(self) -> None:
+        db.insert_events(
+            [
+                self.event(
+                    title="Elon Musk comments on AI investment",
+                    url="https://x.com/elonmusk/status/safe",
+                    source="X @elonmusk",
+                    kol_key="musk",
+                    kol_name="Elon Musk",
+                    kol_name_cn="马斯克",
+                    published_at="2026-07-31T08:00:00+00:00",
+                )
+            ]
+        )
+
+        unfiltered = db.query_events(kols=[])
+        unknown = db.query_events(kols=["unknown_but_valid"])
+        injected = db.query_events(kols=["musk') OR 1=1--"])
+
+        self.assertEqual(len(unfiltered), 1)
+        self.assertEqual(unknown, [])
+        self.assertEqual(injected, [])
+        with db.conn() as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM events").fetchone()[0],
+                1,
+            )
+        with self.assertRaisesRegex(ValueError, "at most 20 KOL filters"):
+            db.query_events(kols=[f"kol_{index}" for index in range(21)])
+
     def test_query_events_uses_each_kol_sighting_time_for_filter_and_order(self) -> None:
         recent = (datetime.now(timezone.utc) - timedelta(hours=1)).replace(
             microsecond=0
@@ -620,7 +763,9 @@ class DatabaseTests(unittest.TestCase):
         db.insert_events(
             [
                 self.event(
-                    title="Shared story",
+                    title=(
+                        "Jensen Huang and Elon Musk discuss NVIDIA AI investment"
+                    ),
                     url="https://example.com/shared",
                     kol_key="huangrenxun",
                     published_at=recent,
@@ -630,7 +775,9 @@ class DatabaseTests(unittest.TestCase):
         db.insert_events(
             [
                 self.event(
-                    title="Shared story",
+                    title=(
+                        "Jensen Huang and Elon Musk discuss NVIDIA AI investment"
+                    ),
                     url="https://x.com/elonmusk/status/old",
                     source="X @elonmusk",
                     kol_key="musk",
@@ -639,7 +786,7 @@ class DatabaseTests(unittest.TestCase):
                     published_at=old,
                 ),
                 self.event(
-                    title="Musk recent story",
+                    title="Elon Musk discusses recent AI investment demand",
                     url="https://x.com/elonmusk/status/recent",
                     source="X @elonmusk",
                     kol_key="musk",
@@ -661,18 +808,144 @@ class DatabaseTests(unittest.TestCase):
         huang_recent = db.query_events(kol="huangrenxun", hours=24)
 
         self.assertEqual(
-            [item["title"] for item in musk_recent], ["Musk recent story"]
+            [item["title"] for item in musk_recent],
+            ["Elon Musk discusses recent AI investment demand"],
         )
         self.assertEqual(
             [item["title"] for item in musk_all],
-            ["Musk recent story", "Shared story"],
+            [
+                "Elon Musk discusses recent AI investment demand",
+                "Jensen Huang and Elon Musk discuss NVIDIA AI investment",
+            ],
         )
         self.assertEqual(
-            [item["title"] for item in huang_recent], ["Shared story"]
+            [item["title"] for item in huang_recent],
+            ["Jensen Huang and Elon Musk discuss NVIDIA AI investment"],
         )
         self.assertEqual(musk_all[1]["first_seen_at"], old)
         self.assertEqual(musk_all[1]["last_seen_at"], old)
         self.assertEqual(musk_all[1]["published_at"], old)
+
+    def test_recent_feed_uses_recent_sighting_but_ai_keeps_global_primary(self) -> None:
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        title = (
+            "Donald Trump and Jensen Huang discuss NVIDIA AI investment"
+        )
+        db.insert_events(
+            [
+                self.event(
+                    title=title,
+                    snippet=(
+                        "Donald Trump and Jensen Huang discuss NVIDIA AI "
+                        "investment and semiconductor policy."
+                    ),
+                    url="https://truthsocial.com/@realDonaldTrump/old-primary",
+                    source="Truth Social @realDonaldTrump",
+                    kol_key="trump",
+                    kol_name="Donald Trump",
+                    kol_name_cn="特朗普",
+                    published_at=(now - timedelta(days=5)).isoformat(),
+                )
+            ]
+        )
+        db.insert_events(
+            [
+                self.event(
+                    title=title,
+                    snippet=(
+                        "Donald Trump and Jensen Huang discuss NVIDIA AI "
+                        "investment and semiconductor policy."
+                    ),
+                    url="https://example.com/recent-nvidia-policy",
+                    source="Bing News",
+                    kol_key="huangrenxun",
+                    kol_name="Jensen Huang",
+                    kol_name_cn="黄仁勋",
+                    published_at=(now - timedelta(hours=1)).isoformat(),
+                )
+            ]
+        )
+
+        recent = db.query_events(hours=24, now=now)
+        candidates = db.query_enrichment_candidates(
+            max_age_hours=72,
+            now=now,
+        )
+        stats = db.stats(hours=24)
+        by_kol = {item["kol_key"]: item for item in db.list_kols()}
+
+        self.assertEqual(len(recent), 1)
+        self.assertEqual(recent[0]["kol_key"], "huangrenxun")
+        self.assertEqual(recent[0]["source"], "Bing News")
+        self.assertEqual(recent[0]["ai_request_eligible"], 0)
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["kol_key"], "trump")
+        self.assertEqual(
+            candidates[0]["source"], "Truth Social @realDonaldTrump"
+        )
+        self.assertEqual(stats["total"], 1)
+        self.assertEqual(stats["active_kols"], 1)
+        self.assertEqual(by_kol["huangrenxun"]["total_24h"], 1)
+        self.assertEqual(by_kol["trump"]["total_24h"], 0)
+
+    def test_stored_high_label_cannot_revive_an_unrelated_accident(self) -> None:
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        db.insert_events(
+            [
+                self.event(
+                    title=(
+                        "Man hospitalised after train strikes tractor in "
+                        "Tullamore crash"
+                    ),
+                    snippet="A local road was closed after the collision.",
+                    url="https://example.com/tullamore-tractor-crash",
+                    source="Bing News",
+                    kol_key="zuckerberg",
+                    kol_name="Mark Zuckerberg",
+                    kol_name_cn="扎克伯格",
+                    impact="high",
+                    has_market_kw=True,
+                    published_at=(now - timedelta(hours=1)).isoformat(),
+                )
+            ]
+        )
+        with db.conn() as connection:
+            event_id = connection.execute("SELECT id FROM events").fetchone()["id"]
+        db.replace_relations(
+            "event",
+            str(event_id),
+            [
+                {
+                    "topic_key": "ai_semiconductors",
+                    "asset_key": "US:META",
+                    "relation_type": "view",
+                    "direction": "negative",
+                    "strength": 0.9,
+                    "confidence": 0.9,
+                    "horizon": "short",
+                    "method": "legacy:test",
+                    "rationale": "A stale relation that must stay private.",
+                    "evidence": {"title": "unrelated accident"},
+                }
+            ],
+        )
+
+        self.assertTrue(db.event_exists(event_id))
+        self.assertEqual(db.query_events(hours=24, now=now), [])
+        self.assertEqual(db.query_enrichment_candidates(now=now), [])
+        self.assertEqual(db.stats(hours=24)["total"], 0)
+        self.assertIsNone(db.get_event_detail(event_id))
+        self.assertEqual(
+            db.query_relations(
+                source_type="event",
+                source_id=str(event_id),
+                eligible_events_only=True,
+            ),
+            [],
+        )
+        by_kol = {item["kol_key"]: item for item in db.list_kols()}
+        self.assertEqual(by_kol["zuckerberg"]["total"], 0)
+        self.assertEqual(by_kol["zuckerberg"]["total_24h"], 0)
 
     def test_kol_pagination_filters_noncontent_sighting_before_limit(self) -> None:
         now = datetime.now(timezone.utc).replace(microsecond=0)
@@ -765,7 +1038,7 @@ class DatabaseTests(unittest.TestCase):
         trump = next(item for item in db.list_kols() if item["kol_key"] == "trump")
         self.assertEqual(trump["total"], 1)
         self.assertEqual(trump["total_24h"], 1)
-        self.assertEqual(db.stats(hours=24)["active_kols"], 2)
+        self.assertEqual(db.stats(hours=24)["active_kols"], 1)
 
     def test_recent_window_uses_publication_not_last_sighting(self) -> None:
         now = datetime(2026, 8, 3, 0, 0, tzinfo=timezone.utc)
@@ -1039,6 +1312,111 @@ class DatabaseTests(unittest.TestCase):
             ).fetchone()["source_count"]
         self.assertEqual(event_count, 2)
 
+    def test_public_source_count_excludes_wrong_kol_attribution(self) -> None:
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        title = "NVIDIA launches a new AI platform"
+        db.insert_events(
+            [
+                self.event(
+                    title=title,
+                    url="https://example.com/valid-nvidia-platform",
+                    published_at=(now - timedelta(hours=2)).isoformat(),
+                )
+            ]
+        )
+        db.insert_events(
+            [
+                self.event(
+                    title=title,
+                    url="https://example.com/wrong-musk-attribution",
+                    source="Bing News",
+                    kol_key="musk",
+                    kol_name="Elon Musk",
+                    kol_name_cn="马斯克",
+                    published_at=(now - timedelta(hours=1)).isoformat(),
+                )
+            ]
+        )
+
+        item = db.query_events(hours=24, now=now)[0]
+        detail = db.get_event_detail(item["id"])
+
+        self.assertEqual(item["source_count"], 1)
+        self.assertIsNotNone(detail)
+        assert detail is not None
+        self.assertEqual(detail["event"]["source_count"], 1)
+        self.assertEqual(len(detail["sightings"]), 1)
+        self.assertEqual(detail["sightings"][0]["kol_key"], "huangrenxun")
+
+    def test_longer_sighting_cannot_lend_provenance_to_wrong_source(self) -> None:
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        bad_title = "NVIDIA launches Blackwell platform"
+        good_title = (
+            "NVIDIA launches Blackwell platform as Elon Musk discusses "
+            "AI investment"
+        )
+        db.insert_events(
+            [
+                self.event(
+                    title=bad_title,
+                    snippet="NVIDIA introduced the Blackwell platform.",
+                    url="https://example.com/bad-musk-attribution",
+                    source="Bing News",
+                    kol_key="musk",
+                    kol_name="Elon Musk",
+                    kol_name_cn="马斯克",
+                    tickers=["NVDA"],
+                    published_at=(now - timedelta(minutes=30)).isoformat(),
+                )
+            ]
+        )
+        self.assertEqual(db.query_events(kol="musk", hours=24, now=now), [])
+
+        db.insert_events(
+            [
+                self.event(
+                    title=good_title,
+                    snippet=(
+                        "Elon Musk discussed AI investment while commenting "
+                        "on the new NVIDIA platform."
+                    ),
+                    url="https://example.com/good-musk-attribution",
+                    source="Reuters",
+                    kol_key="musk",
+                    kol_name="Elon Musk",
+                    kol_name_cn="马斯克",
+                    tickers=["TSLA"],
+                    published_at=(now - timedelta(hours=1)).isoformat(),
+                )
+            ]
+        )
+
+        items = db.query_events(kol="musk", hours=24, now=now)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(
+            items[0]["source_url"],
+            "https://example.com/good-musk-attribution",
+        )
+        self.assertEqual(items[0]["title"], good_title)
+        self.assertEqual(items[0]["tickers"], "TSLA")
+        self.assertEqual(items[0]["source_count"], 1)
+        detail = db.get_event_detail(items[0]["id"])
+        self.assertIsNotNone(detail)
+        assert detail is not None
+        self.assertEqual(
+            [sighting["source_url"] for sighting in detail["sightings"]],
+            ["https://example.com/good-musk-attribution"],
+        )
+        candidate = db.query_enrichment_candidates(now=now)[0]
+        subject = db.get_event_enrichment_subject(items[0]["id"])
+        self.assertEqual(candidate["source_url"], items[0]["source_url"])
+        self.assertEqual(candidate["title"], good_title)
+        self.assertEqual(candidate["tickers"], "TSLA")
+        self.assertIsNotNone(subject)
+        assert subject is not None
+        self.assertEqual(subject["source_url"], items[0]["source_url"])
+        self.assertEqual(subject["tickers"], "TSLA")
+
     def test_init_repairs_inflated_event_source_counts(self) -> None:
         db.insert_events([self.event()])
         with db.conn() as connection:
@@ -1159,9 +1537,16 @@ class DatabaseTests(unittest.TestCase):
                     "SELECT title, snippet, source, canonical_url, url FROM events"
                 ).fetchone()
             )
+            sighting = dict(
+                connection.execute(
+                    "SELECT title, snippet FROM event_sightings"
+                ).fetchone()
+            )
 
         self.assertEqual(row["title"], recovered["title"])
         self.assertEqual(row["snippet"], recovered["snippet"])
+        self.assertEqual(sighting["title"], recovered["title"])
+        self.assertEqual(sighting["snippet"], recovered["snippet"])
         self.assertTrue(llm_enrichment.is_event_enrichment_eligible(row))
 
     def test_merge_title_only_recovery_clears_stale_shell_snippet(self) -> None:
@@ -1616,6 +2001,174 @@ class DatabaseTests(unittest.TestCase):
             ).fetchone()["attempt_count"]
         self.assertEqual(attempt_count, 1)
 
+    def test_same_source_correction_to_irrelevant_content_revokes_claim(
+        self,
+    ) -> None:
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        source_url = "https://example.com/corrected-source"
+        original = self.event(
+            title="Jensen Huang discusses NVIDIA earnings and AI chip demand",
+            snippet=(
+                "Jensen Huang discussed NVIDIA revenue, data-center demand, "
+                "and the next AI chip cycle."
+            ),
+            url=source_url,
+            tickers=["NVDA"],
+            published_at=(now - timedelta(hours=1)).isoformat(),
+        )
+        db.insert_events([original])
+        candidate = db.query_enrichment_candidates(now=now)[0]
+        event_input, old_hash = llm_enrichment.build_event_input(candidate)
+        claim = {
+            "event_id": candidate["id"],
+            "input_hash": old_hash,
+            "prompt_version": llm_enrichment.PROMPT_VERSION,
+            "model": llm_enrichment.DEFAULT_MODEL,
+            "evidence_basis": event_input["evidence_basis"],
+        }
+        old_token = db.claim_event_enrichment(**claim, now=now)
+        self.assertIsInstance(old_token, str)
+
+        db.insert_events(
+            [
+                self.event(
+                    title=(
+                        "Man hospitalised after train strikes tractor in "
+                        "Tullamore crash"
+                    ),
+                    snippet=(
+                        "A local traffic accident caused one injury and a "
+                        "temporary road closure."
+                    ),
+                    url=source_url,
+                    tickers=[],
+                    published_at=(now - timedelta(hours=1)).isoformat(),
+                )
+            ]
+        )
+
+        self.assertEqual(
+            db.query_events(hours=24, now=now + timedelta(minutes=1)),
+            [],
+        )
+        self.assertEqual(
+            db.query_enrichment_candidates(now=now + timedelta(minutes=1)),
+            [],
+        )
+        with db.conn() as connection:
+            cache = connection.execute(
+                "SELECT claim_token FROM event_enrichments WHERE event_id=?",
+                (candidate["id"],),
+            ).fetchone()
+            sighting = connection.execute(
+                "SELECT title, snippet, tickers FROM event_sightings "
+                "WHERE event_id=? AND source_url=?",
+                (candidate["id"], source_url),
+            ).fetchone()
+        self.assertEqual(cache["claim_token"], "")
+        self.assertEqual(
+            sighting["title"],
+            "Man hospitalised after train strikes tractor in Tullamore crash",
+        )
+        self.assertEqual(
+            sighting["snippet"],
+            (
+                "A local traffic accident caused one injury and a temporary "
+                "road closure."
+            ),
+        )
+        self.assertEqual(sighting["tickers"], "")
+        self.assertFalse(
+            db.save_event_enrichment(
+                **claim,
+                claim_token=old_token,
+                result=ready_enrichment(headline_zh="旧输入的迟到结果"),
+            )
+        )
+        self.assertFalse(
+            db.fail_event_enrichment(
+                candidate["id"],
+                input_hash=old_hash,
+                prompt_version=llm_enrichment.PROMPT_VERSION,
+                model=llm_enrichment.DEFAULT_MODEL,
+                claim_token=old_token,
+                error_code="provider_unavailable",
+                retry_after_seconds=1200,
+                now=now + timedelta(minutes=1),
+            )
+        )
+
+    def test_new_preferred_sighting_revokes_an_old_enrichment_lease(self) -> None:
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        title = "Elon Musk and Donald Trump discuss stock market outlook"
+        common = {
+            "title": title,
+            "snippet": "They discussed tariffs, investment and the stock market outlook.",
+            "tickers": [],
+        }
+        db.insert_events(
+            [
+                self.event(
+                    **common,
+                    url="https://x.com/elonmusk/status/preferred-race",
+                    source="X @elonmusk",
+                    kol_key="musk",
+                    kol_name="Elon Musk",
+                    kol_name_cn="马斯克",
+                    published_at=(now - timedelta(hours=2)).isoformat(),
+                )
+            ]
+        )
+        candidate = db.query_enrichment_candidates(now=now)[0]
+        old_input, old_hash = llm_enrichment.build_event_input(candidate)
+        old_claim = {
+            "event_id": candidate["id"],
+            "input_hash": old_hash,
+            "prompt_version": llm_enrichment.PROMPT_VERSION,
+            "model": llm_enrichment.DEFAULT_MODEL,
+            "evidence_basis": old_input["evidence_basis"],
+        }
+        old_token = db.claim_event_enrichment(**old_claim, now=now)
+        self.assertIsInstance(old_token, str)
+
+        db.insert_events(
+            [
+                self.event(
+                    **common,
+                    url=(
+                        "https://truthsocial.com/@realDonaldTrump/"
+                        "preferred-race"
+                    ),
+                    source="Truth Social @realDonaldTrump",
+                    kol_key="trump",
+                    kol_name="Donald Trump",
+                    kol_name_cn="特朗普",
+                    published_at=(now - timedelta(hours=1)).isoformat(),
+                )
+            ]
+        )
+
+        current = db.get_event_enrichment_subject(candidate["id"])
+        self.assertIsNotNone(current)
+        assert current is not None
+        _, current_hash = llm_enrichment.build_event_input(current)
+        self.assertEqual(current["kol_key"], "trump")
+        self.assertNotEqual(current_hash, old_hash)
+        with db.conn() as connection:
+            cache = connection.execute(
+                "SELECT status, claim_token FROM event_enrichments WHERE event_id=?",
+                (candidate["id"],),
+            ).fetchone()
+        self.assertEqual(cache["status"], "pending")
+        self.assertEqual(cache["claim_token"], "")
+        self.assertFalse(
+            db.save_event_enrichment(
+                **old_claim,
+                claim_token=old_token,
+                result=ready_enrichment(headline_zh="旧代表证据的迟到结果"),
+            )
+        )
+
     def test_non_input_event_merge_preserves_live_enrichment_claim(self) -> None:
         now = datetime(2026, 8, 8, 5, 0, tzinfo=timezone.utc)
         original = self.event(
@@ -1736,8 +2289,16 @@ class DatabaseTests(unittest.TestCase):
 
     def test_ready_enrichment_is_nested_in_event_queries_and_searchable(self) -> None:
         now = datetime(2026, 8, 6, 5, 0, tzinfo=timezone.utc)
+        shared_title = (
+            "Jensen Huang and Elon Musk discuss NVIDIA AI investment demand"
+        )
         db.insert_events(
-            [self.event(published_at=(now - timedelta(hours=1)).isoformat())]
+            [
+                self.event(
+                    title=shared_title,
+                    published_at=(now - timedelta(hours=1)).isoformat(),
+                )
+            ]
         )
         candidate = db.query_enrichment_candidates(now=now)[0]
         event_input, input_hash = llm_enrichment.build_event_input(candidate)
@@ -1763,10 +2324,11 @@ class DatabaseTests(unittest.TestCase):
             [
                 {
                     **self.event(
-                        published_at=(now - timedelta(minutes=30)).isoformat()
+                        title=shared_title,
+                        published_at=(now - timedelta(hours=2)).isoformat(),
                     ),
-                    "url": "https://x.com/elonmusk/status/987",
-                    "source": "X @elonmusk",
+                    "url": "https://example.com/elon-musk-ai-interview",
+                    "source": "Interview transcript",
                     "kol_key": "musk",
                     "kol_name": "Elon Musk",
                     "kol_name_cn": "马斯克",
@@ -1780,6 +2342,12 @@ class DatabaseTests(unittest.TestCase):
         rule_high = db.query_events(impact="high", hours=24, now=now)
         ai_high = db.query_events(
             impact="high",
+            hours=24,
+            now=now,
+            use_ai_impact=True,
+        )
+        musk_items = db.query_events(
+            kol="musk",
             hours=24,
             now=now,
             use_ai_impact=True,
@@ -1811,10 +2379,14 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual([row["id"] for row in searched], [candidate["id"]])
         self.assertEqual(rule_high, [])
         self.assertEqual([row["id"] for row in ai_high], [candidate["id"]])
-        self.assertEqual(len(musk_high), 1)
-        self.assertEqual(musk_high[0]["impact"], "high")
-        self.assertEqual(musk_high[0]["ai_status"], "ready")
-        self.assertEqual(musk_high[0]["kol_key"], "musk")
+        self.assertEqual(musk_high, [])
+        self.assertEqual(len(musk_items), 1)
+        self.assertEqual(musk_items[0]["impact"], "medium")
+        self.assertEqual(musk_items[0]["ai_status"], "pending")
+        self.assertIsNone(musk_items[0]["ai_enrichment"])
+        self.assertEqual(musk_items[0]["ai_request_eligible"], 0)
+        self.assertEqual(musk_items[0]["kol_key"], "musk")
+        self.assertEqual(public["ai_request_eligible"], 1)
 
     def test_stale_enrichment_is_fail_closed_after_event_evidence_changes(self) -> None:
         now = datetime.now(timezone.utc).replace(microsecond=0)
@@ -1931,10 +2503,16 @@ class DatabaseTests(unittest.TestCase):
             ("Confident medium becomes low", "medium", 0.65),
         )
         for index, (title, impact, _confidence) in enumerate(cases):
+            snippet = (
+                "Jensen Huang warns that a stock market crash could deepen."
+                if title == "Rule high stays high"
+                else "NVIDIA described its new platform and AI investment demand."
+            )
             db.insert_events(
                 [
                     self.event(
                         title=title,
+                        snippet=snippet,
                         url=f"https://example.com/ai-none-{index}",
                         impact=impact,
                         published_at=(now - timedelta(hours=1)).isoformat(),
@@ -2053,10 +2631,23 @@ class DatabaseTests(unittest.TestCase):
                     title="Partners adopt NVIDIA platform worldwide",
                     url="https://example.com/nvidia-partners",
                     source="Reuters",
-                    kol_key="analyst",
-                    kol_name="Analyst",
-                    kol_name_cn="分析师",
+                    kol_key="huangrenxun",
+                    kol_name="Jensen Huang",
+                    kol_name_cn="黄仁勋",
                     published_at=(now - timedelta(minutes=30)).isoformat(),
+                )
+            ]
+        )
+        db.insert_events(
+            [
+                self.event(
+                    title="Partners adopt NVIDIA platform worldwide",
+                    url="https://x.com/elonmusk/status/nvidia-partners",
+                    source="X @elonmusk",
+                    kol_key="musk",
+                    kol_name="Elon Musk",
+                    kol_name_cn="马斯克",
+                    published_at=(now - timedelta(hours=1)).isoformat(),
                 )
             ]
         )
@@ -2105,6 +2696,14 @@ class DatabaseTests(unittest.TestCase):
         )
         self.assertEqual([item["id"] for item in detail["related"]], [related_id])
         self.assertEqual(detail["related"][0]["headline_zh"], f"事件 {related_id}")
+        self.assertEqual(
+            detail["related"][0]["source_url"],
+            "https://x.com/elonmusk/status/nvidia-partners",
+        )
+        self.assertEqual(
+            detail["related"][0]["canonical_url"],
+            "https://example.com/nvidia-partners",
+        )
         self.assertIsNone(db.get_event_detail(999_999))
 
     def test_replace_relations_is_idempotent_and_updates_payload(self) -> None:
@@ -2636,7 +3235,7 @@ class DatabaseTests(unittest.TestCase):
         db.insert_events(
             [
                 self.event(
-                    title="Fresh verified signal",
+                    title="Fresh warns stock market crash could deepen",
                     url="https://example.com/fresh-signal",
                     kol_key="fresh",
                     kol_name="Fresh",
@@ -2645,7 +3244,7 @@ class DatabaseTests(unittest.TestCase):
                     published_at=(now - timedelta(hours=1)).isoformat(),
                 ),
                 self.event(
-                    title="Old signal observed today",
+                    title="Old discusses stock investment outlook",
                     url="https://example.com/old-signal",
                     kol_key="old",
                     kol_name="Old",
@@ -2653,7 +3252,7 @@ class DatabaseTests(unittest.TestCase):
                     published_at=(now - timedelta(days=400)).isoformat(),
                 ),
                 self.event(
-                    title="Undated signal",
+                    title="Undated discusses stock investment outlook",
                     url="https://example.com/undated-signal",
                     kol_key="undated",
                     kol_name="Undated",
@@ -2675,6 +3274,235 @@ class DatabaseTests(unittest.TestCase):
 
 
 class LegacyMigrationTests(unittest.TestCase):
+    def test_v2_sighting_provenance_migration_is_conservative(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "v2-sighting-provenance.sqlite3")
+            connection = sqlite3.connect(path)
+            # This is the fully migrated v2 table shape: event_sightings has
+            # publication metadata, but does not yet own evidence text/tickers.
+            connection.executescript(
+                """
+                CREATE TABLE events (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  url_hash TEXT UNIQUE NOT NULL,
+                  url TEXT NOT NULL,
+                  title TEXT NOT NULL,
+                  snippet TEXT,
+                  source TEXT,
+                  kol_key TEXT NOT NULL,
+                  kol_name TEXT NOT NULL,
+                  kol_name_cn TEXT NOT NULL,
+                  impact TEXT NOT NULL DEFAULT 'low',
+                  has_market_kw INTEGER NOT NULL DEFAULT 0,
+                  fetched_at TEXT NOT NULL,
+                  published_at TEXT,
+                  published_at_status TEXT NOT NULL DEFAULT 'unknown',
+                  published_at_epoch INTEGER,
+                  dedup_key TEXT,
+                  canonical_url TEXT,
+                  source_count INTEGER NOT NULL DEFAULT 1,
+                  last_seen_at TEXT,
+                  tickers TEXT,
+                  prefix_key TEXT
+                );
+                CREATE TABLE event_sightings (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+                  kol_key TEXT NOT NULL,
+                  kol_name TEXT NOT NULL DEFAULT '',
+                  kol_name_cn TEXT NOT NULL DEFAULT '',
+                  source TEXT NOT NULL DEFAULT '',
+                  source_url TEXT NOT NULL DEFAULT '',
+                  published_at TEXT,
+                  published_at_status TEXT NOT NULL DEFAULT 'unknown',
+                  published_at_epoch INTEGER,
+                  first_seen_at TEXT NOT NULL,
+                  last_seen_at TEXT NOT NULL,
+                  source_count INTEGER NOT NULL DEFAULT 1 CHECK(source_count > 0),
+                  UNIQUE(event_id, kol_key, source, source_url)
+                );
+                PRAGMA user_version=2;
+                """
+            )
+            event_rows = [
+                (
+                    1,
+                    "legacy-single",
+                    "https://example.com/single",
+                    "https://example.com/single",
+                    "NVIDIA launches a new AI platform",
+                    "NVIDIA described its new platform.",
+                    "Bing News",
+                    "huangrenxun",
+                    "Jensen Huang",
+                    "黄仁勋",
+                    1,
+                    "NVDA",
+                ),
+                (
+                    2,
+                    "legacy-multi",
+                    "https://example.com/multi-primary",
+                    "https://example.com/multi-primary",
+                    "Elon Musk discusses Tesla investment strategy",
+                    "Elon Musk discussed Tesla's capital allocation.",
+                    "Bing News",
+                    "musk",
+                    "Elon Musk",
+                    "马斯克",
+                    2,
+                    "TSLA",
+                ),
+                (
+                    3,
+                    "legacy-tracking",
+                    "https://example.com/tracking?utm_source=canonical",
+                    "https://example.com/tracking",
+                    "Cathie Wood discusses ARK portfolio allocation",
+                    "ARK Invest described a portfolio rebalance.",
+                    "Bing News",
+                    "cathiewood",
+                    "Cathie Wood",
+                    "木头姐",
+                    2,
+                    "ARKK,TSLA",
+                ),
+            ]
+            connection.executemany(
+                """
+                INSERT INTO events (
+                  id, url_hash, url, canonical_url, title, snippet, source,
+                  kol_key, kol_name, kol_name_cn, source_count, tickers,
+                  impact, has_market_kw, fetched_at, last_seen_at,
+                  published_at, published_at_status
+                ) VALUES (
+                  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'medium', 1,
+                  '2026-08-02T01:00:00+00:00',
+                  '2026-08-02T01:00:00+00:00',
+                  '2026-08-02T00:00:00+00:00', 'verified'
+                )
+                """,
+                event_rows,
+            )
+            sighting_rows = [
+                (
+                    1,
+                    "huangrenxun",
+                    "Jensen Huang",
+                    "黄仁勋",
+                    "Bing News",
+                    "https://example.com/single",
+                ),
+                (
+                    2,
+                    "musk",
+                    "Elon Musk",
+                    "马斯克",
+                    "Bing News",
+                    "https://example.com/multi-primary",
+                ),
+                (
+                    2,
+                    "musk",
+                    "Elon Musk",
+                    "马斯克",
+                    "Reuters",
+                    "https://example.com/multi-secondary",
+                ),
+                (
+                    3,
+                    "cathiewood",
+                    "Cathie Wood",
+                    "木头姐",
+                    "Bing News",
+                    "https://example.com/tracking?utm_source=one",
+                ),
+                (
+                    3,
+                    "cathiewood",
+                    "Cathie Wood",
+                    "木头姐",
+                    "Bing News",
+                    "https://example.com/tracking?utm_source=two",
+                ),
+            ]
+            connection.executemany(
+                """
+                INSERT INTO event_sightings (
+                  event_id, kol_key, kol_name, kol_name_cn, source, source_url,
+                  published_at, published_at_status, published_at_epoch,
+                  first_seen_at, last_seen_at, source_count
+                ) VALUES (
+                  ?, ?, ?, ?, ?, ?, '2026-08-02T00:00:00+00:00',
+                  'verified', 1785628800, '2026-08-02T01:00:00+00:00',
+                  '2026-08-02T01:00:00+00:00', 1
+                )
+                """,
+                sighting_rows,
+            )
+            connection.commit()
+            connection.close()
+
+            with mock.patch.object(db, "DB_PATH", path):
+                db.init()
+                with db.conn() as migrated:
+                    version = migrated.execute(
+                        "PRAGMA user_version"
+                    ).fetchone()[0]
+                    columns = {
+                        row["name"]
+                        for row in migrated.execute(
+                            "PRAGMA table_info(event_sightings)"
+                        ).fetchall()
+                    }
+                    sightings = migrated.execute(
+                        "SELECT event_id, title, snippet, tickers, source_url "
+                        "FROM event_sightings ORDER BY event_id, source_url"
+                    ).fetchall()
+
+            by_event: dict[int, list[sqlite3.Row]] = {}
+            for sighting in sightings:
+                by_event.setdefault(sighting["event_id"], []).append(sighting)
+
+            self.assertEqual(version, 3)
+            self.assertTrue({"title", "snippet", "tickers"}.issubset(columns))
+            self.assertEqual(len(by_event[1]), 1)
+            self.assertEqual(
+                (
+                    by_event[1][0]["title"],
+                    by_event[1][0]["snippet"],
+                    by_event[1][0]["tickers"],
+                ),
+                (
+                    "NVIDIA launches a new AI platform",
+                    "NVIDIA described its new platform.",
+                    "NVDA",
+                ),
+            )
+            self.assertEqual(len(by_event[2]), 2)
+            self.assertTrue(
+                all(
+                    (row["title"], row["snippet"], row["tickers"])
+                    == ("", "", "")
+                    for row in by_event[2]
+                )
+            )
+            self.assertEqual(len(by_event[3]), 1)
+            self.assertEqual(
+                (
+                    by_event[3][0]["source_url"],
+                    by_event[3][0]["title"],
+                    by_event[3][0]["snippet"],
+                    by_event[3][0]["tickers"],
+                ),
+                (
+                    "https://example.com/tracking",
+                    "Cathie Wood discusses ARK portfolio allocation",
+                    "ARK Invest described a portfolio rebalance.",
+                    "ARKK,TSLA",
+                ),
+            )
+
     def test_market_reaction_pending_migration_is_atomic_and_idempotent(
         self,
     ) -> None:
@@ -3252,6 +4080,57 @@ class ManualAiRequestDatabaseTests(unittest.TestCase):
         )
         self.assertEqual(len(db.query_pending_ai_enrichment_requests()), 1)
 
+    def test_manual_ai_request_treats_a_model_change_as_new_identity(self) -> None:
+        now = datetime(2026, 9, 2, 12, 0, tzinfo=timezone.utc)
+        db.insert_events([self.event(published_at=now.isoformat())])
+        with db.conn() as connection:
+            event_id = int(connection.execute("SELECT id FROM events").fetchone()[0])
+        event = db.get_event_enrichment_subject(event_id)
+        assert event is not None
+        event_input, input_hash = llm_enrichment.build_event_input(event)
+        old_model = "deepseek-v4-flash"
+        claim = db.claim_event_enrichment(
+            event_id,
+            input_hash=input_hash,
+            prompt_version=llm_enrichment.PROMPT_VERSION,
+            model=old_model,
+            evidence_basis=event_input["evidence_basis"],
+            now=now,
+        )
+        self.assertIsInstance(claim, str)
+        assert isinstance(claim, str)
+        self.assertTrue(
+            db.save_event_enrichment(
+                event_id,
+                input_hash=input_hash,
+                prompt_version=llm_enrichment.PROMPT_VERSION,
+                model=old_model,
+                claim_token=claim,
+                evidence_basis=event_input["evidence_basis"],
+                result=ready_enrichment(),
+                generated_at=now.isoformat(),
+            )
+        )
+        new_identity = {
+            "subject_type": "event",
+            "subject_key": str(event_id),
+            "input_hash": input_hash,
+            "prompt_version": llm_enrichment.PROMPT_VERSION,
+            "model": "deepseek-v4-pro",
+        }
+
+        queued = db.request_ai_enrichment(**new_identity, now=now)
+
+        self.assertEqual(queued["state"], "queued")
+        self.assertEqual(
+            db.get_ai_enrichment_request_status(**new_identity, now=now)["state"],
+            "queued",
+        )
+        self.assertEqual(
+            db.query_pending_ai_enrichment_requests()[0]["model"],
+            "deepseek-v4-pro",
+        )
+
     def test_atomic_claim_rejects_changed_event_and_macro_identity(self) -> None:
         now = datetime(2026, 9, 2, 12, 0, tzinfo=timezone.utc)
         db.insert_events([self.event(published_at=now.isoformat())])
@@ -3260,11 +4139,14 @@ class ManualAiRequestDatabaseTests(unittest.TestCase):
         event = db.get_event_enrichment_subject(event_id)
         assert event is not None
         event_input, old_event_hash = llm_enrichment.build_event_input(event)
-        with db.conn(immediate=True) as connection:
-            connection.execute(
-                "UPDATE events SET snippet=? WHERE id=?",
-                ("Richer canonical evidence arrived before claim.", event_id),
-            )
+        db.insert_events(
+            [
+                self.event(
+                    snippet="Richer sighting evidence arrived before claim.",
+                    published_at=now.isoformat(),
+                )
+            ]
+        )
 
         event_claim = db.claim_event_enrichment(
             event_id,

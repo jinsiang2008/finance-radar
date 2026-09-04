@@ -23,6 +23,11 @@ try:
 except ModuleNotFoundError:  # Flat production bundle in /opt/kol-dashboard.
     from content_quality import is_event_content_eligible
 
+try:
+    from kol_dashboard.event_relevance import assess_event_relevance
+except ModuleNotFoundError:  # Flat production bundle in /opt/kol-dashboard.
+    from event_relevance import assess_event_relevance  # type: ignore
+
 
 PROMPT_VERSION = "event-intelligence-v1"
 MACRO_PROMPT_VERSION = "macro-monitor-intelligence-v2"
@@ -131,8 +136,17 @@ def _clean_source_text(value: Any, maximum: int) -> str:
 
 
 def is_event_enrichment_eligible(event: Mapping[str, Any]) -> bool:
-    """Return false for known social placeholders with no textual evidence."""
-    return is_event_content_eligible(event)
+    """Gate LLM work on both reliable attribution and financial relevance."""
+    has_kol_identity = any(
+        str(event.get(field) or "").strip()
+        for field in ("kol_key", "kol_name", "kol_name_cn")
+    )
+    if not has_kol_identity:
+        # Non-KOL callers predate the attribution classifier. Preserve their
+        # content-only contract while every dashboard KOL event takes the
+        # stricter path below.
+        return is_event_content_eligible(event)
+    return bool(assess_event_relevance(event)["intelligence_eligible"])
 
 
 def _official_macro_article_identity(value: Any) -> tuple[str, str] | None:
@@ -170,7 +184,10 @@ def _official_macro_article_identity(value: Any) -> tuple[str, str] | None:
 def build_event_input(event: Mapping[str, Any]) -> tuple[dict[str, Any], str]:
     title = _clean_source_text(event.get("title"), 700)
     snippet = _clean_source_text(event.get("snippet"), 2_200)
-    if not is_event_enrichment_eligible(event):
+    # Evidence-basis classification is part of the stable prompt hash. Keep it
+    # about content completeness; relevance is a separate pre-call gate and
+    # must not invalidate otherwise current caches.
+    if not is_event_content_eligible(event):
         evidence_basis = "noncontent_social_placeholder"
     else:
         title_stem = re.sub(r"[…\.]+$", "", title).strip().lower()

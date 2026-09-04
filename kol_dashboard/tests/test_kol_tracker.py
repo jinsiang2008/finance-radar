@@ -183,8 +183,11 @@ class TruthSocialTests(unittest.TestCase):
     def test_truth_social_never_crowds_out_news_coverage(self) -> None:
         truth_posts = [
             {
-                "title": f"Truth post {index}",
-                "snippet": f"A sufficiently long Truth Social post body {index}",
+                "title": f"Trump tariff policy update {index}",
+                "snippet": (
+                    f"Trump discusses tariffs, trade and the US economy in "
+                    f"this sufficiently long Truth Social post {index}"
+                ),
                 "url": f"https://truthsocial.com/@realDonaldTrump/{index}",
                 "source": "Truth Social @realDonaldTrump",
                 "published_at": "2026-08-04T22:52:51+00:00",
@@ -193,8 +196,11 @@ class TruthSocialTests(unittest.TestCase):
         ]
         news = [
             {
-                "title": f"News story {index}",
-                "snippet": f"A sufficiently long news body {index}",
+                "title": f"Trump stock market news story {index}",
+                "snippet": (
+                    f"Trump discusses tariffs and the stock market in this "
+                    f"sufficiently long news body {index}"
+                ),
                 "url": f"https://news.example.com/{index}",
                 "source": "Bing News",
                 "published_at": "2026-08-04T20:00:00+00:00",
@@ -225,6 +231,85 @@ class TruthSocialTests(unittest.TestCase):
         }
 
         self.assertEqual(handles, {"trump": "realDonaldTrump"})
+
+
+class SearchEntityGateTests(unittest.TestCase):
+    def test_shared_kol_directory_matches_collector_profiles(self) -> None:
+        self.assertEqual(set(kol_tracker.KOLS), set(kol_tracker.KOL_DIRECTORY))
+        for key, profile in kol_tracker.KOLS.items():
+            with self.subTest(key=key):
+                self.assertEqual(
+                    profile["name"], kol_tracker.KOL_DIRECTORY[key]["name"]
+                )
+                self.assertEqual(
+                    profile["name_cn"], kol_tracker.KOL_DIRECTORY[key]["name_cn"]
+                )
+
+    def test_search_query_is_not_treated_as_entity_evidence(self) -> None:
+        wrong_result = {
+            "title": "Man hospitalised after train strikes tractor in Tullamore crash",
+            "snippet": "One person was taken to hospital after a road accident.",
+            "url": "https://example.com/tullamore",
+            "source": "Bing News",
+            "published_at": "2026-09-03T11:29:00+00:00",
+        }
+        valid_result = {
+            "title": "Meta shares crash after guidance cut",
+            "snippet": "The Facebook parent lowered its revenue outlook.",
+            "url": "https://example.com/meta-shares",
+            "source": "Bing News",
+            "published_at": "2026-09-03T12:00:00+00:00",
+        }
+
+        with mock.patch.object(
+            kol_tracker, "search_bing_rss", return_value=[wrong_result, valid_result]
+        ), mock.patch.object(kol_tracker, "search_baidu", return_value=[]):
+            items = kol_tracker.search_kol(
+                "zuckerberg", "Mark Zuckerberg", max_results=5
+            )
+
+        self.assertEqual([item["url"] for item in items], [valid_result["url"]])
+
+    def test_scan_filters_mocked_unattributable_aggregator_results(self) -> None:
+        wrong_result = {
+            "title": "Tiger Woods recovering after car crash",
+            "snippet": "The golfer is in hospital.",
+            "url": "https://example.com/tiger-woods",
+            "source": "Bing News",
+            "published_at": "2026-09-03T12:00:00+00:00",
+        }
+        with mock.patch.object(
+            kol_tracker, "search_kol", return_value=[wrong_result]
+        ):
+            items = kol_tracker.scan_kol("musk", max_results=5)
+
+        self.assertEqual(items, [])
+
+    def test_nonfinancial_hit_does_not_consume_scan_result_budget(self) -> None:
+        nonfinancial = {
+            "title": "Jensen Huang attends a family holiday dinner",
+            "snippet": "Jensen Huang shared photos from a private celebration.",
+            "url": "https://example.com/huang-family-dinner",
+            "source": "Bing News",
+            "published_at": "2026-09-03T12:00:00+00:00",
+        }
+        financial = {
+            "title": "Jensen Huang unveils a new NVIDIA AI platform",
+            "snippet": "The new platform targets data center customers.",
+            "url": "https://example.com/huang-ai-platform",
+            "source": "Bing News",
+            "published_at": "2026-09-03T11:00:00+00:00",
+        }
+
+        with mock.patch.object(
+            kol_tracker,
+            "search_kol",
+            side_effect=[[nonfinancial], [financial], []],
+        ) as search:
+            items = kol_tracker.scan_kol("huangrenxun", max_results=1)
+
+        self.assertEqual([item["url"] for item in items], [financial["url"]])
+        self.assertEqual(search.call_count, 2)
 
 
 class PublishedAtParsingTests(unittest.TestCase):

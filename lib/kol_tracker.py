@@ -47,6 +47,19 @@ for _cand in _DASHBOARD_CANDIDATES:
 
 from content_quality import has_substantive_social_text
 
+try:
+    from kol_dashboard.event_relevance import (
+        KOL_DIRECTORY,
+        assess_event_relevance,
+        classify_rule_impact,
+    )
+except ModuleNotFoundError:  # Flat production bundle in /opt/kol-dashboard.
+    from event_relevance import (  # type: ignore
+        KOL_DIRECTORY,
+        assess_event_relevance,
+        classify_rule_impact,
+    )
+
 
 def _write_to_db(items: list[dict[str, Any]]) -> tuple[int, int]:
     """Best-effort write to dashboard DB; returns (inserted, skipped).
@@ -195,23 +208,12 @@ KOLS = {
     },
 }
 
-# 市场关键词 — 扩展了 AI/半导体/算力相关关键词
-MARKET_KEYWORDS = [
-    "buy", "sell", "invest", "stock", "share", "price", "market",
-    "tariff", "trade", "war", "crisis", "bubble", "crash",
-    "AI", "crypto", "bitcoin", "ethereum", "DOGE",
-    "Tesla", "Apple", "NVIDIA", "Microsoft", "Amazon", "Google",
-    "Dell", "HP", "Intel", "AMD", "TSMC", "Samsung",
-    "算力", "AI泡沫", "AI bubble", "半导体", "semiconductor",
-    "chip", "数据中心", "data center", "GPU", "capital expenditure",
-    "AI算力", "AI资本开支", "大模型", "LLM",
-    "AI spending", "AI capex", "AI investment",
-    "Meta", "OpenAI", "Anthropic", "Google AI",
-    "中国", "A股", "港股", "美股", "牛市", "熊市",
-    "买入", "卖出", "加仓", "减仓", "看好", "看空",
-    "关税", "贸易战", "降息", "加息", "通胀",
-]
-
+# The shared directory is authoritative for public display metadata.  Keeping
+# retrieval-only search/source settings here avoids a backend -> collector
+# dependency while ensuring `/api/kols` and collected rows use the same names.
+for _kol_key, _public_profile in KOL_DIRECTORY.items():
+    if _kol_key in KOLS:
+        KOLS[_kol_key].update(_public_profile)
 
 # ─── 网络请求 ──────────────────────────────────────────
 
@@ -334,6 +336,7 @@ def _parse_bing_items_with_regex(xml: str) -> list[dict[str, Any]]:
             continue
         recovered.append({
             "title": title,
+            "snippet": strip_html(_tagged_text(fragment, "description")),
             "url": link,
             "source": "Bing News",
             "published_at": normalize_published_at(
@@ -372,12 +375,15 @@ def search_bing_rss(query: str, max_results: int = 5) -> list[dict[str, Any]]:
         if tag != "item":
             continue
         title = ""
+        snippet = ""
         link = ""
         pub_date = None
         for child in item:
             ctag = child.tag.lower().rsplit("}", 1)[-1]
             if ctag == "title":
                 title = strip_html(child.text)
+            elif ctag == "description":
+                snippet = strip_html(child.text)
             elif ctag == "link":
                 link = (child.text or "").strip()
             elif ctag == "pubdate":
@@ -385,6 +391,7 @@ def search_bing_rss(query: str, max_results: int = 5) -> list[dict[str, Any]]:
         if title and link:
             results.append({
                 "title": title,
+                "snippet": snippet,
                 "url": link,
                 "source": "Bing News",
                 "published_at": pub_date,
@@ -550,16 +557,38 @@ def search_baidu(query: str, max_results: int = 5) -> list[dict[str, str]]:
 # ─── 搜索单个 KOL ─────────────────────────────────────
 
 def search_kol(key: str, query: str, max_results: int = 5) -> list[dict[str, str]]:
-    """搜索某个 KOL 的近期言论"""
+    """搜索某个 KOL 的近期动态，并拒绝搜索引擎的错误归因。
+
+    The query string is retrieval input, never entity evidence.  A result must
+    name either the person or an affiliated company in its own title/snippet.
+    """
+    kol = KOLS.get(key)
+    if not kol:
+        return []
+
+    def is_attributable(item: dict[str, Any]) -> bool:
+        candidate = {
+            **item,
+            "kol_key": key,
+            "kol_name": kol["name"],
+            "kol_name_cn": kol.get("name_cn", kol["name"]),
+            "kol_baseline_impact": kol.get("impact", "low"),
+        }
+        return bool(
+            assess_event_relevance(candidate)["intelligence_eligible"]
+        )
+
     results = []
     seen = set()
     for item in search_bing_rss(query, max_results):
-        if item["url"] not in seen:
+        if item["url"] not in seen and is_attributable(item):
             seen.add(item["url"])
+            item["query_term"] = query
             results.append(item)
     for item in search_baidu(query, max_results):
-        if item["url"] not in seen:
+        if item["url"] not in seen and is_attributable(item):
             seen.add(item["url"])
+            item["query_term"] = query
             results.append(item)
     return results
 
@@ -578,61 +607,14 @@ def extract_tickers(text: str, limit: int = 8) -> list[str]:
     return seen
 
 
-HIGH_WORDS = [
-    "crisis", "crash", "war", "bubble", "panic", "sell-off",
-    "recession", "depression", "collapse", "bankrupt",
-    "危机", "崩溃", "崩盘", "泡沫", "恐慌", "战争",
-    "降息", "加息", "关税", "核战", "制裁",
-]
-
-MEDIUM_WORDS = [
-    "warning", "alert", "caution", "risk", "slowdown",
-    "inflation", "deflation", "tariff", "trade war",
-    "预警", "警告", "风险", "放缓", "减速",
-    "通胀", "通缩", "贸易战",
-]
-
-
-def _compile_terms(words: list[str]) -> re.Pattern:
-    """ASCII 词加词边界，避免 war 命中 Warsh；CJK 无词边界概念，直接子串匹配。"""
-    parts = []
-    for w in words:
-        esc = re.escape(w.lower())
-        if re.match(r"^[a-z0-9][a-z0-9\s\-]*$", w.lower()):
-            parts.append(rf"\b{esc}\b")
-        else:
-            parts.append(esc)
-    return re.compile("|".join(parts))
-
-
-_HIGH_RE = _compile_terms(HIGH_WORDS)
-_MEDIUM_RE = _compile_terms(MEDIUM_WORDS)
-_MARKET_RE = _compile_terms(MARKET_KEYWORDS)
-
-
 def classify_kol_impact(item: dict[str, Any], kol: dict[str, Any]) -> str:
     """判断单条动态的影响力等级。
 
-    不直接套用 KOL 基线（否则 Trump/黄仁勋等所有新闻都会变成 high）。
-    规则：
-      - 危机/宏观冲击词 → high
-      - 预警/风险词 → medium
-      - 含市场关键词或股票代码，且 KOL 基线为 high/medium → medium
-      - 其余 → low
+    由共享相关性模块做上下文组合判断：物理事故中的 ``crash`` 不会
+    升级，市场崩盘、利率决议、关税行动和地缘升级仍可判为 high。
     """
-    base = kol.get("impact", "low")
-    blob = (item.get("title", "") + " " + item.get("snippet", "")).lower()
-
-    if _HIGH_RE.search(blob):
-        return "high"
-    if _MEDIUM_RE.search(blob):
-        return "medium"
-
-    raw = item.get("title", "") + " " + item.get("snippet", "")
-    if (_MARKET_RE.search(blob) or _TICKER_RE.search(raw)) and base in ("high", "medium"):
-        return "medium"
-
-    return "low"
+    candidate = {**item, "kol_baseline_impact": kol.get("impact", "low")}
+    return classify_rule_impact(candidate)
 
 
 _SCRIPTS_DIRS = [
@@ -716,23 +698,32 @@ def scan_kol(kol_key: str, max_results: int = 5) -> list[dict[str, Any]]:
     if not kol:
         return []
 
-    def annotate(item: dict[str, Any]) -> dict[str, Any]:
+    def annotate(item: dict[str, Any]) -> dict[str, Any] | None:
         item["kol_key"] = kol_key
         item["kol_name"] = kol["name"]
         item["kol_name_cn"] = kol.get("name_cn", kol["name"])
-        item["impact"] = classify_kol_impact(item, kol)
+        item["kol_baseline_impact"] = kol.get("impact", "low")
+        assessment = assess_event_relevance(item)
+        if not assessment["intelligence_eligible"]:
+            return None
+        item["impact"] = assessment["rule_impact"]
         blob = item.get("title", "") + " " + item.get("snippet", "")
         item["tickers"] = extract_tickers(blob)
-        item["has_market_kw"] = bool(item["tickers"]) or bool(
-            _MARKET_RE.search(blob.lower())
-        )
+        item["has_market_kw"] = assessment["finance_relevant"]
+        item["intelligence_eligible"] = assessment["intelligence_eligible"]
+        item["relevance_reason"] = assessment["reason"]
+        item["matched_alias"] = assessment["matched_alias"]
+        item["attribution_basis"] = assessment["attribution_basis"]
+        item["classifier_version"] = assessment["classifier_version"]
         return item
 
     if kol.get("source_type") == "x":
-        return [
-            annotate(item)
-            for item in search_x(kol.get("handle", ""), max_results)
-        ]
+        annotated = []
+        for item in search_x(kol.get("handle", ""), max_results):
+            result = annotate(item)
+            if result is not None:
+                annotated.append(result)
+        return annotated
 
     results = []
     seen = set()
@@ -747,7 +738,9 @@ def scan_kol(kol_key: str, max_results: int = 5) -> list[dict[str, Any]]:
         ):
             if item["url"] not in seen:
                 seen.add(item["url"])
-                results.append(annotate(item))
+                annotated = annotate(item)
+                if annotated is not None:
+                    results.append(annotated)
 
     for term in kol["search_terms"]:
         if len(results) >= max_results:
@@ -755,7 +748,9 @@ def scan_kol(kol_key: str, max_results: int = 5) -> list[dict[str, Any]]:
         for item in search_kol(kol_key, term, max_results):
             if item["url"] not in seen:
                 seen.add(item["url"])
-                results.append(annotate(item))
+                annotated = annotate(item)
+                if annotated is not None:
+                    results.append(annotated)
 
     return results[:max_results]
 

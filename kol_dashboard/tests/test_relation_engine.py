@@ -80,6 +80,20 @@ class EventRelationTests(unittest.TestCase):
             relation_engine.event_relations(event),
         )
 
+    def test_relation_evidence_url_prefers_the_selected_sighting(self) -> None:
+        event = {
+            **self.event("Bullish on NVIDIA; buy the AI leader"),
+            "source_url": "https://selected.example.com/nvda",
+            "canonical_url": "https://canonical.example.com/nvda",
+        }
+
+        relation = relation_engine.event_relations(event)[0]
+
+        self.assertEqual(
+            relation["evidence"]["url"],
+            "https://selected.example.com/nvda",
+        )
+
     def test_negated_bullish_phrase_does_not_become_positive(self) -> None:
         relation = relation_engine.event_relations(
             self.event("Not bullish on NVIDIA at this valuation")

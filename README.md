@@ -103,6 +103,10 @@ VPS_HELPER=/path/to/vps.sh ./kol_dashboard/deploy.sh
 - `--auth`：显式轮换私人模式口令和会话。
 - `--db`：显式上传并覆盖远端数据库；此选项会先创建一致性备份。
 
+成功发布时，脚本还会把升级前数据库以 root-only（目录 `0700`、文件
+`0600`）方式保留在 `/opt/kol-dashboard/backups/`。如果回退到不兼容新
+schema 的旧版本，必须同步恢复对应数据库，不能只切换 `current` 软链接。
+
 不要把口令、会话密钥、数据库或真实持仓写入脚本或提交到 Git。
 
 ## 许可证

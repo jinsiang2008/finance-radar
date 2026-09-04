@@ -41,6 +41,13 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn("decisionRequestGeneration", self.javascript)
         self.assertIn("clearDecisionView", self.javascript)
         self.assertIn("logoutPending", self.javascript)
+        close_start = self.javascript.index("function closeAuth()")
+        close_end = self.javascript.index(
+            "async function lockPrivateMode", close_start
+        )
+        close_contract = self.javascript[close_start:close_end]
+        self.assertIn('passcodeInput.value = ""', close_contract)
+        self.assertIn('authError.textContent = ""', close_contract)
         self.assertIn(
             "requestGeneration !== state.decisionRequestGeneration",
             self.javascript,
@@ -114,9 +121,9 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn('stale ? "数据延迟" : ""', self.javascript)
         self.assertIn('"高收益债利差"', self.javascript)
         self.assertIn("cs.hy_oas", self.javascript)
-        self.assertIn('static/app.js?v=20', self.html)
-        self.assertIn('static/style.css?v=20', self.html)
-        self.assertNotIn('?v=19', self.html)
+        self.assertIn('static/app.js?v=22', self.html)
+        self.assertIn('static/style.css?v=22', self.html)
+        self.assertNotIn('?v=21', self.html)
         self.assertIn(".metric.is-stale", self.css)
 
     def test_macro_events_render_compact_ai_digest_and_bounded_highlights(self) -> None:
@@ -465,6 +472,96 @@ class FrontendContractTests(unittest.TestCase):
         toggle_contract = self.javascript[toggle_start:toggle_end]
         self.assertIn("requestAnimationFrame", toggle_contract)
         self.assertIn("replacement || selectedCard || lensButton", toggle_contract)
+
+    def test_kol_feed_supports_persistent_accessible_multi_selection(self) -> None:
+        for text in (
+            'aria-label="按 KOL 筛选，可多选"',
+            'data-kol="" class="chip active" aria-pressed="true"',
+            'id="kol-filter-status" role="status" aria-live="polite"',
+        ):
+            self.assertIn(text, self.html)
+        for text in (
+            "KOL_SELECTION_STORAGE_KEY",
+            "KOL_SELECTION_LIMIT = 20",
+            "PUBLIC_KOL_KEY_PATTERN",
+            "selectedKols: new Set()",
+            "function loadKolSelection()",
+            "function persistKolSelection()",
+            "localStorage.getItem(KOL_SELECTION_STORAGE_KEY)",
+            "localStorage.setItem(",
+            "function toggleKolSelection(rawKey)",
+            "function clearKolSelection()",
+            "function kolFilterSignature()",
+            'loadedKolFilterSignature: ""',
+            "kolSelectionPersisted: true",
+            "kolCatalogLoaded: false",
+            "viewLoadGeneration: { decision: 0, macro: 0, kol: 0 }",
+            "已选 ${selectedCount} 位 · 仅看所选 KOL",
+            "最多选择 ${KOL_SELECTION_LIMIT} 位 KOL",
+        ):
+            self.assertIn(text, self.javascript)
+
+        toggle_start = self.javascript.index("function toggleKolSelection")
+        toggle_end = self.javascript.index("function clearKolSelection", toggle_start)
+        toggle_contract = self.javascript[toggle_start:toggle_end]
+        self.assertIn("state.selectedKols.delete(key)", toggle_contract)
+        self.assertIn("state.selectedKols.add(key)", toggle_contract)
+        self.assertIn("persistKolSelection()", toggle_contract)
+        self.assertIn("loadEvents()", toggle_contract)
+
+        clear_start = toggle_end
+        clear_end = self.javascript.index("async function loadStats", clear_start)
+        clear_contract = self.javascript[clear_start:clear_end]
+        self.assertIn("state.selectedKols.clear()", clear_contract)
+        self.assertIn("updateKolSelectionUi()", clear_contract)
+
+        load_start = self.javascript.index("async function loadEvents")
+        load_end = self.javascript.index("// ─── Support", load_start)
+        load_contract = self.javascript[load_start:load_end]
+        self.assertIn(
+            'p.set("kols", selectedKolKeys().join(","))',
+            load_contract,
+        )
+        self.assertNotIn('p.set("kol",', load_contract)
+
+        reconcile_start = self.javascript.index("function reconcileKolSelection")
+        reconcile_end = self.javascript.index(
+            "function toggleKolSelection", reconcile_start
+        )
+        reconcile_contract = self.javascript[reconcile_start:reconcile_end]
+        self.assertIn(
+            "previous.filter((key) => available.has(key))",
+            reconcile_contract,
+        )
+        self.assertIn("if (changed) persistKolSelection()", reconcile_contract)
+        self.assertIn(
+            "list.filter((item) => item?.configured !== false)",
+            self.javascript,
+        )
+        self.assertIn("state.kolCatalogLoaded = true", self.javascript)
+        self.assertIn("state.kolCatalogLoaded = false", self.javascript)
+        self.assertIn("KOL 列表加载失败 · 可重试当前视图", self.javascript)
+        self.assertIn("throw new Error(\"invalid_kol_catalog\")", self.javascript)
+        self.assertIn("throw new Error(\"empty_kol_catalog\")", self.javascript)
+        self.assertIn("偏好存于本机，筛选项随请求发送", self.javascript)
+        self.assertIn("当前会话有效，筛选项随请求发送", self.javascript)
+        self.assertIn("仍按本机已选 ${selectedCount} 位筛选", self.javascript)
+        self.assertIn(
+            "state.loadedKolFilterSignature === kolFilterSignature()",
+            self.javascript,
+        )
+        self.assertIn(
+            "state.loadedKolFilterSignature = requestFilterSignature",
+            self.javascript,
+        )
+        self.assertIn("const loadGeneration = ++state.viewLoadGeneration[view]", self.javascript)
+        self.assertIn("state.viewLoadGeneration.kol += 1", self.javascript)
+        self.assertLess(
+            self.javascript.rindex("loadKolSelection();"),
+            self.javascript.index("await ensureViewLoaded(state.view)"),
+        )
+        self.assertIn("max-height: 148px", self.css)
+        self.assertIn("min-height: 44px", self.css)
 
     def test_market_status_prioritizes_applicability_and_pending_before_failure(
         self,
@@ -855,8 +952,16 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn("普通流仅展示前150条", self.javascript)
         self.assertIn("当前窗口采集记录", self.javascript)
         self.assertIn("本人动态", self.javascript)
+        self.assertIn("本人被提及", self.javascript)
+        self.assertIn("关联公司动态", self.javascript)
+        self.assertIn('basis === "person_mention"', self.javascript)
+        self.assertIn('basis === "company_mention"', self.javascript)
         self.assertIn("媒体提及", self.javascript)
         self.assertIn('class="source-kind ${sourceNature.key}"', self.javascript)
+        self.assertIn(
+            "const candidates = [item?.source_url, item?.canonical_url, item?.url]",
+            self.javascript,
+        )
 
     def test_feed_prefers_bounded_ai_fields_and_opens_evidence_drawer(self) -> None:
         for field in (
@@ -893,12 +998,31 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn("aiRequestInFlight: new Map()", self.javascript)
         self.assertIn("if (state.aiRequestInFlight.has(key))", self.javascript)
         self.assertIn('aiRequestControl("event", it.id, it, "card")', self.javascript)
-        self.assertIn('aiRequestControl("event", event.id, event, "drawer")', self.javascript)
+        self.assertIn("primaryAiSubject || event", self.javascript)
+        self.assertIn(
+            'data-ai-request-key="${esc(key)}"',
+            self.javascript,
+        )
         self.assertIn('aiRequestControl("macro_event", e.id, e, "macro")', self.javascript)
         self.assertIn('String(item?.ai_status || "pending")', self.javascript)
         self.assertIn('=== "ready") return ""', self.javascript)
         self.assertIn("相同证据只会处理一次", self.javascript)
         self.assertIn("本次没有额外消耗 Token", self.javascript)
+        self.assertIn("function aiRequestEligible(item)", self.javascript)
+        self.assertIn("AI 已归并到主证据", self.javascript)
+        self.assertIn("AI 只处理事件主证据，避免重复消耗 Token", self.javascript)
+        self.assertIn("primary_ai_subject", self.javascript)
+        self.assertIn("primaryAiSubject?.relations ?? payload?.relations", self.javascript)
+        self.assertIn(
+            "primaryAiSubject?.market_reactions ?? payload?.market_reactions",
+            self.javascript,
+        )
+        self.assertIn("AI 解读绑定事件主证据", self.javascript)
+        self.assertIn("本次没有重新调用模型", self.javascript)
+        self.assertIn("if (!aiRequestEligible(item))", self.javascript)
+        self.assertIn("当前证据 · ${impactText}", self.javascript)
+        self.assertIn(".primary-ai-context", self.css)
+        self.assertIn("同一事件只对主证据生成一次 AI 解读", self.javascript)
         self.assertIn("不能提前绕过退避", self.javascript)
         self.assertIn('role="status" aria-live="polite"', self.javascript)
         self.assertIn('aria-describedby="${esc(statusId)}"', self.javascript)

@@ -90,17 +90,22 @@ class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
             json={"passcode": "open-sesame"},
         )
 
-    def _seed_ai_event(self, *, title: str = "AI demand remains strong") -> int:
+    def _seed_ai_event(
+        self, *, title: str = "Jensen Huang says NVIDIA AI demand remains strong"
+    ) -> int:
         db.insert_events(
             [
                 {
                     "title": title,
                     "url": f"https://example.com/{title.replace(' ', '-').lower()}",
-                    "snippet": "Public evidence with enough content for analysis.",
+                    "snippet": (
+                        "Jensen Huang discussed NVIDIA AI demand and investment "
+                        "with enough public evidence for analysis."
+                    ),
                     "source": "Test News",
-                    "kol_key": "tester",
-                    "kol_name": "Tester",
-                    "kol_name_cn": "测试者",
+                    "kol_key": "huangrenxun",
+                    "kol_name": "Jensen Huang",
+                    "kol_name_cn": "黄仁勋",
                     "impact": "medium",
                     "has_market_kw": True,
                     "published_at": datetime.now(timezone.utc).isoformat(),
@@ -126,9 +131,9 @@ class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
                     "url": "https://example.com/ai-demand",
                     "snippet": "NVIDIA AI demand",
                     "source": "Test News",
-                    "kol_key": "tester",
-                    "kol_name": "Tester",
-                    "kol_name_cn": "测试者",
+                    "kol_key": "huangrenxun",
+                    "kol_name": "Jensen Huang",
+                    "kol_name_cn": "黄仁勋",
                     "impact": "medium",
                     "has_market_kw": True,
                     "published_at": published_at,
@@ -509,11 +514,11 @@ class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
             return {
                 "title": title,
                 "url": f"https://example.com/{title.replace(' ', '-').lower()}",
-                "snippet": "",
+                "snippet": "Jensen Huang discusses NVIDIA investment demand.",
                 "source": "Test News",
-                "kol_key": "tester",
-                "kol_name": "Tester",
-                "kol_name_cn": "测试者",
+                "kol_key": "huangrenxun",
+                "kol_name": "Jensen Huang",
+                "kol_name_cn": "黄仁勋",
                 "impact": "medium",
                 "has_market_kw": True,
                 "published_at": published_at,
@@ -558,6 +563,17 @@ class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
             quarantine.json()["items"][0]["time_status"], "unknown"
         )
         self.assertEqual(invalid.status_code, 422)
+
+    async def test_kol_api_includes_configured_people_without_sightings(self) -> None:
+        response = await self.client.get("/api/kols")
+
+        self.assertEqual(response.status_code, 200)
+        by_key = {item["kol_key"]: item for item in response.json()}
+        self.assertIn("serenity", by_key)
+        self.assertTrue(by_key["serenity"]["configured"])
+        self.assertEqual(by_key["serenity"]["total"], 0)
+        self.assertEqual(by_key["serenity"]["total_24h"], 0)
+        self.assertIsNone(by_key["serenity"]["last_published"])
 
     async def test_noncontent_truth_repost_is_hidden_from_public_intelligence(self) -> None:
         now = datetime.now(timezone.utc).replace(microsecond=0)
@@ -657,16 +673,130 @@ class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(trump["total"], 1)
         self.assertEqual(trump["total_24h"], 1)
 
+    async def test_event_api_supports_persistent_multi_kol_filter_contract(self) -> None:
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        shared = "Elon Musk and Donald Trump discuss AI investment"
+        db.insert_events(
+            [
+                {
+                    "title": shared,
+                    "url": "https://x.com/elonmusk/status/shared",
+                    "snippet": "Elon Musk discussed artificial intelligence investment.",
+                    "source": "X @elonmusk",
+                    "kol_key": "musk",
+                    "kol_name": "Elon Musk",
+                    "kol_name_cn": "马斯克",
+                    "impact": "medium",
+                    "has_market_kw": True,
+                    "published_at": (now - timedelta(hours=2)).isoformat(),
+                },
+                {
+                    "title": "Jensen Huang discusses NVIDIA AI demand",
+                    "url": "https://example.com/jensen-ai-demand",
+                    "snippet": "Jensen Huang discussed NVIDIA demand and investment.",
+                    "source": "Test News",
+                    "kol_key": "huangrenxun",
+                    "kol_name": "Jensen Huang",
+                    "kol_name_cn": "黄仁勋",
+                    "impact": "medium",
+                    "has_market_kw": True,
+                    "published_at": (now - timedelta(minutes=30)).isoformat(),
+                },
+            ]
+        )
+        db.insert_events(
+            [
+                {
+                    "title": shared,
+                    "url": "https://truthsocial.com/@realDonaldTrump/shared",
+                    "snippet": "Donald Trump discussed artificial intelligence investment.",
+                    "source": "Truth Social @realDonaldTrump",
+                    "kol_key": "trump",
+                    "kol_name": "Donald Trump",
+                    "kol_name_cn": "特朗普",
+                    "impact": "medium",
+                    "has_market_kw": True,
+                    "published_at": (now - timedelta(hours=1)).isoformat(),
+                }
+            ]
+        )
+
+        legacy = await self.client.get("/api/events", params={"kol": "musk"})
+        multi = await self.client.get(
+            "/api/events", params={"kols": "musk,trump,musk"}
+        )
+        union = await self.client.get(
+            "/api/events", params={"kol": "musk", "kols": "trump,musk"}
+        )
+        unfiltered = await self.client.get("/api/events", params={"kols": ""})
+        unknown = await self.client.get(
+            "/api/events", params={"kols": "unknown_but_valid"}
+        )
+
+        self.assertEqual(legacy.status_code, 200)
+        self.assertEqual(legacy.json()["count"], 1)
+        self.assertEqual(legacy.json()["items"][0]["kol_key"], "musk")
+        self.assertEqual(multi.status_code, 200)
+        self.assertEqual(multi.json()["count"], 1)
+        selected = multi.json()["items"][0]
+        self.assertEqual(selected["kol_key"], "trump")
+        self.assertEqual(selected["kol_name"], "Donald Trump")
+        self.assertEqual(selected["source"], "Truth Social @realDonaldTrump")
+        self.assertEqual(
+            selected["source_url"],
+            "https://truthsocial.com/@realDonaldTrump/shared",
+        )
+        self.assertEqual(
+            selected["published_at"], (now - timedelta(hours=1)).isoformat()
+        )
+        self.assertEqual(union.json(), multi.json())
+        self.assertEqual(unfiltered.status_code, 200)
+        self.assertEqual(unfiltered.json()["count"], 2)
+        self.assertEqual(unknown.json(), {"items": [], "count": 0})
+
+    async def test_event_api_rejects_invalid_or_excessive_multi_kol_filters(
+        self,
+    ) -> None:
+        injected = await self.client.get(
+            "/api/events", params={"kols": "musk') OR 1=1--"}
+        )
+        uppercase = await self.client.get(
+            "/api/events", params={"kols": "Musk"}
+        )
+        too_many = await self.client.get(
+            "/api/events",
+            params={"kols": ",".join(f"kol_{index}" for index in range(21))},
+        )
+        too_long = await self.client.get(
+            "/api/events", params={"kols": "a" * 1300}
+        )
+        invalid_legacy = await self.client.get(
+            "/api/events", params={"kol": "musk OR 1=1"}
+        )
+
+        self.assertEqual(injected.status_code, 422)
+        self.assertIn("invalid_kols", injected.json()["detail"])
+        self.assertEqual(uppercase.status_code, 422)
+        self.assertEqual(too_many.status_code, 422)
+        self.assertIn("too_many_kols", too_many.json()["detail"])
+        self.assertEqual(too_long.status_code, 422)
+        self.assertEqual(invalid_legacy.status_code, 422)
+
     async def test_event_list_and_integer_detail_expose_nested_enrichment(self) -> None:
         now = datetime.now(timezone.utc).replace(microsecond=0)
         event = {
-            "title": "Current NVIDIA AI demand signal",
+            "title": (
+                "Jensen Huang and Elon Musk discuss NVIDIA AI investment demand"
+            ),
             "url": "https://example.com/current-nvidia-ai-demand",
-            "snippet": "NVIDIA AI demand remains in focus.",
+            "snippet": (
+                "Jensen Huang and Elon Musk said NVIDIA AI investment demand "
+                "remains in focus."
+            ),
             "source": "Test News",
-            "kol_key": "tester",
-            "kol_name": "Tester",
-            "kol_name_cn": "测试者",
+            "kol_key": "huangrenxun",
+            "kol_name": "Jensen Huang",
+            "kol_name_cn": "黄仁勋",
             "impact": "medium",
             "has_market_kw": True,
             "tickers": ["NVDA"],
@@ -690,10 +820,15 @@ class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
                 {
                     **event,
                     "url": "https://example.com/musk-ai-interview",
+                    "snippet": (
+                        "Elon Musk said Tesla deliveries rose while NVIDIA AI "
+                        "investment remained strong."
+                    ),
                     "source": "Interview transcript",
                     "kol_key": "musk",
                     "kol_name": "Elon Musk",
                     "kol_name_cn": "马斯克",
+                    "tickers": ["TSLA"],
                     "published_at": (now - timedelta(minutes=30)).isoformat(),
                 }
             ]
@@ -797,12 +932,38 @@ class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
             "https://x.com/elonmusk/status/123",
         )
         self.assertEqual(detail_for_source.status_code, 200)
-        exact = detail_for_source.json()["event"]
+        exact_body = detail_for_source.json()
+        exact = exact_body["event"]
         self.assertEqual(exact["kol_key"], "musk")
         self.assertEqual(exact["source"], "Interview transcript")
         self.assertEqual(
             exact["source_url"],
             "https://example.com/musk-ai-interview",
+        )
+        self.assertEqual(
+            exact["snippet"],
+            "Elon Musk said Tesla deliveries rose while NVIDIA AI "
+            "investment remained strong.",
+        )
+        self.assertEqual(exact["tickers"], ["TSLA"])
+        self.assertEqual(exact["ai_status"], "ineligible")
+        self.assertFalse(exact["ai_request_eligible"])
+        self.assertIsNone(exact["ai_enrichment"])
+        self.assertEqual(exact["rule_impact"], "medium")
+        self.assertEqual(exact["impact"], "medium")
+        self.assertEqual(exact_body["relations"], [])
+        self.assertEqual(exact_body["market_reactions"], [])
+        primary = exact_body["primary_ai_subject"]
+        self.assertEqual(primary["source"], "X @elonmusk")
+        self.assertEqual(primary["tickers"], ["NVDA"])
+        self.assertEqual(primary["ai_status"], "ready")
+        self.assertTrue(primary["ai_request_eligible"])
+        self.assertEqual(primary["impact"], "high")
+        self.assertEqual(primary["relations"][0]["asset_key"], "US:NVDA")
+        self.assertEqual(primary["market_reactions"], [])
+        self.assertEqual(
+            primary["ai_enrichment"]["headline_zh"],
+            "人工智能需求推动英伟达信号升温",
         )
         self.assertEqual(missing.status_code, 404)
         self.assertEqual(missing.json()["detail"], "event_not_found")
@@ -818,13 +979,16 @@ class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
         db.insert_events(
             [
                 {
-                    "title": "Current NVIDIA signal",
+                    "title": "Jensen Huang says NVIDIA AI platform demand rises",
                     "url": "https://example.com/current-nvidia",
-                    "snippet": "NVIDIA AI",
+                    "snippet": (
+                        "Jensen Huang described NVIDIA data center demand "
+                        "and AI investment."
+                    ),
                     "source": "Test",
-                    "kol_key": "tester",
-                    "kol_name": "Tester",
-                    "kol_name_cn": "测试者",
+                    "kol_key": "huangrenxun",
+                    "kol_name": "Jensen Huang",
+                    "kol_name_cn": "黄仁勋",
                     "impact": "medium",
                     "has_market_kw": True,
                     "published_at": (now - timedelta(hours=1)).isoformat(),
@@ -837,7 +1001,7 @@ class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
             )
         current_evidence = json.dumps(
             {
-                "title": "Current NVIDIA signal",
+                "title": "Jensen Huang says NVIDIA AI platform demand rises",
                 "published_at": (now - timedelta(hours=1)).isoformat(),
             }
         )

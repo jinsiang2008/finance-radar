@@ -38,6 +38,11 @@
     stats: null,
     statsRequestGeneration: 0,
     kolsRequestGeneration: 0,
+    selectedKols: new Set(),
+    availableKols: new Map(),
+    kolSelectionPersisted: true,
+    kolCatalogLoaded: false,
+    loadedKolFilterSignature: "",
     feedItems: [],
     expandedClusters: new Set(),
     feedLoadedCount: 0,
@@ -52,6 +57,7 @@
     viewLastGoodDataAt: { decision: "", macro: "", kol: "" },
     viewLoadErrors: {},
     viewLoadPromises: {},
+    viewLoadGeneration: { decision: 0, macro: 0, kol: 0 },
     systemSignals: { macro: null, decision: null },
     refreshTimer: null,
     supportFactsLoaded: false,
@@ -395,6 +401,11 @@
     return `${String(subjectType || "")}:${String(subjectId || "")}`;
   }
 
+  function aiRequestEligible(item) {
+    const value = item?.ai_request_eligible;
+    return value == null || value === true || Number(value) === 1;
+  }
+
   function aiRequestPresentation(item, requestState = null) {
     const rawStatus = String(item?.ai_status || "pending").toLowerCase();
     const status = String(requestState?.state || "").toLowerCase();
@@ -402,6 +413,16 @@
     const nextAttemptLabel = nextAttempt ? fmtBeijingDateTime(nextAttempt) : "";
     const retrySeconds = Number(requestState?.retry_after_seconds || 0);
     const retryMinutes = retrySeconds > 0 ? Math.max(1, Math.ceil(retrySeconds / 60)) : 0;
+
+    if (!aiRequestEligible(item)) {
+      return {
+        label: "AI 已归并到主证据",
+        note: "这是同一事件的另一位 KOL 或另一来源；AI 只处理事件主证据，避免重复消耗 Token。打开证据链可查看主证据状态。",
+        disabled: true,
+        busy: false,
+        tone: "blocked",
+      };
+    }
 
     if (status === "requesting") {
       return {
@@ -542,18 +563,29 @@
     const normalizedId = String(subjectId || "").trim();
     if (!normalizedId || !["event", "macro_event"].includes(normalizedType)) return "";
     const key = aiRequestKey(normalizedType, normalizedId);
+    const requestState = state.aiRequestStates.get(key) || null;
+    const view = aiRequestPresentation(item, requestState);
+    const statusId = `ai-request-status-${encodeURIComponent(key)}-${encodeURIComponent(
+      placement
+    )}`;
+    if (!aiRequestEligible(item)) {
+      return `<div class="ai-request-rail is-${esc(view.tone)} is-${esc(placement)}">
+        <button type="button" class="ai-request-btn" disabled
+                aria-describedby="${esc(statusId)}" aria-busy="false">
+          <span aria-hidden="true">↑</span>${esc(view.label)}
+        </button>
+        <span class="ai-request-note" id="${esc(statusId)}" role="status" aria-live="polite">${esc(
+          view.note
+        )}</span>
+      </div>`;
+    }
+    if (String(item?.ai_status || "pending").toLowerCase() === "ready") return "";
     state.aiRequestSubjects.set(key, {
       subjectType: normalizedType,
       subjectId: normalizedId,
       item,
       placement,
     });
-    const requestState = state.aiRequestStates.get(key) || null;
-    if (String(item?.ai_status || "pending").toLowerCase() === "ready") return "";
-    const view = aiRequestPresentation(item, requestState);
-    const statusId = `ai-request-status-${encodeURIComponent(key)}-${encodeURIComponent(
-      placement
-    )}`;
     return `<div class="ai-request-rail is-${esc(view.tone)} is-${esc(
       placement
     )}" data-ai-request-key="${esc(key)}" data-ai-request-placement="${esc(
@@ -3218,6 +3250,10 @@
   }
 
   function closeAuth() {
+    const passcodeInput = $("#auth-passcode");
+    if (passcodeInput) passcodeInput.value = "";
+    const authError = $("#auth-error");
+    if (authError) authError.textContent = "";
     $("#auth-modal").hidden = true;
     document.body.style.overflow = "";
     const returnFocus = state.authReturnFocus;
@@ -4209,6 +4245,146 @@
 
   // ─── KOL view ─────────────────────────────
 
+  const KOL_SELECTION_STORAGE_KEY = "finance-radar-kol-selection-v1";
+  const KOL_SELECTION_LIMIT = 20;
+  const PUBLIC_KOL_KEY_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+
+  function normalizedPublicKolKey(value) {
+    const key = String(value || "").trim().toLowerCase();
+    return PUBLIC_KOL_KEY_PATTERN.test(key) ? key : "";
+  }
+
+  function normalizedKolSelection(values) {
+    return Array.from(
+      new Set(
+        (Array.isArray(values) ? values : [])
+          .map(normalizedPublicKolKey)
+          .filter(Boolean)
+      )
+    ).slice(0, KOL_SELECTION_LIMIT);
+  }
+
+  function loadKolSelection() {
+    try {
+      const stored = JSON.parse(
+        localStorage.getItem(KOL_SELECTION_STORAGE_KEY) || "[]"
+      );
+      state.selectedKols = new Set(normalizedKolSelection(stored));
+      state.kolSelectionPersisted = true;
+    } catch (error) {
+      state.selectedKols = new Set();
+      state.kolSelectionPersisted = false;
+      try {
+        localStorage.removeItem(KOL_SELECTION_STORAGE_KEY);
+      } catch (storageError) {}
+    }
+  }
+
+  function persistKolSelection() {
+    try {
+      localStorage.setItem(
+        KOL_SELECTION_STORAGE_KEY,
+        JSON.stringify(Array.from(state.selectedKols).slice(0, KOL_SELECTION_LIMIT))
+      );
+      state.kolSelectionPersisted = true;
+      return true;
+    } catch (error) {
+      state.kolSelectionPersisted = false;
+      return false;
+    }
+  }
+
+  function selectedKolKeys() {
+    return Array.from(state.selectedKols);
+  }
+
+  function kolFilterSignature() {
+    return JSON.stringify({
+      hours: Number(state.hours) || 0,
+      timeStatus: String(state.timeStatus || ""),
+      impact: String(state.impact || ""),
+      q: String(state.q || ""),
+      kols: selectedKolKeys().slice().sort(),
+    });
+  }
+
+  function hasKolSelection() {
+    return state.selectedKols.size > 0;
+  }
+
+  function updateKolSelectionUi() {
+    const selectedCount = state.selectedKols.size;
+    $$("#kol-chips button[data-kol]").forEach((button) => {
+      const key = normalizedPublicKolKey(button.dataset.kol);
+      const active = key ? state.selectedKols.has(key) : selectedCount === 0;
+      button.classList.toggle("active", active);
+      button.setAttribute("aria-pressed", String(active));
+    });
+    const status = $("#kol-filter-status");
+    if (!status) return;
+    const persistenceNote = state.kolSelectionPersisted
+      ? "偏好存于本机，筛选项随请求发送"
+      : "当前会话有效，筛选项随请求发送";
+    if (!selectedCount) {
+      status.textContent = `全部 KOL · 可多选，${persistenceNote}`;
+      status.removeAttribute("title");
+      return;
+    }
+    const names = selectedKolKeys().map(
+      (key) => state.availableKols.get(key)?.label || key
+    );
+    status.textContent = `已选 ${selectedCount} 位 · 仅看所选 KOL · ${persistenceNote}`;
+    status.title = names.join("、");
+  }
+
+  function reconcileKolSelection(list) {
+    const available = new Map();
+    (Array.isArray(list) ? list : []).forEach((item) => {
+      const key = normalizedPublicKolKey(item?.kol_key);
+      if (!key) return;
+      available.set(key, {
+        label: String(item?.kol_name_cn || item?.kol_name || key),
+      });
+    });
+    state.availableKols = available;
+    const previous = selectedKolKeys();
+    const next = previous.filter((key) => available.has(key));
+    const changed = next.length !== previous.length;
+    state.selectedKols = new Set(next);
+    if (changed) persistKolSelection();
+    return changed;
+  }
+
+  function toggleKolSelection(rawKey) {
+    const key = normalizedPublicKolKey(rawKey);
+    if (!key || !state.availableKols.has(key)) return false;
+    if (state.selectedKols.has(key)) {
+      state.selectedKols.delete(key);
+    } else if (state.selectedKols.size < KOL_SELECTION_LIMIT) {
+      state.selectedKols.add(key);
+    } else {
+      const status = $("#kol-filter-status");
+      if (status) {
+        status.textContent = `最多选择 ${KOL_SELECTION_LIMIT} 位 KOL · 请先取消一位`;
+        status.title = "达到多选上限，当前选择未改变";
+      }
+      return false;
+    }
+    persistKolSelection();
+    updateKolSelectionUi();
+    loadEvents();
+    return true;
+  }
+
+  function clearKolSelection() {
+    if (!state.selectedKols.size) return false;
+    state.selectedKols.clear();
+    persistKolSelection();
+    updateKolSelectionUi();
+    loadEvents();
+    return true;
+  }
+
   async function loadStats() {
     const generation = ++state.statsRequestGeneration;
     try {
@@ -4230,30 +4406,75 @@
   async function loadKols() {
     const generation = ++state.kolsRequestGeneration;
     try {
-      const list = await fetchJSON(api("api/kols"), 8000);
-      if (generation !== state.kolsRequestGeneration) return;
+      const response = await fetchJSON(api("api/kols"), 8000);
+      if (generation !== state.kolsRequestGeneration) return false;
+      if (!Array.isArray(response)) {
+        throw new Error("invalid_kol_catalog");
+      }
+      const list = response;
+      const configuredList = list.filter((item) => item?.configured !== false);
+      if (!configuredList.length) {
+        throw new Error("empty_kol_catalog");
+      }
       const host = $("#kol-chips");
+      reconcileKolSelection(configuredList);
       host.querySelectorAll("button[data-kol]:not([data-kol=''])").forEach((b) => b.remove());
-      list.forEach((k) => {
+      configuredList.forEach((k) => {
+        const key = normalizedPublicKolKey(k.kol_key);
+        if (!key) return;
         const b = document.createElement("button");
         b.className = "chip";
-        b.dataset.kol = k.kol_key;
-        b.setAttribute("aria-pressed", String(k.kol_key === state.kol));
-        const label = esc(k.kol_name_cn || k.kol_name || k.kol_key);
-        const badge = k.total_24h > 0 ? `<span class="chip-badge">${k.total_24h}</span>` : "";
-        b.innerHTML = label + badge;
-        if (k.kol_key === state.kol) b.classList.add("active");
+        b.type = "button";
+        b.dataset.kol = key;
+        b.setAttribute("aria-pressed", "false");
+        const label = String(k.kol_name_cn || k.kol_name || key);
+        b.appendChild(document.createTextNode(label));
+        const count = Number(k.total_24h) || 0;
+        if (count > 0) {
+          const badge = document.createElement("span");
+          badge.className = "chip-badge";
+          badge.textContent = String(count);
+          badge.setAttribute("aria-hidden", "true");
+          b.appendChild(badge);
+          b.setAttribute("aria-label", `${label}，24 小时 ${count} 条动态`);
+        }
         host.appendChild(b);
       });
-      $("#footer-meta").textContent = `追踪 ${list.length} 位 KOL`;
+      updateKolSelectionUi();
+      $("#footer-meta").textContent = `追踪 ${configuredList.length} 位 KOL`;
       bindKolChips();
+      state.kolCatalogLoaded = true;
+      return true;
     } catch (e) {
       console.warn("kols", e);
+      if (generation !== state.kolsRequestGeneration) return false;
+      state.kolCatalogLoaded = false;
+      const status = $("#kol-filter-status");
+      if (status) {
+        const selectedCount = state.selectedKols.size;
+        status.textContent = selectedCount
+          ? `KOL 列表加载失败 · 仍按本机已选 ${selectedCount} 位筛选 · 可点全部 KOL 清除`
+          : "KOL 列表加载失败 · 可重试当前视图";
+        status.title = selectedCount
+          ? `当前筛选：${selectedKolKeys().join("、")}`
+          : "已保留上次成功加载的 KOL 选项";
+      }
+      return false;
     }
   }
 
-  function sourceKind(source) {
-    const value = String(source || "").trim();
+  function sourceKind(item) {
+    const basis = String(item?.attribution_basis || "").toLowerCase();
+    if (basis === "direct_source") {
+      return { key: "is-direct", label: "本人动态" };
+    }
+    if (basis === "person_mention") {
+      return { key: "is-person", label: "本人被提及" };
+    }
+    if (basis === "company_mention") {
+      return { key: "is-company", label: "关联公司动态" };
+    }
+    const value = String(item?.source || item || "").trim();
     if (/^(?:truth social\b|x\s*@|twitter\s*@|serenity\b)/i.test(value)) {
       return { key: "is-direct", label: "本人动态" };
     }
@@ -4276,11 +4497,10 @@
       .toLowerCase();
   }
 
-  function eventExternalUrl(item, preferSighting = false) {
-    const sightingFirst = preferSighting || Boolean(state.kol);
-    const candidates = sightingFirst
-      ? [item?.source_url, item?.canonical_url, item?.url]
-      : [item?.canonical_url, item?.url, item?.source_url];
+  function eventExternalUrl(item) {
+    // The displayed KOL/source/time all come from the selected sighting, so
+    // its evidence URL must be the first destination in every feed mode.
+    const candidates = [item?.source_url, item?.canonical_url, item?.url];
     for (const candidate of candidates) {
       const safe = safeExternalUrl(candidate);
       if (safe) return safe;
@@ -4313,7 +4533,7 @@
       parts.push(`当前窗口采集记录 ${state.stats.total} 条`);
     }
     const filtered = Boolean(
-      state.impact || state.kol || state.q || state.timeStatus !== "verified"
+      state.impact || hasKolSelection() || state.q || state.timeStatus !== "verified"
     );
     if (filtered) parts.push("筛选后");
     if (state.feedHighPriority) parts.push("高影响已优先");
@@ -4344,6 +4564,9 @@
   }
 
   function aiStateHTML(item) {
+    if (!aiRequestEligible(item)) {
+      return `<span class="ai-state is-limited" title="同一事件只对主证据生成一次 AI 解读">同事件证据</span>`;
+    }
     const enrichment = eventEnrichment(item);
     if (enrichment && isTitleOnlyEvidence(enrichment)) {
       return `<span class="ai-state is-limited" title="AI 只获得标题，未读取正文">仅标题证据</span>`;
@@ -4449,9 +4672,12 @@
     if (!items.length) {
       state.feedVisibleCount = 0;
       state.feedClusteredCount = 0;
+      const emptyHint = hasKolSelection()
+        ? `所选 ${state.selectedKols.size} 位 KOL 在当前条件下没有动态；可选择其他 KOL 或点击“全部 KOL”`
+        : "试试放宽时间窗口或影响等级";
       $("#feed").innerHTML = `<div class="empty">
         <span class="empty-icon">📭</span>当前筛选条件下没有动态
-        <div class="empty-hint">试试放宽时间窗口或影响等级</div>
+        <div class="empty-hint">${esc(emptyHint)}</div>
       </div>`;
       return;
     }
@@ -4471,7 +4697,7 @@
       .map((group) => {
         const it = group.primary;
         const copy = eventCopy(it);
-        const sourceNature = sourceKind(it.source);
+        const sourceNature = sourceKind(it);
         const lvl = LVL[it.impact] || "transparent";
         const pillLvl = LEVEL_COLOR[it.impact] || "var(--neutral)";
         const aiAssets = (copy.enrichment?.assets || [])
@@ -4527,7 +4753,7 @@
               : collectedAt
                 ? `发布时间未知 · 抓取 ${fmtTime(collectedAt)}`
                 : "发布时间与抓取时间均未知";
-        const externalUrl = eventExternalUrl(it, Boolean(state.kol));
+        const externalUrl = eventExternalUrl(it);
         const titleId = `event-card-title-${esc(it.id)}`;
         const original =
           copy.enrichment && copy.original.headline
@@ -4740,12 +4966,12 @@
   function renderIntelSources(event, sightings) {
     const originalTitle = String(event?.title || "").trim() || "原文标题不可用";
     const originalSnippet = String(event?.snippet || "").trim();
-    const originalUrl = eventExternalUrl(event, Boolean(event?.source_url));
+    const originalUrl = eventExternalUrl(event);
     const sourceItems = Array.isArray(sightings) ? sightings : [];
     const sources = sourceItems.length
       ? sourceItems
           .map((sighting) => {
-            const url = eventExternalUrl(sighting, true);
+            const url = eventExternalUrl(sighting);
             const sourceLabel = String(
               sighting.kol_name_cn ||
                 sighting.kol_name ||
@@ -4753,7 +4979,7 @@
                 "未知来源"
             );
             const timeStatus = String(sighting.time_status || "unknown");
-            const sourceNature = sourceKind(sighting.source);
+            const sourceNature = sourceKind(sighting);
             const publicationTime =
               timeStatus === "verified" && sighting.published_at
                 ? publicationTimeView(sighting.published_at)
@@ -4859,27 +5085,67 @@
   function renderIntelDetail(payload) {
     const event = payload?.event || {};
     const enrichment = eventEnrichment(event);
+    const primaryAiSubject = payload?.primary_ai_subject || null;
+    const primaryEnrichment = eventEnrichment(primaryAiSubject);
+    const analysisEnrichment = enrichment || primaryEnrichment;
+    const analysisFromPrimary = !enrichment && Boolean(primaryAiSubject);
     const copy = eventCopy(event);
-    const relations = Array.isArray(payload?.relations) ? payload.relations : [];
-    const reactions = Array.isArray(payload?.market_reactions)
-      ? payload.market_reactions
+    const analysisRelations = primaryAiSubject?.relations ?? payload?.relations;
+    const analysisReactions =
+      primaryAiSubject?.market_reactions ?? payload?.market_reactions;
+    const relations = Array.isArray(analysisRelations) ? analysisRelations : [];
+    const reactions = Array.isArray(analysisReactions)
+      ? analysisReactions
       : [];
     const impact = String(enrichment?.impact_level || event.impact || "unknown");
-    const impactLabel = {
+    const impactText = {
       high: "高影响",
       medium: "中影响",
       low: "低影响",
       none: "低相关",
       unknown: "影响待评估",
     }[impact] || "影响待评估";
+    const impactLabel = analysisFromPrimary
+      ? `当前证据 · ${impactText}`
+      : impactText;
     const status = String(event.ai_status || "pending").toLowerCase();
     const caveat =
-      enrichment && isTitleOnlyEvidence(enrichment)
+      analysisEnrichment && isTitleOnlyEvidence(analysisEnrichment)
         ? `<div class="evidence-limit" role="note">
             <strong>仅标题证据</strong>
             <span>AI 未读取正文；摘要与影响均为条件性释义，必须回到原文核验。</span>
           </div>`
         : "";
+    const primaryUrl = eventExternalUrl(primaryAiSubject);
+    const primaryLabel = primaryAiSubject
+      ? [
+          primaryAiSubject.kol_name_cn || primaryAiSubject.kol_name,
+          primaryAiSubject.source,
+          primaryAiSubject.published_at
+            ? fmtBeijingDateTime(primaryAiSubject.published_at)
+            : "",
+        ]
+          .filter(Boolean)
+          .join(" · ")
+      : "";
+    const primaryContext = analysisFromPrimary
+      ? `<aside class="primary-ai-context" role="note">
+          <div>
+            <strong>AI 解读绑定事件主证据</strong>
+            <span>${esc(primaryLabel || "主证据信息待核验")}</span>
+          </div>
+          <p>${
+            primaryEnrichment
+              ? "下方第 2–5 步引用主证据的已缓存解读、规则关系与市场核验；本次没有重新调用模型。"
+              : "主证据的事件级分析尚未就绪；当前来源不会重复提交模型。"
+          }</p>
+          ${
+            primaryUrl
+              ? `<a href="${esc(primaryUrl)}" target="_blank" rel="noopener noreferrer">核对主证据 ↗</a>`
+              : ""
+          }
+        </aside>`
+      : "";
     const conclusion = `<div class="intel-conclusion-meta">
         <span class="impact-badge is-${esc(impact)}">${esc(impactLabel)}</span>
         ${aiStateHTML(event)}
@@ -4892,18 +5158,24 @@
       <h2 class="intel-headline">${esc(copy.headline)}</h2>
       <p class="intel-summary">${esc(copy.summary)}</p>
       ${caveat}
-      ${aiRequestControl("event", event.id, event, "drawer")}`;
+      ${primaryContext}
+      ${aiRequestControl(
+        "event",
+        event.id,
+        primaryAiSubject || event,
+        "drawer"
+      )}`;
 
-    const why = enrichment?.why_it_matters_zh
-      ? `<p class="intel-prose">${esc(enrichment.why_it_matters_zh)}</p>`
+    const why = analysisEnrichment?.why_it_matters_zh
+      ? `<p class="intel-prose">${esc(analysisEnrichment.why_it_matters_zh)}</p>`
       : `<p class="intel-degraded">${
           status === "failed"
             ? "AI 解读暂不可用。先核对原文、来源和下方规则关联，避免从标题直接外推。"
             : "AI 解读尚未就绪。先核对原文、来源和下方规则关联，避免从标题直接外推。"
         }</p>`;
 
-    const paths = Array.isArray(enrichment?.impact_path)
-      ? enrichment.impact_path.filter(Boolean)
+    const paths = Array.isArray(analysisEnrichment?.impact_path)
+      ? analysisEnrichment.impact_path.filter(Boolean)
       : [];
     const pathHTML = paths.length
       ? `<ol class="impact-path-list">${paths
@@ -4913,7 +5185,7 @@
 
     const topicTags = Array.from(
       new Set([
-        ...((enrichment?.tags || []).filter(Boolean)),
+        ...((analysisEnrichment?.tags || []).filter(Boolean)),
         ...relations.map((relation) => topicName(relation.topic_key)).filter(Boolean),
       ])
     );
@@ -4922,11 +5194,13 @@
           .map((tag) => `<span>${esc(tag)}</span>`)
           .join("")}</div>`
       : `<p class="intel-degraded">暂无主题标签。</p>`;
-    const auditParts = enrichment
+    const auditParts = analysisEnrichment
       ? [
-          enrichment.language ? `语言 ${enrichment.language}` : "",
-          enrichment.model ? `模型 ${enrichment.model}` : "",
-          enrichment.generated_at ? `生成 ${fmtAbsoluteTime(enrichment.generated_at)}` : "",
+          analysisEnrichment.language ? `语言 ${analysisEnrichment.language}` : "",
+          analysisEnrichment.model ? `模型 ${analysisEnrichment.model}` : "",
+          analysisEnrichment.generated_at
+            ? `生成 ${fmtAbsoluteTime(analysisEnrichment.generated_at)}`
+            : "",
         ].filter(Boolean)
       : [];
     const auditHTML = auditParts.length
@@ -4940,7 +5214,7 @@
       intelSection(
         4,
         "资产",
-        renderIntelAssets(event, enrichment, relations, reactions)
+        renderIntelAssets(event, analysisEnrichment, relations, reactions)
       ),
       intelSection(5, "标签", tagHTML + auditHTML),
       intelSection(6, "原文 / 来源", renderIntelSources(event, payload?.sightings)),
@@ -5138,6 +5412,7 @@
 
   async function loadEvents() {
     const generation = ++state.feedRequestGeneration;
+    const requestFilterSignature = kolFilterSignature();
     state.feedAbortController?.abort();
     const requestController = new AbortController();
     state.feedAbortController = requestController;
@@ -5147,7 +5422,7 @@
     const p = new URLSearchParams();
     if (state.hours) p.set("hours", state.hours);
     if (state.impact) p.set("impact", state.impact);
-    if (state.kol) p.set("kol", state.kol);
+    if (hasKolSelection()) p.set("kols", selectedKolKeys().join(","));
     if (state.q) p.set("q", state.q);
     p.set("time_status", state.timeStatus);
     p.set("limit", "150");
@@ -5188,6 +5463,9 @@
       clearViewLoadError("kol");
       renderEvents(items);
       updateFeedStatus();
+      if (requestFilterSignature === kolFilterSignature()) {
+        state.loadedKolFilterSignature = requestFilterSignature;
+      }
       return true;
     } catch (e) {
       if (generation !== state.feedRequestGeneration) return false;
@@ -5361,8 +5639,18 @@
     });
   }
 
-  const bindKolChips = () =>
-    bindChips("#kol-chips button[data-kol]", "kol", "kol", loadEvents);
+  function bindKolChips() {
+    const host = $("#kol-chips");
+    if (!host || host.__bound) return;
+    host.__bound = true;
+    host.addEventListener("click", (event) => {
+      const button = event.target.closest("button[data-kol]");
+      if (!button || !host.contains(button)) return;
+      const key = normalizedPublicKolKey(button.dataset.kol);
+      if (key) toggleKolSelection(key);
+      else clearKolSelection();
+    });
+  }
 
   function updateTimeWindowBasis() {
     $("#time-window-basis").textContent =
@@ -5402,13 +5690,23 @@
 
   async function ensureViewLoaded(view, { force = false } = {}) {
     const loadedAt = Number(state.viewLoadedAt[view] || 0);
-    if (!force && loadedAt && Date.now() - loadedAt < VIEW_REFRESH_MS) {
+    const kolFiltersAreCurrent =
+      view !== "kol" ||
+      (state.kolCatalogLoaded &&
+        state.loadedKolFilterSignature === kolFilterSignature());
+    if (
+      !force &&
+      loadedAt &&
+      Date.now() - loadedAt < VIEW_REFRESH_MS &&
+      kolFiltersAreCurrent
+    ) {
       if (view === "macro") renderMacroView();
       return true;
     }
     if (!force && state.viewLoadPromises[view]) {
       return state.viewLoadPromises[view];
     }
+    const loadGeneration = ++state.viewLoadGeneration[view];
     const promise = (async () => {
       let criticalSucceeded = false;
       if (view === "decision") {
@@ -5429,14 +5727,20 @@
         criticalSucceeded =
           macroResult.status === "fulfilled" && macroResult.value === true;
       } else if (view === "kol") {
-        const [, , eventsResult] = await Promise.allSettled([
-          loadStats(),
-          loadKols(),
+        const statsPromise = loadStats();
+        // The KOL catalog is authoritative for pruning stale browser selections,
+        // so reconcile it before forming the feed query.
+        const catalogSucceeded = await loadKols();
+        if (loadGeneration !== state.viewLoadGeneration[view]) return false;
+        const [, eventsResult] = await Promise.allSettled([
+          statsPromise,
           loadEvents(),
         ]);
         criticalSucceeded =
+          catalogSucceeded === true &&
           eventsResult.status === "fulfilled" && eventsResult.value === true;
       }
+      if (loadGeneration !== state.viewLoadGeneration[view]) return false;
       if (criticalSucceeded) {
         const loadedNow = Date.now();
         state.viewLoadedAt[view] = loadedNow;
@@ -5463,6 +5767,10 @@
     if (state.view !== view) clearAllAiRequestPolls();
     if (state.view === "kol" && view !== "kol") {
       state.feedAbortController?.abort();
+      if (state.viewLoadPromises.kol) {
+        state.viewLoadGeneration.kol += 1;
+        delete state.viewLoadPromises.kol;
+      }
     }
     state.view = view;
     $$("#tabs .tab").forEach((t) => {
@@ -5513,6 +5821,8 @@
 
   document.addEventListener("DOMContentLoaded", async () => {
     loadDecisionWatchlist();
+    loadKolSelection();
+    updateKolSelectionUi();
     bindChips("#time-chips button", "hours", "hours", () => {
       loadEvents();
       loadStats();
@@ -5678,10 +5988,28 @@
     });
 
     window.addEventListener("storage", (event) => {
-      if (event.key !== DECISION_WATCHLIST_STORAGE_KEY) return;
-      loadDecisionWatchlist();
-      if (state.decisionData) renderDecisions(state.decisionData);
-      updateWatchButtons();
+      if (event.key === DECISION_WATCHLIST_STORAGE_KEY) {
+        loadDecisionWatchlist();
+        if (state.decisionData) renderDecisions(state.decisionData);
+        updateWatchButtons();
+        return;
+      }
+      if (event.key === KOL_SELECTION_STORAGE_KEY) {
+        const previous = selectedKolKeys().join(",");
+        loadKolSelection();
+        if (state.availableKols.size) {
+          reconcileKolSelection(
+            Array.from(state.availableKols, ([kol_key, item]) => ({
+              kol_key,
+              kol_name: item.label,
+            }))
+          );
+        }
+        updateKolSelectionUi();
+        if (state.view === "kol" && previous !== selectedKolKeys().join(",")) {
+          void loadEvents();
+        }
+      }
     });
 
     let qTimer = null;

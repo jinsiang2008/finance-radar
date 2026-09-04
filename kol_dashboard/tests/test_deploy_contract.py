@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -18,6 +19,7 @@ class DeploymentContractTests(unittest.TestCase):
             "app.py",
             "auth.py",
             "content_quality.py",
+            "event_relevance.py",
             "db.py",
             "decision_collect.py",
             "decision_service.py",
@@ -41,6 +43,12 @@ class DeploymentContractTests(unittest.TestCase):
             'export RSH_TIMEOUT="${RSH_TIMEOUT:-1200}"',
             self.deploy,
         )
+
+    def test_deploy_resolves_the_stable_vps_helper_with_explicit_override(self) -> None:
+        self.assertIn('VPS="${VPS_HELPER:-}"', self.deploy)
+        self.assertIn('command -v zlstreet-vps', self.deploy)
+        self.assertIn("请安装 zlstreet-vps 或设置 VPS_HELPER", self.deploy)
+        self.assertNotIn(".cursor/skills/aliyun-ops", self.deploy)
 
     def test_systemd_uses_root_only_environment_file(self) -> None:
         self.assertIn("EnvironmentFile=-/etc/kol-dashboard.env", self.deploy)
@@ -395,6 +403,21 @@ class DeploymentContractTests(unittest.TestCase):
         self.assertIn("current.next", self.deploy)
         self.assertIn("chown -R root:root", self.deploy)
 
+    def test_generated_remote_script_has_valid_bash_syntax(self) -> None:
+        remote_start = self.deploy.index("cat <<'REMOTE'\n") + len(
+            "cat <<'REMOTE'\n"
+        )
+        remote_end = self.deploy.index("\nREMOTE\n", remote_start)
+        remote_script = self.deploy[remote_start:remote_end]
+        result = subprocess.run(
+            ["bash", "-n"],
+            input=remote_script,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_database_transfer_uses_sqlite_backup_and_private_permissions(
         self,
     ) -> None:
@@ -430,6 +453,96 @@ class DeploymentContractTests(unittest.TestCase):
         self.assertIn("DB_ROLLBACK_READY=1", self.deploy)
         self.assertIn("ROLLBACK INCOMPLETE", self.deploy)
         self.assertIn("PRESERVE", self.deploy)
+
+    def test_rollback_never_replaces_database_while_a_writer_can_run(
+        self,
+    ) -> None:
+        cleanup_start = self.deploy.index("cleanup_remote()")
+        cleanup_end = self.deploy.index("\n}\ntrap cleanup_remote", cleanup_start)
+        cleanup = self.deploy[cleanup_start:cleanup_end]
+        stop_guard = cleanup.index('if [[ $rollback_safe == 1 ]]; then')
+        database_restore = cleanup.index("rollback_database", stop_guard)
+        self.assertLess(stop_guard, database_restore)
+        guard_setup = cleanup[:stop_guard]
+        for unit in (
+            "kol-enrich-wakeup.path",
+            "kol-collect-kol.timer",
+            "kol-collect-macro.timer",
+            "kol-collect-decision.timer",
+            "kol-collect-enrich.timer",
+            "kol-collect-kol.service",
+            "kol-collect-macro.service",
+            "kol-collect-decision.service",
+            "kol-collect-enrich.service",
+            "kol-dashboard.service",
+        ):
+            self.assertIn(unit, guard_setup)
+        self.assertIn('systemctl stop "${rollback_units[@]}"', guard_setup)
+        self.assertIn('for unit in "${rollback_units[@]}"', guard_setup)
+        self.assertIn(
+            "systemctl show --property=LoadState --value", guard_setup
+        )
+        self.assertIn(
+            "systemctl show --property=ActiveState --value", guard_setup
+        )
+        self.assertIn("unit_query_rc=$?", guard_setup)
+        self.assertIn("unit_query_rc != 0", guard_setup)
+        self.assertIn('-z "$unit_load_state"', guard_setup)
+        self.assertIn('"$unit_load_state" == not-found', guard_setup)
+        self.assertIn('-z "$unit_state"', guard_setup)
+        self.assertIn('"$unit_state" != inactive', guard_setup)
+        self.assertIn('"$unit_state" != failed', guard_setup)
+        self.assertIn("rollback_safe=0", guard_setup)
+        self.assertNotIn("systemctl cat", guard_setup)
+        abort = cleanup.index("ROLLBACK ABORTED", database_restore)
+        unsafe_start = cleanup.rindex("    else\n", database_restore, abort)
+        unsafe_branch = cleanup[unsafe_start:]
+        self.assertIn('> "$REMOTE_STAGE/PRESERVE"', unsafe_branch)
+        for forbidden in (
+            "rollback_database",
+            "rollback_configuration",
+            "restore_unit_states",
+            'mv -Tf "$CURRENT_NEXT" "$CURRENT_LINK"',
+        ):
+            self.assertNotIn(forbidden, unsafe_branch)
+
+    def test_successful_release_keeps_a_private_pre_migration_database(
+        self,
+    ) -> None:
+        self.assertIn('BACKUPS_DIR="$BASE_DIR/backups"', self.deploy)
+        self.assertIn(
+            'install -d -m 700 "$STAGING_DIR" "$BACKUPS_DIR"',
+            self.deploy,
+        )
+        backup = self.deploy.index(
+            'DURABLE_DB_BACKUP="$BACKUPS_DIR/database.before-'
+            '$RELEASE_ID.sqlite3"'
+        )
+        committed = self.deploy.index("COMMITTED=1", backup)
+        self.assertLess(backup, committed)
+        contract = self.deploy[backup:committed]
+        source_backup = '"$ROLLBACK_DIR/database.before-release"'
+        self.assertIn(source_backup, contract)
+        self.assertNotIn('"$DB_PATH"', contract)
+        self.assertIn("install -o root -g root -m 600", contract)
+        self.assertIn('database_integrity "$DURABLE_DB_BACKUP"', contract)
+        self.assertIn("os.fsync(handle.fileno())", contract)
+        self.assertIn("os.fsync(directory_fd)", contract)
+        source_created = self.deploy.index(
+            '"$ROLLBACK_DIR/database.before-release"',
+            self.deploy.index('if [[ -f "$DB_PATH" ]]'),
+        )
+        schema_migration = self.deploy.index(
+            'python3 -c \'import db; db.init()\''
+        )
+        proxy_healthy = self.deploy.index('[[ "$PROXY_HEALTH" == ok ]]')
+        wakeup_active = self.deploy.index(
+            "systemctl is-active --quiet kol-enrich-wakeup.path",
+            proxy_healthy,
+        )
+        self.assertLess(source_created, schema_migration)
+        self.assertLess(proxy_healthy, wakeup_active)
+        self.assertLess(wakeup_active, backup)
 
     def test_service_is_unprivileged_and_proxy_is_verified_before_timers(
         self,

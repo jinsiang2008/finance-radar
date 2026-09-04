@@ -484,7 +484,11 @@ def event_relations(event: dict[str, Any]) -> list[dict[str, Any]]:
                 "extractor_version": EXTRACTOR_VERSION,
                 "title": str(event.get("title") or "")[:500],
                 "snippet": str(event.get("snippet") or "")[:500],
-                "url": event.get("url"),
+                "url": (
+                    event.get("source_url")
+                    or event.get("canonical_url")
+                    or event.get("url")
+                ),
                 "published_at": event.get("published_at"),
                 "positive_hits": stance["positive_hits"],
                 "negative_hits": stance["negative_hits"],

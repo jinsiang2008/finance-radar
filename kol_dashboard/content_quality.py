@@ -42,7 +42,10 @@ def is_event_content_eligible(event: Mapping[str, Any]) -> bool:
     """Reject known Truth Social placeholders with no textual evidence."""
     source = str(event.get("source") or "").strip().casefold()[:160]
     url = str(
-        event.get("canonical_url") or event.get("url") or ""
+        event.get("source_url")
+        or event.get("canonical_url")
+        or event.get("url")
+        or ""
     ).strip().casefold()[:2_048]
     if "truth social" not in source and "truthsocial.com/" not in url:
         return True

@@ -17,8 +17,9 @@ Schema:
                           assets_json, cluster_key, language, confidence,
                           evidence_basis, model, generated_at)
 
-  event_sightings(event_id, kol_key, kol_name, kol_name_cn, source, source_url,
-                  published_at, first_seen_at, last_seen_at, source_count)
+  event_sightings(event_id, title, snippet, tickers, kol_key, kol_name,
+                  kol_name_cn, source, source_url, published_at, first_seen_at,
+                  last_seen_at, source_count)
 
   relations(source_type, source_id, topic_key, asset_key, relation_type, direction,
             strength, confidence, horizon, method, rationale, evidence_json, created_at)
@@ -50,6 +51,7 @@ import unicodedata
 import urllib.parse
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
@@ -57,6 +59,19 @@ try:
     from kol_dashboard.content_quality import is_event_content_eligible
 except ModuleNotFoundError:  # Flat production bundle in /opt/kol-dashboard.
     from content_quality import is_event_content_eligible
+
+try:
+    from kol_dashboard.event_relevance import (
+        KOL_DIRECTORY,
+        assess_event_relevance,
+        is_owned_direct_source,
+    )
+except ModuleNotFoundError:  # Flat production bundle in /opt/kol-dashboard.
+    from event_relevance import (  # type: ignore
+        KOL_DIRECTORY,
+        assess_event_relevance,
+        is_owned_direct_source,
+    )
 
 _DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "data"
 DB_PATH = os.environ.get(
@@ -67,7 +82,7 @@ DB_PATH = os.environ.get(
 # Bump this whenever ``init`` gains a new migration that existing databases must
 # execute.  A current database takes the read-only fast path instead of scanning
 # and rewriting the event tables on every process start.
-_DB_SCHEMA_VERSION = 2
+_DB_SCHEMA_VERSION = 3
 _BEGIN_RETRY_ENV = "KOL_DB_BEGIN_RETRY_SECONDS"
 _DEFAULT_BEGIN_RETRY_SECONDS = 30.0
 _MAX_BEGIN_RETRY_SECONDS = 120.0
@@ -82,6 +97,90 @@ _AI_REQUEST_RETENTION_ENV = "KOL_AI_REQUEST_RETENTION_DAYS"
 
 RETENTION_DAYS = 14
 MACRO_RETENTION_DAYS = 90
+MAX_EVENT_KOL_FILTERS = 20
+
+
+def _event_relevance_args_sql(sighting_alias: str) -> str:
+    """Build a relevance call from the exact sighting's evidence text."""
+    identity = sighting_alias
+    return (
+        f"{identity}.title, {identity}.snippet, {identity}.source, "
+        f"{identity}.source_url, "
+        f"{identity}.kol_key, {identity}.kol_name, {identity}.kol_name_cn"
+    )
+
+
+def _event_intelligence_sql(sighting_alias: str) -> str:
+    return (
+        "event_intelligence_eligible("
+        f"{_event_relevance_args_sql(sighting_alias)})=1"
+    )
+
+
+def _event_finance_sql(sighting_alias: str) -> str:
+    return (
+        "event_finance_relevant("
+        f"{_event_relevance_args_sql(sighting_alias)})"
+    )
+
+
+def _event_rule_impact_sql(sighting_alias: str) -> str:
+    return (
+        "event_rule_impact("
+        f"{_event_relevance_args_sql(sighting_alias)})"
+    )
+
+
+def _event_owned_direct_sql(sighting_alias: str) -> str:
+    return (
+        "event_owned_direct_source("
+        f"{sighting_alias}.source, {sighting_alias}.source_url, "
+        f"{sighting_alias}.kol_key)"
+    )
+
+
+def _event_eligible_source_count_sql(alias: str = "eligible_source") -> str:
+    return (
+        f"(SELECT COUNT(DISTINCT NULLIF(TRIM({alias}.source_url), '')) "
+        f"FROM event_sightings {alias} "
+        f"WHERE {alias}.event_id=e.id "
+        f"AND {_event_intelligence_sql(alias)})"
+    )
+
+
+def _event_attribution_basis_sql(sighting_alias: str) -> str:
+    return (
+        "event_attribution_basis("
+        f"{_event_relevance_args_sql(sighting_alias)})"
+    )
+
+
+def _event_matched_alias_sql(sighting_alias: str) -> str:
+    return (
+        "event_matched_alias("
+        f"{_event_relevance_args_sql(sighting_alias)})"
+    )
+
+
+def _preferred_sighting_order_sql(alias: str = "s") -> str:
+    """Stable best-evidence order shared by feed and enrichment paths."""
+    return (
+        f"CASE WHEN {alias}.published_at_status='verified' THEN 0 ELSE 1 END, "
+        f"CASE WHEN {_event_owned_direct_sql(alias)}=1 THEN 0 ELSE 1 END, "
+        f"CASE WHEN {alias}.published_at_status='verified' "
+        f"THEN {alias}.published_at_epoch END DESC, "
+        f"CASE WHEN {alias}.published_at_status<>'verified' "
+        f"THEN {alias}.first_seen_at END DESC, "
+        f"{alias}.last_seen_at DESC, {alias}.id DESC"
+    )
+
+
+def _preferred_event_sighting_id_sql(alias: str = "s") -> str:
+    return (
+        f"(SELECT {alias}.id FROM event_sightings {alias} "
+        f"WHERE {alias}.event_id=e.id AND {_event_intelligence_sql(alias)} "
+        f"ORDER BY {_preferred_sighting_order_sql(alias)} LIMIT 1)"
+    )
 
 _MARKET_REACTION_STATUSES = {
     "pending",
@@ -216,6 +315,80 @@ def conn(*, immediate: bool = False):
                     "url": url,
                 }
             )
+        ),
+        deterministic=True,
+    )
+    @lru_cache(maxsize=16_384)
+    def relevance_assessment(
+        title: Any,
+        snippet: Any,
+        source: Any,
+        url: Any,
+        kol_key: Any,
+        kol_name: Any,
+        kol_name_cn: Any,
+    ) -> Mapping[str, Any]:
+        return assess_event_relevance(
+            {
+                "title": title,
+                "snippet": snippet,
+                "source": source,
+                "url": url,
+                "kol_key": kol_key,
+                "kol_name": kol_name,
+                "kol_name_cn": kol_name_cn,
+            }
+        )
+
+    c.create_function(
+        "event_intelligence_eligible",
+        7,
+        lambda *values: int(
+            bool(relevance_assessment(*values)["intelligence_eligible"])
+        ),
+        deterministic=True,
+    )
+    c.create_function(
+        "event_finance_relevant",
+        7,
+        lambda *values: int(
+            bool(relevance_assessment(*values)["finance_relevant"])
+        ),
+        deterministic=True,
+    )
+    c.create_function(
+        "event_rule_impact",
+        7,
+        lambda *values: str(relevance_assessment(*values)["rule_impact"]),
+        deterministic=True,
+    )
+    c.create_function(
+        "event_owned_direct_source",
+        3,
+        lambda source, source_url, kol_key: int(
+            is_owned_direct_source(
+                {
+                    "source": source,
+                    "source_url": source_url,
+                    "kol_key": kol_key,
+                }
+            )
+        ),
+        deterministic=True,
+    )
+    c.create_function(
+        "event_attribution_basis",
+        7,
+        lambda *values: str(
+            relevance_assessment(*values)["attribution_basis"]
+        ),
+        deterministic=True,
+    )
+    c.create_function(
+        "event_matched_alias",
+        7,
+        lambda *values: str(
+            relevance_assessment(*values)["matched_alias"] or ""
         ),
         deterministic=True,
     )
@@ -651,28 +824,6 @@ def _migrate_market_reactions_in(c: sqlite3.Connection) -> None:
             )
 
 
-def _event_ai_input_signature(
-    title: Any,
-    snippet: Any,
-    tickers: Any,
-) -> tuple[str, str, tuple[str, ...]]:
-    """Mirror the bounded event fields sent to the LLM for cache invalidation."""
-    clean_title = re.sub(r"\s+", " ", str(title or "")).strip()[:700]
-    clean_snippet = re.sub(r"\s+", " ", str(snippet or "")).strip()[:2_200]
-    raw_tickers = tickers.split(",") if isinstance(tickers, str) else []
-    clean_tickers = tuple(
-        sorted(
-            {
-                re.sub(r"[^A-Z0-9.^_-]", "", item.strip().upper())[:20]
-                for item in raw_tickers
-                if item.strip()
-            }
-            - {""}
-        )[:12]
-    )
-    return clean_title, clean_snippet, clean_tickers
-
-
 _MAX_FUTURE_SKEW_SECONDS = 5 * 60
 _PUBLICATION_STATUSES = {"verified", "unknown", "future"}
 
@@ -759,7 +910,8 @@ def _backfill_sightings_in(c) -> int:
     """Create one recoverable sighting for every existing canonical event."""
     rows = c.execute(
         """
-        SELECT id, kol_key, kol_name, kol_name_cn, source, url, canonical_url,
+        SELECT id, title, snippet, tickers, kol_key, kol_name, kol_name_cn, source,
+               url, canonical_url,
                published_at, published_at_status, published_at_epoch,
                fetched_at, last_seen_at, source_count
         FROM events
@@ -773,10 +925,11 @@ def _backfill_sightings_in(c) -> int:
         cur = c.execute(
             """
             INSERT INTO event_sightings (
-              event_id, kol_key, kol_name, kol_name_cn, source, source_url,
+              event_id, title, snippet, tickers, kol_key, kol_name, kol_name_cn,
+              source, source_url,
               published_at, published_at_status, published_at_epoch,
               first_seen_at, last_seen_at, source_count
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(event_id, kol_key, source, source_url) DO UPDATE SET
               kol_name=CASE
                 WHEN event_sightings.kol_name='' THEN excluded.kol_name
@@ -822,6 +975,9 @@ def _backfill_sightings_in(c) -> int:
             """,
             (
                 row["id"],
+                row["title"] or "",
+                row["snippet"] or "",
+                row["tickers"] or "",
                 row["kol_key"] or "unknown",
                 row["kol_name"] or "",
                 row["kol_name_cn"] or "",
@@ -881,6 +1037,82 @@ def _recount_event_source_counts_in(c) -> None:
     )
 
 
+def _sighting_ticker_set(value: Any) -> set[str]:
+    raw_values = value.split(",") if isinstance(value, str) else value or ()
+    return {
+        re.sub(r"[^A-Z0-9.^_-]", "", str(item).strip().upper())[:20]
+        for item in raw_values
+        if str(item).strip()
+    } - {""}
+
+
+def _merge_sighting_content(
+    existing: Mapping[str, Any] | None,
+    incoming: Mapping[str, Any],
+    *,
+    source: str,
+    source_url: str,
+) -> tuple[str, str, str]:
+    """Merge observations only within one exact source identity."""
+    incoming_title = clean_display_title(
+        str(incoming.get("title") or "").strip()
+    )
+    incoming_snippet = str(incoming.get("snippet") or "").strip()
+    incoming_tickers = _sighting_ticker_set(incoming.get("tickers"))
+    if existing is None:
+        return (
+            incoming_title,
+            incoming_snippet,
+            ",".join(sorted(incoming_tickers)),
+        )
+
+    existing_title = str(existing.get("title") or "").strip()
+    existing_snippet = str(existing.get("snippet") or "").strip()
+    existing_tickers = _sighting_ticker_set(existing.get("tickers"))
+
+    def substantive(title: str, snippet: str) -> bool:
+        return bool(title or snippet) and is_event_content_eligible(
+            {
+                "title": title,
+                "snippet": snippet,
+                "source": source,
+                "source_url": source_url,
+            }
+        )
+
+    existing_substantive = substantive(existing_title, existing_snippet)
+    incoming_substantive = substantive(incoming_title, incoming_snippet)
+    if existing_substantive and not incoming_substantive:
+        selected_title, selected_snippet = existing_title, existing_snippet
+        selected_tickers = existing_tickers
+    elif incoming_substantive and not existing_substantive:
+        selected_title, selected_snippet = incoming_title, incoming_snippet
+        selected_tickers = incoming_tickers
+    elif (
+        normalize_title(existing_title) != normalize_title(incoming_title)
+        and not is_prefix_dupe(existing_title, incoming_title)
+    ):
+        # An exact URL can be corrected or, occasionally, reused.  Unrelated
+        # text is a replacement observation rather than an extension of the
+        # old story; keeping old tickers here would contaminate the new AI
+        # subject and asset links.
+        selected_title, selected_snippet = incoming_title, incoming_snippet
+        selected_tickers = incoming_tickers
+    else:
+        selected_title = (
+            incoming_title
+            if len(incoming_title) >= len(existing_title)
+            else existing_title
+        )
+        selected_snippet = (
+            incoming_snippet
+            if len(incoming_snippet) >= len(existing_snippet)
+            else existing_snippet
+        )
+        selected_tickers = existing_tickers | incoming_tickers
+    return selected_title, selected_snippet, ",".join(sorted(selected_tickers))
+
+
 def _upsert_sighting(
     c,
     event_id: int,
@@ -891,6 +1123,21 @@ def _upsert_sighting(
 ) -> None:
     raw_url = (item.get("url") or "").strip()
     source_url = canonical_url(raw_url) or raw_url
+    kol_key = item.get("kol_key") or "unknown"
+    source = item.get("source") or ""
+    existing_content = c.execute(
+        "SELECT title, snippet, tickers FROM event_sightings "
+        "WHERE event_id=? AND kol_key=? AND source=? AND source_url=?",
+        (event_id, kol_key, source, source_url),
+    ).fetchone()
+    incoming_title, incoming_snippet, incoming_tickers = (
+        _merge_sighting_content(
+            dict(existing_content) if existing_content is not None else None,
+            item,
+            source=source,
+            source_url=source_url,
+        )
+    )
     published_at, published_status, published_epoch = _publication_metadata(
         item.get("published_at"),
         observed_at=publication_observed_at or seen_at,
@@ -898,11 +1145,15 @@ def _upsert_sighting(
     c.execute(
         """
         INSERT INTO event_sightings (
-          event_id, kol_key, kol_name, kol_name_cn, source, source_url,
+          event_id, title, snippet, tickers, kol_key, kol_name, kol_name_cn,
+          source, source_url,
           published_at, published_at_status, published_at_epoch,
           first_seen_at, last_seen_at, source_count
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
         ON CONFLICT(event_id, kol_key, source, source_url) DO UPDATE SET
+          title=excluded.title,
+          snippet=excluded.snippet,
+          tickers=excluded.tickers,
           kol_name=CASE
             WHEN excluded.kol_name<>'' THEN excluded.kol_name
             ELSE event_sightings.kol_name
@@ -940,10 +1191,13 @@ def _upsert_sighting(
         """,
         (
             event_id,
-            item.get("kol_key") or "unknown",
+            incoming_title,
+            incoming_snippet,
+            incoming_tickers,
+            kol_key,
             item.get("kol_name") or "",
             item.get("kol_name_cn") or "",
-            item.get("source") or "",
+            source,
             source_url,
             published_at,
             published_status,
@@ -955,26 +1209,106 @@ def _upsert_sighting(
     _sync_event_source_count(c, event_id)
 
 
+def _revoke_stale_event_enrichment_in(
+    c: sqlite3.Connection,
+    event_id: int,
+    updated_at: str,
+) -> bool:
+    """Revoke a lease/cache when the preferred sighting changes AI identity."""
+    enrichment = c.execute(
+        "SELECT input_hash FROM event_enrichments WHERE event_id=?",
+        (int(event_id),),
+    ).fetchone()
+    if enrichment is None:
+        return False
+    subject = c.execute(
+        f"""
+        SELECT m.title, m.snippet, m.source, e.url, e.canonical_url,
+               m.source_url, m.kol_key, m.kol_name, m.kol_name_cn,
+               m.tickers
+        FROM events e
+        JOIN event_sightings m ON m.id=(
+          SELECT s.id FROM event_sightings s
+          WHERE s.event_id=e.id AND {_event_intelligence_sql('s')}
+          ORDER BY {_preferred_sighting_order_sql('s')} LIMIT 1
+        )
+        WHERE e.id=?
+        """,
+        (int(event_id),),
+    ).fetchone()
+    if subject is None:
+        # The last eligible sighting may have been corrected into irrelevant
+        # content while an LLM worker still owns a lease. Revoke that lease so
+        # its late result cannot be persisted or consume follow-up work.
+        c.execute(
+            """
+            UPDATE event_enrichments
+            SET status='pending', updated_at=?, next_attempt_at=NULL,
+                error_code='', claim_token=''
+            WHERE event_id=?
+            """,
+            (updated_at, int(event_id)),
+        )
+        return True
+    try:
+        from kol_dashboard import llm_enrichment as enrichment_domain
+    except ModuleNotFoundError:  # Flat production bundle.
+        import llm_enrichment as enrichment_domain
+    _, current_hash = enrichment_domain.build_event_input(dict(subject))
+    if str(enrichment["input_hash"] or "") == current_hash:
+        return False
+    c.execute(
+        """
+        UPDATE event_enrichments
+        SET status='pending', updated_at=?, next_attempt_at=NULL,
+            error_code='', claim_token=''
+        WHERE event_id=?
+        """,
+        (updated_at, int(event_id)),
+    )
+    return True
+
+
 def _move_sightings(c, keep_id: int, victim_id: int) -> None:
     """Move a duplicate event's sightings without losing per-KOL attribution."""
     rows = c.execute(
         """
-        SELECT kol_key, kol_name, kol_name_cn, source, source_url, published_at,
-               published_at_status, published_at_epoch,
+        SELECT title, snippet, tickers, kol_key, kol_name, kol_name_cn, source,
+               source_url, published_at, published_at_status, published_at_epoch,
                first_seen_at, last_seen_at, source_count
         FROM event_sightings WHERE event_id=?
         """,
         (victim_id,),
     ).fetchall()
     for row in rows:
+        existing_content = c.execute(
+            "SELECT title, snippet, tickers FROM event_sightings "
+            "WHERE event_id=? AND kol_key=? AND source=? AND source_url=?",
+            (
+                keep_id,
+                row["kol_key"],
+                row["source"],
+                row["source_url"],
+            ),
+        ).fetchone()
+        merged_title, merged_snippet, merged_tickers = _merge_sighting_content(
+            dict(existing_content) if existing_content is not None else None,
+            dict(row),
+            source=str(row["source"] or ""),
+            source_url=str(row["source_url"] or ""),
+        )
         c.execute(
             """
             INSERT INTO event_sightings (
-              event_id, kol_key, kol_name, kol_name_cn, source, source_url,
+              event_id, title, snippet, tickers, kol_key, kol_name, kol_name_cn,
+              source, source_url,
               published_at, published_at_status, published_at_epoch,
               first_seen_at, last_seen_at, source_count
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(event_id, kol_key, source, source_url) DO UPDATE SET
+              title=excluded.title,
+              snippet=excluded.snippet,
+              tickers=excluded.tickers,
               published_at=CASE
                 WHEN event_sightings.published_at_status='verified'
                   THEN event_sightings.published_at
@@ -1012,6 +1346,9 @@ def _move_sightings(c, keep_id: int, victim_id: int) -> None:
             """,
             (
                 keep_id,
+                merged_title,
+                merged_snippet,
+                merged_tickers,
                 row["kol_key"],
                 row["kol_name"],
                 row["kol_name_cn"],
@@ -1077,7 +1414,8 @@ def _backfill_publication_metadata_in(c) -> None:
 def _normalize_sighting_urls_in(c) -> None:
     rows = c.execute(
         """
-        SELECT id, event_id, kol_key, source, source_url, published_at,
+        SELECT id, event_id, title, snippet, tickers, kol_key, source,
+               source_url, published_at,
                published_at_status, published_at_epoch,
                first_seen_at, last_seen_at, source_count
         FROM event_sightings
@@ -1090,7 +1428,8 @@ def _normalize_sighting_urls_in(c) -> None:
             continue
         existing = c.execute(
             """
-            SELECT id, published_at, published_at_status, published_at_epoch,
+            SELECT id, title, snippet, tickers, published_at,
+                   published_at_status, published_at_epoch,
                    first_seen_at, last_seen_at, source_count
             FROM event_sightings
             WHERE event_id=? AND kol_key=? AND source=? AND source_url=?
@@ -1125,16 +1464,27 @@ def _normalize_sighting_urls_in(c) -> None:
                 row["published_at_epoch"],
             ),
         )
+        merged_title, merged_snippet, merged_tickers = _merge_sighting_content(
+            dict(existing),
+            dict(row),
+            source=str(row["source"] or ""),
+            source_url=str(source_url),
+        )
         c.execute(
             """
             UPDATE event_sightings
-            SET published_at=?, published_at_status=?, published_at_epoch=?,
+            SET title=?, snippet=?,
+                tickers=?,
+                published_at=?, published_at_status=?, published_at_epoch=?,
                 first_seen_at=MIN(first_seen_at, ?),
                 last_seen_at=MAX(last_seen_at, ?),
                 source_count=source_count+?
             WHERE id=?
             """,
             (
+                merged_title,
+                merged_snippet,
+                merged_tickers,
                 *publication,
                 row["first_seen_at"],
                 row["last_seen_at"],
@@ -1234,6 +1584,9 @@ def init() -> None:
             CREATE TABLE IF NOT EXISTS event_sightings (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+              title TEXT NOT NULL DEFAULT '',
+              snippet TEXT NOT NULL DEFAULT '',
+              tickers TEXT NOT NULL DEFAULT '',
               kol_key TEXT NOT NULL,
               kol_name TEXT NOT NULL DEFAULT '',
               kol_name_cn TEXT NOT NULL DEFAULT '',
@@ -1250,6 +1603,30 @@ def init() -> None:
             """
         )
         sighting_columns = _columns(c, "event_sightings")
+        title_column_added = False
+        snippet_column_added = False
+        tickers_column_added = False
+        if "title" not in sighting_columns:
+            # Existing multi-source rows cannot safely inherit the merged
+            # canonical headline. Keep them blank until that exact source is
+            # observed again; precision is preferable to fabricated lineage.
+            c.execute(
+                "ALTER TABLE event_sightings "
+                "ADD COLUMN title TEXT NOT NULL DEFAULT ''"
+            )
+            title_column_added = True
+        if "snippet" not in sighting_columns:
+            c.execute(
+                "ALTER TABLE event_sightings "
+                "ADD COLUMN snippet TEXT NOT NULL DEFAULT ''"
+            )
+            snippet_column_added = True
+        if "tickers" not in sighting_columns:
+            c.execute(
+                "ALTER TABLE event_sightings "
+                "ADD COLUMN tickers TEXT NOT NULL DEFAULT ''"
+            )
+            tickers_column_added = True
         if "published_at_status" not in sighting_columns:
             c.execute(
                 "ALTER TABLE event_sightings ADD COLUMN published_at_status TEXT"
@@ -1624,6 +2001,32 @@ def init() -> None:
         _backfill_publication_metadata_in(c)
         _normalize_sighting_urls_in(c)
         _backfill_sightings_in(c)
+        # Only a one-source event has an unambiguous legacy content owner.
+        # This runs after URL normalization so tracking-URL duplicates that
+        # collapse to one row can be recovered. Multi-source events remain
+        # blank/fail-closed until each exact source is recollected.
+        single_source = (
+            "event_id IN (SELECT event_id FROM event_sightings "
+            "GROUP BY event_id HAVING COUNT(*)=1)"
+        )
+        if title_column_added:
+            c.execute(
+                "UPDATE event_sightings SET title=COALESCE((SELECT e.title "
+                "FROM events e WHERE e.id=event_sightings.event_id), '') "
+                f"WHERE {single_source}"
+            )
+        if snippet_column_added:
+            c.execute(
+                "UPDATE event_sightings SET snippet=COALESCE((SELECT e.snippet "
+                "FROM events e WHERE e.id=event_sightings.event_id), '') "
+                f"WHERE {single_source}"
+            )
+        if tickers_column_added:
+            c.execute(
+                "UPDATE event_sightings SET tickers=COALESCE((SELECT e.tickers "
+                "FROM events e WHERE e.id=event_sightings.event_id), '') "
+                f"WHERE {single_source}"
+            )
         backfill_dedup(connection=c)
         # The marker is deliberately the final statement in the same migration
         # transaction.  Any schema/backfill failure rolls it back as one unit.
@@ -1926,24 +2329,6 @@ def insert_events(items: Iterable[dict[str, Any]]) -> tuple[int, int]:
                     best_snippet = incoming_snippet
                 else:
                     best_snippet = existing_snippet
-                existing_tickers = existing_row["tickers"]
-                next_tickers = (
-                    existing_tickers
-                    if existing_tickers is not None
-                    else tickers_text
-                )
-                ai_input_changed = (
-                    _event_ai_input_signature(
-                        fuller,
-                        best_snippet,
-                        next_tickers,
-                    )
-                    != _event_ai_input_signature(
-                        existing_row["title"],
-                        existing_row["snippet"],
-                        existing_tickers,
-                    )
-                )
                 candidate_publication = _publication_metadata(
                     it.get("published_at"),
                     observed_at=existing_row["fetched_at"],
@@ -1976,26 +2361,17 @@ def insert_events(items: Iterable[dict[str, Any]]) -> tuple[int, int]:
                         existing_row["id"],
                     ),
                 )
-                if ai_input_changed:
-                    # Revoke any live worker lease in the same transaction as
-                    # the canonical input update.  The old hash remains as a
-                    # fail-closed marker until the next worker claims the new
-                    # input; generated output is never served while pending.
-                    c.execute(
-                        """
-                        UPDATE event_enrichments
-                        SET status='pending', updated_at=?, next_attempt_at=NULL,
-                            error_code='', claim_token=''
-                        WHERE event_id=?
-                        """,
-                        (now, existing_row["id"]),
-                    )
                 _upsert_sighting(
                     c,
                     existing_row["id"],
                     it,
                     now,
                     publication_observed_at=existing_row["fetched_at"],
+                )
+                _revoke_stale_event_enrichment_in(
+                    c,
+                    existing_row["id"],
+                    now,
                 )
 
             if existing:
@@ -2079,11 +2455,39 @@ def query_enrichment_candidates(
     safe_limit = max(1, min(int(limit), 5_000))
     with conn() as c:
         rows = c.execute(
-            """
-            SELECT e.id, e.title, e.snippet, e.source, e.url, e.canonical_url,
-                   e.kol_name, e.kol_name_cn, e.impact, e.has_market_kw,
-                   e.tickers, e.source_count, e.fetched_at, e.published_at,
-                   e.published_at_status,
+            f"""
+            WITH recent_events AS MATERIALIZED (
+              SELECT s.event_id,
+                     MAX(
+                       CASE WHEN s.published_at_status='verified'
+                         THEN s.published_at_epoch
+                         ELSE CAST(strftime('%s', s.first_seen_at) AS INTEGER)
+                       END
+                     ) AS activity_epoch
+              FROM event_sightings s
+              JOIN events e ON e.id=s.event_id
+              WHERE {_event_intelligence_sql('s')}
+                AND (
+                  (s.published_at_status='verified'
+                    AND s.published_at_epoch >= ?)
+                  OR (
+                    s.published_at_status IN ('unknown', 'future')
+                    AND CAST(strftime('%s', s.first_seen_at) AS INTEGER) >= ?
+                  )
+                )
+              GROUP BY s.event_id
+            )
+            SELECT e.id, m.title, m.snippet, m.source, e.url, e.canonical_url,
+                   m.source_url,
+                   m.kol_key, m.kol_name, m.kol_name_cn,
+                   {_event_attribution_basis_sql('m')} AS attribution_basis,
+                   {_event_matched_alias_sql('m')} AS matched_alias,
+                   {_event_rule_impact_sql('m')} AS impact,
+                   {_event_finance_sql('m')} AS has_market_kw,
+                   m.tickers,
+                   {_event_eligible_source_count_sql()} AS source_count,
+                   e.fetched_at, m.published_at,
+                   m.published_at_status,
                    ai.input_hash AS ai_input_hash,
                    ai.prompt_version AS ai_prompt_version,
                    ai.status AS ai_status,
@@ -2091,19 +2495,15 @@ def query_enrichment_candidates(
                    ai.updated_at AS ai_updated_at,
                    ai.next_attempt_at AS ai_next_attempt_at,
                    ai.attempt_count AS ai_attempt_count
-            FROM events e
+            FROM recent_events recent
+            JOIN events e ON e.id=recent.event_id
+            JOIN event_sightings m ON m.id=(
+              SELECT s.id FROM event_sightings s
+              WHERE s.event_id=e.id AND {_event_intelligence_sql('s')}
+              ORDER BY {_preferred_sighting_order_sql('s')} LIMIT 1
+            )
             LEFT JOIN event_enrichments ai ON ai.event_id=e.id
-            WHERE event_content_eligible(
-                    e.title, e.snippet, e.source,
-                    COALESCE(NULLIF(e.canonical_url,''), e.url)
-                  )=1
-              AND (
-                (e.published_at_status='verified' AND e.published_at_epoch >= ?)
-                OR (
-                    e.published_at_status IN ('unknown', 'future')
-                    AND CAST(strftime('%s', e.fetched_at) AS INTEGER) >= ?
-                )
-            ) AND (
+            WHERE {_event_intelligence_sql('m')} AND (
                 ai.event_id IS NULL
                 OR ai.status='pending'
                 OR ai.status='ready'
@@ -2124,10 +2524,10 @@ def query_enrichment_candidates(
                 WHEN ai.status='ready' THEN 2
                 ELSE 3
               END,
-              CASE e.impact WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
-              e.has_market_kw DESC,
-              COALESCE(e.published_at_epoch,
-                CAST(strftime('%s', e.fetched_at) AS INTEGER)) DESC,
+              CASE {_event_rule_impact_sql('m')}
+                WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
+              {_event_finance_sql('m')} DESC,
+              recent.activity_epoch DESC,
               e.id DESC
             LIMIT ?
             """,
@@ -2160,8 +2560,14 @@ def claim_event_enrichment(
     with conn(immediate=True) as c:
         if current_event_check is not None:
             event_row = c.execute(
-                "SELECT id, title, snippet, source, url, canonical_url, "
-                "kol_name, kol_name_cn, tickers FROM events WHERE id=?",
+                f"SELECT e.id, m.title, m.snippet, m.source, e.url, "
+                "e.canonical_url, m.source_url, m.kol_key, m.kol_name, "
+                "m.kol_name_cn, m.tickers "
+                "FROM events e JOIN event_sightings m ON m.id=("
+                "SELECT s.id FROM event_sightings s WHERE s.event_id=e.id "
+                f"AND {_event_intelligence_sql('s')} "
+                f"ORDER BY {_preferred_sighting_order_sql('s')} LIMIT 1) "
+                "WHERE e.id=?",
                 (int(event_id),),
             ).fetchone()
             if event_row is None or not current_event_check(dict(event_row)):
@@ -2690,20 +3096,21 @@ def _ai_cache_request_state_in(
     subject_key: str,
     input_hash: str,
     prompt_version: str,
+    model: str,
     now: datetime,
     ready_state: str,
     processing_lease_seconds: int = 20 * 60,
 ) -> dict[str, Any] | None:
     if subject_type == "event":
         row = c.execute(
-            "SELECT input_hash, prompt_version, status, updated_at, "
+            "SELECT input_hash, prompt_version, model, status, updated_at, "
             "next_attempt_at, generated_at FROM event_enrichments "
             "WHERE event_id=?",
             (int(subject_key),),
         ).fetchone()
     else:
         row = c.execute(
-            "SELECT input_hash, prompt_version, status, updated_at, "
+            "SELECT input_hash, prompt_version, model, status, updated_at, "
             "next_attempt_at, generated_at FROM macro_event_enrichments "
             "WHERE event_key=?",
             (subject_key,),
@@ -2712,6 +3119,7 @@ def _ai_cache_request_state_in(
         row is None
         or row["input_hash"] != input_hash
         or row["prompt_version"] != prompt_version
+        or row["model"] != model
     ):
         return None
 
@@ -2791,6 +3199,7 @@ def request_ai_enrichment(
             subject_key=key,
             input_hash=digest,
             prompt_version=prompt,
+            model=clean_model,
             now=current,
             ready_state="cached",
         )
@@ -2800,8 +3209,9 @@ def request_ai_enrichment(
         duplicate = c.execute(
             "SELECT id, accepted_at FROM ai_enrichment_requests "
             "WHERE subject_type=? AND subject_key=? AND input_hash=? "
-            "AND prompt_version=? AND status='pending' ORDER BY id DESC LIMIT 1",
-            (kind, key, digest, prompt),
+            "AND prompt_version=? AND model=? AND status='pending' "
+            "ORDER BY id DESC LIMIT 1",
+            (kind, key, digest, prompt, clean_model),
         ).fetchone()
         if duplicate is not None:
             return {
@@ -2919,7 +3329,7 @@ def get_ai_enrichment_request_status(
     model: str,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    kind, key, digest, prompt, _ = _ai_request_identity(
+    kind, key, digest, prompt, clean_model = _ai_request_identity(
         subject_type, subject_key, input_hash, prompt_version, model
     )
     current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
@@ -2930,6 +3340,7 @@ def get_ai_enrichment_request_status(
             subject_key=key,
             input_hash=digest,
             prompt_version=prompt,
+            model=clean_model,
             now=current,
             ready_state="ready",
         )
@@ -2938,8 +3349,9 @@ def get_ai_enrichment_request_status(
         queued = c.execute(
             "SELECT accepted_at FROM ai_enrichment_requests "
             "WHERE subject_type=? AND subject_key=? AND input_hash=? "
-            "AND prompt_version=? AND status='pending' ORDER BY id DESC LIMIT 1",
-            (kind, key, digest, prompt),
+            "AND prompt_version=? AND model=? AND status='pending' "
+            "ORDER BY id DESC LIMIT 1",
+            (kind, key, digest, prompt, clean_model),
         ).fetchone()
     if queued is not None:
         return {
@@ -3008,10 +3420,19 @@ def get_event_enrichment_subject(event_id: int) -> dict[str, Any] | None:
     """Load one event for a manual request, without the normal age window."""
     with conn() as c:
         row = c.execute(
-            "SELECT id, title, snippet, source, url, canonical_url, kol_name, "
-            "kol_name_cn, tickers, impact, has_market_kw, source_count, "
-            "fetched_at, published_at, published_at_status "
-            "FROM events WHERE id=?",
+            f"SELECT e.id, m.title, m.snippet, m.source, e.url, "
+            "e.canonical_url, m.source_url, m.kol_key, m.kol_name, "
+            "m.kol_name_cn, m.tickers, "
+            f"{_event_rule_impact_sql('m')} AS impact, "
+            f"{_event_finance_sql('m')} AS has_market_kw, "
+            f"{_event_eligible_source_count_sql()} AS source_count, "
+            "e.fetched_at, m.published_at, "
+            "m.published_at_status "
+            "FROM events e JOIN event_sightings m ON m.id=("
+            "SELECT s.id FROM event_sightings s WHERE s.event_id=e.id "
+            f"AND {_event_intelligence_sql('s')} "
+            f"ORDER BY {_preferred_sighting_order_sql('s')} LIMIT 1) "
+            "WHERE e.id=?",
             (int(event_id),),
         ).fetchone()
     return dict(row) if row is not None else None
@@ -3464,14 +3885,14 @@ def query_market_reactions(
     where: list[str] = []
     eligible_sources_sql = ""
     if eligible_events_only:
-        eligible_sources_sql = """
+        eligible_sources_sql = f"""
             WITH eligible_events AS MATERIALIZED (
               SELECT e.id, e.dedup_key
               FROM events e
-              WHERE event_content_eligible(
-                e.title, e.snippet, e.source,
-                COALESCE(NULLIF(e.canonical_url,''), e.url)
-              )=1
+              WHERE EXISTS (
+                SELECT 1 FROM event_sightings s
+                WHERE s.event_id=e.id AND {_event_intelligence_sql('s')}
+              )
             ),
             event_source_ids(source_id) AS MATERIALIZED (
               SELECT CAST(id AS TEXT) FROM eligible_events
@@ -3814,14 +4235,14 @@ def query_relations(
     where: list[str] = []
     eligible_sources_sql = ""
     if eligible_events_only:
-        eligible_sources_sql = """
+        eligible_sources_sql = f"""
             WITH eligible_events AS MATERIALIZED (
               SELECT e.id, e.dedup_key
               FROM events e
-              WHERE event_content_eligible(
-                e.title, e.snippet, e.source,
-                COALESCE(NULLIF(e.canonical_url,''), e.url)
-              )=1
+              WHERE EXISTS (
+                SELECT 1 FROM event_sightings s
+                WHERE s.event_id=e.id AND {_event_intelligence_sql('s')}
+              )
             ),
             event_source_ids(source_id) AS MATERIALIZED (
               SELECT CAST(id AS TEXT) FROM eligible_events
@@ -3860,16 +4281,17 @@ def query_relations(
     return [dict(row) for row in rows]
 
 
-_DECISION_RELATIONS_SQL = """
+_DECISION_RELATIONS_SQL = f"""
     WITH eligible_events AS MATERIALIZED (
       SELECT e.id, e.dedup_key
       FROM events e
-      WHERE event_content_eligible(
-              e.title, e.snippet, e.source,
-              COALESCE(NULLIF(e.canonical_url,''), e.url)
-            )=1
-        AND e.published_at_status='verified'
-        AND e.published_at_epoch BETWEEN ? AND ?
+      WHERE EXISTS (
+        SELECT 1 FROM event_sightings s
+        WHERE s.event_id=e.id
+          AND s.published_at_status='verified'
+          AND s.published_at_epoch BETWEEN ? AND ?
+          AND {_event_intelligence_sql('s')}
+      )
     ),
     event_source_ids(source_id) AS MATERIALIZED (
       SELECT CAST(id AS TEXT) FROM eligible_events
@@ -3938,16 +4360,17 @@ def query_decision_relations(
     return [dict(row) for row in rows]
 
 
-_MARKET_VALIDATION_RELATIONS_SQL = """
+_MARKET_VALIDATION_RELATIONS_SQL = f"""
     WITH eligible_events AS MATERIALIZED (
       SELECT e.id, e.dedup_key
       FROM events e
-      WHERE e.published_at_status='verified'
-        AND event_content_eligible(
-              e.title, e.snippet, e.source,
-              COALESCE(NULLIF(e.canonical_url,''), e.url)
-            )=1
-        AND e.published_at_epoch BETWEEN ? AND ?
+      WHERE EXISTS (
+        SELECT 1 FROM event_sightings s
+        WHERE s.event_id=e.id
+          AND s.published_at_status='verified'
+          AND s.published_at_epoch BETWEEN ? AND ?
+          AND {_event_intelligence_sql('s')}
+      )
     ),
     event_source_ids(source_id) AS MATERIALIZED (
       SELECT CAST(id AS TEXT) FROM eligible_events
@@ -3997,47 +4420,58 @@ def query_market_validation_relations(
 
 # ─── Reads ─────────────────────────────────────────────
 
-_CURRENT_EVENT_AI_SQL = (
-    "ai.status='ready' AND event_ai_cache_current("
-    "ai.input_hash, ai.prompt_version, ai.model, "
-    "e.title, e.snippet, e.source, e.kol_name_cn, e.kol_name, e.tickers, "
-    "COALESCE(NULLIF(e.canonical_url,''), e.url)"
-    ")=1"
-)
+def _current_event_ai_sql(sighting_alias: str) -> str:
+    identity = sighting_alias
+    return (
+        "ai.status='ready' AND event_ai_cache_current("
+        "ai.input_hash, ai.prompt_version, ai.model, "
+        f"{identity}.title, {identity}.snippet, {identity}.source, "
+        f"{identity}.kol_name_cn, {identity}.kol_name, {identity}.tickers, "
+        f"{identity}.source_url"
+        ")=1"
+    )
 
-_EVENT_AI_SELECT = (
-    "ai.status AS ai_status, ai.input_hash AS ai_input_hash, "
-    "ai.prompt_version AS ai_prompt_version, "
-    f"CASE WHEN {_CURRENT_EVENT_AI_SQL} THEN 1 ELSE 0 END "
-    "AS ai_cache_current, "
-    "ai.headline_zh AS ai_headline_zh, "
-    "ai.summary_zh AS ai_summary_zh, "
-    "ai.why_it_matters_zh AS ai_why_it_matters_zh, "
-    "ai.impact_level AS ai_impact_level, "
-    "ai.impact_path_json AS ai_impact_path_json, "
-    "ai.tags_json AS ai_tags_json, ai.assets_json AS ai_assets_json, "
-    "ai.cluster_key AS ai_cluster_key, ai.language AS ai_language, "
-    "ai.confidence AS ai_confidence, "
-    "ai.evidence_basis AS ai_evidence_basis, ai.model AS ai_model, "
-    "ai.generated_at AS ai_generated_at"
-)
+
+def _event_ai_select(sighting_alias: str) -> str:
+    current = _current_event_ai_sql(sighting_alias)
+    return (
+        "ai.status AS ai_status, ai.input_hash AS ai_input_hash, "
+        "ai.prompt_version AS ai_prompt_version, "
+        f"CASE WHEN {current} THEN 1 ELSE 0 END AS ai_cache_current, "
+        "ai.headline_zh AS ai_headline_zh, "
+        "ai.summary_zh AS ai_summary_zh, "
+        "ai.why_it_matters_zh AS ai_why_it_matters_zh, "
+        "ai.impact_level AS ai_impact_level, "
+        "ai.impact_path_json AS ai_impact_path_json, "
+        "ai.tags_json AS ai_tags_json, ai.assets_json AS ai_assets_json, "
+        "ai.cluster_key AS ai_cluster_key, ai.language AS ai_language, "
+        "ai.confidence AS ai_confidence, "
+        "ai.evidence_basis AS ai_evidence_basis, ai.model AS ai_model, "
+        "ai.generated_at AS ai_generated_at"
+    )
+
 
 # The public score combines deterministic rules with the model assessment.
 # Rules retain veto power over high-risk events, while the model may promote a
-# signal or demote a medium rule hit only when it has enough evidence.  A
-# title-only enrichment is capped below this confidence threshold upstream.
-_PUBLIC_IMPACT_SQL = (
-    "CASE "
-    "WHEN e.impact='high' THEN 'high' "
-    f"WHEN {_CURRENT_EVENT_AI_SQL} AND ai.impact_level='high' "
-    "AND ai.confidence>=0.65 THEN 'high' "
-    f"WHEN e.impact='medium' AND {_CURRENT_EVENT_AI_SQL} "
-    "AND ai.impact_level='none' AND ai.confidence>=0.65 THEN 'low' "
-    "WHEN e.impact='medium' THEN 'medium' "
-    f"WHEN {_CURRENT_EVENT_AI_SQL} AND ai.impact_level='medium' "
-    "AND ai.confidence>=0.65 THEN 'medium' "
-    "ELSE 'low' END"
-)
+# signal or demote a medium rule hit only when it has enough evidence.  Stored
+# historical impact is deliberately ignored: the contextual classifier repairs
+# old ambiguous-word false positives without rewriting rows or invalidating AI
+# caches. A title-only enrichment is capped below this threshold upstream.
+def _public_impact_sql(sighting_alias: str) -> str:
+    rule = _event_rule_impact_sql(sighting_alias)
+    current_ai = _current_event_ai_sql(sighting_alias)
+    return (
+        "CASE "
+        f"WHEN {rule}='high' THEN 'high' "
+        f"WHEN {current_ai} AND ai.impact_level='high' "
+        "AND ai.confidence>=0.65 THEN 'high' "
+        f"WHEN {rule}='medium' AND {current_ai} "
+        "AND ai.impact_level='none' AND ai.confidence>=0.65 THEN 'low' "
+        f"WHEN {rule}='medium' THEN 'medium' "
+        f"WHEN {current_ai} AND ai.impact_level='medium' "
+        "AND ai.confidence>=0.65 THEN 'medium' "
+        "ELSE 'low' END"
+    )
 
 
 def _event_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -4054,7 +4488,11 @@ def _event_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
         item["ai_enrichment"] = None
         item["ai_status"] = status or "pending"
         for key in tuple(item):
-            if key.startswith("ai_") and key not in {"ai_status", "ai_enrichment"}:
+            if key.startswith("ai_") and key not in {
+                "ai_status",
+                "ai_enrichment",
+                "ai_request_eligible",
+            }:
                 item.pop(key, None)
         return item
 
@@ -4091,6 +4529,7 @@ def _event_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
 def query_events(
     *,
     kol: str | None = None,
+    kols: Iterable[str] | None = None,
     hours: int | None = None,
     impact: str | None = None,
     q: str | None = None,
@@ -4109,70 +4548,94 @@ def query_events(
     )
     if current is None:
         raise ValueError("now must include a timezone")
+    selected_kols: list[str] = []
+    selected_kol_set: set[str] = set()
+    raw_kols: Iterable[str]
+    if isinstance(kols, str):
+        raw_kols = (kols,)
+    else:
+        raw_kols = kols or ()
+    for raw_key in ((kol,) if kol else ()):
+        if raw_key not in selected_kol_set:
+            selected_kol_set.add(raw_key)
+            selected_kols.append(raw_key)
+    for raw_key in raw_kols:
+        key = str(raw_key)
+        if not key or key in selected_kol_set:
+            continue
+        selected_kol_set.add(key)
+        selected_kols.append(key)
+    if len(selected_kols) > MAX_EVENT_KOL_FILTERS:
+        raise ValueError(
+            f"query_events accepts at most {MAX_EVENT_KOL_FILTERS} KOL filters"
+        )
     now_epoch = int(current.timestamp())
     where: list[str] = []
     params: list[Any] = []
-    effective_impact_sql = "e.impact"
+    rule_impact_sql = _event_rule_impact_sql("m")
+    effective_impact_sql = rule_impact_sql
     if use_ai_impact:
-        effective_impact_sql = _PUBLIC_IMPACT_SQL
+        effective_impact_sql = _public_impact_sql("m")
     select_sql = (
-        "e.id, e.url, e.canonical_url, e.title, e.snippet, e.source, "
-        "e.kol_key, e.kol_name, e.kol_name_cn, e.impact AS rule_impact, "
-        f"{effective_impact_sql} AS impact, e.has_market_kw, "
-        "e.tickers, e.source_count, e.fetched_at, "
-        "e.fetched_at AS first_seen_at, e.last_seen_at, e.published_at, "
-        "e.published_at_status AS time_status, e.published_at_epoch, "
-        f"{_EVENT_AI_SELECT}"
+        "e.id, e.url, e.canonical_url, m.title, m.snippet, m.source, "
+        "m.kol_key, m.kol_name, m.kol_name_cn, "
+        f"{_event_attribution_basis_sql('m')} AS attribution_basis, "
+        f"{_event_matched_alias_sql('m')} AS matched_alias, "
+        f"{rule_impact_sql} AS rule_impact, "
+        f"{effective_impact_sql} AS impact, "
+        f"{_event_finance_sql('m')} AS has_market_kw, "
+        f"m.tickers, {_event_eligible_source_count_sql()} AS source_count, "
+        "e.fetched_at, m.first_seen_at, "
+        "m.last_seen_at, m.published_at, "
+        "m.published_at_status AS time_status, m.published_at_epoch, "
+        "m.source_url, m.id AS sighting_id, "
+        f"CASE WHEN m.id={_preferred_event_sighting_id_sql('preferred_ai')} "
+        "THEN 1 ELSE 0 END AS ai_request_eligible, "
+        f"{_event_ai_select('m')}"
     )
-    from_sql = "events e LEFT JOIN event_enrichments ai ON ai.event_id=e.id"
-    if kol:
-        select_sql = (
-            "e.id, e.url, e.canonical_url, e.title, e.snippet, m.source, "
-            "m.kol_key, m.kol_name, m.kol_name_cn, e.impact AS rule_impact, "
-            f"{effective_impact_sql} AS impact, e.has_market_kw, "
-            "e.tickers, e.source_count, e.fetched_at, m.first_seen_at, "
-            "m.last_seen_at, m.published_at, "
-            "m.published_at_status AS time_status, m.published_at_epoch, "
-            f"m.source_url, {_EVENT_AI_SELECT}"
+    sighting_status = (
+        "s.published_at_status='verified'"
+        if time_status == "verified"
+        else "s.published_at_status IN ('unknown', 'future')"
+    )
+    sighting_order = _preferred_sighting_order_sql("s")
+    selected_sighting_filter = ""
+    if selected_kols:
+        selected_sighting_filter = (
+            "AND s.kol_key IN ("
+            + ",".join("?" for _ in selected_kols)
+            + ") "
         )
-        sighting_status = (
-            "s.published_at_status='verified'"
+        params.extend(selected_kols)
+    sighting_window_filter = ""
+    if hours:
+        cutoff = now_epoch - int(hours) * 3600
+        sighting_time_sql = (
+            "s.published_at_epoch"
             if time_status == "verified"
-            else "s.published_at_status IN ('unknown', 'future')"
+            else "CAST(strftime('%s', s.first_seen_at) AS INTEGER)"
         )
-        sighting_order = (
-            "s.published_at_epoch DESC"
-            if time_status == "verified"
-            else "s.first_seen_at DESC"
-        )
-        from_sql = (
-            "events e JOIN event_sightings m ON m.id=("
-            "SELECT s.id FROM event_sightings s "
-            f"WHERE s.event_id=e.id AND s.kol_key=? AND {sighting_status} "
-            f"ORDER BY {sighting_order}, s.last_seen_at DESC, "
-            "s.id DESC LIMIT 1) "
-            "LEFT JOIN event_enrichments ai ON ai.event_id=e.id"
-        )
-        params.append(kol)
+        sighting_window_filter = f"AND {sighting_time_sql} >= ? "
+        params.append(cutoff)
+    from_sql = (
+        "events e JOIN event_sightings m ON m.id=("
+        "SELECT s.id FROM event_sightings s "
+        f"WHERE s.event_id=e.id {selected_sighting_filter}"
+        f"AND {sighting_status} {sighting_window_filter}"
+        f"AND {_event_intelligence_sql('s')} "
+        f"ORDER BY {sighting_order} LIMIT 1) "
+        "LEFT JOIN event_enrichments ai ON ai.event_id=e.id"
+    )
 
     # Match the exact source/URL semantics returned to the caller. In a KOL
     # view the source comes from the selected sighting, while the canonical URL
     # and content still belong to the merged event. Keeping this predicate in
     # SQL prevents an ineligible sighting from consuming a pagination slot.
-    eligibility_source_sql = "m.source" if kol else "e.source"
-    where.append(
-        "event_content_eligible(e.title, e.snippet, "
-        f"{eligibility_source_sql}, "
-        "COALESCE(NULLIF(e.canonical_url,''), e.url))=1"
-    )
+    where.append(_event_intelligence_sql("m"))
 
-    published_status_sql = (
-        "m.published_at_status" if kol else "e.published_at_status"
-    )
-    published_epoch_sql = (
-        "m.published_at_epoch" if kol else "e.published_at_epoch"
-    )
-    collected_sql = "m.first_seen_at" if kol else "e.fetched_at"
+    published_status_sql = "m.published_at_status"
+    published_epoch_sql = "m.published_at_epoch"
+    collected_sql = "m.first_seen_at"
     collected_epoch_sql = f"CAST(strftime('%s', {collected_sql}) AS INTEGER)"
 
     if time_status == "verified":
@@ -4180,12 +4643,6 @@ def query_events(
     else:
         where.append(f"{published_status_sql} IN ('unknown', 'future')")
 
-    if hours:
-        cutoff = now_epoch - int(hours) * 3600
-        where.append(
-            f"{published_epoch_sql if time_status == 'verified' else collected_epoch_sql} >= ?"
-        )
-        params.append(cutoff)
     if impact:
         if impact == "high+":
             where.append(f"{effective_impact_sql} IN ('high', 'medium')")
@@ -4194,8 +4651,8 @@ def query_events(
             params.append(impact)
     if q:
         where.append(
-            "(e.title LIKE ? OR IFNULL(e.snippet,'') LIKE ? "
-            f"OR (({_CURRENT_EVENT_AI_SQL}) AND ("
+            "(m.title LIKE ? OR IFNULL(m.snippet,'') LIKE ? "
+            f"OR (({_current_event_ai_sql('m')}) AND ("
             "IFNULL(ai.headline_zh,'') LIKE ? "
             "OR IFNULL(ai.summary_zh,'') LIKE ? "
             "OR IFNULL(ai.tags_json,'') LIKE ?)))"
@@ -4222,19 +4679,32 @@ def query_events(
 
 
 def get_event_detail(event_id: int) -> dict[str, Any] | None:
-    """Return a canonical event, all sightings and same-cluster stories."""
+    """Return a canonical event, eligible sightings and same-cluster stories."""
     with conn() as c:
         row = c.execute(
             f"""
-            SELECT e.id, e.url, e.canonical_url, e.title, e.snippet, e.source,
-                   e.kol_key, e.kol_name, e.kol_name_cn,
-                   e.impact AS rule_impact,
-                   {_PUBLIC_IMPACT_SQL} AS impact,
-                   e.has_market_kw, e.tickers, e.source_count, e.fetched_at,
-                   e.fetched_at AS first_seen_at, e.last_seen_at,
-                   e.published_at, e.published_at_status AS time_status,
-                   e.published_at_epoch, {_EVENT_AI_SELECT}
+            SELECT e.id, e.url, e.canonical_url, m.title, m.snippet, m.source,
+                   m.kol_key, m.kol_name, m.kol_name_cn,
+                   {_event_attribution_basis_sql('m')} AS attribution_basis,
+                   {_event_matched_alias_sql('m')} AS matched_alias,
+                   {_event_rule_impact_sql('m')} AS rule_impact,
+                   {_public_impact_sql('m')} AS impact,
+                   {_event_finance_sql('m')} AS has_market_kw,
+                   m.tickers,
+                   {_event_eligible_source_count_sql()} AS source_count,
+                   e.fetched_at,
+                   m.first_seen_at, m.last_seen_at, m.published_at,
+                   m.published_at_status AS time_status,
+                   m.published_at_epoch, m.source_url,
+                   m.id AS sighting_id,
+                   1 AS ai_request_eligible,
+                   {_event_ai_select('m')}
             FROM events e
+            JOIN event_sightings m ON m.id=(
+              SELECT s.id FROM event_sightings s
+              WHERE s.event_id=e.id AND {_event_intelligence_sql('s')}
+              ORDER BY {_preferred_sighting_order_sql('s')} LIMIT 1
+            )
             LEFT JOIN event_enrichments ai ON ai.event_id=e.id
             WHERE e.id=?
             """,
@@ -4246,17 +4716,23 @@ def get_event_detail(event_id: int) -> dict[str, Any] | None:
         sightings = [
             dict(item)
             for item in c.execute(
-                """
-                SELECT kol_key, kol_name, kol_name_cn, source, source_url,
-                       published_at, published_at_status AS time_status,
-                       first_seen_at, last_seen_at, source_count
-                FROM event_sightings
-                WHERE event_id=?
-                ORDER BY
-                  CASE WHEN source LIKE 'X @%' OR source LIKE 'Truth Social%'
-                    THEN 0 ELSE 1 END,
-                  CASE WHEN published_at_status='verified' THEN 0 ELSE 1 END,
-                  COALESCE(published_at, first_seen_at), id
+                f"""
+                SELECT s.id AS sighting_id, s.title, s.snippet,
+                       s.kol_key, s.kol_name,
+                       s.kol_name_cn, s.source, s.source_url,
+                       {_event_attribution_basis_sql('s')} AS attribution_basis,
+                       {_event_matched_alias_sql('s')} AS matched_alias,
+                       {_event_rule_impact_sql('s')} AS rule_impact,
+                       {_public_impact_sql('s')} AS impact,
+                       {_event_finance_sql('s')} AS has_market_kw, s.tickers,
+                       s.published_at,
+                       s.published_at_status AS time_status,
+                       s.first_seen_at, s.last_seen_at, s.source_count
+                FROM event_sightings s
+                JOIN events e ON e.id=s.event_id
+                LEFT JOIN event_enrichments ai ON ai.event_id=e.id
+                WHERE s.event_id=? AND {_event_intelligence_sql('s')}
+                ORDER BY {_preferred_sighting_order_sql('s')}
                 """,
                 (int(event_id),),
             ).fetchall()
@@ -4270,20 +4746,21 @@ def get_event_detail(event_id: int) -> dict[str, Any] | None:
                 dict(item)
                 for item in c.execute(
                     f"""
-                    SELECT e.id, e.title, e.source, e.kol_name_cn,
-                           e.canonical_url, e.url, e.published_at,
+                    SELECT e.id, m.title, m.source, m.kol_name_cn,
+                           m.source_url, e.canonical_url, e.url, m.published_at,
                            ai.headline_zh, ai.summary_zh
                     FROM event_enrichments ai
                     JOIN events e ON e.id=ai.event_id
-                    WHERE {_CURRENT_EVENT_AI_SQL}
+                    JOIN event_sightings m ON m.id=(
+                      SELECT s.id FROM event_sightings s
+                      WHERE s.event_id=e.id AND {_event_intelligence_sql('s')}
+                      ORDER BY {_preferred_sighting_order_sql('s')} LIMIT 1
+                    )
+                    WHERE {_current_event_ai_sql('m')}
                       AND ai.cluster_key=? AND e.id<>?
-                      AND e.published_at_status='verified'
-                      AND event_content_eligible(
-                        e.title, e.snippet, e.source,
-                        COALESCE(NULLIF(e.canonical_url,''), e.url)
-                      )=1
-                    ORDER BY COALESCE(e.published_at_epoch,
-                      CAST(strftime('%s', e.fetched_at) AS INTEGER)) DESC
+                      AND m.published_at_status='verified'
+                    ORDER BY COALESCE(m.published_at_epoch,
+                      CAST(strftime('%s', m.first_seen_at) AS INTEGER)) DESC
                     LIMIT 12
                     """,
                     (cluster_key, int(event_id)),
@@ -4292,8 +4769,18 @@ def get_event_detail(event_id: int) -> dict[str, Any] | None:
     return {"event": event, "sightings": sightings, "related": related}
 
 
+def event_exists(event_id: int) -> bool:
+    """Return whether an event row exists, independent of public eligibility."""
+    with conn() as c:
+        row = c.execute(
+            "SELECT 1 FROM events WHERE id=? LIMIT 1",
+            (int(event_id),),
+        ).fetchone()
+    return row is not None
+
+
 def list_kols() -> list[dict[str, Any]]:
-    """Per-KOL summary: distinct stories, last sighting, high/medium counts in 24h."""
+    """Return the configured KOL directory overlaid with observed summaries."""
     with conn() as c:
         rows = c.execute(
             f"""
@@ -4301,47 +4788,24 @@ def list_kols() -> list[dict[str, Any]]:
               SELECT s.*,
                      ROW_NUMBER() OVER (
                        PARTITION BY s.event_id, s.kol_key
-                       ORDER BY
-                         CASE WHEN s.published_at_status='verified'
-                           THEN 0 ELSE 1 END,
-                         CASE WHEN s.published_at_status='verified'
-                           THEN s.published_at_epoch END DESC,
-                         CASE WHEN s.published_at_status<>'verified'
-                           THEN s.first_seen_at END DESC,
-                         s.last_seen_at DESC,
-                         s.id DESC
-                     ) AS source_rank,
-                     MAX(s.kol_name) OVER (
-                       PARTITION BY s.event_id, s.kol_key
-                     ) AS grouped_kol_name,
-                     MAX(s.kol_name_cn) OVER (
-                       PARTITION BY s.event_id, s.kol_key
-                     ) AS grouped_kol_name_cn,
-                     MAX(s.last_seen_at) OVER (
-                       PARTITION BY s.event_id, s.kol_key
-                     ) AS grouped_last_seen_at,
-                     MAX(
-                       CASE WHEN s.published_at_status='verified'
-                         THEN s.published_at END
-                     ) OVER (
-                       PARTITION BY s.event_id, s.kol_key
-                     ) AS grouped_published_at,
-                     MAX(
-                       CASE WHEN s.published_at_status='verified'
-                         THEN s.published_at_epoch END
-                     ) OVER (
-                       PARTITION BY s.event_id, s.kol_key
-                     ) AS grouped_published_at_epoch
+                       ORDER BY {_preferred_sighting_order_sql('s')}
+                     ) AS source_rank
               FROM event_sightings s
+              JOIN events e ON e.id=s.event_id
+              WHERE {_event_intelligence_sql('s')}
             ), per_event AS (
               SELECT event_id,
+                     title,
+                     snippet,
+                     tickers,
                      kol_key,
-                     grouped_kol_name AS kol_name,
-                     grouped_kol_name_cn AS kol_name_cn,
+                     kol_name,
+                     kol_name_cn,
                      source,
-                     grouped_last_seen_at AS last_seen_at,
-                     grouped_published_at AS published_at,
-                     grouped_published_at_epoch AS published_at_epoch
+                     source_url,
+                     last_seen_at,
+                     published_at,
+                     published_at_epoch
               FROM ranked_sightings
               WHERE source_rank=1
             )
@@ -4352,27 +4816,127 @@ def list_kols() -> list[dict[str, Any]]:
                    MAX(e.id) AS last_id,
                    MAX(p.last_seen_at) AS last_fetched,
                    MAX(p.published_at) AS last_published,
-                   SUM(CASE WHEN {_PUBLIC_IMPACT_SQL}='high'
+                   SUM(CASE WHEN {_public_impact_sql('p')}='high'
                      THEN 1 ELSE 0 END) AS high_total,
-                   SUM(CASE WHEN {_PUBLIC_IMPACT_SQL}='medium'
+                   SUM(CASE WHEN {_public_impact_sql('p')}='medium'
                      THEN 1 ELSE 0 END) AS medium_total,
-                   SUM(CASE WHEN {_PUBLIC_IMPACT_SQL}='high'
-                     AND p.published_at_epoch >= CAST(
-                       strftime('%s','now','-24 hours') AS INTEGER
-                     ) THEN 1 ELSE 0 END) AS high_24h,
-                   SUM(CASE WHEN p.published_at_epoch >= CAST(strftime('%s','now','-24 hours') AS INTEGER) THEN 1 ELSE 0 END) AS total_24h
+                   0 AS high_24h,
+                   0 AS total_24h
             FROM per_event p
             JOIN events e ON e.id=p.event_id
             LEFT JOIN event_enrichments ai ON ai.event_id=e.id
-            WHERE event_content_eligible(
-              e.title, e.snippet, p.source,
-              COALESCE(NULLIF(e.canonical_url,''), e.url)
-            )=1
+            WHERE {_event_intelligence_sql('p')}
             GROUP BY p.kol_key
             ORDER BY total_24h DESC, total DESC
             """
         ).fetchall()
-    return [dict(r) for r in rows]
+        observed_rows = c.execute(
+            """
+            WITH observed AS (
+              SELECT s.kol_key, s.kol_name, s.kol_name_cn,
+                     ROW_NUMBER() OVER (
+                       PARTITION BY s.kol_key
+                       ORDER BY s.last_seen_at DESC, s.id DESC
+                     ) AS observed_rank
+              FROM event_sightings s
+              WHERE NULLIF(TRIM(s.kol_key), '') IS NOT NULL
+            )
+            SELECT kol_key, kol_name, kol_name_cn
+            FROM observed
+            WHERE observed_rank=1
+            """
+        ).fetchall()
+        recent_rows = c.execute(
+            f"""
+            WITH ranked_recent AS (
+              SELECT s.*,
+                     ROW_NUMBER() OVER (
+                       PARTITION BY s.event_id, s.kol_key
+                       ORDER BY {_preferred_sighting_order_sql('s')}
+                     ) AS source_rank
+              FROM event_sightings s
+              JOIN events e ON e.id=s.event_id
+              WHERE s.published_at_status='verified'
+                AND s.published_at_epoch >= CAST(
+                  strftime('%s','now','-24 hours') AS INTEGER
+                )
+                AND {_event_intelligence_sql('s')}
+            ), per_recent_event AS (
+              SELECT * FROM ranked_recent WHERE source_rank=1
+            )
+            SELECT p.kol_key,
+                   COUNT(*) AS total_24h,
+                   SUM(CASE WHEN {_public_impact_sql('p')}='high'
+                     THEN 1 ELSE 0 END) AS high_24h
+            FROM per_recent_event p
+            JOIN events e ON e.id=p.event_id
+            LEFT JOIN event_enrichments ai ON ai.event_id=e.id
+            GROUP BY p.kol_key
+            """
+        ).fetchall()
+    recent_by_key = {
+        str(row["kol_key"] or ""): {
+            "total_24h": int(row["total_24h"] or 0),
+            "high_24h": int(row["high_24h"] or 0),
+        }
+        for row in recent_rows
+    }
+    summaries: list[dict[str, Any]] = []
+    observed_keys: set[str] = set()
+    for row in rows:
+        item = dict(row)
+        key = str(item.get("kol_key") or "")
+        observed_keys.add(key)
+        configured = KOL_DIRECTORY.get(key)
+        item["configured"] = configured is not None
+        if configured is not None:
+            item["kol_name"] = configured["name"]
+            item["kol_name_cn"] = configured["name_cn"]
+            item["category"] = configured["category"]
+        else:
+            item["category"] = "other"
+        item.update(recent_by_key.get(key, {}))
+        summaries.append(item)
+
+    empty_summary = {
+        "total": 0,
+        "last_id": None,
+        "last_fetched": None,
+        "last_published": None,
+        "high_total": 0,
+        "medium_total": 0,
+        "high_24h": 0,
+        "total_24h": 0,
+    }
+    for row in observed_rows:
+        key = str(row["kol_key"] or "")
+        if not key or key in observed_keys or key in KOL_DIRECTORY:
+            continue
+        summaries.append(
+            {
+                "kol_key": key,
+                "kol_name": str(row["kol_name"] or key),
+                "kol_name_cn": str(row["kol_name_cn"] or row["kol_name"] or key),
+                "category": "other",
+                "configured": False,
+                **empty_summary,
+            }
+        )
+        observed_keys.add(key)
+    for key, configured in KOL_DIRECTORY.items():
+        if key in observed_keys:
+            continue
+        summaries.append(
+            {
+                "kol_key": key,
+                "kol_name": configured["name"],
+                "kol_name_cn": configured["name_cn"],
+                "category": configured["category"],
+                "configured": True,
+                **empty_summary,
+            }
+        )
+    return summaries
 
 
 def stats(hours: int = 24) -> dict[str, Any]:
@@ -4380,42 +4944,32 @@ def stats(hours: int = 24) -> dict[str, Any]:
     if hours < 0:
         raise ValueError("hours must be non-negative")
     modifier = f"-{hours} hours"
-    win = (
-        "AND e.published_at_status='verified' "
-        "AND e.published_at_epoch >= CAST(strftime('%s','now',?) AS INTEGER)"
-    )
     with conn() as c:
         def count(cond: str = "") -> int:
             return c.execute(
                 "SELECT COUNT(*) n FROM events e "
+                "JOIN event_sightings m ON m.id=("
+                "SELECT s.id FROM event_sightings s "
+                "WHERE s.event_id=e.id AND s.published_at_status='verified' "
+                "AND s.published_at_epoch >= "
+                "CAST(strftime('%s','now',?) AS INTEGER) "
+                f"AND {_event_intelligence_sql('s')} "
+                f"ORDER BY {_preferred_sighting_order_sql('s')} LIMIT 1) "
                 "LEFT JOIN event_enrichments ai ON ai.event_id=e.id "
-                "WHERE event_content_eligible("
-                "e.title, e.snippet, e.source, "
-                "COALESCE(NULLIF(e.canonical_url,''), e.url)"
-                ")=1 "
-                f"{cond} {win}",
+                f"WHERE {_event_intelligence_sql('m')} "
+                f"{cond}",
                 (modifier,),
             ).fetchone()["n"]
 
         total = count()
-        high = count(f"AND {_PUBLIC_IMPACT_SQL}='high'")
-        med = count(f"AND {_PUBLIC_IMPACT_SQL}='medium'")
-        with_market = count("AND e.has_market_kw=1")
+        high = count(f"AND {_public_impact_sql('m')}='high'")
+        med = count(f"AND {_public_impact_sql('m')}='medium'")
+        with_market = count(f"AND {_event_finance_sql('m')}=1")
         active_kols = c.execute(
-            "WITH ranked_sightings AS ("
-            "SELECT s.*, ROW_NUMBER() OVER ("
-            "PARTITION BY s.event_id, s.kol_key "
-            "ORDER BY s.published_at_epoch DESC, s.last_seen_at DESC, s.id DESC"
-            ") AS source_rank FROM event_sightings s "
-            "WHERE s.published_at_status='verified'"
-            ") "
-            "SELECT COUNT(DISTINCT s.kol_key) n FROM ranked_sightings s "
+            "SELECT COUNT(DISTINCT s.kol_key) n FROM event_sightings s "
             "JOIN events e ON e.id=s.event_id "
-            "WHERE s.source_rank=1 "
-            "AND event_content_eligible("
-            "e.title, e.snippet, s.source, "
-            "COALESCE(NULLIF(e.canonical_url,''), e.url)"
-            ")=1 "
+            "WHERE s.published_at_status='verified' "
+            f"AND {_event_intelligence_sql('s')} "
             "AND s.published_at_epoch >= "
             "CAST(strftime('%s','now',?) AS INTEGER)",
             (modifier,),

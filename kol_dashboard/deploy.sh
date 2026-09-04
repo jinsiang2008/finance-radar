@@ -33,8 +33,14 @@ trap cleanup_auth_only EXIT INT TERM
 # helper's generic 60-second SSH ceiling. Callers may raise this further.
 export RSH_TIMEOUT="${RSH_TIMEOUT:-1200}"
 
-VPS="${VPS_HELPER:-$HOME/.cursor/skills/aliyun-ops/scripts/vps.sh}"
-[[ -x "$VPS" ]] || { echo "缺少远程操作 helper: $VPS" >&2; exit 1; }
+VPS="${VPS_HELPER:-}"
+if [[ -z "$VPS" ]]; then
+  VPS="$(command -v zlstreet-vps || true)"
+fi
+[[ -x "$VPS" ]] || {
+  echo "缺少远程操作 helper；请安装 zlstreet-vps 或设置 VPS_HELPER" >&2
+  exit 1
+}
 
 LOCAL_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$LOCAL_DIR/.." && pwd)"
@@ -74,7 +80,7 @@ trap cleanup_local EXIT INT TERM
 
 echo "→ 打包应用与采集器"
 mkdir -p "$WORK/pkg/lib"
-cp "$LOCAL_DIR"/{app.py,auth.py,content_quality.py,db.py,decision_collect.py,decision_service.py,decision_snapshot.py,market_data.py,portfolio.py,relation_engine.py,macro_collect.py,llm_enrichment.py,enrichment_collect.py,collect.sh} "$WORK/pkg/"
+cp "$LOCAL_DIR"/{app.py,auth.py,content_quality.py,event_relevance.py,db.py,decision_collect.py,decision_service.py,decision_snapshot.py,market_data.py,portfolio.py,relation_engine.py,macro_collect.py,llm_enrichment.py,enrichment_collect.py,collect.sh} "$WORK/pkg/"
 cp -R "$LOCAL_DIR"/templates "$LOCAL_DIR"/static "$WORK/pkg/"
 cp "$LIB_DIR"/{kol_tracker.py,macro_fetcher.py,risk_radar.py} "$WORK/pkg/lib/"
 cp "$LIB_DIR/serenity_tracker.py" "$WORK/pkg/lib/"
@@ -169,6 +175,7 @@ STAGING_DIR="$BASE_DIR/.staging"
 RELEASES_DIR="$BASE_DIR/releases"
 DATA_DIR="$BASE_DIR/data"
 PRIVATE_DIR="$BASE_DIR/private"
+BACKUPS_DIR="$BASE_DIR/backups"
 DB_PATH="$DATA_DIR/kol_dashboard.db"
 CURRENT_LINK="$BASE_DIR/current"
 CURRENT_NEXT="$BASE_DIR/current.next.$RELEASE_ID"
@@ -331,54 +338,78 @@ cleanup_remote() {
   set +e
   rm -f "$CURRENT_NEXT" "$DB_NEXT"
   if [[ $rc != 0 && $ROLLBACK_READY == 1 && $COMMITTED == 0 ]]; then
-    local rollback_failed=0 unit active_target
+    local rollback_failed=0 rollback_safe=1 unit unit_load_state unit_state
+    local unit_query_rc active_target rollback_health
+    local -a rollback_units=(
+      kol-enrich-wakeup.path
+      kol-collect-kol.timer kol-collect-macro.timer
+      kol-collect-decision.timer kol-collect-enrich.timer
+      kol-collect-kol.service kol-collect-macro.service
+      kol-collect-decision.service kol-collect-enrich.service
+      kol-dashboard.service
+    )
     echo "部署失败，恢复上一版本、数据库和配置" >&2
-    systemctl stop kol-enrich-wakeup.path \
-      kol-collect-kol.timer kol-collect-macro.timer \
-      kol-collect-decision.timer kol-collect-enrich.timer \
-      kol-collect-kol.service kol-collect-macro.service \
-      kol-collect-decision.service kol-collect-enrich.service \
-      kol-dashboard.service >/dev/null 2>&1 || true
-    for unit in kol-collect-kol.service kol-collect-macro.service \
-      kol-collect-decision.service kol-collect-enrich.service \
-      kol-dashboard.service; do
-      if systemctl is-active --quiet "$unit"; then
-        echo "回滚前仍有写入进程: $unit" >&2
-        rollback_failed=1
+    systemctl stop "${rollback_units[@]}" >/dev/null 2>&1 || true
+    for unit in "${rollback_units[@]}"; do
+      unit_load_state="$(systemctl show --property=LoadState --value \
+        "$unit" 2>/dev/null)"
+      unit_query_rc=$?
+      if [[ $unit_query_rc != 0 || -z "$unit_load_state" ]]; then
+        echo "无法确认回滚单元是否存在: $unit" >&2
+        rollback_safe=0
+        continue
+      fi
+      if [[ "$unit_load_state" == not-found ]]; then
+        continue
+      fi
+      unit_state="$(systemctl show --property=ActiveState --value \
+        "$unit" 2>/dev/null)"
+      unit_query_rc=$?
+      if [[ $unit_query_rc != 0 || -z "$unit_state" ||
+            ( "$unit_state" != inactive && "$unit_state" != failed ) ]]; then
+        echo "回滚前数据库写入进程或触发器未停净: $unit ($unit_state)" >&2
+        rollback_safe=0
       fi
     done
-    rollback_database || rollback_failed=1
-    prepare_unit_state_rollback || rollback_failed=1
-    rollback_configuration || rollback_failed=1
-    if [[ -n "$PREVIOUS_TARGET" && -d "$PREVIOUS_TARGET" ]]; then
-      ln -s "$PREVIOUS_TARGET" "$CURRENT_NEXT" || rollback_failed=1
-      mv -Tf "$CURRENT_NEXT" "$CURRENT_LINK" || rollback_failed=1
-      active_target="$(readlink -f "$CURRENT_LINK" 2>/dev/null)"
-      [[ "$active_target" == "$PREVIOUS_TARGET" ]] || rollback_failed=1
+
+    if [[ $rollback_safe == 1 ]]; then
+      rollback_database || rollback_failed=1
+      prepare_unit_state_rollback || rollback_failed=1
+      rollback_configuration || rollback_failed=1
+      if [[ -n "$PREVIOUS_TARGET" && -d "$PREVIOUS_TARGET" ]]; then
+        ln -s "$PREVIOUS_TARGET" "$CURRENT_NEXT" || rollback_failed=1
+        mv -Tf "$CURRENT_NEXT" "$CURRENT_LINK" || rollback_failed=1
+        active_target="$(readlink -f "$CURRENT_LINK" 2>/dev/null)"
+        [[ "$active_target" == "$PREVIOUS_TARGET" ]] || rollback_failed=1
+      else
+        rm -f "$CURRENT_LINK" || rollback_failed=1
+      fi
+      systemctl daemon-reload || rollback_failed=1
+      restore_unit_states || rollback_failed=1
+      activate_nginx >/dev/null 2>&1 || rollback_failed=1
+      if unit_was_active kol-dashboard.service; then
+        rollback_health=FAILED
+        for _ in $(seq 1 15); do
+          if curl -sf --max-time 4 \
+            http://127.0.0.1:8088/health >/dev/null; then
+            rollback_health=ok
+            break
+          fi
+          sleep 2
+        done
+        [[ "$rollback_health" == ok ]] || rollback_failed=1
+      fi
+      if [[ $rollback_failed != 0 ]]; then
+        : > "$REMOTE_STAGE/PRESERVE"
+        chmod 600 "$REMOTE_STAGE/PRESERVE"
+        echo "ROLLBACK INCOMPLETE: 恢复材料保留在 $REMOTE_STAGE" >&2
+      else
+        echo "回滚验证完成，旧服务健康" >&2
+      fi
     else
-      rm -f "$CURRENT_LINK" || rollback_failed=1
-    fi
-    systemctl daemon-reload || rollback_failed=1
-    restore_unit_states || rollback_failed=1
-    activate_nginx >/dev/null 2>&1 || rollback_failed=1
-    if unit_was_active kol-dashboard.service; then
-      rollback_health=FAILED
-      for _ in $(seq 1 15); do
-        if curl -sf --max-time 4 \
-          http://127.0.0.1:8088/health >/dev/null; then
-          rollback_health=ok
-          break
-        fi
-        sleep 2
-      done
-      [[ "$rollback_health" == ok ]] || rollback_failed=1
-    fi
-    if [[ $rollback_failed != 0 ]]; then
       : > "$REMOTE_STAGE/PRESERVE"
       chmod 600 "$REMOTE_STAGE/PRESERVE"
-      echo "ROLLBACK INCOMPLETE: 恢复材料保留在 $REMOTE_STAGE" >&2
-    else
-      echo "回滚验证完成，旧服务健康" >&2
+      echo "ROLLBACK ABORTED: 写入进程或触发器未停止；数据库、代码和配置保持失败现场，恢复材料保留在 $REMOTE_STAGE" >&2
     fi
   fi
   active_target="$(readlink -f "$CURRENT_LINK" 2>/dev/null || true)"
@@ -399,7 +430,7 @@ trap cleanup_remote EXIT
 }
 
 install -d -m 755 "$BASE_DIR" "$RELEASES_DIR"
-install -d -m 700 "$STAGING_DIR"
+install -d -m 700 "$STAGING_DIR" "$BACKUPS_DIR"
 chmod 700 "$REMOTE_STAGE"
 exec 9>"$BASE_DIR/.deploy.lock"
 flock -n 9 || {
@@ -994,6 +1025,30 @@ systemctl is-active --quiet kol-enrich-wakeup.path || {
   echo "enrichment 唤醒 path 未运行" >&2
   exit 1
 }
+
+# Schema migrations are forward-only. Keep the verified pre-release database
+# outside the disposable staging tree so an operator can pair an old binary
+# rollback with its compatible database instead of only switching `current`.
+if [[ -f "$ROLLBACK_DIR/database.before-release" ]]; then
+  DURABLE_DB_BACKUP="$BACKUPS_DIR/database.before-$RELEASE_ID.sqlite3"
+  install -o root -g root -m 600 \
+    "$ROLLBACK_DIR/database.before-release" "$DURABLE_DB_BACKUP"
+  database_integrity "$DURABLE_DB_BACKUP"
+  python3 - "$DURABLE_DB_BACKUP" <<'PY'
+from pathlib import Path
+import os
+import sys
+
+backup_path = Path(sys.argv[1])
+with backup_path.open("rb") as handle:
+    os.fsync(handle.fileno())
+directory_fd = os.open(backup_path.parent, os.O_RDONLY)
+try:
+    os.fsync(directory_fd)
+finally:
+    os.close(directory_fd)
+PY
+fi
 SERVICES_STOPPED=0
 COMMITTED=1
 echo "service: $(systemctl is-active kol-dashboard)  health: ok"

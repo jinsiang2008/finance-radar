@@ -70,6 +70,9 @@ _AI_ACTION_VALUE = "request-ai-enrichment"
 _AI_SUBJECT_TYPES = {"event", "macro_event"}
 _EVENT_SUBJECT_ID = re.compile(r"^[1-9][0-9]{0,18}$")
 _SQLITE_MAX_INTEGER = (1 << 63) - 1
+_KOL_KEY = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_MAX_KOL_FILTERS = db.MAX_EVENT_KOL_FILTERS
+_MAX_KOL_FILTER_QUERY_LENGTH = _MAX_KOL_FILTERS * 64 + _MAX_KOL_FILTERS - 1
 _AI_PUBLIC_RESPONSE_FIELDS = frozenset(
     {
         "state",
@@ -80,6 +83,41 @@ _AI_PUBLIC_RESPONSE_FIELDS = frozenset(
         "next_attempt_at",
     }
 )
+
+
+def _parse_kol_filters(kol: str | None, kols: str | None) -> list[str]:
+    """Return a stable, de-duplicated union of legacy and multi-KOL filters."""
+    selected: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: str) -> None:
+        if not _KOL_KEY.fullmatch(value):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "invalid_kols: keys must use lowercase letters, "
+                    "numbers, underscores, or hyphens"
+                ),
+            )
+        if value in seen:
+            return
+        seen.add(value)
+        selected.append(value)
+
+    if kol:
+        add(kol)
+    if kols:
+        for raw_key in kols.split(","):
+            key = raw_key.strip()
+            if not key:
+                continue
+            add(key)
+    if len(selected) > _MAX_KOL_FILTERS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"too_many_kols: select at most {_MAX_KOL_FILTERS}",
+        )
+    return selected
 
 
 def _auth_config() -> auth.AuthConfig:
@@ -244,7 +282,8 @@ def api_kols() -> list:
 
 @app.get("/api/events")
 def api_events(
-    kol: Optional[str] = Query(None),
+    kol: Optional[str] = Query(None, max_length=64),
+    kols: Optional[str] = Query(None, max_length=_MAX_KOL_FILTER_QUERY_LENGTH),
     hours: Optional[int] = Query(24, ge=1, le=720),
     impact: Optional[str] = Query(None),
     q: Optional[str] = Query(None, max_length=120),
@@ -252,8 +291,9 @@ def api_events(
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
 ) -> dict:
+    selected_kols = _parse_kol_filters(kol, kols)
     items = db.query_events(
-        kol=kol,
+        kols=selected_kols,
         hours=hours,
         impact=impact,
         q=q,
@@ -280,13 +320,25 @@ def api_event_detail(
 ) -> JSONResponse:
     detail = db.get_event_detail(event_id)
     if detail is None:
-        raise HTTPException(status_code=404, detail="event_not_found")
+        reason = (
+            "event_not_available" if db.event_exists(event_id)
+            else "event_not_found"
+        )
+        raise HTTPException(status_code=404, detail=reason)
     event = detail["event"]
     if not llm_enrichment.is_event_enrichment_eligible(event):
         raise HTTPException(status_code=404, detail="event_not_available")
     event["tickers"] = [
         ticker for ticker in (event.get("tickers") or "").split(",") if ticker
     ]
+    for sighting in detail["sightings"]:
+        sighting_tickers = sighting.get("tickers") or ""
+        sighting["tickers"] = (
+            [ticker for ticker in sighting_tickers.split(",") if ticker]
+            if isinstance(sighting_tickers, str)
+            else list(sighting_tickers)
+        )
+    primary_ai_subject = None
     if kol or source_url:
         selected_sighting = next(
             (
@@ -303,20 +355,67 @@ def api_event_detail(
             ),
             None,
         )
-        if selected_sighting:
-            for field in (
-                "source_url",
-                "source",
-                "kol_key",
-                "kol_name",
-                "kol_name_cn",
-                "published_at",
-                "time_status",
-                "first_seen_at",
-                "last_seen_at",
-                "source_count",
-            ):
-                event[field] = selected_sighting.get(field)
+        if selected_sighting is None:
+            raise HTTPException(status_code=404, detail="event_sighting_not_found")
+        primary_event = dict(event)
+        same_ai_subject = (
+            int(event.get("sighting_id") or 0)
+            == int(selected_sighting.get("sighting_id") or -1)
+        )
+        for field in (
+            "title",
+            "snippet",
+            "tickers",
+            "source_url",
+            "source",
+            "kol_key",
+            "kol_name",
+            "kol_name_cn",
+            "attribution_basis",
+            "matched_alias",
+            "rule_impact",
+            "impact",
+            "has_market_kw",
+            "published_at",
+            "time_status",
+            "first_seen_at",
+            "last_seen_at",
+            "sighting_id",
+        ):
+            event[field] = selected_sighting.get(field)
+        selected_tickers = event.get("tickers") or ""
+        event["tickers"] = (
+            [ticker for ticker in selected_tickers.split(",") if ticker]
+            if isinstance(selected_tickers, str)
+            else list(selected_tickers)
+        )
+        event["ai_request_eligible"] = same_ai_subject
+        if not same_ai_subject:
+            primary_ai_subject = {
+                key: primary_event.get(key)
+                for key in (
+                    "sighting_id",
+                    "title",
+                    "snippet",
+                    "tickers",
+                    "source_url",
+                    "source",
+                    "kol_key",
+                    "kol_name",
+                    "kol_name_cn",
+                    "attribution_basis",
+                    "matched_alias",
+                    "published_at",
+                    "time_status",
+                    "impact",
+                    "rule_impact",
+                    "ai_status",
+                    "ai_enrichment",
+                )
+            }
+            primary_ai_subject["ai_request_eligible"] = True
+            event["ai_status"] = "ineligible"
+            event["ai_enrichment"] = None
         if not llm_enrichment.is_event_enrichment_eligible(event):
             raise HTTPException(status_code=404, detail="event_not_available")
     relations = decision_service.project_public_relations(
@@ -333,9 +432,18 @@ def api_event_detail(
             limit=100,
         )
     )
+    if primary_ai_subject is not None:
+        # Relations and market reactions are generated once from the event's
+        # preferred evidence. Keep them attached to that identity when the
+        # caller is inspecting another KOL/source sighting.
+        primary_ai_subject["relations"] = relations
+        primary_ai_subject["market_reactions"] = reactions
+        relations = []
+        reactions = []
     return JSONResponse(
         {
             **detail,
+            "primary_ai_subject": primary_ai_subject,
             "relations": relations,
             "market_reactions": reactions,
         },
