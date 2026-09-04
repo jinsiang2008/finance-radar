@@ -18,7 +18,7 @@
     } catch (e) {}
   })();
 </script>
-  <link rel="stylesheet" href="static/style.css?v=25" />
+  <link rel="stylesheet" href="static/style.css?v=29" />
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ccircle cx='50' cy='50' r='42' fill='%230b1720' stroke='%2331d69b' stroke-width='6'/%3E%3Ccircle cx='50' cy='50' r='20' fill='none' stroke='%234ab8d8' stroke-width='5'/%3E%3Cpath d='M50 50L82 24' stroke='%23f4b942' stroke-width='6' stroke-linecap='round'/%3E%3Ccircle cx='50' cy='50' r='7' fill='%23eef4f2'/%3E%3C/svg%3E" />
 </head>
 <body>
@@ -156,25 +156,32 @@
   <div class="wrap daily-wrap">
     <header class="daily-masthead">
       <div class="daily-masthead-copy">
-        <p class="section-kicker">DAILY INTELLIGENCE</p>
+        <p class="daily-eyebrow">每日情报台</p>
         <h1>每日市场情报</h1>
-        <p>先看事实，再看影响；两次点击内回到原始来源。</p>
+        <p>六个栏目持续去重，先看当日主线，再回到原始来源。</p>
       </div>
-      <div class="daily-clock" aria-live="polite">
+      <div class="daily-clock">
         <time class="daily-date" id="daily-date">—</time>
         <span class="daily-edition" id="daily-edition">正在确认版本</span>
         <span class="daily-as-of" id="daily-as-of">数据时间待确认</span>
       </div>
     </header>
 
-    <nav class="daily-jump-nav" aria-label="简报章节">
+    <nav class="daily-jump-nav" aria-label="简报栏目" hidden>
       <a href="#daily-highlights-title">60 秒读完</a>
-      <a href="#daily-firsthand-title">一手速递</a>
-      <a href="#daily-watchpoints-title">下一复核</a>
+      <a href="#daily-section-macro">宏观</a>
+      <a href="#daily-section-world">全球</a>
+      <a href="#daily-section-finance">金融</a>
+      <a href="#daily-section-technology">科技</a>
+      <a href="#daily-section-ai">AI</a>
+      <a href="#daily-section-investors">投资大师</a>
+      <a href="#daily-evidence-desk-title">核验台</a>
     </nav>
 
+    <p class="sr-only" id="daily-live-status" role="status"
+       aria-live="polite" aria-atomic="true">正在加载每日简报。</p>
     <section class="daily-stage" id="daily-stage" aria-busy="true"
-             aria-live="polite" aria-labelledby="daily-highlights-title">
+             aria-labelledby="daily-highlights-title">
       <div class="daily-stage-loading">
         <h2 class="sr-only" id="daily-highlights-title">每日简报加载中</h2>
         <h2 class="sr-only" id="daily-firsthand-title">一手速递加载中</h2>
@@ -413,6 +420,6 @@
   </div>
 </div>
 
-<script src="static/app.js?v=25"></script>
+<script src="static/app.js?v=29"></script>
 </body>
 </html>

@@ -10,10 +10,13 @@ from __future__ import annotations
 
 import math
 import re
+import hashlib
+import ipaddress
+import unicodedata
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 
@@ -22,9 +25,69 @@ STALE_AFTER_SECONDS = 90 * 60
 MAX_HIGHLIGHTS = 5
 MAX_FIRSTHAND = 6
 MAX_WATCHPOINTS = 5
+MAX_SECTION_ITEMS = 6
 EVENT_LOOKBACK_HOURS = 24
 EVENT_QUERY_LIMIT = 240
 MACRO_HISTORY_LIMIT = 72
+
+SECTION_KEYS = ("macro", "world", "finance", "technology", "ai", "investors")
+SECTION_DEFINITIONS: dict[str, tuple[str, str]] = {
+    "macro": ("宏观信息", "央行、通胀、就业、增长、财政与关键经济指标"),
+    "world": ("全球要闻", "地缘政治、政策、贸易与全球供应链变化"),
+    "finance": ("金融要闻", "市场异动、财报、监管、并购与金融体系动态"),
+    "technology": ("科技前沿", "芯片、云、机器人、生物科技与前沿工程进展"),
+    "ai": ("AI 前沿", "模型、算力、AI 产品、研究、融资与治理进展"),
+    "investors": ("投资大师动态", "投资人公开披露、持仓、信件、演讲与访谈"),
+}
+
+# Ninety minutes describes whether a populated rail is currently fresh.  It is
+# deliberately shorter than the 24-hour inclusion window: useful context can
+# remain visible while the UI still tells the reader that this particular rail
+# has not received a recent verified update.
+SECTION_STALE_AFTER_SECONDS = STALE_AFTER_SECONDS
+
+_INVESTOR_KOL_KEYS = {
+    "buffett",
+    "dalio",
+    "duanyongping",
+    "danbin",
+    "dimon",
+    "burry",
+    "howardmarks",
+    "cathiewood",
+    "serenity",
+}
+_MACRO_KOL_KEYS = {"powell", "pangongsheng", "renzeping"}
+_TRACKING_QUERY_KEYS = {
+    "fbclid",
+    "gclid",
+    "ocid",
+    "ref",
+    "ref_src",
+    "spm",
+}
+_SENSITIVE_QUERY_KEYS = {
+    "access_token",
+    "api-key",
+    "api_key",
+    "apikey",
+    "auth",
+    "authorization",
+    "code",
+    "credential",
+    "key",
+    "password",
+    "secret",
+    "session",
+    "sessionid",
+    "sig",
+    "signature",
+    "token",
+    "x-amz-credential",
+    "x-amz-security-token",
+    "x-amz-signature",
+    "x-amz-token",
+}
 
 DISCLAIMER = (
     "仅供信息发现与风险监测，不构成投资建议；请打开原始来源核验，"
@@ -42,9 +105,22 @@ _EVIDENCE_BASES = {
 }
 _IMPACT_RANK = {"high": 3, "medium": 2, "low": 1, "none": 0, "unknown": 0}
 _TIER_RANK = {"official": 3, "first_party": 3, "reporting": 1, "discovery": 0}
+_EVIDENCE_RANK = {
+    "official_body": 3,
+    "indicator_data": 3,
+    "post_text": 3,
+    "title_and_snippet": 2,
+    "title": 1,
+    "title_only": 1,
+}
+_REVISION_PROVENANCE_RANK = {
+    "kol_event": 1,
+    "macro_event": 1,
+    "imported_event": 0,
+}
 _TIER_LABELS = {
     "official": "官方正文",
-    "first_party": "本人原文",
+    "first_party": "一手原文",
     "reporting": "媒体报道",
     "discovery": "聚合线索",
 }
@@ -110,6 +186,269 @@ _ASSET_LABELS = {
     "THEME:GLOBAL_RISK_ASSETS": "全球风险资产",
 }
 
+_AI_RE = re.compile(
+    r"(?:(?<![A-Za-z0-9_])"
+    r"(?:ai|agi|llm|chatgpt|openai|anthropic|deepmind|gemini|claude)"
+    r"(?![A-Za-z0-9_])|"
+    r"人工智能|生成式\s*AI|大模型|基础模型|推理模型|多模态|智能体|"
+    r"机器学习|神经网络|模型训练|模型推理|算力集群)",
+    re.IGNORECASE,
+)
+_TECHNOLOGY_RE = re.compile(
+    r"(?:半导体|芯片|晶圆|光刻|机器人|自动驾驶|量子|云计算|数据中心|"
+    r"网络安全|生物科技|航天|火箭|卫星|软件|开源|开发者|"
+    r"(?<![A-Za-z0-9_])(?:semiconductor|chip|robotics?|quantum|cloud|"
+    r"cybersecurity|biotech|spacex|software|hardware|gpu|cuda)"
+    r"(?![A-Za-z0-9_]))",
+    re.IGNORECASE,
+)
+_MACRO_RE = re.compile(
+    r"(?:央行|美联储|人民银行|货币政策|财政政策|利率决议|加息|降息|"
+    r"通胀|消费者价格|生产者价格|非农|失业率|就业数据|国内生产总值|"
+    r"经济增长|衰退|国债收益率|收益率曲线|"
+    r"(?<![A-Za-z0-9_])(?:pmi|gdp|cpi|ppi|fed|fomc|central bank|"
+    r"inflation|payrolls?|unemployment|interest rates?|rate cut|rate hike|"
+    r"recession|treasury yields?)(?![A-Za-z0-9_]))",
+    re.IGNORECASE,
+)
+_WORLD_RE = re.compile(
+    r"(?:地缘|战争|冲突|军事行动|停火|制裁|关税|贸易战|外交|大选|"
+    r"政府|白宫|国会|欧盟|北约|供应链|伊朗|以色列|乌克兰|俄罗斯|"
+    r"(?<![A-Za-z0-9_])(?:war|conflict|ceasefire|sanctions?|tariffs?|"
+    r"geopolitic|white house|congress|election|nato|iran|israel|ukraine|"
+    r"russia)(?![A-Za-z0-9_]))",
+    re.IGNORECASE,
+)
+_FINANCE_RE = re.compile(
+    r"(?:股市|股票|债券|外汇|汇率|商品|黄金|原油|比特币|加密资产|"
+    r"财报|营收|利润|监管|并购|收购|上市|IPO|基金|银行|保险|"
+    r"(?<![A-Za-z0-9_])(?:stocks?|shares?|bonds?|forex|earnings|revenue|"
+    r"profit|merger|acquisition|ipo|fund|bank|bitcoin|crypto)"
+    r"(?![A-Za-z0-9_]))",
+    re.IGNORECASE,
+)
+_INVESTOR_ACTION_RE = re.compile(
+    r"(?:持仓|加仓|增持|买入|减持|卖出|清仓|建仓|披露|股东信|致股东|"
+    r"投资组合|公开信|访谈|演讲|观点|看好|警告|押注|13F|"
+    r"(?<![A-Za-z0-9_])(?:buys?|bought|adds?|increases?|trims?|cuts?|"
+    r"sells?|sold|stake|portfolio|shareholder letter|filing|interview|"
+    r"speech|bet)(?![A-Za-z0-9_]))",
+    re.IGNORECASE,
+)
+_KNOWN_ENTITY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "vance",
+        re.compile(
+            r"(?:万斯|(?<![A-Za-z0-9_])(?:jd|j\.d\.)\s+vance"
+            r"(?![A-Za-z0-9_]))",
+            re.I,
+        ),
+    ),
+    ("trump", re.compile(r"(?:特朗普|川普|(?<![A-Za-z0-9_])trump(?![A-Za-z0-9_]))", re.I)),
+    ("iran", re.compile(r"(?:伊朗|对伊|(?<![A-Za-z0-9_])iran(?![A-Za-z0-9_]))", re.I)),
+    ("israel", re.compile(r"(?:以色列|(?<![A-Za-z0-9_])israel(?![A-Za-z0-9_]))", re.I)),
+    ("fed", re.compile(r"(?:美联储|(?<![A-Za-z0-9_])(?:fed|fomc)(?![A-Za-z0-9_]))", re.I)),
+    ("pboc", re.compile(r"(?:中国人民银行|(?<![A-Za-z0-9_])pboc(?![A-Za-z0-9_]))", re.I)),
+    ("openai", re.compile(r"(?:OpenAI|开放人工智能)", re.I)),
+    ("nvidia", re.compile(r"(?:英伟达|(?<![A-Za-z0-9_])nvidia(?![A-Za-z0-9_]))", re.I)),
+    ("tesla", re.compile(r"(?:特斯拉|(?<![A-Za-z0-9_])tesla(?![A-Za-z0-9_]))", re.I)),
+    ("apple", re.compile(r"(?:苹果公司|(?<![A-Za-z0-9_])(?:apple|aapl)(?![A-Za-z0-9_]))", re.I)),
+    ("meta", re.compile(r"(?:Meta\s+Platforms|(?<![A-Za-z0-9_])meta(?![A-Za-z0-9_])|脸书)", re.I)),
+    ("amd", re.compile(r"(?:(?<![A-Za-z0-9_])amd(?![A-Za-z0-9_])|超威半导体)", re.I)),
+    ("bitcoin", re.compile(r"(?:比特币|(?<![A-Za-z0-9_])bitcoin(?![A-Za-z0-9_]))", re.I)),
+)
+_TITLE_SYNONYMS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"(?:美国|美)副总统", re.I), ""),
+    (re.compile(r"(?:j\.d\.|jd)\s*vance", re.I), "vance"),
+    (re.compile(r"对伊朗", re.I), "对伊"),
+    (re.compile(r"(?:伊朗军事行动|对伊军事行动)", re.I), "对伊冲突"),
+    (re.compile(r"(?:并不(?:是|算)|并非|不是|不算)", re.I), "非"),
+    (re.compile(r"(?:表示|声称|宣称|说道|说)[:：]?", re.I), "称"),
+    (re.compile(r"(?:最新|快讯|突发)[:：]?", re.I), ""),
+)
+_SEMANTIC_MODAL_RE = re.compile(
+    r"(?:可能|或将|预计|预期|计划|拟于?|有望|据悉|传闻|将于|即将|"
+    r"如果|假如|若(?:非)?|是否|考虑|讨论|研究|评估|"
+    r"明天|明年|下周|下月|下季度|下次会议|未来|"
+    r"将(?:会)?(?=.{0,8}(?:降息|加息|发布|推出|召回|增持|减持|买入|卖出))|"
+    r"(?<![A-Za-z0-9_])(?:may|might|could|would|will|expects?|expected|"
+    r"plans?|planned|reportedly|rumou?red|set\s+to|scheduled\s+to|"
+    r"forecast(?:s|ed)?|likely\s+to|if|"
+    r"next\s+(?:week|month|quarter|year|meeting)|"
+    r"consider(?:s|ed|ing)?|debate(?:s|d|ing)?|weigh(?:s|ed|ing)?|"
+    r"discuss(?:es|ed|ing)?|eye(?:s|d|ing)?|explor(?:e|es|ed|ing)|"
+    r"assess(?:es|ed|ing)?|evaluat(?:e|es|ed|ing)|"
+    r"(?:leave(?:s)?|left)\s+(?:the\s+)?door\s+open)(?![A-Za-z0-9_])|"
+    r"[?？])",
+    re.IGNORECASE,
+)
+_SEMANTIC_HISTORICAL_CONTEXT_RE = re.compile(
+    r"(?:此前|曾经?|去年|上月|上季度|上次会议|前次会议|"
+    r"[0-9一二三四五六七八九十]{1,3}月|"
+    r"(?<![A-Za-z0-9_])(?:after|following|previously|earlier|last\s+year|"
+    r"(?:at\s+(?:its\s+)?|in\s+(?:its\s+)?)previous\s+meeting|"
+    r"in\s+(?:january|february|march|april|may|june|july|august|"
+    r"september|october|november|december|jan|feb|mar|apr|jun|jul|"
+    r"aug|sep|sept|oct|nov|dec))"
+    r"(?![A-Za-z0-9_]))",
+    re.IGNORECASE,
+)
+_SEMANTIC_POSITIVE_ACTION_PATTERNS: tuple[
+    tuple[str, re.Pattern[str]], ...
+] = (
+    (
+        "rate_cut",
+        re.compile(
+            r"(?:降息|下调(?:基准|政策)?利率|\b(?:cut|cuts|cutting|lowered|lowers)\s+"
+            r"(?:the\s+)?(?:policy\s+)?rates?\b)",
+            re.I,
+        ),
+    ),
+    (
+        "rate_hike",
+        re.compile(
+            r"(?:加息|上调(?:基准|政策)?利率|\b(?:hike|hikes|hiked|raise|raises|raised)\s+"
+            r"(?:the\s+)?(?:policy\s+)?rates?\b)",
+            re.I,
+        ),
+    ),
+    (
+        "rate_hold",
+        re.compile(
+            r"(?:维持(?:政策)?利率不变|按兵不动|"
+            r"\b(?:keep|keeps|kept|hold|holds|held|leave|leaves|left)\s+"
+            r"(?:the\s+)?(?:policy\s+)?rates?\s+(?:steady|unchanged)\b)",
+            re.I,
+        ),
+    ),
+    (
+        "product_recall",
+        re.compile(r"(?:召回|撤回产品|\brecall(?:s|ed|ing)?\b)", re.I),
+    ),
+    (
+        "holding_decrease",
+        re.compile(
+            r"(?:减持|卖出|清仓|削减持仓|\b(?:trim|trims|trimmed|sell|sells|sold|"
+            r"cuts?)\s+(?:its\s+)?(?:stake|holding|position|shares?)\b)",
+            re.I,
+        ),
+    ),
+    (
+        "holding_increase",
+        re.compile(
+            r"(?:增持|加仓|买入|建仓|\b(?:buy|buys|bought|add|adds|added|"
+            r"increase|increases|increased)\s+(?:its\s+)?(?:stake|holding|position|shares?)\b)",
+            re.I,
+        ),
+    ),
+    (
+        "product_release",
+        re.compile(
+            r"(?:发布|推出|揭晓|\b(?:release|releases|released|launch|launches|"
+            r"launched|unveil|unveils|unveiled)\b)",
+            re.I,
+        ),
+    ),
+)
+_NARROW_SEMANTIC_CLAIM_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
+    "rate_cut": (
+        re.compile(
+            r"^(?:the\s+)?(?:fed|fomc|pboc)\s+"
+            r"(?:cuts?|cut|lowers?|lowered)\s+(?:the\s+)?"
+            r"(?:(?:policy|benchmark|key)\s+)?rates?\s+(?:by\s+)?"
+            r"\d+(?:\.\d+)?\s*(?:bps?|basis\s+points?)\.?$",
+            re.I,
+        ),
+        re.compile(
+            r"^(?:美联储|中国人民银行|央行)\s*(?:宣布|决定)?\s*"
+            r"(?:降息|下调(?:基准|政策)?利率)\s*\d+(?:\.\d+)?\s*"
+            r"个?基点[。.!！]?$",
+            re.I,
+        ),
+    ),
+    "rate_hike": (
+        re.compile(
+            r"^(?:the\s+)?(?:fed|fomc|pboc)\s+"
+            r"(?:hikes?|hiked|raises?|raised)\s+(?:the\s+)?"
+            r"(?:(?:policy|benchmark|key)\s+)?rates?\s+(?:by\s+)?"
+            r"\d+(?:\.\d+)?\s*(?:bps?|basis\s+points?)\.?$",
+            re.I,
+        ),
+        re.compile(
+            r"^(?:美联储|中国人民银行|央行)\s*(?:宣布|决定)?\s*"
+            r"(?:加息|上调(?:基准|政策)?利率)\s*\d+(?:\.\d+)?\s*"
+            r"个?基点[。.!！]?$",
+            re.I,
+        ),
+    ),
+    "war_denial": (
+        re.compile(
+            r"^(?:美国\s*)?(?:副总统\s*)?万斯\s*(?:表示|声称|宣称|称)?\s*"
+            r"(?:对伊朗?|伊朗)\s*(?:军事行动|冲突)?\s*"
+            r"(?:并非|不是|不算|并不算)\s*(?:一场)?战争[。.!！]?$",
+            re.I,
+        ),
+        re.compile(
+            r"^(?:(?:u\.?s\.?)\s+vice\s+president\s+)?"
+            r"(?:(?:j\.?d\.?)\s+)?vance\s+(?:says?|said|calls?)\s+"
+            r"(?:the\s+)?iran(?:ian)?\s+(?:operation|conflict)\s+"
+            r"(?:is|was)\s+not\s+(?:a\s+)?war\.?$",
+            re.I,
+        ),
+    ),
+    "product_release": (
+        re.compile(
+            r"^openai\s+(?:releases?|released|launches?|launched|"
+            r"unveils?|unveiled)\s+(?:a\s+|an\s+|the\s+)?"
+            r"(?:(?:gpt[- ]?[a-z0-9.]+)(?:\s+(?:ai\s+)?model)?|"
+            r"(?:new\s+)?(?:reasoning|ai|foundation|multimodal)\s+model)"
+            r"(?:\s+(?:for|aimed\s+at)\s+(?:enterprise\s+)?"
+            r"(?:developers?|customers?|users?|businesses?))?[.!]?$",
+            re.I,
+        ),
+        re.compile(
+            r"^(?:openai|开放人工智能)\s*(?:发布|推出|揭晓)\s*(?:新)?"
+            r"(?:gpt[- ]?[a-z0-9.]+(?:\s*模型)?|推理模型|大模型|"
+            r"基础模型|多模态模型)[。.!！]?$",
+            re.I,
+        ),
+        re.compile(
+            r"^(?:新)?(?:推理模型|大模型|基础模型|多模态模型)\s*由\s*"
+            r"(?:openai|开放人工智能)\s*(?:正式)?\s*(?:发布|推出|揭晓)"
+            r"[。.!！]?$",
+            re.I,
+        ),
+    ),
+}
+_PUBLIC_ITEM_FIELDS = (
+    "id",
+    "kind",
+    "title",
+    "summary",
+    "why_it_matters",
+    "impact",
+    "source_tier",
+    "source_label",
+    "source_url",
+    "published_at",
+    "disclosed_at",
+    "effective_at",
+    "fetched_at",
+    "last_updated_at",
+    "time_status",
+    "source_count",
+    "related_records",
+    "kol_name",
+    "ai_status",
+    "ai_summary_used",
+    "evidence_basis",
+    "assets",
+    "rank_reason",
+    "story_key",
+    "primary_section",
+    "cross_tags",
+)
+
 
 def _text(value: Any, maximum: int) -> str:
     if not isinstance(value, (str, int, float)) or isinstance(value, bool):
@@ -158,6 +497,58 @@ def _iso(value: datetime) -> str:
     return value.astimezone(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def _public_temporal(value: Any) -> str:
+    """Normalize an explicit public date/timestamp without inventing a zone."""
+    if isinstance(value, str):
+        raw = value.strip()
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+            try:
+                datetime.strptime(raw, "%Y-%m-%d")
+            except ValueError:
+                return ""
+            return raw
+    parsed = _datetime(value)
+    return _iso(parsed) if parsed is not None else ""
+
+
+def _query_key_is_sensitive(value: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", value).strip()
+    normalized = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", normalized)
+    normalized = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", normalized)
+    normalized = normalized.casefold()
+    normalized = re.sub(r"[^a-z0-9]+", "_", normalized)
+    segments = tuple(part for part in normalized.split("_") if part)
+    sensitive_segments = {
+        "auth",
+        "authorization",
+        "apikey",
+        "bearer",
+        "credential",
+        "jwt",
+        "password",
+        "passwd",
+        "secret",
+        "session",
+        "sessionid",
+        "signature",
+        "token",
+    }
+    compact = normalized.replace("_", "")
+    return (
+        normalized in _SENSITIVE_QUERY_KEYS
+        or any(part in sensitive_segments for part in segments)
+        or any(
+            segments[index : index + 2] in {("api", "key"), ("access", "code")}
+            for index in range(max(0, len(segments) - 1))
+        )
+        or compact.startswith(("clientsecret", "secretkey"))
+        or compact.endswith("apikey")
+        or compact.endswith(
+            ("token", "secret", "password", "credential", "signature", "sessionid")
+        )
+    )
+
+
 def edition_for(value: Any = None) -> tuple[str, str]:
     """Return the edition code and label using Beijing wall-clock cutoffs."""
     local = _now(value).astimezone(BEIJING)
@@ -173,22 +564,88 @@ def edition_for(value: Any = None) -> tuple[str, str]:
 
 def _public_url(value: Any) -> str:
     raw = _text(value, 2_048)
-    if not raw:
+    # WHATWG URL parsers treat backslashes as authority/path separators for
+    # special schemes.  urllib does not, so reject them (and embedded
+    # whitespace) before parsing to keep the browser destination identical to
+    # the server-side safety decision.
+    if not raw or "\\" in raw or any(char.isspace() for char in raw):
         return ""
     try:
         parsed = urlsplit(raw)
         port = parsed.port
     except (TypeError, ValueError):
         return ""
+    scheme = parsed.scheme.lower()
+    raw_host = parsed.hostname or ""
+    # Browsers apply UTS46-style normalization to Unicode/fullwidth numeric
+    # hosts and percent escapes inside an authority.  Reject both categories
+    # instead of letting urllib validate one destination while the click opens
+    # another (for example fullwidth 127.0.0.1 -> loopback).
+    if not raw_host.isascii() or "%" in raw_host:
+        return ""
+    host = raw_host.lower().rstrip(".")
     if (
-        parsed.scheme.lower() not in {"http", "https"}
-        or not parsed.hostname
+        scheme not in {"http", "https"}
+        or not host
         or parsed.username is not None
         or parsed.password is not None
-        or port not in {None, 80, 443}
+        or (
+            port is not None
+            and not (
+                (scheme == "http" and port == 80)
+                or (scheme == "https" and port == 443)
+            )
+        )
     ):
         return ""
-    return raw
+    address = None
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    if address is None and re.fullmatch(
+        r"(?:0x[0-9a-f]+|[0-9]+)(?:\.(?:0x[0-9a-f]+|[0-9]+))*",
+        host,
+        re.IGNORECASE,
+    ):
+        return ""
+    if (
+        host == "localhost"
+        or host.endswith(".localhost")
+        or host.endswith(".local")
+        or (address is None and "." not in host)
+        or "%" in host
+    ):
+        return ""
+    if address is not None and (
+        not address.is_global
+        or address.is_private
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_multicast
+        or address.is_reserved
+        or address.is_unspecified
+    ):
+        return ""
+
+    query_items = parse_qsl(parsed.query, keep_blank_values=True)
+    if any(_query_key_is_sensitive(key) for key, _ in query_items):
+        return ""
+    safe_query = urlencode(
+        sorted(
+            (key, item_value)
+            for key, item_value in query_items
+            if not key.casefold().strip().startswith("utm_")
+            and key.casefold().strip() not in _TRACKING_QUERY_KEYS
+        ),
+        doseq=True,
+    )
+    display_host = f"[{host}]" if address is not None and address.version == 6 else host
+    is_default_port = (scheme == "http" and port == 80) or (
+        scheme == "https" and port == 443
+    )
+    netloc = display_host if port is None or is_default_port else f"{display_host}:{port}"
+    return urlunsplit((scheme, netloc, parsed.path, safe_query, ""))
 
 
 def _host(value: Any) -> str:
@@ -196,6 +653,460 @@ def _host(value: Any) -> str:
         return (urlsplit(str(value or "")).hostname or "").lower().rstrip(".")
     except (TypeError, ValueError):
         return ""
+
+
+def _canonical_identity_url(value: Any) -> str:
+    """Return a comparison-only URL with tracking noise removed.
+
+    The public link remains untouched.  Query parameters are retained unless
+    they are known campaign/referral keys because some regulators and IR sites
+    use a query parameter as the actual document identity.
+    """
+    raw = _public_url(value)
+    if not raw:
+        return ""
+    try:
+        parsed = urlsplit(raw)
+    except (TypeError, ValueError):
+        return ""
+    query = urlencode(
+        sorted(
+            (key, value)
+            for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+            if not key.lower().startswith("utm_")
+            and key.lower() not in _TRACKING_QUERY_KEYS
+        ),
+        doseq=True,
+    )
+    path = re.sub(r"/{2,}", "/", parsed.path or "/")
+    if path != "/":
+        path = path.rstrip("/")
+    host = (parsed.hostname or "").lower().rstrip(".")
+    port = parsed.port
+    netloc = host if port in {None, 80, 443} else f"{host}:{port}"
+    return urlunsplit((parsed.scheme.lower(), netloc, path, query, ""))
+
+
+def _observed_time(item: Mapping[str, Any]) -> datetime | None:
+    for field in (
+        "last_updated_at",
+        "last_seen_at",
+        "published_at",
+        "fetched_at",
+    ):
+        parsed = _datetime(item.get(field))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _publication_time(item: Mapping[str, Any]) -> datetime | None:
+    if _text(item.get("time_status"), 24).lower() != "verified":
+        return None
+    return _datetime(item.get("published_at"))
+
+
+def _latest_timestamp(source: Mapping[str, Any], fields: tuple[str, ...]) -> str:
+    values = [
+        parsed
+        for field in fields
+        if (parsed := _datetime(source.get(field))) is not None
+    ]
+    return _iso(max(values)) if values else ""
+
+
+def _normalized_title(value: Any) -> str:
+    text = unicodedata.normalize("NFKC", _text(value, 240)).casefold()
+    for pattern, replacement in _TITLE_SYNONYMS:
+        text = pattern.sub(replacement, text)
+    # Publisher suffixes and punctuation are presentation differences rather
+    # than story identity.  Keep letters, numbers and CJK characters only.
+    text = re.sub(r"(?:[-–—_|｜]\s*)?(?:路透|reuters|彭博|bloomberg)$", "", text)
+    return re.sub(r"[^0-9a-z\u3400-\u9fff]+", "", text)
+
+
+def _semantic_action(text: str) -> str:
+    if re.search(r"(?:战争|\bwar\b)", text, re.I) and re.search(
+        r"(?:非战争|不是战争|并非战争|not\s+(?:a\s+)?war)", text, re.I
+    ):
+        return "war_denial"
+    negation = (
+        r"(?:不会|可能不会|不太可能|不再|并未|并没有|未曾|未|没有|暂不|"
+        r"无意|不打算|暂无计划|拒绝|避免|放弃|"
+        r"传闻不实|消息不实|并不属实|系谣言|辟谣|否认(?:将|会)?|"
+        r"\b(?:not|never|without|cannot|can't|unlikely\s+to|rules?\s+out|"
+        r"against|refuses?\s+to|refrains?\s+from|avoids?|"
+        r"has\s+no\s+intention\s+of|will\s+not|won't|would\s+not|"
+        r"has\s+not|hasn't|had\s+not|hadn't|does\s+not|"
+        r"doesn't|did\s+not|didn't|is\s+not|isn't|are\s+not|aren't|"
+        r"was\s+not|wasn't|were\s+not|weren't|no\s+plans?\s+to|"
+        r"not\s+(?:currently\s+)?expected\s+to|"
+        r"den(?:y|ies|ied)\s+(?:it\s+)?"
+        r"(?:will|would|has|had)?))"
+    )
+    negated_actions = (
+        (
+            "rate_cut_denial",
+            r"(?:降息|下调(?:基准|政策)?利率|"
+            r"(?:cut|cuts|cutting|lower|lowers|lowered|lowering)\s+"
+            r"(?:the\s+)?(?:policy\s+)?rates?)",
+        ),
+        (
+            "rate_hike_denial",
+            r"(?:加息|上调(?:基准|政策)?利率|"
+            r"(?:hike|hikes|hiked|hiking|raise|raises|raised|raising)\s+"
+            r"(?:the\s+)?(?:policy\s+)?rates?)",
+        ),
+        (
+            "holding_decrease_denial",
+            r"(?:减持|卖出|清仓|削减持仓|"
+            r"(?:trim|trims|trimmed|trimming|sell|sells|sold|selling|"
+            r"cut|cuts|cutting)\s+"
+            r"(?:its\s+)?(?:stake|holding|position|shares?))",
+        ),
+        (
+            "holding_increase_denial",
+            r"(?:增持|加仓|买入|建仓|"
+            r"(?:buy|buys|bought|buying|add|adds|added|adding|increase|"
+            r"increases|increased|increasing)\s+"
+            r"(?:its\s+)?(?:stake|holding|position|shares?))",
+        ),
+        (
+            "product_recall_denial",
+            r"(?:召回|撤回产品|recall(?:s|ed|ing)?)",
+        ),
+        (
+            "product_release_denial",
+            r"(?:发布|推出|揭晓|(?:release|releases|released|releasing|"
+            r"launch|launches|launched|launching|unveil|unveils|unveiled|"
+            r"unveiling))",
+        ),
+    )
+    for action, pattern in negated_actions:
+        # Keep negated claims in a separate bucket even when qualifiers sit
+        # between the negation and action ("not in September cutting", "未如
+        # 预期降息").  A title-level negation is deliberately fail-closed for
+        # deduplication: uncertain grammar should produce fewer merges, never
+        # collapse a denial into an affirmative market-moving event.
+        if re.search(negation, text, re.I) and re.search(pattern, text, re.I):
+            return action
+    for action, pattern in _SEMANTIC_POSITIVE_ACTION_PATTERNS:
+        if action != "rate_hold" and pattern.search(text):
+            return action
+    return ""
+
+
+def _has_ambiguous_action_context(text: str) -> bool:
+    """Fail closed when a headline contains more than one temporal/action claim."""
+    actions = {
+        action
+        for action, pattern in _SEMANTIC_POSITIVE_ACTION_PATTERNS
+        if pattern.search(text)
+    }
+    return len(actions) > 1 or bool(
+        actions and _SEMANTIC_HISTORICAL_CONTEXT_RE.search(text)
+    )
+
+
+def _is_narrow_semantic_claim(text: str, action: str) -> bool:
+    """Allow cross-source semantics only for small, auditable fact grammars."""
+    return any(
+        pattern.fullmatch(text.strip())
+        for pattern in _NARROW_SEMANTIC_CLAIM_PATTERNS.get(action, ())
+    )
+
+
+def _semantic_amounts(text: str) -> tuple[str, ...]:
+    output: set[str] = set()
+    for match in re.finditer(
+        r"(?<!\d)(\d+(?:\.\d+)?)\s*(?:个?基点|bps?\b|basis\s+points?\b)",
+        text,
+        re.I,
+    ):
+        number = float(match.group(1))
+        output.add(f"{number:g}bp")
+    for match in re.finditer(r"(?<!\d)(\d+(?:\.\d+)?)\s*%", text):
+        number = float(match.group(1))
+        output.add(f"{number:g}pct")
+    return tuple(sorted(output))
+
+
+def _semantic_features(item: Mapping[str, Any]) -> tuple[str, ...] | None:
+    """Build a bounded deterministic signature for defensible near-duplicates.
+
+    There is intentionally no general fuzzy match.  A candidate needs a known
+    actor/entity, an explicit directional action, compatible object details and
+    a verified publication-day bucket.  Exact equality prevents transitive
+    cluster drift and keeps runtime linear in the number of candidates.
+    """
+    published = _publication_time(item)
+    if published is None:
+        return None
+    raw_title = _text(item.get("_raw_title") or item.get("title"), 240)
+    if not raw_title:
+        return None
+    normalized_text = unicodedata.normalize("NFKC", raw_title).casefold()
+    action = _semantic_action(normalized_text)
+    english_infinitive = re.search(
+        r"(?<![A-Za-z0-9_])to\s+(?:cut|lower|hike|raise|release|launch|"
+        r"unveil|recall|trim|sell|buy|add|increase)(?![A-Za-z0-9_])",
+        normalized_text,
+        re.I,
+    )
+    if action and (
+        _SEMANTIC_MODAL_RE.search(normalized_text)
+        or english_infinitive
+        or _has_ambiguous_action_context(normalized_text)
+    ):
+        # Forecasts, plans and rumours must never collapse into an observed
+        # event.  Multiple actions and historical clauses are equally unsafe:
+        # a regex cannot reliably decide which clause is the current fact.
+        # Exact/stable source identities can still deduplicate these records;
+        # cross-source semantic merging deliberately abstains.
+        return None
+    if action.endswith("_denial") and action != "war_denial":
+        # Negation scope is too easy to overstate with headline regexes (for
+        # example "cuts rates, not ending QT").  Keep such records distinct
+        # across sources unless their exact URL/title identity already proves
+        # equivalence.  This intentionally trades recall for factual safety.
+        return None
+    if action and not _is_narrow_semantic_claim(normalized_text, action):
+        # Entity/action extraction alone cannot safely distinguish a current
+        # fact from advice, counterfactuals or subordinate clauses.  Unknown
+        # wording stays separate instead of expanding an open-ended denylist.
+        return None
+    title_entities = {
+        key
+        for key, pattern in _KNOWN_ENTITY_PATTERNS
+        if pattern.search(normalized_text)
+    }
+    day_bucket = published.astimezone(BEIJING).date().isoformat()
+    if not action:
+        # Even a named label such as "OpenAI Update" can describe several
+        # unrelated stories on the same day.  Exact-title identity is therefore
+        # URL/stable-ID scoped; cross-source merging requires an explicit action
+        # that passes one of the narrow fact grammars above.
+        return None
+    kol_key = _text(item.get("_kol_key"), 80).lower()
+    asset_entities = {
+        f"asset:{key}"
+        for asset in item.get("assets", [])
+        if isinstance(asset, Mapping)
+        if (key := _text(asset.get("asset_key"), 40).upper())
+    }
+
+    details: set[str] = set(_semantic_amounts(normalized_text))
+    if action in {
+        "rate_cut",
+        "rate_hike",
+        "rate_cut_denial",
+        "rate_hike_denial",
+    }:
+        policy_entities = title_entities.intersection({"fed", "pboc"})
+        if not policy_entities:
+            return None
+        entities = policy_entities
+        details.add("policy_rate")
+    elif action == "war_denial":
+        entities = title_entities.intersection(
+            {"vance", "trump", "iran", "israel"}
+        )
+        if "vance" not in entities or "iran" not in entities:
+            return None
+        details.add("iran_conflict")
+    elif action in {
+        "holding_increase",
+        "holding_decrease",
+        "holding_increase_denial",
+        "holding_decrease_denial",
+    }:
+        entities = title_entities | asset_entities
+        if kol_key:
+            entities.add(f"kol:{kol_key}")
+        # An actor alone is insufficient: two portfolio changes by the same
+        # investor on the same day must not collapse into one story.
+        if len(entities) < 2:
+            return None
+    else:
+        entities = title_entities | asset_entities
+        if not entities:
+            return None
+        if re.search(r"(?:推理模型|reasoning\s+model)", normalized_text, re.I):
+            details.add("reasoning_model")
+        elif re.search(r"(?:大模型|基础模型|\b(?:ai\s+)?model\b)", normalized_text, re.I):
+            details.add("model")
+        product_names = re.findall(
+            r"(?<![A-Za-z0-9_])(?:gpt|claude|gemini|llama|iphone|cuda)"
+            r"[- ]?[a-z0-9.]+(?![A-Za-z0-9_])",
+            normalized_text,
+            re.I,
+        )
+        details.update(name.replace(" ", "-").lower() for name in product_names)
+        if not details:
+            return None
+
+    return (
+        day_bucket,
+        action,
+        ",".join(sorted(entities)),
+        ",".join(sorted(details)),
+    )
+
+
+def _ai_cluster_bucket(item: Mapping[str, Any]) -> str:
+    cluster = _text(item.get("_ai_cluster_key"), 96)
+    if not cluster:
+        return ""
+    # A model cluster is supporting evidence, not permission to erase time,
+    # entity, object or action boundaries.  Reuse the deterministic signature
+    # so a broad model label cannot collapse GPT-6/GPT-7 or assertion/denial.
+    signature = _semantic_features(item)
+    if signature is None:
+        return ""
+    return "\x1f".join((cluster, *signature))
+
+
+def _stable_external_id(source: Mapping[str, Any], *, kind: str) -> str:
+    for field in ("document_id", "accession_id", "official_id", "external_id"):
+        value = _text(source.get(field), 160)
+        if value:
+            return f"{field}:{value.casefold()}"
+    if kind == "macro_event":
+        value = _text(source.get("id"), 160)
+        if value:
+            return f"macro:{value.casefold()}"
+    return ""
+
+
+def _ai_cluster_identity(
+    enrichment: Mapping[str, Any] | None,
+    *,
+    evidence_basis: str,
+) -> str:
+    if enrichment is None or evidence_basis == "title_only":
+        return ""
+    confidence = _finite_number(enrichment.get("confidence"))
+    cluster = _text(enrichment.get("cluster_key"), 96).lower()
+    if confidence is None or confidence < 0.75:
+        return ""
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{2,95}", cluster):
+        return ""
+    return cluster
+
+
+def _section_text(item: Mapping[str, Any]) -> str:
+    values = [
+        item.get("_raw_title"),
+        item.get("title"),
+        item.get("summary"),
+        item.get("why_it_matters"),
+        item.get("kol_name"),
+    ]
+    tags = item.get("_tags")
+    if isinstance(tags, list):
+        values.extend(tags)
+    assets = item.get("assets")
+    if isinstance(assets, list):
+        for asset in assets:
+            if isinstance(asset, Mapping):
+                values.extend((asset.get("asset_key"), asset.get("name_zh")))
+            else:
+                values.append(asset)
+    return " ".join(_text(value, 500) for value in values if value is not None)
+
+
+def _section_matches(
+    text: str,
+    *,
+    kol_key: str,
+    kol_name: str,
+) -> set[str]:
+    matches: set[str] = set()
+    if _AI_RE.search(text) or "THEME:AI" in text.upper():
+        matches.add("ai")
+    if _TECHNOLOGY_RE.search(text) or "THEME:SEMICONDUCTOR" in text.upper():
+        matches.add("technology")
+    if _MACRO_RE.search(text) or kol_key in _MACRO_KOL_KEYS:
+        matches.add("macro")
+    if _WORLD_RE.search(text):
+        matches.add("world")
+    if _FINANCE_RE.search(text):
+        matches.add("finance")
+    if kol_key in _INVESTOR_KOL_KEYS or (
+        _INVESTOR_ACTION_RE.search(text)
+        and kol_name
+        and kol_key not in _MACRO_KOL_KEYS
+        and not _MACRO_RE.search(text)
+    ):
+        matches.add("investors")
+    return matches
+
+
+def _section_memberships(item: Mapping[str, Any]) -> tuple[str, list[str]]:
+    """Choose a fact-led primary section and context-derived cross tags."""
+    kind = _text(item.get("kind"), 40).lower()
+    kol_key = _text(item.get("_kol_key"), 80).lower()
+    kol_name = _text(item.get("kol_name"), 80)
+    section_hint = _text(item.get("_section_hint"), 24).lower()
+    raw_cross = item.get("_cross_tags_hint")
+    # Primary placement is a fact classification.  AI-generated headlines may
+    # add cross-navigation context, but must never move the source event into a
+    # different primary rail.
+    title_text = _text(item.get("_raw_title"), 500) or _text(
+        item.get("title"), 500
+    )
+    primary_matches = _section_matches(
+        title_text,
+        kol_key=kol_key,
+        kol_name=kol_name,
+    )
+    matches = primary_matches | _section_matches(
+        _section_text(item),
+        kol_key=kol_key,
+        kol_name=kol_name,
+    )
+    if section_hint in SECTION_KEYS:
+        matches.add(section_hint)
+    if isinstance(raw_cross, list):
+        matches.update(
+            key
+            for value in raw_cross
+            if (key := _text(value, 24).lower()) in SECTION_KEYS
+        )
+
+    if kind == "imported_event" and section_hint in SECTION_KEYS:
+        # The importer has already validated the source rail.  Content-derived
+        # matches enrich navigation only and must not silently move a persisted
+        # item to a different primary section.
+        primary = section_hint
+    elif kind == "macro_event":
+        primary = "macro"
+    elif kol_key in _MACRO_KOL_KEYS:
+        primary = "macro"
+    elif kol_key in _INVESTOR_KOL_KEYS:
+        primary = "investors"
+    elif primary_matches:
+        primary = next(
+            key
+            for key in (
+                "macro",
+                "world",
+                "investors",
+                "ai",
+                "technology",
+                "finance",
+            )
+            if key in primary_matches
+        )
+    elif section_hint in SECTION_KEYS:
+        primary = section_hint
+    else:
+        # Persisted KOL rows have already passed financial-intelligence gates;
+        # when no narrower classification is defensible, finance is the safe
+        # home rather than inventing a topical claim.
+        primary = "finance"
+    cross_tags = [key for key in SECTION_KEYS if key in matches and key != primary]
+    return primary, cross_tags
 
 
 def _official_host(host: str) -> bool:
@@ -211,20 +1122,28 @@ def _official_host(host: str) -> bool:
 
 
 def _original_social_post(source: Any, url: Any) -> bool:
-    source_text = _text(source, 120).lower()
+    source_text = _text(source, 120).casefold()
     try:
         parsed = urlsplit(str(url or ""))
     except (TypeError, ValueError):
         return False
     host = (parsed.hostname or "").lower().rstrip(".")
-    path = parsed.path.lower()
+    path = unquote(parsed.path)
     if host in {"x.com", "www.x.com", "twitter.com", "www.twitter.com"}:
-        return (
-            (source_text.startswith("x @") or source_text.startswith("twitter @"))
-            and "/status/" in path
+        match = re.fullmatch(
+            r"/([A-Za-z0-9_]{1,15})/status/([0-9]+)(?:/.*)?",
+            path,
         )
+        if match is None:
+            return False
+        prefix = "x @" if host in {"x.com", "www.x.com"} else "twitter @"
+        return source_text == f"{prefix}{match.group(1).casefold()}"
     if host in {"truthsocial.com", "www.truthsocial.com"}:
-        return source_text.startswith("truth social @") and "/@" in path
+        match = re.fullmatch(r"/@([^/]+)/(?:posts/)?([0-9]+)(?:/.*)?", path)
+        return bool(
+            match is not None
+            and source_text == f"truth social @{match.group(1).casefold()}"
+        )
     return False
 
 
@@ -430,6 +1349,14 @@ def _event_highlight(source: Mapping[str, Any]) -> dict[str, Any] | None:
         "ai_status": ai_status,
         "ai_summary_used": enrichment is not None,
         "evidence_basis": evidence_basis,
+        "_trusted_evidence_basis": trusted_basis,
+        "_raw_title": original_title,
+        "_canonical_url": _canonical_identity_url(
+            source.get("canonical_url") or source_url
+        ),
+        "_stable_external_id": _stable_external_id(source, kind="kol_event"),
+        "_kol_key": _text(source.get("kol_key"), 80).lower(),
+        "_kind_hint": _text(source.get("kind") or source.get("event_type"), 40),
     }
     if enrichment is not None:
         why = _text(enrichment.get("why_it_matters_zh"), 320)
@@ -438,6 +1365,19 @@ def _event_highlight(source: Mapping[str, Any]) -> dict[str, Any] | None:
             item["why_it_matters"] = why
         if assets:
             item["assets"] = assets
+        tags = enrichment.get("tags")
+        if isinstance(tags, list):
+            item["_tags"] = [
+                value
+                for raw in tags[:8]
+                if (value := _text(raw, 40))
+            ]
+        cluster = _ai_cluster_identity(
+            enrichment,
+            evidence_basis=trusted_basis,
+        )
+        if cluster:
+            item["_ai_cluster_key"] = cluster
     if source_url:
         item["source_url"] = source_url
     for field in ("published_at", "fetched_at"):
@@ -448,11 +1388,17 @@ def _event_highlight(source: Mapping[str, Any]) -> dict[str, Any] | None:
     if time_status:
         item["time_status"] = time_status
     related = source.get("source_count")
-    if isinstance(related, int) and not isinstance(related, bool) and related >= 0:
+    if isinstance(related, int) and not isinstance(related, bool) and related >= 1:
         item["related_records"] = related
+        item["source_count"] = related
     kol_name = _text(source.get("kol_name_cn") or source.get("kol_name"), 80)
     if kol_name:
         item["kol_name"] = kol_name
+    # A re-fetch is collection metadata, not proof that the underlying report
+    # changed.  Keep the public evidence timestamp anchored to publication.
+    last_updated = _latest_timestamp(source, ("published_at",))
+    if last_updated:
+        item["last_updated_at"] = last_updated
     item["rank_reason"] = _rank_reason(item)
     return item
 
@@ -495,6 +1441,14 @@ def _macro_highlight(source: Mapping[str, Any], macro: Mapping[str, Any]) -> dic
         "ai_status": ai_status,
         "ai_summary_used": enrichment is not None,
         "evidence_basis": evidence_basis,
+        "_trusted_evidence_basis": trusted_basis,
+        "_raw_title": original_title,
+        "_canonical_url": _canonical_identity_url(
+            source.get("content_source_url") or source.get("url")
+        ),
+        "_stable_external_id": _stable_external_id(source, kind="macro_event"),
+        "_kol_key": "",
+        "_kind_hint": _text(source.get("kind"), 40),
     }
     if enrichment is not None:
         why = _text(enrichment.get("why_it_matters_zh"), 320)
@@ -503,6 +1457,19 @@ def _macro_highlight(source: Mapping[str, Any], macro: Mapping[str, Any]) -> dic
             item["why_it_matters"] = why
         if assets:
             item["assets"] = assets
+        tags = enrichment.get("tags")
+        if isinstance(tags, list):
+            item["_tags"] = [
+                value
+                for raw in tags[:8]
+                if (value := _text(raw, 40))
+            ]
+        cluster = _ai_cluster_identity(
+            enrichment,
+            evidence_basis=trusted_basis,
+        )
+        if cluster:
+            item["_ai_cluster_key"] = cluster
     if source_url:
         item["source_url"] = source_url
     published = _text(source.get("published_at"), 64)
@@ -514,38 +1481,673 @@ def _macro_highlight(source: Mapping[str, Any], macro: Mapping[str, Any]) -> dic
     time_status = _text(source.get("time_status"), 24).lower()
     if time_status:
         item["time_status"] = time_status
+    # The macro snapshot generation time is a collector heartbeat, not a
+    # revision time for the linked policy/indicator event.
+    last_updated = _latest_timestamp(source, ("published_at",))
+    if last_updated:
+        item["last_updated_at"] = last_updated
     item["rank_reason"] = _rank_reason(item)
     return item
 
 
+def _imported_highlight(
+    source: Mapping[str, Any],
+    *,
+    section_hint: str,
+    now: datetime,
+) -> dict[str, Any] | None:
+    """Project one already-validated imported snapshot item conservatively.
+
+    A fetch timestamp proves discovery, not publication.  Therefore only rows
+    with a verified, in-window publication time may enter the news rails.
+    """
+    if _text(source.get("time_status"), 24).lower() != "verified":
+        return None
+    published = _datetime(source.get("published_at"))
+    if (
+        published is None
+        or published > now
+        or published < now - timedelta(hours=EVENT_LOOKBACK_HOURS)
+    ):
+        return None
+    title = _text(source.get("title"), 180)
+    if not title:
+        return None
+    source_url = _public_url(
+        source.get("source_url") or source.get("canonical_url")
+    )
+    if not source_url:
+        return None
+
+    raw_tier = _text(source.get("source_tier"), 24).lower()
+    host = _host(source_url)
+    if raw_tier == "official" and _official_host(host):
+        tier = "official"
+    elif raw_tier == "first_party" and _original_social_post(
+        source.get("source_label") or source.get("source"), source_url
+    ):
+        tier = "first_party"
+    else:
+        classified = classify_source(source, source_url=source_url)
+        tier = (
+            "reporting"
+            if raw_tier in {"media", "reporting"}
+            and classified == "reporting"
+            else "discovery"
+        )
+    # Directness and evidence depth are separate claims.  A first-party or
+    # official URL does not prove that the snapshot contains the body/post.
+    evidence_basis = (
+        "title_and_snippet"
+        if _text(source.get("summary"), 420)
+        else "title_only"
+    )
+
+    summary = _text(source.get("summary"), 420) or title
+    item: dict[str, Any] = {
+        "id": _text(source.get("story_key"), 80),
+        "kind": "imported_event",
+        "title": title,
+        "summary": summary,
+        # v1 intentionally has no producer-controlled importance score.
+        # Imported priority is derived from validated source directness and
+        # publication time instead of trusting an undeclared field.
+        "impact": "unknown",
+        "source_tier": tier,
+        "source_label": _text(
+            source.get("source_label") or source.get("source"), 120
+        )
+        or _host(source_url)
+        or "导入来源",
+        "source_url": source_url,
+        "published_at": _iso(published),
+        "time_status": "verified",
+        "ai_status": "ineligible",
+        "ai_summary_used": False,
+        "evidence_basis": evidence_basis,
+        "_trusted_evidence_basis": evidence_basis,
+        "_raw_title": title,
+        "_canonical_url": _canonical_identity_url(
+            source.get("canonical_url") or source_url
+        ),
+        "_stable_external_id": (
+            f"imported_story:{_text(source.get('story_key'), 120).casefold()}"
+            if _text(source.get("story_key"), 120)
+            else ""
+        ),
+        "_kol_key": _text(source.get("kol_key"), 80).lower(),
+        "_kind_hint": _text(source.get("kind"), 40),
+        "_section_hint": section_hint,
+    }
+    cross_tags = source.get("cross_tags")
+    if isinstance(cross_tags, list):
+        item["_cross_tags_hint"] = list(cross_tags[:6])
+    why = _text(source.get("why_it_matters"), 320)
+    if why:
+        item["why_it_matters"] = why
+    assets: list[dict[str, str]] = []
+    raw_assets = source.get("assets")
+    if isinstance(raw_assets, list):
+        for raw in raw_assets:
+            if isinstance(raw, Mapping):
+                asset_key = _text(raw.get("asset_key"), 40).upper()
+            else:
+                asset_key = _text(raw, 40).upper()
+            if _ASSET_KEY_RE.fullmatch(asset_key):
+                assets.append({"asset_key": asset_key})
+            if len(assets) >= 6:
+                break
+    if assets:
+        item["assets"] = assets
+    count = source.get("source_count")
+    if isinstance(count, int) and not isinstance(count, bool) and count >= 1:
+        item["source_count"] = count
+        item["related_records"] = count
+    # Re-fetching a persisted snapshot does not update the underlying news.
+    # Until an upstream revision has its own verified publication timestamp,
+    # the public update time is the verified publication time itself.
+    item["last_updated_at"] = _iso(published)
+    disclosed_at = _public_temporal(source.get("disclosed_at"))
+    if disclosed_at:
+        item["disclosed_at"] = disclosed_at
+    effective_at = ""
+    for field in ("effective_at", "period_end", "data_as_of"):
+        effective_at = _public_temporal(source.get(field))
+        if effective_at:
+            break
+    if effective_at:
+        item["effective_at"] = effective_at
+    item["rank_reason"] = _rank_reason(item)
+    return item
+
+
+def _imported_candidates(
+    snapshot: Mapping[str, Any] | None,
+    *,
+    now: datetime,
+) -> list[dict[str, Any]]:
+    if not _imported_snapshot_shape_is_valid(snapshot):
+        return []
+    assert isinstance(snapshot, Mapping)
+    sections = snapshot.get("sections")
+    assert isinstance(sections, Mapping)
+
+    output: list[dict[str, Any]] = []
+    for key in SECTION_KEYS:
+        raw_items = sections.get(key)
+        assert isinstance(raw_items, list)  # validated above
+        for raw in raw_items:
+            if not isinstance(raw, Mapping):
+                continue
+            item = _imported_highlight(raw, section_hint=key, now=now)
+            if item is not None:
+                output.append(item)
+    return output
+
+
+def _imported_snapshot_shape_is_valid(
+    snapshot: Mapping[str, Any] | None,
+) -> bool:
+    if not isinstance(snapshot, Mapping):
+        return False
+    version = snapshot.get("schema_version")
+    if not isinstance(version, int) or isinstance(version, bool):
+        return False
+    if version != 1:
+        return False
+    sections = snapshot.get("sections")
+    if not isinstance(sections, Mapping):
+        return False
+    if set(sections) != set(SECTION_KEYS):
+        return False
+    total = 0
+    for key in SECTION_KEYS:
+        raw_items = sections.get(key)
+        if not isinstance(raw_items, list) or len(raw_items) > 80:
+            return False
+        total += len(raw_items)
+    if total > 300:
+        return False
+    return True
+
+
+def _imported_source_coverage_as_of(
+    snapshot: Mapping[str, Any] | None,
+    *,
+    now: datetime,
+) -> datetime | None:
+    if not _imported_snapshot_shape_is_valid(snapshot):
+        return None
+    assert isinstance(snapshot, Mapping)
+    value = _datetime(snapshot.get("source_as_of"))
+    return value if value is not None and value <= now else None
+
+
 def _highlight_time(item: Mapping[str, Any]) -> datetime:
-    for field in ("published_at", "fetched_at"):
-        parsed = _datetime(item.get(field))
-        if parsed is not None:
-            return parsed
-    return datetime.min.replace(tzinfo=timezone.utc)
+    return _publication_time(item) or datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _publication_day_bucket(item: Mapping[str, Any]) -> str:
+    published = _publication_time(item)
+    return published.astimezone(BEIJING).date().isoformat() if published else ""
+
+
+def _exact_compatibility_bucket(item: Mapping[str, Any]) -> str:
+    signature = _semantic_features(item)
+    if signature is not None:
+        return "semantic\x1f" + "\x1f".join(signature[1:])
+    normalized = _normalized_title(item.get("_raw_title") or item.get("title"))
+    return "title\x1f" + normalized if normalized else ""
+
+
+def _stable_id_bucket(item: Mapping[str, Any]) -> str:
+    value = _text(item.get("_stable_external_id"), 200)
+    day = _publication_day_bucket(item)
+    compatibility = _exact_compatibility_bucket(item)
+    return (
+        "\x1f".join((value, day, compatibility))
+        if value and day and compatibility
+        else ""
+    )
+
+
+def _canonical_url_bucket(item: Mapping[str, Any]) -> str:
+    value = _text(item.get("_canonical_url"), 2_048)
+    day = _publication_day_bucket(item)
+    compatibility = _exact_compatibility_bucket(item)
+    return (
+        "\x1f".join((value, day, compatibility))
+        if value and day and compatibility
+        else ""
+    )
 
 
 def _highlight_rank(item: Mapping[str, Any]) -> tuple[int, int, float, str, str]:
     return (
-        -_IMPACT_RANK.get(_text(item.get("impact"), 24).lower(), 0),
         -_TIER_RANK.get(_text(item.get("source_tier"), 24).lower(), 0),
+        -_IMPACT_RANK.get(_text(item.get("impact"), 24).lower(), 0),
         -_highlight_time(item).timestamp(),
         _text(item.get("kind"), 24),
         _text(item.get("id"), 80),
     )
 
 
-def _deduplicate(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    output: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for item in sorted(items, key=_highlight_rank):
-        url = _text(item.get("source_url"), 2_048).lower()
-        identity = url or _text(item.get("title"), 180).casefold()
-        if not identity or identity in seen:
+def _primary_source_rank(item: Mapping[str, Any]) -> tuple[int, int, float, str]:
+    return (
+        -_TIER_RANK.get(_text(item.get("source_tier"), 24).lower(), 0),
+        -_IMPACT_RANK.get(_text(item.get("impact"), 24).lower(), 0),
+        -_highlight_time(item).timestamp(),
+        _text(item.get("source_url"), 2_048),
+    )
+
+
+def _revision_rank(
+    item: Mapping[str, Any],
+) -> tuple[int, int, float, int, float, int, str]:
+    publication = _highlight_time(item)
+    observed = _observed_time(item) or publication
+    return (
+        # A later low-trust import must never replace a validated native
+        # record merely because both resolve to the same canonical URL.  Once
+        # source trust and evidence depth are equal, the latest verified
+        # publication is the representative revision; provenance only breaks
+        # a true timestamp tie.
+        -_TIER_RANK.get(_text(item.get("source_tier"), 24).lower(), 0),
+        -_EVIDENCE_RANK.get(
+            _text(
+                item.get("_trusted_evidence_basis") or item.get("evidence_basis"),
+                40,
+            ).lower(),
+            0,
+        ),
+        -publication.timestamp(),
+        -_REVISION_PROVENANCE_RANK.get(_text(item.get("kind"), 24), 0),
+        -observed.timestamp(),
+        -_IMPACT_RANK.get(_text(item.get("impact"), 24).lower(), 0),
+        _text(item.get("id"), 80),
+    )
+
+
+def _revision_trust_key(item: Mapping[str, Any]) -> tuple[int, int]:
+    return (
+        _TIER_RANK.get(_text(item.get("source_tier"), 24).lower(), 0),
+        _EVIDENCE_RANK.get(
+            _text(
+                item.get("_trusted_evidence_basis") or item.get("evidence_basis"),
+                40,
+            ).lower(),
+            0,
+        ),
+    )
+
+
+def _story_key(group: list[Mapping[str, Any]]) -> str:
+    stable = sorted(
+        value
+        for item in group
+        if (value := _text(item.get("_stable_external_id"), 200))
+    )
+    urls = sorted(
+        value
+        for item in group
+        if (value := _text(item.get("_canonical_url"), 2_048))
+    )
+    clusters = sorted(
+        value
+        for item in group
+        if (value := _text(item.get("_ai_cluster_key"), 96))
+    )
+    if stable:
+        day = _publication_day_bucket(group[0])
+        compatibility = _exact_compatibility_bucket(group[0])
+        identity = "stable\x1f" + stable[0] + "\x1f" + day + "\x1f" + compatibility
+    elif urls:
+        days = sorted(
+            value for item in group if (value := _publication_day_bucket(item))
+        )
+        compatibility = _exact_compatibility_bucket(group[0])
+        identity = (
+            "url\x1f"
+            + urls[0]
+            + "\x1f"
+            + (days[0] if days else "")
+            + "\x1f"
+            + compatibility
+        )
+    elif clusters:
+        identity = "cluster\x1f" + clusters[0]
+    else:
+        normalized = sorted(
+            value
+            for item in group
+            if (
+                value := _normalized_title(
+                    item.get("_raw_title") or item.get("title")
+                )
+            )
+        )
+        identity = "title\x1f" + (normalized[0] if normalized else "unknown")
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return f"story_{digest[:24]}"
+
+
+def _merge_duplicate_group(
+    group: list[dict[str, Any]],
+    *,
+    prefer_latest_revision: bool = False,
+) -> dict[str, Any]:
+    base = dict(
+        min(
+            group,
+            key=_revision_rank if prefer_latest_revision else _primary_source_rank,
+        )
+    )
+    if not prefer_latest_revision:
+        highest_impact = max(
+            (_impact(item.get("impact")) for item in group),
+            key=lambda value: _IMPACT_RANK.get(value, 0),
+            default="unknown",
+        )
+        base["impact"] = highest_impact
+
+    base_trust = _revision_trust_key(base)
+    trusted_group = [
+        item for item in group if _revision_trust_key(item) == base_trust
+    ]
+    if prefer_latest_revision and _impact(base.get("impact")) == "unknown":
+        base["impact"] = max(
+            (_impact(item.get("impact")) for item in trusted_group),
+            key=lambda value: _IMPACT_RANK.get(value, 0),
+            default="unknown",
+        )
+    observed = [
+        value
+        for item in trusted_group
+        if (value := _observed_time(item))
+    ]
+    if observed:
+        base["last_updated_at"] = _iso(max(observed))
+
+    reported_counts = [
+        count
+        for item in group
+        if isinstance((count := item.get("source_count")), int)
+        and not isinstance(count, bool)
+        and count >= 1
+    ]
+    source_urls = {
+        value
+        for item in group
+        if (value := _text(item.get("_canonical_url"), 2_048))
+    }
+    if reported_counts or len(group) > 1:
+        source_count = max(
+            max(reported_counts, default=0),
+            len(source_urls),
+            len(group),
+        )
+        base["source_count"] = source_count
+        base["related_records"] = source_count
+
+    for field in ("disclosed_at", "effective_at"):
+        if field in base:
             continue
-        seen.add(identity)
-        output.append(item)
+        for item in sorted(group, key=_primary_source_rank):
+            value = _text(item.get(field), 64)
+            if value:
+                base[field] = value
+                break
+
+    for field in ("_tags", "_cross_tags_hint"):
+        merged: list[str] = []
+        seen: set[str] = set()
+        for item in group:
+            values = item.get(field)
+            if not isinstance(values, list):
+                continue
+            for raw in values:
+                value = _text(raw, 40)
+                if value and value not in seen:
+                    seen.add(value)
+                    merged.append(value)
+        if merged:
+            base[field] = merged[:12]
+    section_hints = [
+        value
+        for item in group
+        if (value := _text(item.get("_section_hint"), 24)) in SECTION_KEYS
+    ]
+    if section_hints and not _text(base.get("_section_hint"), 24):
+        base["_section_hint"] = section_hints[0]
+
+    base["story_key"] = _story_key(group)
+    base["rank_reason"] = _rank_reason(base)
+    return base
+
+
+def _deduplicate_with_stats(
+    items: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    parents = list(range(len(items)))
+
+    def find(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(left: int, right: int) -> bool:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root == right_root:
+            return False
+        parents[right_root] = left_root
+        return True
+
+    stats = {
+        "input_count": len(items),
+        "output_count": 0,
+        "merged_count": 0,
+        "stable_id_matches": 0,
+        "canonical_url_matches": 0,
+        "ai_cluster_matches": 0,
+        "semantic_matches": 0,
+    }
+    indexes: dict[str, dict[str, int]] = {
+        "stable": {},
+        "url": {},
+        "cluster": {},
+    }
+    for index, item in enumerate(items):
+        exact_values = (
+            (
+                "stable",
+                _stable_id_bucket(item),
+                "stable_id_matches",
+            ),
+            (
+                "url",
+                _canonical_url_bucket(item),
+                "canonical_url_matches",
+            ),
+            (
+                "cluster",
+                _ai_cluster_bucket(item),
+                "ai_cluster_matches",
+            ),
+        )
+        for namespace, value, stat_key in exact_values:
+            if not value:
+                continue
+            previous = indexes[namespace].get(value)
+            if previous is not None and union(index, previous):
+                stats[stat_key] += 1
+            indexes[namespace][value] = index
+
+    groups: dict[int, list[dict[str, Any]]] = {}
+    for index, item in enumerate(items):
+        groups.setdefault(find(index), []).append(item)
+    exact_output: list[dict[str, Any]] = []
+    for group in groups.values():
+        stable_values = [
+            value for item in group if (value := _stable_id_bucket(item))
+        ]
+        url_values = [
+            value for item in group if (value := _canonical_url_bucket(item))
+        ]
+        shared_revision_identity = (
+            len(stable_values) != len(set(stable_values))
+            or len(url_values) != len(set(url_values))
+        )
+        exact_output.append(
+            _merge_duplicate_group(
+                group,
+                prefer_latest_revision=shared_revision_identity,
+            )
+        )
+
+    # Semantic clustering is a second, linear pass over exact clusters.  Only
+    # identical deterministic signatures share a bucket; no pairwise fuzzy
+    # union means one marginal title cannot transitively join two stories.
+    semantic_groups: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+    unmatched: list[dict[str, Any]] = []
+    for item in exact_output:
+        signature = _semantic_features(item)
+        if signature is None:
+            unmatched.append(item)
+        else:
+            semantic_groups.setdefault(signature, []).append(item)
+    output = list(unmatched)
+    for group in semantic_groups.values():
+        output.append(_merge_duplicate_group(group))
+        stats["semantic_matches"] += len(group) - 1
+    output.sort(key=_highlight_rank)
+    stats["output_count"] = len(output)
+    stats["merged_count"] = len(items) - len(output)
+    return output, stats
+
+
+def _deduplicate(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Compatibility wrapper for callers that only need the clustered items."""
+    return _deduplicate_with_stats(items)[0]
+
+
+def _section_rank(
+    item: Mapping[str, Any],
+    *,
+    now: datetime,
+) -> tuple[int, int, int, float, str]:
+    publication = _publication_time(item)
+    tier = _TIER_RANK.get(_text(item.get("source_tier"), 24).lower(), 0)
+    is_fresh = (
+        publication is not None
+        and publication <= now
+        and (now - publication).total_seconds() <= SECTION_STALE_AFTER_SECONDS
+    )
+    # Recent verified official/first-party/reporting evidence leads.  A stale
+    # primary source still beats a fresh discovery-only lead, but it cannot
+    # saturate all six cards and hide current verified reporting.
+    freshness_quality = (
+        0 if is_fresh and tier >= 1 else 1 if tier >= 1 else 2 if is_fresh else 3
+    )
+    return (
+        freshness_quality,
+        -tier,
+        -_IMPACT_RANK.get(_text(item.get("impact"), 24).lower(), 0),
+        -_highlight_time(item).timestamp(),
+        _text(item.get("story_key"), 80),
+    )
+
+
+def _public_item(item: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: item[key]
+        for key in _PUBLIC_ITEM_FIELDS
+        if key in item
+    }
+
+
+def _section_payloads(
+    items: list[dict[str, Any]],
+    *,
+    now: datetime,
+) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+    grouped: dict[str, list[dict[str, Any]]] = {key: [] for key in SECTION_KEYS}
+    for item in items:
+        primary, cross_tags = _section_memberships(item)
+        item["primary_section"] = primary
+        item["cross_tags"] = cross_tags
+        grouped[primary].append(item)
+
+    sections: list[dict[str, Any]] = []
+    selected: dict[str, list[dict[str, Any]]] = {}
+    for key in SECTION_KEYS:
+        ranked = sorted(grouped[key], key=lambda item: _section_rank(item, now=now))
+        selected[key] = ranked[:MAX_SECTION_ITEMS]
+        observed = [
+            value
+            for item in selected[key]
+            if (value := _publication_time(item)) is not None and value <= now
+        ]
+        as_of = max(observed) if observed else None
+        stale = (
+            as_of is None
+            or (now - as_of).total_seconds() > SECTION_STALE_AFTER_SECONDS
+        )
+        label, description = SECTION_DEFINITIONS[key]
+        sections.append(
+            {
+                "key": key,
+                "label": label,
+                "description": description,
+                "source_as_of": _iso(as_of) if as_of is not None else None,
+                "stale": stale,
+                "status": "empty" if not ranked else "stale" if stale else "fresh",
+                "verified_count": sum(
+                    item.get("time_status") == "verified" for item in ranked
+                ),
+                "total_count": len(ranked),
+                "items": [_public_item(item) for item in selected[key]],
+            }
+        )
+    return sections, selected
+
+
+def _top_highlights(
+    selected: Mapping[str, list[dict[str, Any]]],
+    *,
+    now: datetime,
+) -> list[dict[str, Any]]:
+    """Select Top 5 from section contents with a one-per-section first pass."""
+    output: list[dict[str, Any]] = []
+    used: set[str] = set()
+    heads = [
+        items[0]
+        for key in SECTION_KEYS
+        if (items := selected.get(key))
+    ]
+    for item in sorted(heads, key=lambda item: _section_rank(item, now=now)):
+        story_key = _text(item.get("story_key"), 80)
+        if story_key and story_key not in used:
+            used.add(story_key)
+            output.append(item)
+        if len(output) >= MAX_HIGHLIGHTS:
+            return output
+    remainder = sorted(
+        (
+            item
+            for key in SECTION_KEYS
+            for item in selected.get(key, [])[1:]
+        ),
+        key=lambda item: _section_rank(item, now=now),
+    )
+    for item in remainder:
+        story_key = _text(item.get("story_key"), 80)
+        if story_key and story_key not in used:
+            used.add(story_key)
+            output.append(item)
+        if len(output) >= MAX_HIGHLIGHTS:
+            break
     return output
 
 
@@ -621,6 +2223,9 @@ def _watchpoints(decision_record: Mapping[str, Any] | None) -> list[dict[str, An
         count = raw.get("source_count")
         if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
             item["source_count"] = count
+        data_as_of = _public_temporal(raw.get("data_as_of"))
+        if data_as_of:
+            item["data_as_of"] = data_as_of
         score = _finite_number(raw.get("total_score")) or 0.0
         ranked.append(
             (
@@ -700,8 +2305,7 @@ def _lead(
 def _source_as_of(
     items: list[Mapping[str, Any]],
     macro: Mapping[str, Any] | None,
-    history: list[Mapping[str, Any]],
-    decision_record: Mapping[str, Any] | None,
+    watchpoints: list[Mapping[str, Any]],
     *,
     now: datetime,
 ) -> datetime | None:
@@ -713,20 +2317,15 @@ def _source_as_of(
             values.append(parsed)
 
     for item in items:
-        for field in ("published_at", "fetched_at"):
-            append_if_observed(item.get(field))
+        if _text(item.get("time_status"), 24).lower() == "verified":
+            append_if_observed(item.get("published_at"))
     if isinstance(macro, Mapping):
         for field in ("timestamp", "created_at"):
             append_if_observed(macro.get(field))
-    for item in history:
-        append_if_observed(item.get("created_at"))
-    if isinstance(decision_record, Mapping):
-        summary = decision_record.get("summary")
-        cards = summary.get("decisions") if isinstance(summary, Mapping) else None
-        if isinstance(cards, list):
-            for card in cards:
-                if isinstance(card, Mapping):
-                    append_if_observed(card.get("data_as_of"))
+    for item in watchpoints:
+        # Date-only disclosures stay visible in the card, but are not coerced
+        # into an invented instant for a global freshness promise.
+        append_if_observed(item.get("data_as_of"))
     return max(values) if values else None
 
 
@@ -748,6 +2347,7 @@ def build_latest_briefing(
     repository: Any,
     public_macro: Mapping[str, Any] | None,
     decision_record: Mapping[str, Any] | None,
+    imported_snapshot: Mapping[str, Any] | None = None,
     now: Any = None,
 ) -> dict[str, Any]:
     """Build one stable Daily payload from already-persisted public data."""
@@ -780,38 +2380,81 @@ def build_latest_briefing(
             if _is_current_verified_macro_event(source, now=current)
             if (item := _macro_highlight(source, macro)) is not None
         )
-    ranked = _deduplicate(candidates)
-    highlights = ranked[:MAX_HIGHLIGHTS]
-    firsthand = [
-        item
-        for item in ranked
-        if item.get("source_tier") in {"official", "first_party"}
-    ][:MAX_FIRSTHAND]
+    candidates.extend(_imported_candidates(imported_snapshot, now=current))
+    ranked, dedup_stats = _deduplicate_with_stats(candidates)
+    sections, selected_by_section = _section_payloads(ranked, now=current)
+    highlight_items = _top_highlights(selected_by_section, now=current)
+    highlights = [_public_item(item) for item in highlight_items]
+    public_ranked = [_public_item(item) for item in ranked]
+    firsthand = sorted(
+        (
+            item
+            for item in public_ranked
+            if item.get("source_tier") in {"official", "first_party"}
+        ),
+        key=lambda item: _section_rank(item, now=current),
+    )[:MAX_FIRSTHAND]
     watchpoints = _watchpoints(decision_record)
-    as_of = _source_as_of(
-        ranked,
-        macro,
-        safe_history,
-        decision_record,
+    source_coverage_as_of = _imported_source_coverage_as_of(
+        imported_snapshot,
         now=current,
     )
-    available = bool(ranked or macro or watchpoints)
+    displayed_items_by_story: dict[str, Mapping[str, Any]] = {}
+    for section_items in selected_by_section.values():
+        for item in section_items:
+            displayed_items_by_story[_text(item.get("story_key"), 80)] = item
+    for item in firsthand:
+        displayed_items_by_story[_text(item.get("story_key"), 80)] = item
+    as_of = _source_as_of(
+        list(displayed_items_by_story.values()),
+        macro,
+        watchpoints,
+        now=current,
+    )
+    available = bool(ranked or macro or watchpoints or source_coverage_as_of)
     age_seconds = (
         max(0.0, (current - as_of).total_seconds()) if as_of is not None else None
     )
+    coverage_age_seconds = (
+        max(0.0, (current - source_coverage_as_of).total_seconds())
+        if source_coverage_as_of is not None
+        else None
+    )
+    public_as_of = _iso(as_of) if as_of is not None else None
     return {
         "available": available,
         "date": current.astimezone(BEIJING).date().isoformat(),
         "edition": edition,
         "edition_label": edition_label,
         "generated_at": _iso(current),
-        "source_as_of": _iso(as_of) if as_of is not None else None,
+        "coverage_window_hours": EVENT_LOOKBACK_HOURS,
+        # The historical OpenClaw 10:00 job is only a migrated contract, not
+        # an active scheduler.  Do not present a guessed refresh promise.
+        "next_refresh_at": None,
+        "refresh_schedule_status": "unconfigured",
+        # ``source_as_of`` remains as a compatibility alias for the latest
+        # displayed evidence.  The imported batch coverage has a separate
+        # field so an empty successful scan is not confused with cron failure.
+        "source_as_of": public_as_of,
+        "content_as_of": public_as_of,
+        "source_coverage_as_of": (
+            _iso(source_coverage_as_of)
+            if source_coverage_as_of is not None
+            else None
+        ),
+        "source_coverage_stale": (
+            coverage_age_seconds > STALE_AFTER_SECONDS
+            if coverage_age_seconds is not None
+            else None
+        ),
         "stale": age_seconds is None or age_seconds > STALE_AFTER_SECONDS,
-        "coverage": _coverage(ranked),
+        "coverage": _coverage(public_ranked),
+        "dedup_stats": dedup_stats,
         "lead": _lead(highlights, macro, safe_history),
         "highlights": highlights,
         "firsthand": firsthand,
         "watchpoints": watchpoints,
+        "sections": sections,
         "disclaimer": DISCLAIMER,
     }
 
@@ -819,7 +2462,9 @@ def build_latest_briefing(
 __all__ = [
     "MAX_FIRSTHAND",
     "MAX_HIGHLIGHTS",
+    "MAX_SECTION_ITEMS",
     "MAX_WATCHPOINTS",
+    "SECTION_KEYS",
     "build_latest_briefing",
     "classify_source",
     "edition_for",

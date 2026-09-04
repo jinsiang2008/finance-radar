@@ -6,7 +6,7 @@ import tempfile
 import threading
 import unittest
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -3606,7 +3606,303 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(by_kol["undated"]["total_24h"], 0)
 
 
+class DailyBriefingDatabaseTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self.tmp.name) / "daily-briefing.sqlite3")
+        self.db_path_patch = mock.patch.object(db, "DB_PATH", self.db_path)
+        self.db_path_patch.start()
+        db.init()
+
+    def tearDown(self) -> None:
+        self.db_path_patch.stop()
+        self.tmp.cleanup()
+
+    @staticmethod
+    def payload(
+        day: str,
+        observed_at: datetime,
+        *,
+        marker: str | None = None,
+        schema_version: int = 1,
+    ) -> dict:
+        sections = {section: [] for section in db._DAILY_BRIEFING_SECTION_KEYS}
+        if marker is not None:
+            sections["finance"].append(
+                {
+                    "section": "finance",
+                    "title": marker,
+                }
+            )
+        timestamp = observed_at.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+        return {
+            "schema_version": schema_version,
+            "snapshot_date": day,
+            "generated_at": timestamp,
+            "source_as_of": timestamp,
+            "sections": sections,
+        }
+
+    def upsert(self, payload: dict, *, imported_at: datetime) -> int:
+        return db.upsert_daily_briefing_snapshot(
+            snapshot_date=payload["snapshot_date"],
+            schema_version=payload["schema_version"],
+            generated_at=payload["generated_at"],
+            source_as_of=payload["source_as_of"],
+            payload=payload,
+            imported_at=imported_at.isoformat(),
+        )
+
+    def test_upsert_rejects_timestamp_regression_without_replacing_payload(self) -> None:
+        current = datetime(2026, 9, 5, 2, 0, tzinfo=timezone.utc)
+        current_payload = self.payload("2026-09-05", current, marker="current")
+        snapshot_id = self.upsert(current_payload, imported_at=current)
+        regressed = self.payload(
+            "2026-09-05",
+            current - timedelta(minutes=1),
+            marker="regressed",
+        )
+
+        with self.assertRaisesRegex(ValueError, "cannot regress"):
+            self.upsert(regressed, imported_at=current + timedelta(minutes=1))
+
+        with db.conn() as connection:
+            row = connection.execute(
+                "SELECT id, payload_json FROM daily_briefing_snapshots"
+            ).fetchone()
+        self.assertEqual(row["id"], snapshot_id)
+        self.assertEqual(
+            json.loads(row["payload_json"])["sections"]["finance"][0]["title"],
+            "current",
+        )
+
+    def test_upsert_requires_time_advance_for_changed_payload(self) -> None:
+        current = datetime(2026, 9, 5, 2, 0, tzinfo=timezone.utc)
+        original = self.payload("2026-09-05", current, marker="corrected")
+        snapshot_id = self.upsert(original, imported_at=current)
+
+        self.assertEqual(
+            self.upsert(original, imported_at=current + timedelta(minutes=1)),
+            snapshot_id,
+        )
+        replay = self.payload("2026-09-05", current, marker="old-replay")
+        with self.assertRaisesRegex(ValueError, "must advance"):
+            self.upsert(replay, imported_at=current + timedelta(minutes=2))
+
+        with db.conn() as connection:
+            row = connection.execute(
+                "SELECT payload_json FROM daily_briefing_snapshots WHERE id=?",
+                (snapshot_id,),
+            ).fetchone()
+        self.assertEqual(
+            json.loads(row["payload_json"])["sections"]["finance"][0]["title"],
+            "corrected",
+        )
+
+    def test_latest_read_prefers_freshest_source_over_latest_generation(self) -> None:
+        current = datetime(2026, 9, 5, 2, 0, tzinfo=timezone.utc)
+        fresher_source = current - timedelta(hours=11)
+        fresher = self.payload("2026-09-04", fresher_source, marker="fresh-source")
+        self.upsert(fresher, imported_at=fresher_source)
+
+        newer_generation = self.payload(
+            "2026-09-05",
+            current,
+            marker="newer-generation-stale-source",
+        )
+        newer_generation["source_as_of"] = (
+            current - timedelta(hours=18)
+        ).isoformat()
+        self.upsert(newer_generation, imported_at=current)
+
+        latest = db.load_latest_daily_briefing_snapshot(now=current)
+
+        self.assertIsNotNone(latest)
+        self.assertEqual(
+            latest["payload"]["sections"]["finance"][0]["title"],
+            "fresh-source",
+        )
+
+    def test_latest_read_accepts_only_bounded_self_consistent_v1(self) -> None:
+        current = datetime(2026, 9, 5, 2, 0, tzinfo=timezone.utc)
+        valid = self.payload("2026-09-05", current, marker="valid")
+        valid_id = self.upsert(valid, imported_at=current)
+
+        invalid_v2 = self.payload(
+            "2026-09-06",
+            current + timedelta(minutes=2),
+            schema_version=2,
+        )
+        invalid_sections = self.payload(
+            "2026-09-07",
+            current + timedelta(minutes=1),
+        )
+        del invalid_sections["sections"]["investors"]
+        with db.conn(immediate=True) as connection:
+            for payload in (invalid_v2, invalid_sections):
+                connection.execute(
+                    """
+                    INSERT INTO daily_briefing_snapshots (
+                      snapshot_date, schema_version, generated_at, source_as_of,
+                      payload_json, imported_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        payload["snapshot_date"],
+                        payload["schema_version"],
+                        payload["generated_at"],
+                        payload["source_as_of"],
+                        json.dumps(payload),
+                        payload["generated_at"],
+                    ),
+                )
+
+        latest = db.load_latest_daily_briefing_snapshot(
+            now=current + timedelta(minutes=3)
+        )
+        self.assertIsNotNone(latest)
+        self.assertEqual(latest["snapshot_id"], valid_id)
+
+        per_section = {
+            section: [] for section in db._DAILY_BRIEFING_SECTION_KEYS
+        }
+        per_section["macro"] = [
+            {"section": "macro"}
+            for _ in range(db._DAILY_BRIEFING_MAX_ITEMS_PER_SECTION + 1)
+        ]
+        self.assertFalse(db._daily_briefing_sections_are_valid(per_section))
+
+        over_total = {
+            section: [{"section": section} for _ in range(51)]
+            for section in db._DAILY_BRIEFING_SECTION_KEYS
+        }
+        self.assertFalse(db._daily_briefing_sections_are_valid(over_total))
+
+    def test_upsert_prunes_old_and_excess_rows_but_keeps_current_and_future(self) -> None:
+        current = datetime(2026, 9, 5, 2, 0, tzinfo=timezone.utc)
+        old_time = current - timedelta(days=60)
+        old = self.payload(old_time.date().isoformat(), old_time)
+        future_time = current + timedelta(days=1)
+        future = self.payload(future_time.date().isoformat(), future_time)
+        with db.conn(immediate=True) as connection:
+            for payload in (old, future):
+                connection.execute(
+                    """
+                    INSERT INTO daily_briefing_snapshots (
+                      snapshot_date, schema_version, generated_at, source_as_of,
+                      payload_json, imported_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        payload["snapshot_date"],
+                        payload["schema_version"],
+                        payload["generated_at"],
+                        payload["source_as_of"],
+                        json.dumps(payload),
+                        payload["generated_at"],
+                    ),
+                )
+            for schema_version in range(2, 72):
+                invalid = self.payload(
+                    current.date().isoformat(),
+                    current - timedelta(seconds=schema_version),
+                    schema_version=schema_version,
+                )
+                connection.execute(
+                    """
+                    INSERT INTO daily_briefing_snapshots (
+                      snapshot_date, schema_version, generated_at, source_as_of,
+                      payload_json, imported_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        invalid["snapshot_date"],
+                        invalid["schema_version"],
+                        invalid["generated_at"],
+                        invalid["source_as_of"],
+                        json.dumps(invalid),
+                        invalid["generated_at"],
+                    ),
+                )
+
+        current_payload = self.payload(current.date().isoformat(), current)
+        current_id = self.upsert(current_payload, imported_at=current)
+        with db.conn() as connection:
+            rows = connection.execute(
+                "SELECT id, snapshot_date, schema_version "
+                "FROM daily_briefing_snapshots"
+            ).fetchall()
+
+        self.assertLessEqual(len(rows), db._DAILY_BRIEFING_MAX_ROWS)
+        identities = {
+            (row["snapshot_date"], row["schema_version"]) for row in rows
+        }
+        self.assertIn(("2026-09-05", 1), identities)
+        self.assertIn(("2026-09-06", 1), identities)
+        self.assertNotIn((old["snapshot_date"], 1), identities)
+        self.assertIn(current_id, {row["id"] for row in rows})
+
+    def test_reverse_chronological_import_stays_bounded_to_latest_window(self) -> None:
+        latest = datetime(2026, 9, 5, 2, 0, tzinfo=timezone.utc)
+        current_id = 0
+        for offset in range(70):
+            observed = latest - timedelta(days=offset)
+            payload = self.payload(
+                observed.date().isoformat(),
+                observed,
+                marker=f"day-{offset}",
+            )
+            current_id = self.upsert(payload, imported_at=latest)
+
+        with db.conn() as connection:
+            rows = connection.execute(
+                "SELECT id, snapshot_date FROM daily_briefing_snapshots "
+                "ORDER BY snapshot_date DESC"
+            ).fetchall()
+
+        self.assertLessEqual(len(rows), db._DAILY_BRIEFING_MAX_ROWS)
+        self.assertEqual(len(rows), db._DAILY_BRIEFING_RETENTION_DAYS + 1)
+        latest_day = max(date.fromisoformat(row["snapshot_date"]) for row in rows)
+        cutoff = latest_day - timedelta(
+            days=db._DAILY_BRIEFING_RETENTION_DAYS - 1
+        )
+        outside_window = [
+            row
+            for row in rows
+            if date.fromisoformat(row["snapshot_date"]) < cutoff
+        ]
+        self.assertEqual([row["id"] for row in outside_window], [current_id])
+
+
 class LegacyMigrationTests(unittest.TestCase):
+    def test_direct_v3_to_v4_migration_adds_daily_briefing_storage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "v3-to-v4.sqlite3")
+            with mock.patch.object(db, "DB_PATH", path):
+                db.init()
+                with db.conn(immediate=True) as connection:
+                    connection.execute(
+                        "INSERT INTO meta(key, value) VALUES('v3-marker', 'preserved')"
+                    )
+                    connection.execute("DROP TABLE daily_briefing_snapshots")
+                    connection.execute("PRAGMA user_version=3")
+
+                db.init()
+                db.init()
+                with db.conn() as migrated:
+                    version = migrated.execute("PRAGMA user_version").fetchone()[0]
+                    table = migrated.execute(
+                        "SELECT 1 FROM sqlite_master "
+                        "WHERE type='table' AND name='daily_briefing_snapshots'"
+                    ).fetchone()
+                    marker = migrated.execute(
+                        "SELECT value FROM meta WHERE key='v3-marker'"
+                    ).fetchone()["value"]
+
+            self.assertEqual(version, 4)
+            self.assertIsNotNone(table)
+            self.assertEqual(marker, "preserved")
+
     def test_v2_sighting_provenance_migration_is_conservative(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = str(Path(tmp) / "v2-sighting-provenance.sqlite3")
@@ -3792,12 +4088,17 @@ class LegacyMigrationTests(unittest.TestCase):
                         "SELECT event_id, title, snippet, tickers, source_url "
                         "FROM event_sightings ORDER BY event_id, source_url"
                     ).fetchall()
+                    daily_table = migrated.execute(
+                        "SELECT 1 FROM sqlite_master "
+                        "WHERE type='table' AND name='daily_briefing_snapshots'"
+                    ).fetchone()
 
             by_event: dict[int, list[sqlite3.Row]] = {}
             for sighting in sightings:
                 by_event.setdefault(sighting["event_id"], []).append(sighting)
 
-            self.assertEqual(version, 3)
+            self.assertEqual(version, db._DB_SCHEMA_VERSION)
+            self.assertIsNotNone(daily_table)
             self.assertTrue({"title", "snippet", "tickers"}.issubset(columns))
             self.assertEqual(len(by_event[1]), 1)
             self.assertEqual(

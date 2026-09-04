@@ -29,6 +29,9 @@ Schema:
   decision_snapshots(id, schema_version, engine_version, source_hash,
                      source_as_of, generated_at, summary_json, full_json)
 
+  daily_briefing_snapshots(id, snapshot_date, schema_version, generated_at,
+                           source_as_of, payload_json, imported_at)
+
   meta(key, value)  — small KV store for last-sent-id state etc.
 
 Dedup: news aggregators hand out a fresh tracking URL for the same article on
@@ -50,10 +53,11 @@ import time
 import unicodedata
 import urllib.parse
 from contextlib import contextmanager, nullcontext
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
+from zoneinfo import ZoneInfo
 
 try:
     from kol_dashboard.content_quality import is_event_content_eligible
@@ -82,7 +86,7 @@ DB_PATH = os.environ.get(
 # Bump this whenever ``init`` gains a new migration that existing databases must
 # execute.  A current database takes the read-only fast path instead of scanning
 # and rewriting the event tables on every process start.
-_DB_SCHEMA_VERSION = 3
+_DB_SCHEMA_VERSION = 4
 _BEGIN_RETRY_ENV = "KOL_DB_BEGIN_RETRY_SECONDS"
 _DEFAULT_BEGIN_RETRY_SECONDS = 30.0
 _MAX_BEGIN_RETRY_SECONDS = 120.0
@@ -2024,6 +2028,28 @@ def init() -> None:
         c.execute(
             "CREATE INDEX IF NOT EXISTS idx_decision_snapshot_current "
             "ON decision_snapshots(schema_version, engine_version, id DESC)"
+        )
+
+        # OpenClaw/Hermes exports are imported out-of-band as fully validated
+        # JSON snapshots. Public GET handlers only read this table; they never
+        # execute the producer, fetch a source, or invoke an LLM.
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS daily_briefing_snapshots (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              snapshot_date TEXT NOT NULL,
+              schema_version INTEGER NOT NULL CHECK(schema_version > 0),
+              generated_at TEXT NOT NULL,
+              source_as_of TEXT NOT NULL,
+              payload_json TEXT NOT NULL,
+              imported_at TEXT NOT NULL,
+              UNIQUE(snapshot_date, schema_version)
+            )
+            """
+        )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_daily_briefing_latest "
+            "ON daily_briefing_snapshots(generated_at DESC, imported_at DESC, id DESC)"
         )
 
         c.execute(
@@ -5061,6 +5087,345 @@ def latest_macro() -> dict[str, Any] | None:
     payload["snapshot_id"] = row["id"]
     payload["created_at"] = row["created_at"]
     return payload
+
+
+_DAILY_BRIEFING_MAX_JSON_BYTES = 2 * 1024 * 1024
+_DAILY_BRIEFING_SCHEMA_VERSION = 1
+_DAILY_BRIEFING_SECTION_KEYS = (
+    "macro",
+    "world",
+    "finance",
+    "technology",
+    "ai",
+    "investors",
+)
+_DAILY_BRIEFING_MAX_ITEMS_PER_SECTION = 80
+_DAILY_BRIEFING_MAX_TOTAL_ITEMS = 300
+_DAILY_BRIEFING_RETENTION_DAYS = 45
+_DAILY_BRIEFING_MAX_ROWS = 64
+_DAILY_BRIEFING_BEIJING = ZoneInfo("Asia/Shanghai")
+
+
+def _daily_briefing_sections_are_valid(sections: Any) -> bool:
+    if not isinstance(sections, dict) or set(sections) != set(
+        _DAILY_BRIEFING_SECTION_KEYS
+    ):
+        return False
+    total = 0
+    for section in _DAILY_BRIEFING_SECTION_KEYS:
+        items = sections[section]
+        if (
+            not isinstance(items, list)
+            or len(items) > _DAILY_BRIEFING_MAX_ITEMS_PER_SECTION
+        ):
+            return False
+        total += len(items)
+        if total > _DAILY_BRIEFING_MAX_TOTAL_ITEMS:
+            return False
+        if any(
+            not isinstance(item, dict) or item.get("section") != section
+            for item in items
+        ):
+            return False
+    return True
+
+
+def _daily_briefing_snapshot_row(
+    row: sqlite3.Row | None,
+) -> dict[str, Any] | None:
+    """Decode one imported briefing row without trusting stored JSON blindly."""
+    if row is None:
+        return None
+    raw_payload = row["payload_json"]
+    if not isinstance(raw_payload, str):
+        return None
+    try:
+        if len(raw_payload.encode("utf-8")) > _DAILY_BRIEFING_MAX_JSON_BYTES:
+            return None
+        payload = json.loads(raw_payload)
+    except (TypeError, UnicodeEncodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    try:
+        schema_version = int(row["schema_version"])
+    except (TypeError, ValueError, OverflowError):
+        return None
+    payload_schema = payload.get("schema_version")
+    try:
+        snapshot_day = date.fromisoformat(str(row["snapshot_date"]))
+    except ValueError:
+        return None
+    generated_time = _parse_utc_datetime(row["generated_at"])
+    source_time = _parse_utc_datetime(row["source_as_of"])
+    if (
+        schema_version != _DAILY_BRIEFING_SCHEMA_VERSION
+        or isinstance(payload_schema, bool)
+        or payload_schema != schema_version
+        or payload.get("snapshot_date") != row["snapshot_date"]
+        or payload.get("generated_at") != row["generated_at"]
+        or payload.get("source_as_of") != row["source_as_of"]
+        or snapshot_day.isoformat() != row["snapshot_date"]
+        or generated_time is None
+        or source_time is None
+        or snapshot_day != generated_time.astimezone(_DAILY_BRIEFING_BEIJING).date()
+        or source_time
+        > generated_time + timedelta(seconds=_MAX_FUTURE_SKEW_SECONDS)
+        or set(payload)
+        != {
+            "schema_version",
+            "snapshot_date",
+            "generated_at",
+            "source_as_of",
+            "sections",
+        }
+        or not _daily_briefing_sections_are_valid(payload.get("sections"))
+    ):
+        return None
+    return {
+        "snapshot_id": int(row["id"]),
+        "snapshot_date": row["snapshot_date"],
+        "schema_version": schema_version,
+        "generated_at": row["generated_at"],
+        "source_as_of": row["source_as_of"],
+        "imported_at": row["imported_at"],
+        "payload": payload,
+    }
+
+
+def _prune_daily_briefing_snapshots_in(
+    c: sqlite3.Connection,
+    *,
+    current_id: int,
+    reference_day: date,
+) -> None:
+    """Bound history around the newest valid day while retaining this write."""
+    rows = c.execute(
+        """
+        SELECT id, snapshot_date, schema_version, generated_at,
+               source_as_of, payload_json, imported_at
+        FROM daily_briefing_snapshots
+        ORDER BY generated_at DESC, imported_at DESC, id DESC
+        """
+    ).fetchall()
+    latest_valid_day = reference_day
+    for row in rows:
+        if _daily_briefing_snapshot_row(row) is None:
+            continue
+        try:
+            row_day = date.fromisoformat(str(row["snapshot_date"]))
+        except ValueError:
+            continue
+        latest_valid_day = max(latest_valid_day, row_day)
+
+    cutoff = latest_valid_day - timedelta(
+        days=_DAILY_BRIEFING_RETENTION_DAYS - 1
+    )
+    c.execute(
+        "DELETE FROM daily_briefing_snapshots "
+        "WHERE id<>? AND snapshot_date<?",
+        (current_id, cutoff.isoformat()),
+    )
+    rows = c.execute(
+        """
+        SELECT id, snapshot_date, schema_version, generated_at,
+               source_as_of, payload_json, imported_at
+        FROM daily_briefing_snapshots
+        ORDER BY generated_at DESC, imported_at DESC, id DESC
+        """
+    ).fetchall()
+    other_ids = [int(row["id"]) for row in rows if int(row["id"]) != current_id]
+    keep_others = max(0, _DAILY_BRIEFING_MAX_ROWS - 1)
+    delete_ids = other_ids[keep_others:]
+    if delete_ids:
+        c.executemany(
+            "DELETE FROM daily_briefing_snapshots WHERE id=?",
+            ((row_id,) for row_id in delete_ids),
+        )
+
+
+def upsert_daily_briefing_snapshot(
+    *,
+    snapshot_date: str,
+    schema_version: int,
+    generated_at: str,
+    source_as_of: str,
+    payload: Mapping[str, Any],
+    imported_at: str | None = None,
+) -> int:
+    """Idempotently persist one externally validated Daily Briefing snapshot."""
+    day_text = _required_text(snapshot_date, "snapshot_date", maximum=10)
+    try:
+        parsed_day = date.fromisoformat(day_text)
+    except ValueError as exc:
+        raise ValueError("snapshot_date must be an ISO-8601 date") from exc
+    if parsed_day.isoformat() != day_text:
+        raise ValueError("snapshot_date must use YYYY-MM-DD")
+    schema = _bounded_integer(
+        schema_version,
+        "schema_version",
+        minimum=_DAILY_BRIEFING_SCHEMA_VERSION,
+        maximum=_DAILY_BRIEFING_SCHEMA_VERSION,
+    )
+    generated = _observed_at(generated_at)
+    source_time = _observed_at(source_as_of)
+    imported = _observed_at(imported_at)
+    generated_datetime = _parse_utc_datetime(generated)
+    source_datetime = _parse_utc_datetime(source_time)
+    assert generated_datetime is not None and source_datetime is not None
+    if parsed_day != generated_datetime.astimezone(_DAILY_BRIEFING_BEIJING).date():
+        raise ValueError("snapshot_date must match generated_at in Asia/Shanghai")
+    if source_datetime > generated_datetime + timedelta(
+        seconds=_MAX_FUTURE_SKEW_SECONDS
+    ):
+        raise ValueError("source_as_of cannot be after generated_at")
+    if not isinstance(payload, Mapping):
+        raise ValueError("daily briefing payload must be an object")
+    clean_payload = dict(payload)
+    if isinstance(clean_payload.get("schema_version"), bool) or clean_payload.get(
+        "schema_version"
+    ) != schema:
+        raise ValueError("payload schema_version does not match snapshot metadata")
+    if clean_payload.get("snapshot_date") != day_text:
+        raise ValueError("payload snapshot_date does not match snapshot metadata")
+    if clean_payload.get("generated_at") != generated:
+        raise ValueError("payload generated_at does not match snapshot metadata")
+    if clean_payload.get("source_as_of") != source_time:
+        raise ValueError("payload source_as_of does not match snapshot metadata")
+    if set(clean_payload) != {
+        "schema_version",
+        "snapshot_date",
+        "generated_at",
+        "source_as_of",
+        "sections",
+    }:
+        raise ValueError("daily briefing payload must contain only v1 fields")
+    if not _daily_briefing_sections_are_valid(clean_payload.get("sections")):
+        raise ValueError("payload sections do not match the bounded v1 schema")
+    payload_json = _safe_json(clean_payload, "daily briefing payload")
+    if len(payload_json.encode("utf-8")) > _DAILY_BRIEFING_MAX_JSON_BYTES:
+        raise ValueError("daily briefing payload exceeds the supported size")
+
+    with conn(immediate=True) as c:
+        existing = c.execute(
+            "SELECT id, generated_at, source_as_of, payload_json "
+            "FROM daily_briefing_snapshots "
+            "WHERE snapshot_date=? AND schema_version=?",
+            (day_text, schema),
+        ).fetchone()
+        if existing is not None:
+            existing_generated = _parse_utc_datetime(existing["generated_at"])
+            existing_source = _parse_utc_datetime(existing["source_as_of"])
+            if (
+                existing_generated is not None
+                and existing_source is not None
+                and (
+                    generated_datetime < existing_generated
+                    or source_datetime < existing_source
+                )
+            ):
+                raise ValueError(
+                    "daily briefing snapshot cannot regress generated_at or source_as_of"
+                )
+            if (
+                existing_generated == generated_datetime
+                and existing_source == source_datetime
+            ):
+                if existing["payload_json"] != payload_json:
+                    raise ValueError(
+                        "daily briefing snapshot must advance generated_at or "
+                        "source_as_of when payload changes"
+                    )
+                snapshot_id = int(existing["id"])
+                _prune_daily_briefing_snapshots_in(
+                    c,
+                    current_id=snapshot_id,
+                    reference_day=parsed_day,
+                )
+                return snapshot_id
+        c.execute(
+            """
+            INSERT INTO daily_briefing_snapshots (
+              snapshot_date, schema_version, generated_at, source_as_of,
+              payload_json, imported_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(snapshot_date, schema_version) DO UPDATE SET
+              generated_at=excluded.generated_at,
+              source_as_of=excluded.source_as_of,
+              payload_json=excluded.payload_json,
+              imported_at=excluded.imported_at
+            """,
+            (
+                day_text,
+                schema,
+                generated,
+                source_time,
+                payload_json,
+                imported,
+            ),
+        )
+        row = c.execute(
+            "SELECT id FROM daily_briefing_snapshots "
+            "WHERE snapshot_date=? AND schema_version=?",
+            (day_text, schema),
+        ).fetchone()
+        if row is None:
+            raise sqlite3.IntegrityError("daily briefing upsert returned no row")
+        snapshot_id = int(row["id"])
+        _prune_daily_briefing_snapshots_in(
+            c,
+            current_id=snapshot_id,
+            reference_day=parsed_day,
+        )
+    return snapshot_id
+
+
+def load_latest_daily_briefing_snapshot(
+    *,
+    max_age_hours: int = 24,
+    now: datetime | str | None = None,
+) -> dict[str, Any] | None:
+    """Return the newest parseable, source-fresh imported briefing.
+
+    Freshness is anchored to ``source_as_of`` rather than import time so a
+    newly copied stale file cannot masquerade as current news. Malformed rows
+    are skipped and never turn the public read endpoint into a 500 response.
+    """
+    age_hours = _bounded_integer(
+        max_age_hours,
+        "max_age_hours",
+        minimum=1,
+        maximum=31 * 24,
+    )
+    current = _utc_datetime(now, "now")
+    oldest = current - timedelta(hours=age_hours)
+    latest_allowed = current + timedelta(seconds=_MAX_FUTURE_SKEW_SECONDS)
+    with conn() as c:
+        rows = c.execute(
+            """
+            SELECT id, snapshot_date, schema_version, generated_at,
+                   source_as_of, payload_json, imported_at
+            FROM daily_briefing_snapshots
+            WHERE schema_version=?
+            ORDER BY source_as_of DESC, generated_at DESC, imported_at DESC, id DESC
+            LIMIT 64
+            """,
+            (_DAILY_BRIEFING_SCHEMA_VERSION,),
+        ).fetchall()
+    for row in rows:
+        record = _daily_briefing_snapshot_row(row)
+        if record is None:
+            continue
+        source_time = _parse_utc_datetime(record["source_as_of"])
+        generated = _parse_utc_datetime(record["generated_at"])
+        if source_time is None or generated is None:
+            continue
+        if source_time < oldest or source_time > latest_allowed:
+            continue
+        if generated > latest_allowed:
+            continue
+        return record
+    return None
 
 
 def save_decision_snapshot(

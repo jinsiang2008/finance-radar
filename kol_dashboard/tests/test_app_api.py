@@ -17,6 +17,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import auth  # noqa: E402
+import briefing_import  # noqa: E402
 import db  # noqa: E402
 import llm_enrichment  # noqa: E402
 import portfolio  # noqa: E402
@@ -1278,11 +1279,19 @@ class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
                 "edition_label",
                 "generated_at",
                 "source_as_of",
+                "content_as_of",
+                "source_coverage_as_of",
+                "source_coverage_stale",
                 "stale",
                 "coverage",
+                "coverage_window_hours",
+                "dedup_stats",
                 "lead",
                 "highlights",
                 "firsthand",
+                "next_refresh_at",
+                "refresh_schedule_status",
+                "sections",
                 "watchpoints",
                 "disclaimer",
             },
@@ -1306,6 +1315,154 @@ class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
             "private-full-portfolio",
         ):
             self.assertNotIn(forbidden, encoded)
+
+    async def test_daily_briefing_passes_a_current_imported_snapshot(self) -> None:
+        generated = datetime.now(timezone.utc).replace(microsecond=0)
+        snapshot = {
+            "schema_version": 1,
+            "snapshot_date": (generated + timedelta(hours=8)).date().isoformat(),
+            "generated_at": generated.isoformat(),
+            "source_as_of": generated.isoformat(),
+            "sections": {
+                section: [] for section in briefing_import.SECTION_KEYS
+            },
+        }
+        snapshot["sections"]["ai"].append(
+            {
+                "title": "AI lab publishes a new model system card",
+                "source": "AI lab",
+                "source_url": "https://example.com/ai/system-card",
+                "published_at": (generated - timedelta(minutes=5)).isoformat(),
+                "source_tier": "official",
+                "summary": "The system card documents the new model release.",
+                "why_it_matters": "Primary documentation limits rumor risk.",
+                "assets": ["THEME:AI"],
+            }
+        )
+        briefing_import.import_payload(snapshot, now=generated)
+
+        with patch.object(
+            dashboard_app.briefing_service,
+            "build_latest_briefing",
+            return_value={"available": True},
+        ) as build:
+            response = await self.client.get("/api/briefings/latest")
+
+        self.assertEqual(response.status_code, 200)
+        imported = build.call_args.kwargs["imported_snapshot"]
+        self.assertIsNotNone(imported)
+        self.assertEqual(
+            imported["sections"]["ai"][0]["title"],
+            "AI lab publishes a new model system card",
+        )
+
+    async def test_daily_briefing_distinguishes_empty_scan_from_missing_job(
+        self,
+    ) -> None:
+        generated = datetime.now(timezone.utc).replace(microsecond=0)
+        snapshot = {
+            "schema_version": 1,
+            "snapshot_date": (generated + timedelta(hours=8)).date().isoformat(),
+            "generated_at": generated.isoformat(),
+            "source_as_of": generated.isoformat(),
+            "sections": {
+                section: [] for section in briefing_import.SECTION_KEYS
+            },
+        }
+        briefing_import.import_payload(snapshot, now=generated)
+
+        response = await self.client.get("/api/briefings/latest")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertTrue(body["available"])
+        self.assertIsNone(body["content_as_of"])
+        self.assertIsNone(body["source_as_of"])
+        self.assertEqual(body["source_coverage_as_of"], generated.isoformat())
+        self.assertFalse(body["source_coverage_stale"])
+        self.assertEqual(body["coverage"]["total"], 0)
+
+    async def test_daily_briefing_preserves_investor_disclosure_dates_end_to_end(
+        self,
+    ) -> None:
+        generated = datetime.now(timezone.utc).replace(microsecond=0)
+        disclosed = generated - timedelta(minutes=8)
+        snapshot = {
+            "schema_version": 1,
+            "snapshot_date": (generated + timedelta(hours=8)).date().isoformat(),
+            "generated_at": generated.isoformat(),
+            "source_as_of": generated.isoformat(),
+            "sections": {
+                section: [] for section in briefing_import.SECTION_KEYS
+            },
+        }
+        snapshot["sections"]["investors"].append(
+            {
+                "title": "Investor files quarterly holdings",
+                "source": "SEC",
+                "source_url": "https://www.sec.gov/edgar/browse/example",
+                "published_at": disclosed.isoformat(),
+                "disclosed_at": disclosed.isoformat(),
+                "period_end": "2026-06-30",
+                "source_tier": "official",
+                "summary": "The filing reports prior-quarter holdings.",
+            }
+        )
+        briefing_import.import_payload(snapshot, now=generated)
+
+        response = await self.client.get("/api/briefings/latest")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        investors = next(
+            section
+            for section in body["sections"]
+            if section["key"] == "investors"
+        )
+        self.assertEqual(len(investors["items"]), 1)
+        item = investors["items"][0]
+        self.assertEqual(item["disclosed_at"], disclosed.isoformat())
+        self.assertEqual(item["effective_at"], "2026-06-30")
+        self.assertNotIn("period_end", response.text)
+        self.assertNotIn("data_as_of", response.text)
+
+    async def test_daily_briefing_ignores_a_source_stale_import(self) -> None:
+        generated = (
+            datetime.now(timezone.utc).replace(microsecond=0)
+            - timedelta(hours=25)
+        )
+        snapshot = {
+            "schema_version": 1,
+            "snapshot_date": (generated + timedelta(hours=8)).date().isoformat(),
+            "generated_at": generated.isoformat(),
+            "source_as_of": generated.isoformat(),
+            "sections": {
+                section: [] for section in briefing_import.SECTION_KEYS
+            },
+        }
+        snapshot["sections"]["world"].append(
+            {
+                "title": "Stale world news must not replace live fallback data",
+                "source_url": "https://example.com/world/stale",
+                "published_at": generated.isoformat(),
+                "source_tier": "media",
+            }
+        )
+        briefing_import.import_payload(
+            snapshot,
+            now=generated,
+            imported_at=generated,
+        )
+
+        with patch.object(
+            dashboard_app.briefing_service,
+            "build_latest_briefing",
+            return_value={"available": False},
+        ) as build:
+            response = await self.client.get("/api/briefings/latest")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(build.call_args.kwargs["imported_snapshot"])
 
     async def test_macro_coverage_uses_collector_accounting(self) -> None:
         db.save_macro_snapshot(

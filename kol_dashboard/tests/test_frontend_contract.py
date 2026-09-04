@@ -50,7 +50,7 @@ class FrontendContractTests(unittest.TestCase):
     def test_daily_briefing_keeps_source_directness_and_verification_explicit(self) -> None:
         for label in (
             "官方正文",
-            "本人原文",
+            "一手原文",
             "媒体报道",
             "聚合线索",
             "发布时间待核验",
@@ -67,6 +67,12 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn("safeExternalUrl", self.javascript)
         self.assertIn('target="_blank"', self.javascript)
         self.assertIn('rel="noopener noreferrer"', self.javascript)
+        self.assertIn('source.key === "first_party"', self.javascript)
+        self.assertNotIn("本人原文", self.javascript)
+        self.assertIn("条发布时间已核验", self.javascript)
+        self.assertNotIn("${section.verified_count} 条已核验", self.javascript)
+        self.assertIn("`${view.short} 北京时间", self.javascript)
+        self.assertIn("const visible = compact", self.javascript)
 
     def test_daily_briefing_uses_responsive_editorial_hierarchy(self) -> None:
         for selector in (
@@ -79,6 +85,174 @@ class FrontendContractTests(unittest.TestCase):
             self.assertIn(selector, self.css)
         self.assertIn("grid-template-columns: 1fr", self.css)
         self.assertIn("min-height: 44px", self.css)
+
+    def test_daily_briefing_exposes_six_deduplicated_editorial_sections(self) -> None:
+        for key, label in (
+            ("macro", "宏观信息"),
+            ("world", "全球要闻"),
+            ("finance", "金融要闻"),
+            ("technology", "科技前沿"),
+            ("ai", "AI 前沿"),
+            ("investors", "投资大师动态"),
+        ):
+            self.assertIn(f'href="#daily-section-{key}"', self.html)
+            self.assertIn(f'key: "{key}", label: "{label}"', self.javascript)
+        for contract in (
+            "data?.sections",
+            "function dailyStoryKey(item)",
+            "function dailyUniqueItems(items)",
+            "function dailyNormalizedSections(data)",
+            "story_key",
+            "primary_section",
+            "cross_tags",
+            ".slice(0, 6)",
+            "index >= 3",
+        ):
+            self.assertIn(contract, self.javascript)
+        self.assertIn("同一故事只进入一个主栏目", self.javascript)
+        self.assertIn("不会使用旧闻或重复转载填充本栏", self.javascript)
+
+    def test_daily_sections_have_freshness_empty_and_expand_states(self) -> None:
+        for contract in (
+            "source_as_of",
+            "verified_count",
+            "total_count",
+            "section.stale",
+            'status === "empty"',
+            'status === "stale"',
+            '["partial", "limited"].includes(section.status)',
+            "data-daily-section-toggle",
+            'aria-expanded="false"',
+            "setDailySectionExpanded",
+            "自动刷新未接通",
+            "refresh_schedule_status",
+            "source_coverage_as_of",
+            "source_coverage_stale",
+            "内容证据截至",
+            "已扫描至",
+            "本轮扫描完成，暂无达到门槛的新事件",
+            "不会使用旧闻或重复转载填充版面",
+        ):
+            self.assertIn(contract, self.javascript)
+        for selector in (
+            ".daily-status-band",
+            ".daily-status-columns",
+            ".daily-stream-section",
+            ".daily-section-empty",
+            ".daily-stale-note",
+            ".daily-section-toggle",
+            ".daily-cluster-marker",
+        ):
+            self.assertIn(selector, self.css)
+
+    def test_daily_collapsed_rows_are_really_hidden_and_toggleable(self) -> None:
+        hidden_rule = ".daily-stream-item[hidden] { display: none; }"
+        self.assertIn(hidden_rule, self.css)
+        self.assertLess(
+            self.css.index(".daily-stream-item {"),
+            self.css.index(hidden_rule),
+        )
+        toggle_start = self.javascript.index(
+            "function setDailySectionExpanded(section, expanded)"
+        )
+        toggle_end = self.javascript.index(
+            "function announceDailyStatus", toggle_start
+        )
+        toggle_contract = self.javascript[toggle_start:toggle_end]
+        self.assertIn("item.hidden = !expanded", toggle_contract)
+        self.assertIn(
+            'button.setAttribute("aria-expanded", String(expanded))',
+            toggle_contract,
+        )
+
+    def test_daily_investor_cards_separate_disclosure_and_holding_dates(self) -> None:
+        for contract in (
+            "function dailyInvestorDatesHTML(item)",
+            "const disclosed = dailyDateView(item?.disclosed_at)",
+            "const published = dailyDateView(item?.published_at)",
+            "item?.effective_at || item?.period_end || item?.data_as_of",
+            "const evidenceAt = dailyDateView(item?.data_as_of)",
+            "证据截至：",
+            "披露日期待核验",
+            "持仓日期待核验",
+            "来源发布",
+            "披露不等于当日交易",
+        ):
+            self.assertIn(contract, self.javascript)
+        self.assertIn("daily-investor-dates", self.css)
+
+    def test_daily_uses_one_small_live_status_instead_of_a_live_document(self) -> None:
+        announcer_start = self.html.index('id="daily-live-status"')
+        announcer_end = self.html.index(">", announcer_start)
+        announcer = self.html[announcer_start:announcer_end]
+        self.assertIn('role="status"', announcer)
+        self.assertIn('aria-live="polite"', announcer)
+        self.assertIn('aria-atomic="true"', announcer)
+        stage_start = self.html.index('class="daily-stage"')
+        stage_end = self.html.index(">", stage_start)
+        self.assertNotIn("aria-live", self.html[stage_start:stage_end])
+        self.assertIn("function announceDailyStatus(message)", self.javascript)
+        self.assertIn("简报已更新，共 ${total} 条去重记录。", self.javascript)
+
+    def test_daily_unavailable_state_keeps_six_column_health_visible(self) -> None:
+        unavailable_start = self.javascript.index("if (!data?.available)")
+        unavailable_end = self.javascript.index(
+            "if (jumpNav) jumpNav.hidden = false", unavailable_start
+        )
+        unavailable_contract = self.javascript[unavailable_start:unavailable_end]
+        self.assertIn("const unavailableSections = sections.map", unavailable_contract)
+        self.assertIn('refresh_schedule_status: "unconfigured"', unavailable_contract)
+        self.assertIn(
+            "dailyStatusBandHTML(unavailableData, unavailableSections",
+            unavailable_contract,
+        )
+        self.assertIn("linkable: false", unavailable_contract)
+
+    def test_daily_first_load_failure_keeps_health_band_and_retry(self) -> None:
+        load_start = self.javascript.index("async function loadDaily()")
+        load_end = self.javascript.index(
+            "// ─── Decision cockpit", load_start
+        )
+        load_contract = self.javascript[load_start:load_end]
+        self.assertIn("renderDaily({", load_contract)
+        self.assertIn("available: false", load_contract)
+        self.assertIn('refresh_schedule_status: "unconfigured"', load_contract)
+        self.assertIn("本轮无法形成可信简报，未使用旧闻补位", load_contract)
+        self.assertNotIn("errorHTML(error, url)", load_contract)
+        self.assertIn('setViewLoadError("daily", error, url)', load_contract)
+        self.assertIn('data-view-retry="${esc(view)}"', self.javascript)
+
+    def test_daily_nested_evidence_sections_use_third_level_headings(self) -> None:
+        self.assertIn('<h3 id="daily-firsthand-title">', self.javascript)
+        self.assertIn('<h3 id="daily-watchpoints-title">', self.javascript)
+        self.assertIn(".daily-subsection-head h3", self.css)
+
+    def test_daily_mobile_navigation_and_controls_are_touch_accessible(self) -> None:
+        self.assertIn('aria-label="简报栏目"', self.html)
+        self.assertIn("overflow-x: auto", self.css)
+        self.assertIn("scroll-snap-type: x proximity", self.css)
+        self.assertIn(".daily-status-columns { grid-template-columns: repeat(2", self.css)
+        self.assertIn(".daily-section-toggle { grid-column: 1", self.css)
+        self.assertIn(".daily-overview-item > a { min-height: 44px", self.css)
+        self.assertIn(".daily-stream-summary { font-size: 13px; }", self.css)
+        self.assertIn(".daily-stream-why { font-size: 12px; }", self.css)
+        self.assertIn("(prefers-reduced-motion: reduce)", self.css)
+        self.assertNotIn("DAILY INTELLIGENCE", self.html)
+        self.assertNotIn("60 SECOND READ", self.javascript)
+        self.assertNotIn("DIRECT SOURCES", self.javascript)
+        self.assertNotIn("NEXT CHECK", self.javascript)
+
+    def test_daily_assets_share_the_v29_cachebuster(self) -> None:
+        self.assertIn('static/app.js?v=29', self.html)
+        self.assertIn('static/style.css?v=29', self.html)
+        self.assertEqual(self.html.count("?v=29"), 2)
+        self.assertNotIn("?v=26", self.html)
+
+    def test_daily_event_clusters_do_not_claim_independent_sources(self) -> None:
+        self.assertIn("事件簇 · ${sourceCount} 条关联记录 · 不代表独立确认", self.javascript)
+        self.assertNotIn("事件簇 · ${sourceCount} 个来源", self.javascript)
+        self.assertIn("证据截至 ${esc(lastUpdated)}", self.javascript)
+        self.assertNotIn(" · 更新 ${esc(lastUpdated)}", self.javascript)
 
     def test_private_mode_uses_password_form_and_private_endpoint(self) -> None:
         self.assertIn('type="password"', self.html)
@@ -169,9 +343,9 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn('stale ? "数据延迟" : ""', self.javascript)
         self.assertIn('"高收益债利差"', self.javascript)
         self.assertIn("cs.hy_oas", self.javascript)
-        self.assertIn('static/app.js?v=25', self.html)
-        self.assertIn('static/style.css?v=25', self.html)
-        self.assertNotIn('?v=24', self.html)
+        self.assertIn('static/app.js?v=29', self.html)
+        self.assertIn('static/style.css?v=29', self.html)
+        self.assertNotIn('?v=26', self.html)
         self.assertIn(".metric.is-stale", self.css)
 
     def test_macro_events_render_compact_ai_digest_and_bounded_highlights(self) -> None:

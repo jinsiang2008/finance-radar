@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import unittest
 from datetime import datetime, timezone
+from time import perf_counter
 
 from kol_dashboard import briefing_service
 
@@ -74,6 +75,73 @@ class EditionTests(unittest.TestCase):
 
 
 class SourceTierTests(unittest.TestCase):
+    def test_public_urls_reject_internal_or_secret_bearing_targets(self) -> None:
+        unsafe = (
+            "http://localhost/story",
+            "http://api.localhost/story",
+            "http://127.0.0.1/story",
+            "http://10.0.0.8/story",
+            "http://169.254.1.2/story",
+            "http://224.0.0.1/story",
+            "http://0.0.0.0/story",
+            "http://[::1]/story",
+            "http://[ff00::1]/story",
+            "http://0177.0.0.1/story",
+            "http://0x7f.0.0.1/story",
+            "http://127.1/story",
+            "http://2130706433/story",
+            "http://0x7f000001/story",
+            "http://127.0.0.1\\.example.com/story",
+            "http://10.0.0.1\\foo",
+            "https://example.com/story with space",
+            "https://０x7f.0.0.1/status",
+            "https://１２７.0.0.1/status",
+            "https://127．0.0.1/status",
+            "https://%31%32%37.0.0.1/status",
+            "https://example.com:80/story",
+            "http://example.com:443/story",
+            "https://example.com/story?token=private",
+            "https://example.com/story?api%5Fkey=private",
+            "https://example.com/story?id_token=private",
+            "https://example.com/story?refresh_token=private",
+            "https://example.com/story?client_secret=private",
+            "https://example.com/story?secret_key=private",
+            "https://example.com/story?auth_token=private",
+            "https://example.com/story?api-key=private",
+            "https://example.com/story?x_api_key=private",
+            "https://example.com/story?my-api-key=private",
+            "https://example.com/story?jwt=private",
+            "https://example.com/story?bearer=private",
+            "https://example.com/story?api_key[]=private",
+            "https://example.com/story?token[]=private",
+            "https://example.com/story?credentials[token]=private",
+            "https://example.com/story?auth[access_token]=private",
+            "https://example.com/story?authorizationCode=private",
+            "https://example.com/story?sessionKey=private",
+            "https://example.com/story?credentialKey=private",
+            "https://example.com/story?apiKeyValue=private",
+            "https://example.com/story?APIKeyValue=private",
+            "https://example.com/story?accessCodeValue=private",
+            "https://example.com/story?tokenValue=private",
+            "https://example.com/story?secretValue=private",
+            "https://example.com/story?passwordValue=private",
+            "https://example.com/story?refreshTokenValue=private",
+            "https://example.com/story?X-Amz-Signature=private",
+            "https://example.com/story?sessionid=private",
+            "https://example.com/story?code=private",
+            "https://example.com/story?X-Amz-Token=private",
+        )
+        for url in unsafe:
+            with self.subTest(url=url):
+                self.assertEqual(briefing_service._public_url(url), "")
+
+        self.assertEqual(
+            briefing_service._public_url(
+                "HTTPS://Example.COM/story?utm_source=test&z=2&a=1#fragment"
+            ),
+            "https://example.com/story?a=1&z=2",
+        )
+
     def test_conservative_source_tiers(self) -> None:
         official = {
             "source": "Federal Reserve",
@@ -123,6 +191,17 @@ class SourceTierTests(unittest.TestCase):
             briefing_service.classify_source(impostor, evidence_basis="post_text"),
             "discovery",
         )
+        mismatched_handle = {
+            **x_post,
+            "source_url": "https://x.com/not_elon/status/123",
+        }
+        self.assertEqual(
+            briefing_service.classify_source(
+                mismatched_handle,
+                evidence_basis="post_text",
+            ),
+            "discovery",
+        )
         self.assertEqual(
             briefing_service.classify_source(
                 {
@@ -148,6 +227,40 @@ class SourceTierTests(unittest.TestCase):
 
 
 class BriefingBuildTests(unittest.TestCase):
+    @staticmethod
+    def event(
+        event_id: int,
+        title: str,
+        *,
+        published_at: str = "2026-09-04T01:55:00+00:00",
+        source: str = "Reuters",
+        source_url: str | None = None,
+        kol_key: str = "",
+        kol_name: str = "",
+        impact: str = "medium",
+        ai_enrichment: dict | None = None,
+    ) -> dict:
+        return {
+            "id": event_id,
+            "title": title,
+            "snippet": f"{title} 的已采集事实摘要",
+            "source": source,
+            "source_url": source_url
+            or f"https://www.reuters.com/world/story-{event_id}",
+            "canonical_url": source_url
+            or f"https://www.reuters.com/world/story-{event_id}",
+            "impact": impact,
+            "published_at": published_at,
+            "fetched_at": published_at,
+            "last_seen_at": published_at,
+            "time_status": "verified",
+            "source_count": 1,
+            "kol_key": kol_key,
+            "kol_name_cn": kol_name,
+            "ai_status": "ready" if ai_enrichment else "pending",
+            "ai_enrichment": ai_enrichment,
+        }
+
     def test_empty_database_has_stable_shape_and_no_synthetic_firsthand(self) -> None:
         repository = FakeRepository()
 
@@ -166,23 +279,71 @@ class BriefingBuildTests(unittest.TestCase):
                 "edition",
                 "edition_label",
                 "generated_at",
+                "coverage_window_hours",
+                "next_refresh_at",
+                "refresh_schedule_status",
                 "source_as_of",
+                "content_as_of",
+                "source_coverage_as_of",
+                "source_coverage_stale",
                 "stale",
                 "coverage",
+                "dedup_stats",
                 "lead",
                 "highlights",
                 "firsthand",
                 "watchpoints",
+                "sections",
                 "disclaimer",
             },
         )
         self.assertFalse(result["available"])
         self.assertTrue(result["stale"])
         self.assertIsNone(result["source_as_of"])
+        self.assertIsNone(result["content_as_of"])
+        self.assertIsNone(result["source_coverage_as_of"])
+        self.assertIsNone(result["source_coverage_stale"])
         self.assertEqual(result["lead"], {})
         self.assertEqual(result["highlights"], [])
         self.assertEqual(result["firsthand"], [])
         self.assertEqual(result["watchpoints"], [])
+        self.assertEqual(result["coverage_window_hours"], 24)
+        self.assertIsNone(result["next_refresh_at"])
+        self.assertEqual(result["refresh_schedule_status"], "unconfigured")
+        self.assertEqual(
+            [section["key"] for section in result["sections"]],
+            list(briefing_service.SECTION_KEYS),
+        )
+        for section in result["sections"]:
+            self.assertEqual(
+                set(section),
+                {
+                    "key",
+                    "label",
+                    "description",
+                    "source_as_of",
+                    "stale",
+                    "status",
+                    "verified_count",
+                    "total_count",
+                    "items",
+                },
+            )
+            self.assertEqual(section["items"], [])
+            self.assertEqual(section["status"], "empty")
+            self.assertTrue(section["stale"])
+        self.assertEqual(
+            result["dedup_stats"],
+            {
+                "input_count": 0,
+                "output_count": 0,
+                "merged_count": 0,
+                "stable_id_matches": 0,
+                "canonical_url_matches": 0,
+                "ai_cluster_matches": 0,
+                "semantic_matches": 0,
+            },
+        )
         self.assertEqual(
             result["coverage"],
             {
@@ -199,6 +360,72 @@ class BriefingBuildTests(unittest.TestCase):
         self.assertEqual(repository.event_query["hours"], 24)
         self.assertEqual(repository.event_query["time_status"], "verified")
         self.assertEqual(repository.event_query["use_ai_impact"], True)
+
+    def test_current_empty_import_reports_scan_coverage_without_fake_news(self) -> None:
+        snapshot = {
+            "schema_version": 1,
+            "generated_at": "2026-09-04T01:59:00+00:00",
+            "source_as_of": "2026-09-04T01:58:00+00:00",
+            "sections": {key: [] for key in briefing_service.SECTION_KEYS},
+        }
+
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository(),
+            public_macro=None,
+            decision_record=None,
+            imported_snapshot=snapshot,
+            now=NOW,
+        )
+
+        self.assertTrue(result["available"])
+        self.assertIsNone(result["source_as_of"])
+        self.assertIsNone(result["content_as_of"])
+        self.assertEqual(
+            result["source_coverage_as_of"],
+            "2026-09-04T01:58:00+00:00",
+        )
+        self.assertFalse(result["source_coverage_stale"])
+        self.assertTrue(result["stale"])
+        self.assertEqual(result["coverage"]["total"], 0)
+
+    def test_batch_coverage_does_not_freshen_old_displayed_evidence(self) -> None:
+        snapshot = {
+            "schema_version": 1,
+            "generated_at": "2026-09-04T01:59:00+00:00",
+            "source_as_of": "2026-09-04T01:58:00+00:00",
+            "sections": {key: [] for key in briefing_service.SECTION_KEYS},
+        }
+        snapshot["sections"]["finance"].append(
+            {
+                "title": "Older verified bank report remains relevant",
+                "source": "Reuters",
+                "source_url": "https://www.reuters.com/markets/older-bank-report",
+                "story_key": "older-bank-report",
+                "published_at": "2026-09-03T22:00:00+00:00",
+                "time_status": "verified",
+                "source_tier": "reporting",
+                "summary": "The report is still inside the 24-hour window.",
+                "assets": [],
+                "cross_tags": [],
+            }
+        )
+
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository(),
+            public_macro=None,
+            decision_record=None,
+            imported_snapshot=snapshot,
+            now=NOW,
+        )
+
+        self.assertEqual(result["content_as_of"], "2026-09-03T22:00:00+00:00")
+        self.assertEqual(result["source_as_of"], result["content_as_of"])
+        self.assertTrue(result["stale"])
+        self.assertEqual(
+            result["source_coverage_as_of"],
+            "2026-09-04T01:58:00+00:00",
+        )
+        self.assertFalse(result["source_coverage_stale"])
 
     def test_ranking_limits_ai_fallback_and_related_record_semantics(self) -> None:
         events = [
@@ -302,7 +529,11 @@ class BriefingBuildTests(unittest.TestCase):
             "direction": "positive",
         })
         self.assertEqual(first["related_records"], 2)
-        self.assertNotIn("source_count", first)
+        self.assertEqual(first["source_count"], 2)
+        self.assertIn("last_updated_at", first)
+        self.assertEqual(first["primary_section"], "finance")
+        self.assertIn("ai", first["cross_tags"])
+        self.assertIn("story_key", first)
         self.assertEqual(
             {item["source_tier"] for item in result["firsthand"]},
             {"official", "first_party"},
@@ -522,6 +753,46 @@ class BriefingBuildTests(unittest.TestCase):
         self.assertTrue(result["available"])
         self.assertEqual(result["source_as_of"], "2026-09-03T22:00:00+00:00")
         self.assertTrue(result["stale"])
+        self.assertEqual(
+            result["watchpoints"][0]["data_as_of"],
+            "2026-09-03T22:00:00+00:00",
+        )
+
+    def test_hidden_watchpoint_does_not_freshen_global_evidence_time(self) -> None:
+        decisions = [
+            {
+                "topic_key": f"selected_{index}",
+                "asset_key": f"US:S{index}",
+                "action_stage": "verify",
+                "total_score": 10 - index,
+                "data_as_of": "2026-09-03T22:00:00+00:00",
+            }
+            for index in range(5)
+        ]
+        decisions.append(
+            {
+                "topic_key": "hidden_fresh",
+                "asset_key": "US:HIDDEN",
+                "action_stage": "observe",
+                "total_score": 99,
+                "data_as_of": "2026-09-04T01:59:00+00:00",
+            }
+        )
+
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository(),
+            public_macro=None,
+            decision_record={"summary": {"decisions": decisions}},
+            now=NOW,
+        )
+
+        self.assertEqual(len(result["watchpoints"]), 5)
+        self.assertNotIn(
+            "US:HIDDEN",
+            {item["asset_key"] for item in result["watchpoints"]},
+        )
+        self.assertEqual(result["source_as_of"], "2026-09-03T22:00:00+00:00")
+        self.assertTrue(result["stale"])
 
     def test_watchpoints_are_sorted_capped_and_public_allowlisted(self) -> None:
         decisions = []
@@ -572,6 +843,1386 @@ class BriefingBuildTests(unittest.TestCase):
         self.assertNotIn("private-account", encoded)
         self.assertNotIn("private-position", encoded)
         self.assertNotIn("positions", encoded)
+
+    def test_six_sections_are_stable_and_each_story_has_one_primary_home(self) -> None:
+        events = [
+            self.event(1, "美国与伊朗冲突升级牵动全球供应链"),
+            self.event(2, "大型银行发布季度财报并上调利润指引"),
+            self.event(3, "量子芯片与机器人平台取得工程进展"),
+            self.event(4, "OpenAI 发布新一代推理模型"),
+            self.event(
+                5,
+                "巴菲特披露伯克希尔最新持仓",
+                kol_key="buffett",
+                kol_name="巴菲特",
+            ),
+        ]
+        macro = {
+            "created_at": "2026-09-04T01:56:00+00:00",
+            "monitored_events": [
+                {
+                    "id": "cpi-release",
+                    "kind": "indicator",
+                    "title": "官方公布最新 CPI 通胀数据",
+                    "source": "Bureau of Labor Statistics",
+                    "url": "https://www.bls.gov/news.release/cpi.htm",
+                    "content_status": "ready",
+                    "content_source_url": "https://www.bls.gov/news.release/cpi.htm",
+                    "published_at": "2026-09-04T01:56:00+00:00",
+                    "time_status": "verified",
+                    "severity": "high",
+                    "ai_status": "pending",
+                }
+            ],
+        }
+
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository(events),
+            public_macro=macro,
+            decision_record=None,
+            now=NOW,
+        )
+
+        sections = {section["key"]: section for section in result["sections"]}
+        self.assertEqual(set(sections), set(briefing_service.SECTION_KEYS))
+        self.assertTrue(all(sections[key]["total_count"] >= 1 for key in sections))
+        story_keys = []
+        for key, section in sections.items():
+            self.assertLessEqual(
+                len(section["items"]), briefing_service.MAX_SECTION_ITEMS
+            )
+            for item in section["items"]:
+                self.assertEqual(item["primary_section"], key)
+                self.assertNotIn(key, item["cross_tags"])
+                story_keys.append(item["story_key"])
+        self.assertEqual(len(story_keys), len(set(story_keys)))
+
+        # Top 5 is a quota-based view over real section items, not generated
+        # copy. With six populated rails it represents five distinct rails.
+        section_story_keys = {
+            item["story_key"]
+            for section in result["sections"]
+            for item in section["items"]
+        }
+        self.assertEqual(len(result["highlights"]), 5)
+        self.assertEqual(
+            len({item["primary_section"] for item in result["highlights"]}),
+            5,
+        )
+        self.assertTrue(
+            all(
+                item["story_key"] in section_story_keys
+                for item in result["highlights"]
+            )
+        )
+
+    def test_primary_section_follows_fact_title_not_ai_commentary(self) -> None:
+        tariff = self.event(
+            1,
+            "美国宣布对华关税新措施",
+            ai_enrichment=ready_ai(
+                headline_zh="美国关税措施影响 AI 芯片供应链",
+                why_it_matters_zh="AI 芯片与 GPU 供应链可能受到影响",
+            ),
+        )
+        powell = self.event(
+            2,
+            "鲍威尔称美联储维持利率路径",
+            kol_key="powell",
+            kol_name="鲍威尔",
+            ai_enrichment=ready_ai(
+                headline_zh="鲍威尔利率表态影响 AI 估值",
+                why_it_matters_zh="AI 成长股估值可能重新定价",
+            ),
+        )
+        apple = self.event(
+            3,
+            "Apple reports quarterly earnings",
+            ai_enrichment=ready_ai(
+                headline_zh="美联储政策影响苹果财报",
+                why_it_matters_zh="利率路径可能影响估值",
+            ),
+        )
+
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository([tariff, powell, apple]),
+            public_macro=None,
+            decision_record=None,
+            now=NOW,
+        )
+        by_id = {
+            item["id"]: item
+            for section in result["sections"]
+            for item in section["items"]
+        }
+
+        self.assertEqual(by_id["1"]["primary_section"], "world")
+        self.assertIn("ai", by_id["1"]["cross_tags"])
+        self.assertIn("technology", by_id["1"]["cross_tags"])
+        self.assertEqual(by_id["2"]["primary_section"], "macro")
+        self.assertIn("ai", by_id["2"]["cross_tags"])
+        self.assertEqual(by_id["3"]["primary_section"], "finance")
+        self.assertIn("macro", by_id["3"]["cross_tags"])
+
+    def test_ascii_ai_names_classify_next_to_chinese_text(self) -> None:
+        titles = (
+            "OpenAI发布GPT-6",
+            "AI前沿突破",
+            "ChatGPT推出新功能",
+            "Claude发布新版",
+        )
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository(
+                [
+                    self.event(
+                        index,
+                        title,
+                        source_url=f"https://example.com/mixed-ai-{index}",
+                    )
+                    for index, title in enumerate(titles, start=1)
+                ]
+            ),
+            public_macro=None,
+            decision_record=None,
+            now=NOW,
+        )
+
+        ai = next(section for section in result["sections"] if section["key"] == "ai")
+        self.assertEqual(ai["total_count"], len(titles))
+
+    def test_top_five_prioritizes_validated_primary_source_without_v1_impact(self) -> None:
+        section_titles = {
+            "macro": "Official monetary policy filing",
+            "world": "Global diplomatic talks update",
+            "finance": "Bank funding market update",
+            "technology": "Semiconductor process update",
+            "ai": "OpenAI reasoning model update",
+            "investors": "Investor portfolio disclosure update",
+        }
+        sections = {}
+        for index, key in enumerate(briefing_service.SECTION_KEYS):
+            official = key == "macro"
+            sections[key] = [
+                {
+                    "section": key,
+                    "title": section_titles[key],
+                    "source": "SEC" if official else "Reuters",
+                    "source_url": (
+                        "https://www.sec.gov/newsroom/press-releases/official-top"
+                        if official
+                        else f"https://www.reuters.com/world/{key}-top"
+                    ),
+                    "canonical_url": (
+                        "https://www.sec.gov/newsroom/press-releases/official-top"
+                        if official
+                        else f"https://www.reuters.com/world/{key}-top"
+                    ),
+                    "story_key": f"{key}-top",
+                    "published_at": f"2026-09-04T01:{40 + index:02d}:00+00:00",
+                    "time_status": "verified",
+                    "source_tier": "official" if official else "reporting",
+                    "source_count": 1,
+                    "summary": section_titles[key],
+                    "cross_tags": [],
+                    "assets": [],
+                    # v1 does not declare this field; the service must ignore it.
+                    "impact": "low" if official else "high",
+                }
+            ]
+
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository(),
+            public_macro=None,
+            decision_record=None,
+            imported_snapshot={"schema_version": 1, "sections": sections},
+            now=NOW,
+        )
+
+        self.assertEqual(result["highlights"][0]["id"], "macro-top")
+        self.assertIn(
+            "macro-top", {item["id"] for item in result["highlights"]}
+        )
+        self.assertTrue(
+            all(item["impact"] == "unknown" for item in result["highlights"])
+        )
+        self.assertNotIn("本人原文", json.dumps(result, ensure_ascii=False))
+
+    def test_section_freshness_is_independent(self) -> None:
+        events = [
+            self.event(
+                1,
+                "银行发布最新财报",
+                published_at="2026-09-04T01:55:00+00:00",
+            ),
+            self.event(
+                2,
+                "全球停火谈判继续",
+                published_at="2026-09-03T22:00:00+00:00",
+            ),
+        ]
+        events[0]["fetched_at"] = "2026-09-04T01:59:00+00:00"
+        events[0]["last_seen_at"] = "2026-09-04T01:59:00+00:00"
+
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository(events),
+            public_macro=None,
+            decision_record=None,
+            now=NOW,
+        )
+
+        sections = {section["key"]: section for section in result["sections"]}
+        self.assertFalse(sections["finance"]["stale"])
+        self.assertEqual(sections["finance"]["status"], "fresh")
+        self.assertTrue(sections["world"]["stale"])
+        self.assertEqual(sections["world"]["status"], "stale")
+        self.assertFalse(result["stale"])
+
+    def test_fresh_reporting_survives_stale_official_saturation(self) -> None:
+        official = [
+            {
+                "section": "finance",
+                "title": f"Regulator archive notice {index}",
+                "source": "SEC",
+                "source_url": (
+                    "https://www.sec.gov/newsroom/press-releases/"
+                    f"stale-official-{index}"
+                ),
+                "story_key": f"stale-official-{index}",
+                "published_at": "2026-09-03T03:00:00+00:00",
+                "time_status": "verified",
+                "source_tier": "official",
+                "summary": "A verified but older regulatory notice.",
+                "assets": [],
+                "cross_tags": [],
+            }
+            for index in range(6)
+        ]
+        fresh = {
+            "section": "finance",
+            "title": "Reuters reports a current bank funding development",
+            "source": "Reuters",
+            "source_url": "https://www.reuters.com/markets/current-bank-funding",
+            "story_key": "fresh-reporting",
+            "published_at": "2026-09-04T01:55:00+00:00",
+            "time_status": "verified",
+            "source_tier": "reporting",
+            "summary": "Current verified reporting on bank funding.",
+            "assets": [],
+            "cross_tags": [],
+        }
+        snapshot = {
+            "schema_version": 1,
+            "sections": {
+                key: (official + [fresh] if key == "finance" else [])
+                for key in briefing_service.SECTION_KEYS
+            },
+        }
+
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository(),
+            public_macro=None,
+            decision_record=None,
+            imported_snapshot=snapshot,
+            now=NOW,
+        )
+        finance = next(
+            section for section in result["sections"] if section["key"] == "finance"
+        )
+
+        self.assertEqual(finance["total_count"], 7)
+        self.assertEqual(len(finance["items"]), 6)
+        self.assertEqual(finance["items"][0]["id"], "fresh-reporting")
+        self.assertFalse(finance["stale"])
+        self.assertEqual(result["highlights"][0]["id"], "fresh-reporting")
+
+    def test_fresh_official_survives_stale_firsthand_saturation(self) -> None:
+        events = []
+        for index in range(7):
+            fresh = index == 6
+            events.append(
+                {
+                    "id": f"official-{index}",
+                    "kind": "policy",
+                    "title": f"Federal Reserve policy release {index}",
+                    "source": "Federal Reserve",
+                    "url": (
+                        "https://www.federalreserve.gov/newsevents/pressreleases/"
+                        f"monetary2026090{index + 1}a.htm"
+                    ),
+                    "content_status": "ready",
+                    "content_excerpt": "The Committee published its decision.",
+                    "content_source_url": (
+                        "https://www.federalreserve.gov/newsevents/pressreleases/"
+                        f"monetary2026090{index + 1}a.htm"
+                    ),
+                    "published_at": (
+                        "2026-09-04T01:55:00+00:00"
+                        if fresh
+                        else "2026-09-03T03:00:00+00:00"
+                    ),
+                    "time_status": "verified",
+                    "severity": "low" if fresh else "high",
+                    "ai_status": "pending",
+                }
+            )
+
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository(),
+            public_macro={"monitored_events": events},
+            decision_record=None,
+            now=NOW,
+        )
+
+        self.assertEqual(len(result["firsthand"]), 6)
+        self.assertEqual(result["firsthand"][0]["id"], "official-6")
+        self.assertIn(
+            "official-6", {item["id"] for item in result["firsthand"]}
+        )
+
+    def test_refetch_time_does_not_claim_the_story_was_updated(self) -> None:
+        old = self.event(
+            1,
+            "Bank publishes quarterly earnings report",
+            published_at="2026-09-03T03:00:00+00:00",
+        )
+        old["fetched_at"] = "2026-09-04T01:59:00+00:00"
+        old["last_seen_at"] = "2026-09-04T01:59:00+00:00"
+        macro_event = {
+            "id": "old-policy",
+            "kind": "policy",
+            "title": "Federal Reserve policy statement remains available",
+            "source": "Federal Reserve",
+            "url": (
+                "https://www.federalreserve.gov/newsevents/pressreleases/"
+                "monetary20260903a.htm"
+            ),
+            "content_status": "ready",
+            "content_excerpt": "The Committee statement remains unchanged.",
+            "content_source_url": (
+                "https://www.federalreserve.gov/newsevents/pressreleases/"
+                "monetary20260903a.htm"
+            ),
+            "published_at": "2026-09-03T03:00:00+00:00",
+            "time_status": "verified",
+            "severity": "medium",
+            "ai_status": "pending",
+        }
+
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository([old]),
+            public_macro={
+                "created_at": "2026-09-04T01:59:00+00:00",
+                "monitored_events": [macro_event],
+            },
+            decision_record=None,
+            now=NOW,
+        )
+        items = {
+            item["id"]: item
+            for section in result["sections"]
+            for item in section["items"]
+        }
+
+        self.assertEqual(items["1"]["last_updated_at"], old["published_at"])
+        self.assertEqual(
+            items["old-policy"]["last_updated_at"],
+            macro_event["published_at"],
+        )
+
+    def test_section_limit_preserves_official_source_ahead_of_discovery(self) -> None:
+        discovery = [
+            {
+                "section": "finance",
+                "title": f"市场聚合线索 {index}",
+                "source_url": f"https://news.google.com/articles/{index}",
+                "canonical_url": f"https://news.google.com/articles/{index}",
+                "story_key": f"discovery-{index}",
+                "published_at": f"2026-09-04T01:{50-index:02d}:00+00:00",
+                "last_updated_at": f"2026-09-04T01:{50-index:02d}:00+00:00",
+                "time_status": "verified",
+                "source_tier": "discovery",
+                "source_count": 1,
+                "summary": "市场股票异动线索",
+                "cross_tags": [],
+                "assets": [],
+                "impact": "high",
+            }
+            for index in range(8)
+        ]
+        official = {
+            "section": "finance",
+            "title": "监管机构发布正式市场公告",
+            "source": "SEC",
+            "source_url": "https://www.sec.gov/newsroom/press-releases/official-one",
+            "canonical_url": "https://www.sec.gov/newsroom/press-releases/official-one",
+            "story_key": "official-one",
+            "published_at": "2026-09-04T01:10:00+00:00",
+            "last_updated_at": "2026-09-04T01:10:00+00:00",
+            "time_status": "verified",
+            "source_tier": "official",
+            "source_count": 1,
+            "summary": "监管机构正式披露",
+            "cross_tags": [],
+            "assets": [],
+            "impact": "low",
+        }
+        snapshot = {
+            "schema_version": 1,
+            "sections": {
+                key: (discovery + [official] if key == "finance" else [])
+                for key in briefing_service.SECTION_KEYS
+            },
+        }
+
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository(),
+            public_macro=None,
+            decision_record=None,
+            imported_snapshot=snapshot,
+            now=NOW,
+        )
+
+        finance = next(
+            section for section in result["sections"] if section["key"] == "finance"
+        )
+        self.assertEqual(finance["total_count"], 9)
+        self.assertEqual(len(finance["items"]), 6)
+        self.assertEqual(finance["items"][0]["source_tier"], "official")
+        self.assertTrue(
+            any(item["title"] == official["title"] for item in finance["items"])
+        )
+
+    def test_semantic_dedup_merges_vance_iran_wording_across_urls(self) -> None:
+        events = [
+            self.event(
+                1,
+                "万斯称对伊冲突并非战争",
+                source="Reuters",
+                source_url="https://www.reuters.com/world/vance-iran-one",
+                kol_key="trump",
+                kol_name="特朗普",
+            ),
+            self.event(
+                2,
+                "美国副总统万斯表示对伊军事行动不是战争",
+                source="Bing News",
+                source_url="https://www.bing.com/news/vance-iran-two",
+                kol_key="trump",
+                kol_name="特朗普",
+                published_at="2026-09-04T01:50:00+00:00",
+            ),
+        ]
+
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository(events),
+            public_macro=None,
+            decision_record=None,
+            now=NOW,
+        )
+
+        world = next(
+            section for section in result["sections"] if section["key"] == "world"
+        )
+        self.assertEqual(world["total_count"], 1)
+        merged = world["items"][0]
+        self.assertEqual(merged["source_tier"], "reporting")
+        self.assertEqual(merged["source_count"], 2)
+        self.assertEqual(merged["related_records"], 2)
+        self.assertEqual(
+            merged["last_updated_at"], "2026-09-04T01:55:00+00:00"
+        )
+        self.assertEqual(result["dedup_stats"]["semantic_matches"], 1)
+        self.assertEqual(result["dedup_stats"]["merged_count"], 1)
+
+    def test_same_url_conflicts_are_preserved_but_compatible_duplicates_merge(
+        self,
+    ) -> None:
+        shared_url = "https://example.com/fed/live-statement"
+        events = [
+            self.event(
+                1,
+                "Fed cuts rates by 50 basis points",
+                source_url=shared_url,
+                published_at="2026-09-04T00:30:00+00:00",
+                kol_key="powell",
+                kol_name="鲍威尔",
+                impact="high",
+            ),
+            self.event(
+                2,
+                "Fed cuts rates by 50 basis points",
+                source_url=shared_url,
+                published_at="2026-09-04T00:45:00+00:00",
+                kol_key="powell",
+                kol_name="鲍威尔",
+                impact="medium",
+            ),
+            self.event(
+                3,
+                "Fed did not cut rates by 50 basis points",
+                source_url=shared_url,
+                published_at="2026-09-04T01:30:00+00:00",
+                kol_key="powell",
+                kol_name="鲍威尔",
+                impact="low",
+            ),
+        ]
+
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository(events),
+            public_macro=None,
+            decision_record=None,
+            now=NOW,
+        )
+        macro = next(
+            section for section in result["sections"] if section["key"] == "macro"
+        )
+
+        self.assertEqual(macro["total_count"], 2)
+        self.assertEqual(result["dedup_stats"]["canonical_url_matches"], 1)
+        self.assertEqual(len({item["story_key"] for item in macro["items"]}), 2)
+        self.assertTrue(any("did not" in item["title"] for item in macro["items"]))
+        affirmative = next(
+            item for item in macro["items"] if "did not" not in item["title"]
+        )
+        self.assertEqual(affirmative["published_at"], "2026-09-04T00:45:00+00:00")
+        self.assertEqual(affirmative["impact"], "medium")
+
+    def test_later_import_cannot_replace_trusted_native_same_url_revision(
+        self,
+    ) -> None:
+        shared_url = "https://www.reuters.com/world/fed-policy-update"
+        trusted = self.event(
+            1,
+            "Fed cuts rates by 25 basis points",
+            source_url=shared_url,
+            published_at="2026-09-04T01:50:00+00:00",
+            impact="high",
+        )
+        snapshot = {
+            "schema_version": 1,
+            "sections": {
+                key: (
+                    [
+                        {
+                            "title": "Fed cuts rates by 25 basis points",
+                            "summary": "UNTRUSTED IMPORT MUST NOT WIN",
+                            "source_label": "Unverified feed label",
+                            "source_url": shared_url,
+                            "story_key": "untrusted-later-revision",
+                            "published_at": "2026-09-04T01:55:00+00:00",
+                            "time_status": "verified",
+                            "source_tier": "discovery",
+                            "assets": [],
+                            "cross_tags": [],
+                        }
+                    ]
+                    if key == "macro"
+                    else []
+                )
+                for key in briefing_service.SECTION_KEYS
+            },
+        }
+
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository([trusted]),
+            public_macro=None,
+            decision_record=None,
+            imported_snapshot=snapshot,
+            now=NOW,
+        )
+        macro = next(
+            section for section in result["sections"] if section["key"] == "macro"
+        )
+
+        self.assertEqual(macro["total_count"], 1)
+        representative = macro["items"][0]
+        self.assertEqual(representative["id"], "1")
+        self.assertEqual(representative["source_tier"], "reporting")
+        self.assertEqual(representative["source_label"], "Reuters")
+        self.assertNotIn("UNTRUSTED", representative["summary"])
+        self.assertEqual(representative["impact"], "high")
+        self.assertEqual(representative["source_count"], 2)
+        self.assertEqual(
+            representative["last_updated_at"], "2026-09-04T01:50:00+00:00"
+        )
+
+    def test_same_tier_current_revision_wins_and_keeps_known_impact(self) -> None:
+        shared_url = "https://www.reuters.com/markets/bank-funding-update"
+        old_native = self.event(
+            1,
+            "Bank funding conditions improve",
+            source_url=shared_url,
+            published_at="2026-09-03T18:00:00+00:00",
+            impact="high",
+        )
+        snapshot = {
+            "schema_version": 1,
+            "sections": {
+                key: (
+                    [
+                        {
+                            "title": "Bank funding conditions improve",
+                            "summary": "Current Reuters revision.",
+                            "source_label": "Reuters",
+                            "source_url": shared_url,
+                            "story_key": "current-bank-revision",
+                            "published_at": "2026-09-04T01:55:00+00:00",
+                            "time_status": "verified",
+                            "source_tier": "reporting",
+                            "assets": [],
+                            "cross_tags": [],
+                        }
+                    ]
+                    if key == "finance"
+                    else []
+                )
+                for key in briefing_service.SECTION_KEYS
+            },
+        }
+
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository([old_native]),
+            public_macro=None,
+            decision_record=None,
+            imported_snapshot=snapshot,
+            now=NOW,
+        )
+        finance = next(
+            section for section in result["sections"] if section["key"] == "finance"
+        )
+
+        self.assertEqual(finance["total_count"], 1)
+        representative = finance["items"][0]
+        self.assertEqual(representative["id"], "current-bank-revision")
+        self.assertEqual(representative["published_at"], "2026-09-04T01:55:00+00:00")
+        self.assertEqual(representative["last_updated_at"], representative["published_at"])
+        self.assertEqual(representative["impact"], "high")
+        self.assertFalse(finance["stale"])
+
+    def test_actionless_exact_titles_on_different_urls_are_not_merged(self) -> None:
+        events = [
+            self.event(
+                1,
+                "Market Update",
+                source_url="https://example.com/market-update-one",
+            ),
+            self.event(
+                2,
+                "Market Update",
+                source_url="https://example.com/market-update-two",
+            ),
+            self.event(
+                3,
+                "OpenAI Update",
+                source_url="https://example.com/openai-update-one",
+            ),
+            self.event(
+                4,
+                "OpenAI Update",
+                source_url="https://example.com/openai-update-two",
+            ),
+        ]
+
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository(events),
+            public_macro=None,
+            decision_record=None,
+            now=NOW,
+        )
+
+        self.assertEqual(result["coverage"]["total"], 4)
+        self.assertEqual(result["dedup_stats"]["semantic_matches"], 0)
+
+    def test_reused_landing_page_on_different_beijing_days_is_not_merged(self) -> None:
+        shared_url = "https://example.com/daily/latest"
+        events = [
+            self.event(
+                1,
+                "Daily market briefing",
+                source_url=shared_url,
+                published_at="2026-09-03T15:30:00+00:00",
+            ),
+            self.event(
+                2,
+                "Daily market briefing",
+                source_url=shared_url,
+                published_at="2026-09-03T16:30:00+00:00",
+            ),
+        ]
+
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository(events),
+            public_macro=None,
+            decision_record=None,
+            now=NOW,
+        )
+        finance = next(
+            section for section in result["sections"] if section["key"] == "finance"
+        )
+
+        self.assertEqual(finance["total_count"], 2)
+        self.assertEqual(result["dedup_stats"]["canonical_url_matches"], 0)
+        self.assertEqual(len({item["story_key"] for item in finance["items"]}), 2)
+
+    def test_high_confidence_cluster_dedups_but_distinct_actions_do_not(self) -> None:
+        clustered = ready_ai(
+            confidence=0.91,
+            cluster_key="openai-releases-reasoning-model",
+            evidence_basis="title_and_snippet",
+        )
+        events = [
+            self.event(
+                1,
+                "OpenAI 发布推理模型",
+                source_url="https://www.reuters.com/technology/openai-one",
+                ai_enrichment=clustered,
+            ),
+            self.event(
+                2,
+                "新推理模型由 OpenAI 正式推出",
+                source_url="https://example.com/openai-two",
+                ai_enrichment=clustered,
+            ),
+            self.event(
+                8,
+                "OpenAI recalls its reasoning model",
+                source_url="https://example.com/openai-recall",
+                ai_enrichment=clustered,
+            ),
+            self.event(
+                9,
+                "OpenAI releases GPT-6",
+                source_url="https://example.com/openai-gpt-6",
+                ai_enrichment=clustered,
+            ),
+            self.event(
+                10,
+                "OpenAI releases GPT-7",
+                source_url="https://example.com/openai-gpt-7",
+                ai_enrichment=clustered,
+            ),
+            self.event(
+                3,
+                "巴菲特增持日本商社",
+                kol_key="buffett",
+                kol_name="巴菲特",
+            ),
+            self.event(
+                4,
+                "巴菲特减持苹果股份",
+                kol_key="buffett",
+                kol_name="巴菲特",
+            ),
+        ]
+
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository(events),
+            public_macro=None,
+            decision_record=None,
+            now=NOW,
+        )
+
+        sections = {section["key"]: section for section in result["sections"]}
+        self.assertEqual(sections["ai"]["total_count"], 4)
+        self.assertEqual(sections["investors"]["total_count"], 2)
+        self.assertEqual(result["dedup_stats"]["ai_cluster_matches"], 1)
+
+    def test_english_semantic_dedup_keeps_different_openai_event_apart(self) -> None:
+        events = [
+            self.event(
+                1,
+                "OpenAI releases reasoning model for enterprise developers",
+                source_url="https://www.reuters.com/technology/openai-model",
+            ),
+            self.event(
+                2,
+                "OpenAI launches a reasoning model aimed at enterprise developers",
+                source_url="https://example.com/openai-model-launch",
+            ),
+            self.event(
+                3,
+                "OpenAI raises capital from global institutional investors",
+                source_url="https://example.com/openai-fundraising",
+            ),
+        ]
+
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository(events),
+            public_macro=None,
+            decision_record=None,
+            now=NOW,
+        )
+
+        ai = next(section for section in result["sections"] if section["key"] == "ai")
+        self.assertEqual(ai["total_count"], 2)
+        self.assertEqual(result["dedup_stats"]["semantic_matches"], 1)
+        self.assertTrue(
+            any("raises capital" in item["title"] for item in ai["items"])
+        )
+
+    def test_semantic_signature_is_bilingual_and_direction_safe(self) -> None:
+        events = [
+            self.event(
+                1,
+                "美联储降息25个基点",
+                kol_key="powell",
+                kol_name="鲍威尔",
+            ),
+            self.event(
+                2,
+                "Fed cuts rates by 25 basis points",
+                source_url="https://example.com/fed-cut-25bp",
+                kol_key="powell",
+                kol_name="鲍威尔",
+            ),
+            self.event(
+                3,
+                "美联储加息25个基点",
+                source_url="https://example.com/fed-hike-25bp",
+                kol_key="powell",
+                kol_name="鲍威尔",
+            ),
+            self.event(
+                4,
+                "巴菲特增持苹果公司股份",
+                kol_key="buffett",
+                kol_name="巴菲特",
+            ),
+            self.event(
+                5,
+                "巴菲特减持苹果公司股份",
+                source_url="https://example.com/buffett-cuts-apple",
+                kol_key="buffett",
+                kol_name="巴菲特",
+            ),
+            self.event(
+                6,
+                "OpenAI releases GPT-5.1 model",
+                source_url="https://example.com/openai-release-gpt-5-1",
+            ),
+            self.event(
+                7,
+                "OpenAI recalls GPT-5.1 model",
+                source_url="https://example.com/openai-recall-gpt-5-1",
+            ),
+            self.event(
+                8,
+                "美联储不会降息25个基点",
+                source_url="https://example.com/fed-no-cut-25bp",
+                kol_key="powell",
+                kol_name="鲍威尔",
+            ),
+            self.event(
+                9,
+                "OpenAI will not release GPT-5.1 model",
+                source_url="https://example.com/openai-no-release-gpt-5-1",
+            ),
+        ]
+
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository(events),
+            public_macro=None,
+            decision_record=None,
+            now=NOW,
+        )
+
+        sections = {section["key"]: section for section in result["sections"]}
+        macro_titles = [item["title"] for item in sections["macro"]["items"]]
+        self.assertEqual(sections["macro"]["total_count"], 3)
+        self.assertTrue(
+            any("降息" in title or "cuts rates" in title for title in macro_titles)
+        )
+        self.assertTrue(any("加息" in title for title in macro_titles))
+        self.assertEqual(sections["investors"]["total_count"], 2)
+        self.assertEqual(sections["ai"]["total_count"], 3)
+        self.assertEqual(result["dedup_stats"]["semantic_matches"], 1)
+
+    def test_rate_cut_negations_never_merge_with_positive_event(self) -> None:
+        titles = (
+            "Fed cuts rates by 25 basis points",
+            "美联储未降息25个基点",
+            "美联储没有降息25个基点",
+            "美联储暂不降息25个基点",
+            "Fed is not cutting rates by 25 basis points",
+            "Fed will not in September cut rates by 25 basis points",
+            "美联储未如预期降息25个基点",
+            "Fed has not cut rates by 25 basis points",
+            "美联储降息25个基点的传闻不实",
+            "Fed unlikely to cut rates by 25 basis points",
+            "Fed rules out cutting rates by 25 basis points",
+            "Fed without cutting rates by 25 basis points",
+            "Fed has no intention of cutting rates by 25 basis points",
+            "Fed decides against cutting rates by 25 basis points",
+            "美联储拒绝降息25个基点",
+        )
+        events = [
+            self.event(
+                index,
+                title,
+                source_url=f"https://example.com/rate-action-{index}",
+                kol_key="powell",
+                kol_name="鲍威尔",
+            )
+            for index, title in enumerate(titles, start=1)
+        ]
+
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository(events),
+            public_macro=None,
+            decision_record=None,
+            now=NOW,
+        )
+
+        macro = next(
+            section for section in result["sections"] if section["key"] == "macro"
+        )
+        self.assertEqual(macro["total_count"], len(titles))
+        self.assertEqual(result["dedup_stats"]["semantic_matches"], 0)
+
+    def test_product_release_expectation_denial_is_not_an_announcement(self) -> None:
+        events = [
+            self.event(
+                1,
+                "OpenAI releases GPT-6",
+                source_url="https://example.com/openai-releases-gpt-6",
+            ),
+            self.event(
+                2,
+                "OpenAI is not expected to release GPT-6",
+                source_url="https://example.com/openai-not-expected-gpt-6",
+            ),
+            self.event(
+                3,
+                "OpenAI has not released GPT-6",
+                source_url="https://example.com/openai-has-not-gpt-6",
+            ),
+            self.event(
+                4,
+                "OpenAI cannot release GPT-6",
+                source_url="https://example.com/openai-cannot-gpt-6",
+            ),
+            self.event(
+                5,
+                "OpenAI unlikely to release GPT-6",
+                source_url="https://example.com/openai-unlikely-gpt-6",
+            ),
+        ]
+
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository(events),
+            public_macro=None,
+            decision_record=None,
+            now=NOW,
+        )
+
+        ai = next(section for section in result["sections"] if section["key"] == "ai")
+        self.assertEqual(ai["total_count"], len(events))
+        self.assertEqual(result["dedup_stats"]["semantic_matches"], 0)
+
+    def test_negation_in_another_clause_never_merges_with_a_denial(self) -> None:
+        titles = (
+            "Fed cuts rates by 25 basis points, not ending QT",
+            "Fed did not cut rates by 25 basis points",
+            "美联储降息25个基点，未结束缩表",
+            "美联储未降息25个基点",
+        )
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository(
+                [
+                    self.event(
+                        index,
+                        title,
+                        source_url=f"https://example.com/negation-scope-{index}",
+                        kol_key="powell",
+                        kol_name="鲍威尔",
+                    )
+                    for index, title in enumerate(titles, start=1)
+                ]
+            ),
+            public_macro=None,
+            decision_record=None,
+            now=NOW,
+        )
+        macro = next(
+            section for section in result["sections"] if section["key"] == "macro"
+        )
+
+        self.assertEqual(macro["total_count"], len(titles))
+        self.assertEqual(result["dedup_stats"]["semantic_matches"], 0)
+
+    def test_predictions_and_rumours_never_merge_with_observed_events(self) -> None:
+        events = [
+            self.event(1, "Fed cuts rates by 25 basis points"),
+            self.event(
+                2,
+                "Markets expect Fed to cut rates by 25 basis points in September",
+                source_url="https://example.com/fed-expect-september",
+            ),
+            self.event(
+                3,
+                "Markets expect Fed to cut rates by 25 basis points in December",
+                source_url="https://example.com/fed-expect-december",
+            ),
+            self.event(
+                4,
+                "OpenAI releases GPT-6",
+                source_url="https://example.com/openai-gpt6-observed",
+            ),
+            self.event(
+                5,
+                "OpenAI may release GPT-6",
+                source_url="https://example.com/openai-gpt6-maybe",
+            ),
+            self.event(
+                6,
+                "Fed to cut rates by 25 basis points",
+                source_url="https://example.com/fed-to-cut",
+            ),
+            self.event(
+                7,
+                "Fed due to cut rates by 25 basis points",
+                source_url="https://example.com/fed-due-to-cut",
+            ),
+            self.event(
+                8,
+                "美联储将降息25个基点",
+                source_url="https://example.com/fed-future-cut-cn",
+            ),
+            self.event(
+                9,
+                "OpenAI to release GPT-6 next week",
+                source_url="https://example.com/openai-to-release",
+            ),
+            self.event(
+                10,
+                "OpenAI 将发布 GPT-6",
+                source_url="https://example.com/openai-future-cn",
+            ),
+        ]
+
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository(events),
+            public_macro=None,
+            decision_record=None,
+            now=NOW,
+        )
+        sections = {section["key"]: section for section in result["sections"]}
+
+        self.assertEqual(sections["macro"]["total_count"], 6)
+        self.assertEqual(sections["ai"]["total_count"], 4)
+        self.assertEqual(result["dedup_stats"]["semantic_matches"], 0)
+
+    def test_discussion_conditionals_and_questions_never_merge_as_facts(
+        self,
+    ) -> None:
+        macro_titles = (
+            "Fed cuts rates by 25 basis points",
+            "Fed considers cutting rates by 25 basis points",
+            "Fed debates cutting rates by 25 basis points",
+            "Fed weighs cutting rates by 25 basis points",
+            "Fed discusses cutting rates by 25 basis points",
+            "Fed eyes cutting rates by 25 basis points",
+            "Fed leaves the door open to cutting rates by 25 basis points",
+            "美联储讨论降息25个基点",
+            "美联储考虑降息25个基点",
+            "美联储研究降息25个基点",
+            "美联储将在下次会议评估是否降息25个基点",
+            "If Fed cuts rates by 25 basis points",
+            "Fed cuts rates by 25 basis points?",
+            "美联储如果降息25个基点",
+            "美联储若降息25个基点",
+            "美联储降息25个基点？",
+            "Fed cuts rates by 25 basis points next year",
+            "美联储明年降息25个基点",
+        )
+        ai_titles = (
+            "OpenAI releases GPT-6",
+            "If OpenAI releases GPT-6",
+            "OpenAI releases GPT-6?",
+        )
+        events = [
+            self.event(
+                index,
+                title,
+                source_url=f"https://example.com/ambiguous-macro-{index}",
+                kol_key="powell",
+                kol_name="鲍威尔",
+            )
+            for index, title in enumerate(macro_titles, start=1)
+        ]
+        events.extend(
+            self.event(
+                index,
+                title,
+                source_url=f"https://example.com/ambiguous-ai-{index}",
+            )
+            for index, title in enumerate(ai_titles, start=100)
+        )
+
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository(events),
+            public_macro=None,
+            decision_record=None,
+            now=NOW,
+        )
+        sections = {section["key"]: section for section in result["sections"]}
+
+        self.assertEqual(sections["macro"]["total_count"], len(macro_titles))
+        self.assertEqual(sections["ai"]["total_count"], len(ai_titles))
+        self.assertEqual(result["dedup_stats"]["semantic_matches"], 0)
+
+    def test_multiple_actions_and_historical_clauses_never_semantic_merge(
+        self,
+    ) -> None:
+        titles = (
+            "Fed cuts rates by 25 basis points",
+            "Fed hikes rates after cutting rates last year",
+            "美联储加息，此前曾降息25个基点",
+            "Fed keeps rates unchanged after cutting rates by 25 basis points in July",
+            "美联储维持利率不变，此前曾降息25个基点",
+            "Fed cut rates by 25 basis points in July",
+            "Fed cut rates by 25 basis points at its previous meeting",
+            "美联储7月降息25个基点",
+            "美联储在上次会议降息25个基点",
+        )
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository(
+                [
+                    self.event(
+                        index,
+                        title,
+                        source_url=f"https://example.com/multi-action-{index}",
+                        kol_key="powell",
+                        kol_name="鲍威尔",
+                    )
+                    for index, title in enumerate(titles, start=1)
+                ]
+            ),
+            public_macro=None,
+            decision_record=None,
+            now=NOW,
+        )
+        macro = next(
+            section for section in result["sections"] if section["key"] == "macro"
+        )
+
+        self.assertEqual(macro["total_count"], len(titles))
+        self.assertEqual(result["dedup_stats"]["semantic_matches"], 0)
+
+    def test_section_freshness_uses_only_displayed_verified_publication_time(self) -> None:
+        old_items = []
+        for index in range(6):
+            item = self.event(
+                index,
+                f"银行季度财报事件 {index}",
+                published_at="2026-09-03T22:00:00+00:00",
+            )
+            item["fetched_at"] = "2026-09-04T01:59:00+00:00"
+            item["last_seen_at"] = "2026-09-04T01:59:00+00:00"
+            old_items.append(item)
+        hidden_fresh = self.event(
+            99,
+            "银行聚合市场线索 99",
+            published_at="2026-09-04T01:58:00+00:00",
+            source="Bing News",
+            source_url="https://www.bing.com/news/hidden-fresh",
+            impact="high",
+        )
+
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository(old_items + [hidden_fresh]),
+            public_macro=None,
+            decision_record=None,
+            now=NOW,
+        )
+
+        finance = next(
+            section for section in result["sections"] if section["key"] == "finance"
+        )
+        self.assertEqual(len(finance["items"]), 6)
+        self.assertTrue(finance["stale"])
+        self.assertEqual(finance["source_as_of"], "2026-09-03T22:00:00+00:00")
+        self.assertTrue(result["stale"])
+        self.assertEqual(result["source_as_of"], "2026-09-03T22:00:00+00:00")
+
+        old_only = briefing_service.build_latest_briefing(
+            repository=FakeRepository([old_items[0]]),
+            public_macro=None,
+            decision_record=None,
+            now=NOW,
+        )
+        self.assertEqual(old_only["source_as_of"], "2026-09-03T22:00:00+00:00")
+        self.assertTrue(old_only["stale"])
+
+    def test_imported_hint_evidence_and_disclosure_dates_are_fail_closed(self) -> None:
+        official = {
+            "section": "world",
+            "title": "OpenAI releases a new reasoning model",
+            "source": "SEC",
+            "source_url": "https://www.sec.gov/newsroom/press-releases/example",
+            "canonical_url": "https://www.sec.gov/newsroom/press-releases/example",
+            "story_key": "official-openai-release",
+            "published_at": "2026-09-04T01:40:00+00:00",
+            "last_updated_at": "2026-09-04T01:59:00+00:00",
+            "fetched_at": "2026-09-04T01:59:00+00:00",
+            "time_status": "verified",
+            "source_tier": "official",
+            "source_count": 1,
+            "summary": "The filing describes the product release.",
+            "cross_tags": [],
+            "assets": [],
+            "disclosed_at": "2026-09-04T01:30:00+00:00",
+            "period_end": "2026-06-30",
+            "account": "must-not-leak",
+        }
+        firsthand = {
+            "section": "investors",
+            "title": "投资人发布持仓观点",
+            "source": "X @investor",
+            "source_url": "https://x.com/investor/status/123",
+            "canonical_url": "https://x.com/investor/status/123",
+            "story_key": "investor-post",
+            "published_at": "2026-09-04T01:42:00+00:00",
+            "last_updated_at": "2026-09-04T01:42:00+00:00",
+            "time_status": "verified",
+            "source_tier": "first_party",
+            "source_count": 1,
+            "summary": "",
+            "cross_tags": [],
+            "assets": [],
+        }
+        snapshot = {
+            "schema_version": 1,
+            "sections": {
+                key: (
+                    [official]
+                    if key == "world"
+                    else [firsthand]
+                    if key == "investors"
+                    else []
+                )
+                for key in briefing_service.SECTION_KEYS
+            },
+        }
+
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository(),
+            public_macro=None,
+            decision_record=None,
+            imported_snapshot=snapshot,
+            now=NOW,
+        )
+
+        sections = {section["key"]: section for section in result["sections"]}
+        imported = sections["world"]["items"][0]
+        self.assertEqual(imported["primary_section"], "world")
+        self.assertIn("ai", imported["cross_tags"])
+        self.assertEqual(imported["source_tier"], "official")
+        self.assertEqual(imported["evidence_basis"], "title_and_snippet")
+        self.assertEqual(imported["last_updated_at"], imported["published_at"])
+        self.assertEqual(imported["disclosed_at"], "2026-09-04T01:30:00+00:00")
+        self.assertEqual(imported["effective_at"], "2026-06-30")
+        investor = sections["investors"]["items"][0]
+        self.assertEqual(investor["source_tier"], "first_party")
+        self.assertEqual(investor["evidence_basis"], "title_only")
+        self.assertNotIn("disclosed_at", investor)
+        self.assertNotIn("effective_at", investor)
+        self.assertNotIn("account", json.dumps(result, ensure_ascii=False))
+
+    def test_imported_snapshot_schema_and_bounds_are_revalidated(self) -> None:
+        def payload() -> dict:
+            return {
+                "schema_version": 1,
+                "sections": {key: [] for key in briefing_service.SECTION_KEYS},
+            }
+
+        invalid_payloads = []
+        unsupported = payload()
+        unsupported["schema_version"] = 2
+        invalid_payloads.append(unsupported)
+        missing_section = payload()
+        missing_section["sections"].pop("macro")
+        invalid_payloads.append(missing_section)
+        too_many_in_one = payload()
+        too_many_in_one["sections"]["world"] = [{}] * 81
+        invalid_payloads.append(too_many_in_one)
+        too_many_total = payload()
+        for key in briefing_service.SECTION_KEYS:
+            too_many_total["sections"][key] = [{}] * 51
+        invalid_payloads.append(too_many_total)
+
+        for snapshot in invalid_payloads:
+            with self.subTest(snapshot=snapshot["schema_version"]):
+                result = briefing_service.build_latest_briefing(
+                    repository=FakeRepository(),
+                    public_macro=None,
+                    decision_record=None,
+                    imported_snapshot=snapshot,
+                    now=NOW,
+                )
+                self.assertFalse(result["available"])
+                self.assertEqual(result["dedup_stats"]["input_count"], 0)
+
+    def test_dedup_projection_is_bounded_for_large_candidate_page(self) -> None:
+        events = [
+            self.event(
+                index,
+                f"Company {index} reports distinct quarterly result {index}",
+                source_url=f"https://example.com/distinct/{index}",
+            )
+            for index in range(564)
+        ]
+
+        started = perf_counter()
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository(events),
+            public_macro=None,
+            decision_record=None,
+            now=NOW,
+        )
+        elapsed = perf_counter() - started
+
+        self.assertEqual(result["dedup_stats"]["input_count"], 564)
+        self.assertEqual(result["dedup_stats"]["output_count"], 564)
+        self.assertLess(elapsed, 1.0)
+
+    def test_imported_fetched_only_item_cannot_enter_news_sections(self) -> None:
+        item = {
+            "section": "world",
+            "title": "只有抓取时间的旧格式线索",
+            "source_url": "https://example.com/fetched-only",
+            "canonical_url": "https://example.com/fetched-only",
+            "story_key": "fetched-only",
+            "published_at": None,
+            "fetched_at": "2026-09-04T01:58:00+00:00",
+            "last_updated_at": "2026-09-04T01:58:00+00:00",
+            "time_status": "fetched_only",
+            "source_tier": "media",
+            "source_count": 1,
+            "summary": "不能将抓取时间冒充发布时间",
+            "cross_tags": [],
+            "assets": [],
+        }
+        snapshot = {
+            "schema_version": 1,
+            "sections": {
+                key: ([item] if key == "world" else [])
+                for key in briefing_service.SECTION_KEYS
+            },
+        }
+
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository(),
+            public_macro=None,
+            decision_record=None,
+            imported_snapshot=snapshot,
+            now=NOW,
+        )
+
+        self.assertFalse(result["available"])
+        self.assertEqual(result["highlights"], [])
+        self.assertTrue(all(not section["items"] for section in result["sections"]))
 
 
 if __name__ == "__main__":

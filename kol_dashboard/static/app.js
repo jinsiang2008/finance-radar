@@ -926,7 +926,7 @@
       note: "政府、监管、交易所或机构原始发布",
     },
     first_party: {
-      label: "本人原文",
+      label: "一手原文",
       note: "已定位到本人或机构的原始公开表达",
     },
     reporting: {
@@ -947,6 +947,16 @@
     none: "低相关",
     unknown: "影响待核验",
   };
+
+  const DAILY_SECTION_META = [
+    { key: "macro", label: "宏观信息", description: "政策、利率、通胀与经济数据" },
+    { key: "world", label: "全球要闻", description: "地缘、外交与跨市场突发事件" },
+    { key: "finance", label: "金融要闻", description: "市场、公司、监管与资本流向" },
+    { key: "technology", label: "科技前沿", description: "芯片、云计算与产业技术进展" },
+    { key: "ai", label: "AI 前沿", description: "模型、算力、产品与 AI 治理" },
+    { key: "investors", label: "投资大师动态", description: "本人表态、持仓披露与重要行动" },
+  ];
+  const DAILY_SECTION_KEYS = new Set(DAILY_SECTION_META.map((section) => section.key));
 
   function dailySourceView(value) {
     const key = String(value || "discovery").toLowerCase();
@@ -1003,7 +1013,10 @@
 
   function dailySourceBadge(item, { compact = false } = {}) {
     const source = dailySourceView(item?.source_tier);
-    const label = String(item?.source_tier_label || source.label).trim();
+    const label =
+      source.key === "first_party"
+        ? source.label
+        : String(item?.source_tier_label || source.label).trim();
     const sourceLabel = String(item?.source_label || item?.source || "").trim();
     return `<span class="daily-source-badge is-${esc(source.key)}" title="${esc(
       source.note
@@ -1014,17 +1027,66 @@
     }`;
   }
 
-  function dailyTimeHTML(item) {
-    const publishedAt = item?.published_at;
-    const exact = publishedAt ? fmtBeijingDateTime(publishedAt) : "";
-    if (!exact) return `<span class="daily-time is-unverified">发布时间待核验</span>`;
+  function dailyDateView(value) {
+    if (!value) return null;
+    const raw = String(value).trim();
+    if (!raw) return null;
+    const dateOnly = /^\d{4}-\d{2}-\d{2}$/.test(raw);
+    const comparable = dateOnly ? `${raw}T12:00:00+08:00` : raw;
+    const exact = dateOnly ? raw : fmtBeijingDateTime(raw);
+    if (!exact) return null;
     let datetime = "";
     try {
-      datetime = new Date(String(publishedAt)).toISOString();
+      datetime = dateOnly ? raw : new Date(raw).toISOString();
     } catch (error) {}
+    return {
+      exact,
+      datetime,
+      date: exact.slice(0, 10),
+      short: dateOnly ? raw.slice(5) : exact.slice(5, 16),
+      relative: fmtRelativeTime(comparable),
+    };
+  }
+
+  function dailyTimeHTML(item) {
+    const view = dailyDateView(item?.published_at);
+    if (!view) return `<span class="daily-time is-unverified">发布时间待核验</span>`;
     return `<time class="daily-time"${
-      datetime ? ` datetime="${esc(datetime)}"` : ""
-    } title="发布时间 ${esc(exact)}（北京时间）">${esc(fmtRelativeTime(publishedAt))}</time>`;
+      view.datetime ? ` datetime="${esc(view.datetime)}"` : ""
+    } title="发布时间 ${esc(view.exact)}（北京时间）">${esc(
+      `${view.short} 北京时间${view.relative ? ` · ${view.relative}` : ""}`
+    )}</time>`;
+  }
+
+  function dailyInvestorDatesHTML(item) {
+    const disclosed = dailyDateView(item?.disclosed_at);
+    const published = dailyDateView(item?.published_at);
+    const effective = dailyDateView(
+      item?.effective_at || item?.period_end || item?.data_as_of
+    );
+    const disclosedHTML = disclosed
+      ? `<time datetime="${esc(disclosed.datetime)}" title="披露时间 ${esc(
+          disclosed.exact
+        )}（北京时间）">披露 ${esc(disclosed.date)}</time>`
+      : `<span class="is-missing">披露日期待核验</span>`;
+    const effectiveHTML = effective
+      ? `<time datetime="${esc(effective.datetime)}" title="持仓截至 ${esc(
+          effective.exact
+        )}">持仓截至 ${esc(effective.date)}</time>`
+      : `<span class="is-missing">持仓日期待核验</span>`;
+    const publishedHTML =
+      published && (!disclosed || published.exact !== disclosed.exact)
+        ? `<time datetime="${esc(published.datetime)}" title="来源发布时间 ${esc(
+            published.exact
+          )}（北京时间）">来源发布 ${esc(published.date)}</time>`
+        : "";
+    return `<span class="daily-investor-dates">${disclosedHTML}${effectiveHTML}${publishedHTML}<span class="daily-investor-date-note">披露不等于当日交易</span></span>`;
+  }
+
+  function dailyItemTimeHTML(item) {
+    return String(item?.primary_section || "").toLowerCase() === "investors"
+      ? dailyInvestorDatesHTML(item)
+      : dailyTimeHTML(item);
   }
 
   function dailyHighlightHTML(item, index) {
@@ -1045,7 +1107,7 @@
     const evidenceBasis = String(item?.evidence_basis || "").toLowerCase();
     const basisLabel = {
       official_body: "已读取官方正文",
-      post_text: "本人原文证据",
+      post_text: "一手原文证据",
       indicator_data: "结构化指标证据",
       title_and_snippet: "标题与摘要证据",
       title: "仅标题证据",
@@ -1057,7 +1119,7 @@
         <header class="daily-signal-head">
           <div class="daily-signal-provenance">
             ${dailySourceBadge(item)}
-            ${dailyTimeHTML(item)}
+            ${dailyItemTimeHTML(item)}
             <span class="daily-impact is-${esc(impact)}">${esc(
               DAILY_IMPACT_LABEL[impact] || DAILY_IMPACT_LABEL.unknown
             )}</span>
@@ -1104,7 +1166,7 @@
     if (!rows.length) {
       return `<div class="daily-firsthand-empty" role="note">
         <strong>当前没有可证明的一手新增</strong>
-        <p>媒体转述仍在 60 秒摘要中保留，但不会在这里冒充官方或本人原文。</p>
+        <p>媒体转述仍在 60 秒摘要中保留，但不会在这里冒充官方或一手原文。</p>
       </div>`;
     }
     return `<ol class="daily-firsthand-list">${rows
@@ -1114,7 +1176,7 @@
         return `<li>
           <div class="daily-firsthand-marker" aria-hidden="true"></div>
           <div class="daily-firsthand-copy">
-            <div>${dailySourceBadge(item, { compact: true })}${dailyTimeHTML(item)}</div>
+            <div>${dailySourceBadge(item, { compact: true })}${dailyItemTimeHTML(item)}</div>
             <strong>${esc(title)}</strong>
             <span>${esc(item?.source_label || item?.source || "发布主体待核验")}</span>
           </div>
@@ -1142,6 +1204,7 @@
         const nextReview = item?.next_review_at
           ? fmtBeijingDateTime(item.next_review_at)
           : "等待新的可核验证据";
+        const evidenceAt = dailyDateView(item?.data_as_of);
         const reason = String(item?.reason || item?.status_label || "").trim();
         const related = Number(item?.source_count ?? item?.related_records);
         return `<article class="daily-watch-item">
@@ -1152,6 +1215,17 @@
           )}">${esc(direction)}</div>
           ${reason ? `<p>${esc(reason)}</p>` : ""}
           <footer>
+            ${
+              evidenceAt
+                ? `<time${
+                    evidenceAt.datetime
+                      ? ` datetime="${esc(evidenceAt.datetime)}"`
+                      : ""
+                  } title="证据截至 ${esc(evidenceAt.exact)}">证据截至：${esc(
+                    evidenceAt.exact
+                  )}</time>`
+                : ""
+            }
             <span>下一复核：${esc(nextReview)}</span>
             ${
               Number.isFinite(related) && related > 0
@@ -1174,7 +1248,7 @@
     const verified = Number(values.time_verified) || 0;
     return `<div class="daily-coverage-grid">
       <div><strong>${official}</strong><span>官方正文</span></div>
-      <div><strong>${firstParty}</strong><span>本人原文</span></div>
+      <div><strong>${firstParty}</strong><span>一手原文</span></div>
       <div><strong>${reporting}</strong><span>媒体报道</span></div>
       <div><strong>${discovery}</strong><span>聚合线索</span></div>
     </div>
@@ -1185,6 +1259,442 @@
     } 来源直接性不是事实正确率。</p>`;
   }
 
+  function dailyStoryKey(item) {
+    const explicit = String(item?.story_key || "").trim();
+    if (explicit) return `story:${explicit}`;
+    const title = String(item?.title || item?.headline || "")
+      .normalize("NFKC")
+      .toLowerCase()
+      .replace(/^(快讯|突发|最新|独家)[：:\s-]*/u, "")
+      .replace(/[\s·•，。、“”‘’：:；;！？!?（）()【】\[\]《》<>—–_-]+/gu, "");
+    if (title) return `title:${title}`;
+    const url = safeExternalUrl(item?.source_url || item?.url);
+    if (url) return `url:${url.split("#")[0]}`;
+    return `${String(item?.kind || "record")}:${String(item?.id || "unknown")}`;
+  }
+
+  function dailyStoryAnchor(item) {
+    const key = dailyStoryKey(item);
+    let hash = 2166136261;
+    for (let index = 0; index < key.length; index += 1) {
+      hash ^= key.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
+    }
+    return `daily-story-${(hash >>> 0).toString(36)}`;
+  }
+
+  function dailyItemPriority(item) {
+    const sourceRank = {
+      official: 4,
+      first_party: 3,
+      reporting: 2,
+      discovery: 1,
+    }[String(item?.source_tier || "discovery").toLowerCase()] || 0;
+    return (
+      sourceRank * 100 +
+      (item?.published_at ? 10 : 0) +
+      (safeExternalUrl(item?.source_url || item?.url) ? 2 : 0) +
+      (item?.summary ? 1 : 0)
+    );
+  }
+
+  function dailyUniqueItems(items) {
+    const orderedKeys = [];
+    const selected = new Map();
+    for (const rawItem of Array.isArray(items) ? items : []) {
+      if (!rawItem || typeof rawItem !== "object") continue;
+      const key = dailyStoryKey(rawItem);
+      const previous = selected.get(key);
+      if (!previous) {
+        orderedKeys.push(key);
+        selected.set(key, rawItem);
+      } else if (dailyItemPriority(rawItem) > dailyItemPriority(previous)) {
+        selected.set(key, rawItem);
+      }
+    }
+    return orderedKeys.map((key) => selected.get(key));
+  }
+
+  function dailyNormalizedSections(data) {
+    const rawSections = Array.isArray(data?.sections) ? data.sections : [];
+    const rawByKey = new Map();
+    const storyOrder = [];
+    const stories = new Map();
+    const candidates = [];
+
+    for (const rawSection of rawSections) {
+      const sectionKey = String(rawSection?.key || "").toLowerCase();
+      if (!DAILY_SECTION_KEYS.has(sectionKey)) continue;
+      rawByKey.set(sectionKey, rawSection);
+      for (const item of Array.isArray(rawSection?.items) ? rawSection.items : []) {
+        candidates.push({ item, sectionKey });
+      }
+    }
+
+    if (!rawSections.length) {
+      for (const item of Array.isArray(data?.highlights) ? data.highlights : []) {
+        const requested = String(item?.primary_section || "").toLowerCase();
+        candidates.push({
+          item,
+          sectionKey: DAILY_SECTION_KEYS.has(requested) ? requested : "finance",
+        });
+      }
+    }
+
+    for (const candidate of candidates) {
+      const item = candidate.item;
+      if (!item || typeof item !== "object") continue;
+      const storyKey = dailyStoryKey(item);
+      const requestedPrimary = String(item?.primary_section || "").toLowerCase();
+      const targetKey = DAILY_SECTION_KEYS.has(requestedPrimary)
+        ? requestedPrimary
+        : candidate.sectionKey;
+      const previous = stories.get(storyKey);
+      const crossTags = new Set(
+        Array.isArray(item?.cross_tags)
+          ? item.cross_tags.filter((key) => DAILY_SECTION_KEYS.has(String(key)))
+          : []
+      );
+      if (candidate.sectionKey !== targetKey) crossTags.add(candidate.sectionKey);
+      if (!previous) {
+        storyOrder.push(storyKey);
+        stories.set(storyKey, { item, targetKey, crossTags });
+        continue;
+      }
+      previous.crossTags.forEach((key) => crossTags.add(key));
+      if (previous.targetKey !== targetKey) {
+        crossTags.add(previous.targetKey);
+        crossTags.add(targetKey);
+      }
+      if (dailyItemPriority(item) > dailyItemPriority(previous.item)) {
+        stories.set(storyKey, { item, targetKey, crossTags });
+      } else {
+        crossTags.delete(previous.targetKey);
+        previous.crossTags = crossTags;
+      }
+    }
+
+    const buckets = new Map(DAILY_SECTION_META.map((meta) => [meta.key, []]));
+    for (const storyKey of storyOrder) {
+      const record = stories.get(storyKey);
+      if (!record || !DAILY_SECTION_KEYS.has(record.targetKey)) continue;
+      record.crossTags.delete(record.targetKey);
+      buckets.get(record.targetKey).push({
+        ...record.item,
+        primary_section: record.targetKey,
+        cross_tags: Array.from(record.crossTags),
+      });
+    }
+
+    return DAILY_SECTION_META.map((meta) => {
+      const raw = rawByKey.get(meta.key) || {};
+      const items = buckets.get(meta.key).slice(0, 6);
+      const rawTotal = Number(raw.total_count);
+      const rawVerified = Number(raw.verified_count);
+      return {
+        ...meta,
+        label: String(raw.label || meta.label),
+        description: String(raw.description || meta.description),
+        source_as_of: raw.source_as_of || null,
+        stale: raw.stale === true,
+        status: String(raw.status || (items.length ? "ready" : "empty")),
+        verified_count: Number.isFinite(rawVerified) ? rawVerified : 0,
+        total_count: Math.max(Number.isFinite(rawTotal) ? rawTotal : 0, items.length),
+        items,
+      };
+    });
+  }
+
+  function dailySectionStatus(section) {
+    if (!section.items.length || section.status === "empty") {
+      return { key: "empty", label: "暂无新增" };
+    }
+    if (section.stale || section.status === "stale") {
+      return { key: "stale", label: "更新延迟" };
+    }
+    if (["partial", "limited"].includes(section.status)) {
+      return { key: "partial", label: "覆盖有限" };
+    }
+    return { key: "fresh", label: "已更新" };
+  }
+
+  function dailySectionTimeHTML(section, { compact = false } = {}) {
+    const view = dailyDateView(section?.source_as_of);
+    if (!view) return `<span class="daily-section-time is-missing">${compact ? "待更新" : "更新时间待确认"}</span>`;
+    const visible = compact
+      ? view.short
+      : `${view.short} 北京时间${view.relative ? ` · ${view.relative}` : ""}`;
+    return `<time class="daily-section-time"${
+      view.datetime ? ` datetime="${esc(view.datetime)}"` : ""
+    } title="数据截至 ${esc(view.exact)}（北京时间）">${esc(visible)}</time>`;
+  }
+
+  function dailyStatusBandHTML(data, sections, { linkable = true } = {}) {
+    const populated = sections.filter((section) => section.items.length).length;
+    const total = sections.reduce((sum, section) => sum + section.total_count, 0);
+    const coverageHours = Number(data?.coverage_window_hours);
+    const nextRefresh = fmtBeijingDateTime(data?.next_refresh_at);
+    const sourceCoverage = dailyDateView(data?.source_coverage_as_of);
+    const refreshStatus = String(data?.refresh_schedule_status || "").toLowerCase();
+    const refreshState = {
+      unconfigured: { key: "unconfigured", label: "自动刷新未接通" },
+      active: { key: "active", label: "自动刷新已接通" },
+      configured: { key: "active", label: "自动刷新已接通" },
+      scheduled: { key: "active", label: "自动刷新已接通" },
+      delayed: { key: "delayed", label: "自动刷新延迟" },
+      error: { key: "delayed", label: "自动刷新异常" },
+    }[refreshStatus];
+    return `<section class="daily-status-band" aria-labelledby="daily-status-title">
+      <header class="daily-status-summary">
+        <div>
+          <span id="daily-status-title">栏目覆盖</span>
+          <strong>${populated} / ${sections.length}</strong>
+          <small>${total} 条去重记录</small>
+        </div>
+        <p>${
+          Number.isFinite(coverageHours) && coverageHours > 0
+            ? `滚动观察最近 ${coverageHours} 小时`
+            : "滚动观察当日可核验信息"
+        }${nextRefresh ? ` · 下次刷新 ${esc(nextRefresh)}` : ""}${
+          sourceCoverage
+            ? ` · ${
+                data?.source_coverage_stale ? "采集覆盖延迟至" : "采集覆盖至"
+              } ${esc(sourceCoverage.short)}`
+            : ""
+        }${
+          refreshState
+            ? ` <span class="daily-refresh-state is-${esc(refreshState.key)}">${esc(
+                refreshState.label
+              )}</span>`
+            : ""
+        }</p>
+      </header>
+      <div class="daily-status-columns" role="list" aria-label="六栏目覆盖与时效">
+        ${sections
+          .map((section) => {
+            const status = dailySectionStatus(section);
+            const contents = `
+              <span>${esc(section.label)}</span>
+              <strong>${section.total_count}</strong>
+              <small><b>${esc(status.label)}</b>${dailySectionTimeHTML(section, { compact: true })}</small>
+            `;
+            return linkable
+              ? `<a class="daily-status-cell is-${esc(status.key)}" href="#daily-section-${esc(
+                  section.key
+                )}" role="listitem">${contents}</a>`
+              : `<div class="daily-status-cell is-${esc(
+                  status.key
+                )}" role="listitem">${contents}</div>`;
+          })
+          .join("")}
+      </div>
+    </section>`;
+  }
+
+  function dailyOverviewItems(data, sections) {
+    const supplied = dailyUniqueItems(data?.highlights).slice(0, 5);
+    if (supplied.length) return supplied;
+    const interleaved = [];
+    for (let row = 0; row < 6 && interleaved.length < 5; row += 1) {
+      for (const section of sections) {
+        if (section.items[row]) interleaved.push(section.items[row]);
+        if (interleaved.length === 5) break;
+      }
+    }
+    return dailyUniqueItems(interleaved).slice(0, 5);
+  }
+
+  function dailyOverviewHTML(items, sectionItemsByKey) {
+    if (!items.length) {
+      return `<div class="daily-section-empty" role="note">
+        <strong>当前没有达到简报门槛的重点记录</strong>
+        <span>系统不会使用旧闻或低质量转载补足 Top 5。</span>
+      </div>`;
+    }
+    return `<ol class="daily-overview-list">${items
+      .map((item, index) => {
+        const storyKey = dailyStoryKey(item);
+        const sectionItem = sectionItemsByKey.get(storyKey);
+        const primaryKey = String(
+          sectionItem?.primary_section || item?.primary_section || "finance"
+        ).toLowerCase();
+        const sectionMeta =
+          DAILY_SECTION_META.find((section) => section.key === primaryKey) ||
+          DAILY_SECTION_META[2];
+        const title = String(item?.title || item?.headline || "标题待补充").trim();
+        const summary = String(item?.summary || "").trim();
+        const anchor = sectionItem ? dailyStoryAnchor(sectionItem) : "";
+        return `<li class="daily-overview-item">
+          <span class="daily-overview-rank" aria-hidden="true">${String(index + 1).padStart(
+            2,
+            "0"
+          )}</span>
+          <div class="daily-overview-copy">
+            <div>${dailySourceBadge(item, { compact: true })}${dailyItemTimeHTML(
+              sectionItem || item
+            )}<span class="daily-overview-section">${esc(
+              sectionMeta.label
+            )}</span></div>
+            <h3>${esc(title)}</h3>
+            ${summary ? `<p>${esc(shortText(summary, 120))}</p>` : ""}
+          </div>
+          ${
+            anchor
+              ? `<a href="#${esc(anchor)}" data-daily-story-target="${esc(
+                  anchor
+                )}" aria-label="在${esc(sectionMeta.label)}中查看${esc(shortText(title, 32))}">详见栏目 <span aria-hidden="true">↓</span></a>`
+              : `<span class="daily-overview-pending">等待归档</span>`
+          }
+        </li>`;
+      })
+      .join("")}</ol>`;
+  }
+
+  function dailySectionItemHTML(item, index) {
+    const impact = String(item?.impact || "unknown").toLowerCase();
+    const title = String(item?.title || item?.headline || "标题待补充").trim();
+    const summary = String(item?.summary || "当前仅有标题线索，请先核对原文。").trim();
+    const why = String(item?.why_it_matters || "").trim();
+    const sourceUrl = safeExternalUrl(item?.source_url || item?.url);
+    const eventId = Number(item?.id);
+    const itemKind = String(item?.kind || "kol_event");
+    const canOpenEvidence =
+      ["event", "kol_event"].includes(itemKind) &&
+      Number.isInteger(eventId) &&
+      eventId > 0;
+    const sourceCount = Number(item?.source_count ?? item?.related_records);
+    const lastUpdated = fmtBeijingDateTime(item?.last_updated_at);
+    const crossTags = (Array.isArray(item?.cross_tags) ? item.cross_tags : [])
+      .map((key) => DAILY_SECTION_META.find((section) => section.key === key))
+      .filter(Boolean);
+    const anchor = dailyStoryAnchor(item);
+    return `<article class="daily-stream-item is-${esc(impact)}" id="${esc(
+      anchor
+    )}" tabindex="-1"${index >= 3 ? " hidden data-daily-extra" : ""}>
+      <div class="daily-stream-sequence" aria-hidden="true">${String(index + 1).padStart(2, "0")}</div>
+      <div class="daily-stream-copy">
+        <header>
+          <div class="daily-stream-provenance">
+            ${dailySourceBadge(item)}${dailyItemTimeHTML(item)}
+            <span class="daily-impact is-${esc(impact)}">${esc(
+              DAILY_IMPACT_LABEL[impact] || DAILY_IMPACT_LABEL.unknown
+            )}</span>
+          </div>
+          ${
+            Number.isFinite(sourceCount) && sourceCount > 1
+              ? `<span class="daily-cluster-marker">事件簇 · ${sourceCount} 条关联记录 · 不代表独立确认${
+                  lastUpdated ? ` · 证据截至 ${esc(lastUpdated)}` : ""
+                }</span>`
+              : lastUpdated
+                ? `<span class="daily-cluster-marker">证据截至 ${esc(lastUpdated)}</span>`
+                : ""
+          }
+        </header>
+        <h3>${esc(title)}</h3>
+        <p class="daily-stream-summary">${esc(summary)}</p>
+        ${why ? `<p class="daily-stream-why"><span>影响</span>${esc(why)}</p>` : ""}
+        ${dailyAssetTags(item?.assets, 5)}
+        ${
+          crossTags.length
+            ? `<div class="daily-cross-tags" aria-label="同时关联栏目">${crossTags
+                .map(
+                  (tag) => `<a href="#daily-section-${esc(tag.key)}">关联 ${esc(tag.label)}</a>`
+                )
+                .join("")}</div>`
+            : ""
+        }
+        <footer class="daily-stream-footer">
+          <span>${esc(String(item?.rank_reason || "按来源直接性与时效排序"))}</span>
+          <div>
+            ${
+              canOpenEvidence
+                ? `<button type="button" class="daily-evidence-btn"
+                     data-daily-event-detail="${eventId}"
+                     data-event-kol="${esc(item?.kol_key || "")}"
+                     data-event-source-url="${esc(sourceUrl)}">核验证据</button>`
+                : ""
+            }
+            ${
+              sourceUrl
+                ? `<a class="daily-source-link" href="${esc(sourceUrl)}" target="_blank"
+                     rel="noopener noreferrer">打开原文 <span aria-hidden="true">↗</span></a>`
+                : `<span class="daily-source-missing">原文链接待补充</span>`
+            }
+          </div>
+        </footer>
+      </div>
+    </article>`;
+  }
+
+  function dailySectionHTML(section, index) {
+    const rows = section.items.slice(0, 6);
+    const status = dailySectionStatus(section);
+    const titleId = `daily-section-${section.key}`;
+    const listId = `daily-section-list-${section.key}`;
+    const hiddenCount = Math.max(rows.length - 3, 0);
+    return `<section class="daily-stream-section is-${esc(status.key)}" aria-labelledby="${esc(
+      titleId
+    )}">
+      <header class="daily-stream-head">
+        <div class="daily-stream-heading">
+          <span aria-hidden="true">${String(index + 1).padStart(2, "0")}</span>
+          <div>
+            <h2 id="${esc(titleId)}">${esc(section.label)}</h2>
+            <p>${esc(section.description)}</p>
+          </div>
+        </div>
+        <div class="daily-stream-health is-${esc(status.key)}">
+          <strong>${esc(status.label)}</strong>
+          <span>${section.total_count} 条 · ${section.verified_count} 条发布时间已核验</span>
+          ${dailySectionTimeHTML(section)}
+        </div>
+      </header>
+      <div class="daily-stream-list" id="${esc(listId)}">
+        ${
+          rows.length
+            ? `${
+                status.key === "stale"
+                  ? `<p class="daily-stale-note" role="status">本栏来源更新时间已超过门槛，请先核对原文时间再采取行动。</p>`
+                  : ""
+              }${rows
+                .map((item, itemIndex) => dailySectionItemHTML(item, itemIndex))
+                .join("")}`
+            : `<div class="daily-section-empty" role="note">
+                <strong>本轮暂无达到门槛的新增</strong>
+                <span>继续监控；不会使用旧闻或重复转载填充本栏。</span>
+              </div>`
+        }
+      </div>
+      ${
+        hiddenCount
+          ? `<button type="button" class="daily-section-toggle" data-daily-section-toggle
+               aria-expanded="false" aria-controls="${esc(listId)}">
+               展开另外 ${hiddenCount} 条 <span aria-hidden="true">＋</span>
+             </button>`
+          : ""
+      }
+    </section>`;
+  }
+
+  function setDailySectionExpanded(section, expanded) {
+    if (!section) return;
+    const button = section.querySelector("[data-daily-section-toggle]");
+    const extras = section.querySelectorAll("[data-daily-extra]");
+    extras.forEach((item) => {
+      item.hidden = !expanded;
+    });
+    if (!button) return;
+    button.setAttribute("aria-expanded", String(expanded));
+    button.innerHTML = expanded
+      ? `收起扩展内容 <span aria-hidden="true">−</span>`
+      : `展开另外 ${extras.length} 条 <span aria-hidden="true">＋</span>`;
+  }
+
+  function announceDailyStatus(message) {
+    const announcer = $("#daily-live-status");
+    if (announcer) announcer.textContent = String(message || "");
+  }
+
   function renderDaily(data) {
     const stage = $("#daily-stage");
     const jumpNav = $("#view-daily .daily-jump-nav");
@@ -1192,28 +1702,72 @@
     stage.setAttribute("aria-busy", "false");
     $("#daily-date").textContent = fmtDailyDate(data?.date || data?.generated_at);
     $("#daily-edition").textContent = data?.edition_label || "滚动更新版";
-    const sourceAsOf = fmtBeijingDateTime(data?.source_as_of);
-    $("#daily-as-of").textContent = sourceAsOf
-      ? `${data?.stale ? "数据延迟 · " : "数据截至 "}${sourceAsOf}`
-      : "数据时间待确认";
+    const sourceAsOf = fmtBeijingDateTime(
+      data?.content_as_of || data?.source_as_of
+    );
+    const sourceCoverageAsOf = fmtBeijingDateTime(data?.source_coverage_as_of);
+    let asOfLabel = sourceAsOf
+      ? `${data?.stale ? "内容证据延迟 · " : "内容证据截至 "}${sourceAsOf}`
+      : sourceCoverageAsOf
+        ? `${data?.source_coverage_stale ? "采集覆盖延迟至" : "已扫描至"} ${sourceCoverageAsOf} · 本轮无可核验新增`
+        : "数据时间待确认";
+    if (sourceAsOf && sourceCoverageAsOf && sourceCoverageAsOf !== sourceAsOf) {
+      asOfLabel += ` · 扫描至 ${sourceCoverageAsOf}`;
+    }
+    $("#daily-as-of").textContent = asOfLabel;
+    const sections = dailyNormalizedSections(data);
+    const total = sections.reduce((sum, section) => sum + section.total_count, 0);
 
     if (!data?.available) {
       if (jumpNav) jumpNav.hidden = true;
-      stage.innerHTML = `<div class="daily-empty">
+      const unavailableSections = sections.map((section) => ({
+        ...section,
+        source_as_of: null,
+        stale: false,
+        status: "empty",
+        verified_count: 0,
+        total_count: 0,
+        items: [],
+      }));
+      const unavailableData = {
+        ...(data && typeof data === "object" ? data : {}),
+        next_refresh_at: null,
+        refresh_schedule_status: "unconfigured",
+      };
+      stage.innerHTML = `${dailyStatusBandHTML(unavailableData, unavailableSections, {
+        linkable: false,
+      })}<div class="daily-empty">
         <span class="daily-empty-mark" aria-hidden="true">◌</span>
         <h2 id="daily-highlights-title">本版简报尚未形成</h2>
         <p>${esc(data?.reason || "当前没有达到发布时间与证据门槛的内容。")}</p>
         <button type="button" data-daily-view="kol">查看实时 KOL 信号</button>
       </div>`;
+      announceDailyStatus("简报已更新，共 0 条去重记录。");
       return;
     }
     if (jumpNav) jumpNav.hidden = false;
 
+    const sectionItemsByKey = new Map();
+    for (const section of sections) {
+      for (const item of section.items) sectionItemsByKey.set(dailyStoryKey(item), item);
+    }
+    const highlights = dailyOverviewItems(data, sections);
     const lead = data?.lead && typeof data.lead === "object" ? data.lead : {};
-    const highlights = Array.isArray(data?.highlights) ? data.highlights.slice(0, 5) : [];
-    const fallbackLead = highlights[0] || {};
-    const headline = String(lead.headline || fallbackLead.title || "今日主线仍待确认").trim();
-    const summary = String(lead.summary || fallbackLead.summary || "").trim();
+    const fallbackLead = highlights[0] || sections.flatMap((section) => section.items)[0] || {};
+    const headline = String(
+      lead.headline ||
+        fallbackLead.title ||
+        (sourceCoverageAsOf && total === 0
+          ? "本轮扫描完成，暂无达到门槛的新事件"
+          : "今日主线仍待确认")
+    ).trim();
+    const summary = String(
+      lead.summary ||
+        fallbackLead.summary ||
+        (sourceCoverageAsOf && total === 0
+          ? "六个栏目已检查；不会使用旧闻或重复转载填充版面。"
+          : "")
+    ).trim();
     const why = String(lead.why_it_matters || fallbackLead.why_it_matters || "").trim();
     const riskScore =
       typeof lead.risk_score === "number" ? lead.risk_score : Number.NaN;
@@ -1227,7 +1781,8 @@
       ? `${delta > 0 ? "+" : ""}${delta.toFixed(1)} / 24h`
       : "暂无 24h 可比";
 
-    stage.innerHTML = `<section class="daily-lead-band is-${esc(riskLevel)}" aria-labelledby="daily-lead-title">
+    stage.innerHTML = `${dailyStatusBandHTML(data, sections)}
+      <section class="daily-lead-band is-${esc(riskLevel)}" aria-labelledby="daily-lead-title">
         <div class="daily-risk-pulse">
           <span>综合风险</span>
           <strong>${hasRiskScore ? esc(Math.round(riskScore)) : "—"}</strong>
@@ -1245,47 +1800,54 @@
         </aside>
       </section>
 
-      <div class="daily-content-grid">
-        <section class="daily-highlights" aria-labelledby="daily-highlights-title">
-          <header class="daily-section-head">
-            <div><p class="section-kicker">60 SECOND READ</p><h2 id="daily-highlights-title">60 秒读完</h2></div>
-            <p>按影响、来源直接性与新鲜度排序，不按转载量排序。</p>
-          </header>
-          ${
-            highlights.length
-              ? `<ol class="daily-signal-axis">${highlights
-                  .map(dailyHighlightHTML)
-                  .join("")}</ol>`
-              : `<div class="daily-watch-empty">当前没有达到简报门槛的重点记录。</div>`
-          }
-        </section>
+      <section class="daily-overview" aria-labelledby="daily-highlights-title">
+        <header class="daily-section-head">
+          <div><span class="daily-section-label">先读这五条</span><h2 id="daily-highlights-title">60 秒读完</h2></div>
+          <p>同一故事只进入一个主栏目；点击后定位到栏目正文。</p>
+        </header>
+        ${dailyOverviewHTML(highlights, sectionItemsByKey)}
+      </section>
 
-        <aside class="daily-firsthand" aria-labelledby="daily-firsthand-title">
-          <header class="daily-section-head">
-            <div><p class="section-kicker">DIRECT SOURCES</p><h2 id="daily-firsthand-title">一手速递</h2></div>
-            <p>只收官方正文或可定位的本人原文。</p>
-          </header>
-          ${dailyFirsthandHTML(data?.firsthand)}
-        </aside>
+      <div class="daily-stream" aria-label="六栏目情报流">
+        ${sections.map(dailySectionHTML).join("")}
       </div>
 
-      <section class="daily-watchpoints" aria-labelledby="daily-watchpoints-title">
-        <header class="daily-section-head">
-          <div><p class="section-kicker">NEXT CHECK</p><h2 id="daily-watchpoints-title">下一复核</h2></div>
-          <p>这些是待验证的影响路径，不构成交易建议。</p>
+      <section class="daily-evidence-desk" aria-labelledby="daily-evidence-desk-title">
+        <header class="daily-section-head daily-evidence-head">
+          <div><span class="daily-section-label">行动前再核对</span><h2 id="daily-evidence-desk-title">证据与下一复核</h2></div>
+          <p>一手来源与待验证影响路径分开陈列，不把转述当成确认。</p>
         </header>
-        ${dailyWatchpointsHTML(data?.watchpoints)}
+        <div class="daily-evidence-grid">
+          <section class="daily-firsthand" aria-labelledby="daily-firsthand-title">
+            <header class="daily-subsection-head">
+              <h3 id="daily-firsthand-title">一手速递</h3>
+              <p>只收官方正文或可定位的一手原文。</p>
+            </header>
+            ${dailyFirsthandHTML(data?.firsthand)}
+          </section>
+          <section class="daily-watchpoints" aria-labelledby="daily-watchpoints-title">
+            <header class="daily-subsection-head">
+              <h3 id="daily-watchpoints-title">下一复核</h3>
+              <p>待验证的影响路径，不构成交易建议。</p>
+            </header>
+            ${dailyWatchpointsHTML(data?.watchpoints)}
+          </section>
+        </div>
       </section>
 
       <p class="daily-disclaimer">${esc(
         data?.disclaimer || "AI 只负责压缩已列出的公开证据；请以原始公告、监管文件和实时市场数据为准。"
       )}</p>`;
+    announceDailyStatus(`简报已更新，共 ${total} 条去重记录。`);
     renderSupportCard("daily");
   }
 
   async function loadDaily() {
     const generation = ++state.dailyRequestGeneration;
     const url = api("api/briefings/latest");
+    const stage = $("#daily-stage");
+    stage?.setAttribute("aria-busy", "true");
+    announceDailyStatus("正在加载每日简报。");
     try {
       const data = await fetchJSON(url, 12_000);
       if (generation !== state.dailyRequestGeneration) return false;
@@ -1295,12 +1857,15 @@
       return true;
     } catch (error) {
       if (generation !== state.dailyRequestGeneration) return false;
+      stage?.setAttribute("aria-busy", "false");
       if (!state.dailyData) {
-        const jumpNav = $("#view-daily .daily-jump-nav");
-        if (jumpNav) jumpNav.hidden = true;
-        $("#daily-stage").setAttribute("aria-busy", "false");
-        $("#daily-stage").innerHTML = errorHTML(error, url);
+        renderDaily({
+          available: false,
+          reason: `${loadErrorCause(error)}；本轮无法形成可信简报，未使用旧闻补位。`,
+          refresh_schedule_status: "unconfigured",
+        });
       }
+      announceDailyStatus("每日简报加载失败，请稍后重试。");
       setViewLoadError("daily", error, url);
       return false;
     }
@@ -6331,6 +6896,27 @@
       const viewTarget = event.target.closest("[data-daily-view]");
       if (viewTarget) {
         switchView(viewTarget.dataset.dailyView);
+        return;
+      }
+      const sectionToggle = event.target.closest("[data-daily-section-toggle]");
+      if (sectionToggle) {
+        const section = sectionToggle.closest(".daily-stream-section");
+        const expanded = sectionToggle.getAttribute("aria-expanded") !== "true";
+        setDailySectionExpanded(section, expanded);
+        return;
+      }
+      const storyLink = event.target.closest("[data-daily-story-target]");
+      if (storyLink) {
+        const storyId = storyLink.dataset.dailyStoryTarget;
+        const story = storyId ? document.getElementById(storyId) : null;
+        if (!story) return;
+        event.preventDefault();
+        if (story.hidden) {
+          setDailySectionExpanded(story.closest(".daily-stream-section"), true);
+        }
+        const reduceMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches;
+        story.scrollIntoView({ behavior: reduceMotion ? "auto" : "smooth", block: "start" });
+        story.focus({ preventScroll: true });
         return;
       }
       const trigger = event.target.closest("[data-daily-event-detail]");

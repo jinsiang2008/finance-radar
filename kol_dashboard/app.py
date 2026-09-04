@@ -525,10 +525,18 @@ def api_latest_briefing() -> JSONResponse:
     # ``load_public_snapshot`` is intentionally used instead of
     # ``ensure_public_snapshot``: an HTTP read must not rebuild decisions.
     decision_record = decision_snapshot.load_public_snapshot()
+    imported_record = db.load_latest_daily_briefing_snapshot(max_age_hours=24)
+    imported_snapshot = (
+        imported_record.get("payload")
+        if isinstance(imported_record, Mapping)
+        and isinstance(imported_record.get("payload"), Mapping)
+        else None
+    )
     payload = briefing_service.build_latest_briefing(
         repository=db,
         public_macro=_public_macro_snapshot(),
         decision_record=decision_record,
+        imported_snapshot=imported_snapshot,
     )
     return JSONResponse(payload, headers=_BRIEFING_CACHE_HEADERS)
 

@@ -13,6 +13,8 @@ Finance Radar 是一个面向投资研究的 FastAPI 仪表盘，组合了 KOL �
 - 将机制证据与 1D/3D/5D 市场统计验证分开呈现，避免把相关性写成因果。
 - 严格处理时间可信度：缺失、无效或未来的发布时间默认隔离，不能进入决策。
 - 通过服务端签名 Cookie 解锁私人持仓影响；公开 API 不返回持仓详情。
+- 提供六栏每日情报、逐栏时效和跨来源事件去重；OpenClaw/Hermes 仅能通过
+  受验证的离线 JSON 快照导入，公开 GET 不会触发任务或模型。
 - 提供原子部署、SQLite 一致性备份和失败回滚。
 
 ## 目录结构
@@ -49,6 +51,29 @@ cp private/holdings.example.md private/holdings.md
 
 采集过程需要访问公开新闻和市场数据源。所有命令均可重复执行；数据库层会
 处理去重和幂等更新。
+
+## OpenClaw / Hermes Daily 快照
+
+Daily 页可合并一个 24 小时内的结构化快照。生产者必须输出 v1 JSON；旧的
+临时文本或 Slack 文稿不能直接入库，因为它们缺少可靠的发布时间、来源等级
+和事件身份。完整字段与旧栏目映射见
+[`docs/daily-briefing-v1.md`](docs/daily-briefing-v1.md)。
+
+离线导入命令：
+
+```bash
+python3 kol_dashboard/briefing_import.py /path/to/daily-briefing.json \
+  --db /path/to/kol_dashboard.db
+```
+
+导入器会限制文件和字段大小、拒绝私网或携带敏感参数的 URL、复核来源等级、
+规范化链接并跨栏目去重。同一天重复导入只能向更新的 `generated_at` 与
+`source_as_of` 前进。只有带时区的 `published_at` 会被视为已核验发布时间；只有
+`fetched_at` 的线索会保留在快照中但不会进入新闻正文。投资披露可另外携带
+`disclosed_at` 与 `effective_at`，页面会把披露时间和持仓截至时间分开显示。
+API 还会分开返回内容证据时间与批次采集覆盖时间：空批次代表“扫描完成但暂无
+新增”，不会被误报成任务未运行；重新抓取也不会把旧文章的证据时间刷新。
+该命令不会运行 OpenClaw/Hermes、访问网络或调用 LLM，也没有对应的公网写 API。
 
 ## 私人模式
 
