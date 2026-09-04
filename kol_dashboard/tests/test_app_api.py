@@ -50,6 +50,47 @@ def api_enrichment_result(**overrides) -> dict:
     return result
 
 
+class DashboardStartupTests(unittest.TestCase):
+    def test_init_db_warms_relevance_cache_after_schema_init(self) -> None:
+        calls: list[str] = []
+
+        with (
+            patch.object(
+                dashboard_app.db,
+                "init",
+                side_effect=lambda: calls.append("init"),
+            ) as init_db,
+            patch.object(
+                dashboard_app.db,
+                "warm_event_relevance_cache",
+                side_effect=lambda: calls.append("warm"),
+            ) as warm_cache,
+        ):
+            dashboard_app._init_db()
+
+        self.assertEqual(calls, ["init", "warm"])
+        init_db.assert_called_once_with()
+        warm_cache.assert_called_once_with()
+
+    def test_init_db_propagates_relevance_cache_warmup_failure(self) -> None:
+        failure = RuntimeError("relevance cache warmup failed")
+
+        with (
+            patch.object(dashboard_app.db, "init") as init_db,
+            patch.object(
+                dashboard_app.db,
+                "warm_event_relevance_cache",
+                side_effect=failure,
+            ) as warm_cache,
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                dashboard_app._init_db()
+
+        self.assertIs(raised.exception, failure)
+        init_db.assert_called_once_with()
+        warm_cache.assert_called_once_with()
+
+
 class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()

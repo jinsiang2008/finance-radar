@@ -805,6 +805,232 @@ class DatabaseTests(unittest.TestCase):
             "SEARCH s USING INDEX idx_sighting_publication", plan
         )
 
+    def test_event_relevance_cache_is_warmed_and_shared_across_connections(
+        self,
+    ) -> None:
+        db.insert_events(
+            [
+                self.event(
+                    title="Jensen Huang discusses NVIDIA AI investment",
+                    snippet="NVIDIA described data-center demand and shares.",
+                    source_url="https://example.com/nvidia-ai-investment",
+                )
+            ]
+        )
+        db._cached_event_relevance_assessment.cache_clear()
+        original_assessment = db.assess_event_relevance
+        relevance_sql = (
+            "SELECT event_rule_impact(title, snippet, source, source_url, "
+            "kol_key, kol_name, kol_name_cn) FROM event_sightings"
+        )
+
+        try:
+            with mock.patch.object(
+                db,
+                "assess_event_relevance",
+                wraps=original_assessment,
+            ) as assessment:
+                self.assertEqual(db.warm_event_relevance_cache(), 1)
+                warmed_calls = assessment.call_count
+                self.assertEqual(warmed_calls, 1)
+
+                for _ in range(2):
+                    with db.conn() as connection:
+                        self.assertEqual(
+                            connection.execute(relevance_sql).fetchone()[0],
+                            "medium",
+                        )
+                self.assertEqual(assessment.call_count, warmed_calls)
+
+                with db.conn() as connection:
+                    connection.execute(
+                        relevance_sql.replace(
+                            "title, snippet",
+                            "title || ' updated', snippet",
+                        )
+                    ).fetchone()
+                self.assertEqual(assessment.call_count, warmed_calls + 1)
+        finally:
+            db._cached_event_relevance_assessment.cache_clear()
+
+    def test_event_relevance_cache_warmup_is_bounded_to_newest_sightings(
+        self,
+    ) -> None:
+        db.insert_events(
+            [
+                self.event(
+                    title=f"NVIDIA market update {index}",
+                    url=f"https://example.com/cache-warm/{index}",
+                )
+                for index in range(3)
+            ]
+        )
+        db._cached_event_relevance_assessment.cache_clear()
+        original_assessment = db.assess_event_relevance
+        relevance_sql = (
+            "SELECT event_rule_impact(title, snippet, source, source_url, "
+            "kol_key, kol_name, kol_name_cn) FROM event_sightings "
+            "WHERE source_url=?"
+        )
+
+        try:
+            with (
+                mock.patch.object(db, "_EVENT_RELEVANCE_CACHE_SIZE", 2),
+                mock.patch.object(
+                    db,
+                    "assess_event_relevance",
+                    wraps=original_assessment,
+                ) as assessment,
+            ):
+                self.assertEqual(db.warm_event_relevance_cache(), 2)
+                self.assertEqual(assessment.call_count, 2)
+
+                with db.conn() as connection:
+                    connection.execute(
+                        relevance_sql,
+                        ("https://example.com/cache-warm/2",),
+                    ).fetchone()
+                self.assertEqual(assessment.call_count, 2)
+
+                with db.conn() as connection:
+                    connection.execute(
+                        relevance_sql,
+                        ("https://example.com/cache-warm/0",),
+                    ).fetchone()
+                self.assertEqual(assessment.call_count, 3)
+        finally:
+            db._cached_event_relevance_assessment.cache_clear()
+
+    def test_query_events_materializes_page_before_expensive_projection(
+        self,
+    ) -> None:
+        now = datetime(2026, 8, 1, 12, tzinfo=timezone.utc)
+        candidate_count = 24
+        page_limit = 3
+        page_offset = 4
+        events = []
+        for index in range(candidate_count):
+            kol_key = "musk" if index % 2 == 0 else "trump"
+            kol_name = "Elon Musk" if kol_key == "musk" else "Donald Trump"
+            events.append(
+                self.event(
+                    title=(
+                        f"{kol_name} candidate {index:02d} warns of a stock "
+                        "market crash"
+                    ),
+                    snippet=(
+                        "The warning concerns global markets, equities and "
+                        "asset prices."
+                    ),
+                    url=f"https://example.com/page-candidate/{index}",
+                    source="Reuters",
+                    kol_key=kol_key,
+                    kol_name=kol_name,
+                    kol_name_cn="马斯克" if kol_key == "musk" else "特朗普",
+                    published_at=(
+                        now - timedelta(hours=candidate_count - index)
+                    ).isoformat(),
+                )
+            )
+        # Insert oldest first so the newest page entries arrive at the end of
+        # an event-id scan.  The sorter must inspect every matching candidate,
+        # but outer display projections must still run only for the page.
+        db.insert_events(events)
+
+        statements: list[str] = []
+        projection_calls = {
+            "attribution_basis": 0,
+            "finance_relevant": 0,
+            "matched_alias": 0,
+        }
+        original_conn = db.conn
+
+        def count_projection(name: str, result):
+            def projected(*_values):
+                projection_calls[name] += 1
+                return result
+
+            return projected
+
+        @contextmanager
+        def instrumented_conn(*, immediate: bool = False):
+            with original_conn(immediate=immediate) as connection:
+                connection.set_trace_callback(statements.append)
+                connection.create_function(
+                    "event_attribution_basis",
+                    7,
+                    count_projection("attribution_basis", "title"),
+                    deterministic=True,
+                )
+                connection.create_function(
+                    "event_finance_relevant",
+                    7,
+                    count_projection("finance_relevant", 1),
+                    deterministic=True,
+                )
+                connection.create_function(
+                    "event_matched_alias",
+                    7,
+                    count_projection("matched_alias", ""),
+                    deterministic=True,
+                )
+                yield connection
+
+        with mock.patch.object(db, "conn", instrumented_conn):
+            items = db.query_events(
+                kols=["musk", "trump"],
+                hours=720,
+                limit=page_limit,
+                offset=page_offset,
+                now=now,
+            )
+
+        expected_indexes = range(
+            candidate_count - page_offset - 1,
+            candidate_count - page_offset - page_limit - 1,
+            -1,
+        )
+        self.assertEqual(
+            [item["title"] for item in items],
+            [
+                (
+                    f"{'Elon Musk' if index % 2 == 0 else 'Donald Trump'} "
+                    f"candidate {index:02d} warns of a stock market crash"
+                )
+                for index in expected_indexes
+            ],
+        )
+        self.assertEqual(
+            projection_calls,
+            {
+                "attribution_basis": page_limit,
+                "finance_relevant": page_limit,
+                "matched_alias": page_limit,
+            },
+        )
+
+        query = next(
+            statement
+            for statement in statements
+            if "WITH event_page(event_id, sighting_id, order_key)" in statement
+        )
+        outer_select_at = query.index("SELECT e.id, e.url")
+        self.assertNotIn("event_enrichments", query[:outer_select_at])
+        self.assertIn(
+            "LEFT JOIN event_enrichments ai ON ai.event_id=e.id",
+            query[outer_select_at:],
+        )
+        with original_conn() as connection:
+            plan = "\n".join(
+                row["detail"]
+                for row in connection.execute(
+                    "EXPLAIN QUERY PLAN " + query
+                ).fetchall()
+            )
+        self.assertIn("MATERIALIZE event_page", plan)
+        self.assertIn("SEARCH e USING INTEGER PRIMARY KEY (rowid=?)", plan)
+        self.assertIn("SEARCH m USING INTEGER PRIMARY KEY (rowid=?)", plan)
+
     def test_query_events_uses_each_kol_sighting_time_for_filter_and_order(self) -> None:
         recent = (datetime.now(timezone.utc) - timedelta(hours=1)).replace(
             microsecond=0
@@ -3281,6 +3507,61 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(db.stats("24")["hours"], 24)
         with self.assertRaises((TypeError, ValueError)):
             db.stats("24 hours') OR 1=1 --")
+
+    def test_stats_aggregates_one_indexed_representative_event_scan(self) -> None:
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        db.insert_events(
+            [
+                self.event(
+                    title="Jensen Huang says NVIDIA AI investment is rising",
+                    snippet="NVIDIA discussed data-center demand and shares.",
+                    published_at=(now - timedelta(hours=1)).isoformat(),
+                ),
+                self.event(
+                    title="Elon Musk discusses Tesla vehicle production",
+                    snippet="Tesla production and company investment remain in focus.",
+                    url="https://example.com/tesla-production",
+                    kol_key="musk",
+                    kol_name="Elon Musk",
+                    kol_name_cn="马斯克",
+                    published_at=(now - timedelta(hours=2)).isoformat(),
+                ),
+            ]
+        )
+        statements: list[str] = []
+        original_conn = db.conn
+
+        @contextmanager
+        def tracing_conn(*, immediate: bool = False):
+            with original_conn(immediate=immediate) as connection:
+                connection.set_trace_callback(statements.append)
+                yield connection
+
+        with mock.patch.object(db, "conn", tracing_conn):
+            summary = db.stats(hours=24)
+
+        self.assertEqual(summary["total"], 2)
+        aggregate = next(
+            statement
+            for statement in statements
+            if "WITH representative_events(event_id, sighting_id)" in statement
+        )
+        self.assertEqual(
+            aggregate.count("SELECT s.id\n                FROM event_sightings s"),
+            1,
+        )
+        with original_conn() as connection:
+            plan = "\n".join(
+                row["detail"]
+                for row in connection.execute(
+                    "EXPLAIN QUERY PLAN " + aggregate
+                ).fetchall()
+            )
+        self.assertIn("MATERIALIZE representative_events", plan)
+        self.assertIn(
+            "SEARCH s USING INDEX idx_sighting_event (event_id=?)",
+            plan,
+        )
 
     def test_stats_and_kol_activity_use_verified_publication_time(self) -> None:
         now = datetime.now(timezone.utc).replace(microsecond=0)

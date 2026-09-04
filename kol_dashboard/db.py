@@ -98,6 +98,37 @@ _AI_REQUEST_RETENTION_ENV = "KOL_AI_REQUEST_RETENTION_DAYS"
 RETENTION_DAYS = 14
 MACRO_RETENTION_DAYS = 90
 MAX_EVENT_KOL_FILTERS = 20
+_EVENT_RELEVANCE_CACHE_SIZE = 32_768
+
+
+@lru_cache(maxsize=_EVENT_RELEVANCE_CACHE_SIZE)
+def _cached_event_relevance_assessment(
+    title: Any,
+    snippet: Any,
+    source: Any,
+    url: Any,
+    kol_key: Any,
+    kol_name: Any,
+    kol_name_cn: Any,
+) -> Mapping[str, Any]:
+    """Reuse the pure classifier across public read connections.
+
+    SQLite opens a fresh connection for each API read. Keeping this cache at
+    module scope prevents the catalog, counters and two feed projections from
+    re-running the same regex classifier independently. Evidence corrections
+    naturally form a new key, and a process restart clears the bounded cache.
+    """
+    return assess_event_relevance(
+        {
+            "title": title,
+            "snippet": snippet,
+            "source": source,
+            "url": url,
+            "kol_key": kol_key,
+            "kol_name": kol_name,
+            "kol_name_cn": kol_name_cn,
+        }
+    )
 
 
 def _event_relevance_args_sql(sighting_alias: str) -> str:
@@ -217,6 +248,7 @@ _TRACKING_PARAMS = {
 }
 
 
+@lru_cache(maxsize=_EVENT_RELEVANCE_CACHE_SIZE)
 def _event_ai_cache_current_sql(
     input_hash: Any,
     prompt_version: Any,
@@ -229,6 +261,7 @@ def _event_ai_cache_current_sql(
     tickers: Any,
     url: Any,
 ) -> int:
+    """Return whether stored AI still matches, reusing pure identity hashes."""
     try:
         from kol_dashboard import llm_enrichment as enrichment_domain
     except ModuleNotFoundError:  # Flat production bundle.
@@ -318,33 +351,15 @@ def conn(*, immediate: bool = False):
         ),
         deterministic=True,
     )
-    @lru_cache(maxsize=16_384)
-    def relevance_assessment(
-        title: Any,
-        snippet: Any,
-        source: Any,
-        url: Any,
-        kol_key: Any,
-        kol_name: Any,
-        kol_name_cn: Any,
-    ) -> Mapping[str, Any]:
-        return assess_event_relevance(
-            {
-                "title": title,
-                "snippet": snippet,
-                "source": source,
-                "url": url,
-                "kol_key": kol_key,
-                "kol_name": kol_name,
-                "kol_name_cn": kol_name_cn,
-            }
-        )
-
     c.create_function(
         "event_intelligence_eligible",
         7,
         lambda *values: int(
-            bool(relevance_assessment(*values)["intelligence_eligible"])
+            bool(
+                _cached_event_relevance_assessment(*values)[
+                    "intelligence_eligible"
+                ]
+            )
         ),
         deterministic=True,
     )
@@ -352,14 +367,16 @@ def conn(*, immediate: bool = False):
         "event_finance_relevant",
         7,
         lambda *values: int(
-            bool(relevance_assessment(*values)["finance_relevant"])
+            bool(_cached_event_relevance_assessment(*values)["finance_relevant"])
         ),
         deterministic=True,
     )
     c.create_function(
         "event_rule_impact",
         7,
-        lambda *values: str(relevance_assessment(*values)["rule_impact"]),
+        lambda *values: str(
+            _cached_event_relevance_assessment(*values)["rule_impact"]
+        ),
         deterministic=True,
     )
     c.create_function(
@@ -380,7 +397,7 @@ def conn(*, immediate: bool = False):
         "event_attribution_basis",
         7,
         lambda *values: str(
-            relevance_assessment(*values)["attribution_basis"]
+            _cached_event_relevance_assessment(*values)["attribution_basis"]
         ),
         deterministic=True,
     )
@@ -388,7 +405,7 @@ def conn(*, immediate: bool = False):
         "event_matched_alias",
         7,
         lambda *values: str(
-            relevance_assessment(*values)["matched_alias"] or ""
+            _cached_event_relevance_assessment(*values)["matched_alias"] or ""
         ),
         deterministic=True,
     )
@@ -418,6 +435,26 @@ def conn(*, immediate: bool = False):
         raise
     finally:
         c.close()
+
+
+def warm_event_relevance_cache() -> int:
+    """Prime recent public classification keys before the service is ready."""
+    warmed = 0
+    with conn() as c:
+        rows = c.execute(
+            """
+            SELECT title, snippet, source, source_url,
+                   kol_key, kol_name, kol_name_cn
+            FROM event_sightings
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (_EVENT_RELEVANCE_CACHE_SIZE,),
+        )
+        for row in rows:
+            _cached_event_relevance_assessment(*tuple(row))
+            warmed += 1
+    return warmed
 
 
 # ─── Identity helpers ──────────────────────────────────
@@ -4617,14 +4654,16 @@ def query_events(
         )
         sighting_window_filter = f"AND {sighting_time_sql} >= ? "
         params.append(cutoff)
+    page_ai_join = ""
+    if q or (impact and use_ai_impact):
+        page_ai_join = " LEFT JOIN event_enrichments ai ON ai.event_id=e.id"
     from_sql = (
         "events e JOIN event_sightings m ON m.id=("
         "SELECT s.id FROM event_sightings s INDEXED BY idx_sighting_event "
         f"WHERE s.event_id=e.id {selected_sighting_filter}"
         f"AND {sighting_status} {sighting_window_filter}"
         f"AND {_event_intelligence_sql('s')} "
-        f"ORDER BY {sighting_order} LIMIT 1) "
-        "LEFT JOIN event_enrichments ai ON ai.event_id=e.id"
+        f"ORDER BY {sighting_order} LIMIT 1){page_ai_join}"
     )
 
     # Match the exact source/URL semantics returned to the caller. In a KOL
@@ -4661,16 +4700,25 @@ def query_events(
         params.extend([like, like, like, like, like])
 
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
-    sql = f"""
-      SELECT {select_sql}
-      FROM {from_sql}
-      {where_sql}
-      ORDER BY {
+    order_key_sql = (
         published_epoch_sql
         if time_status == "verified"
         else collected_epoch_sql
-      } DESC, e.id DESC
-      LIMIT ? OFFSET ?
+    )
+    sql = f"""
+      WITH event_page(event_id, sighting_id, order_key) AS MATERIALIZED (
+        SELECT e.id, m.id, {order_key_sql}
+        FROM {from_sql}
+        {where_sql}
+        ORDER BY {order_key_sql} DESC, e.id DESC
+        LIMIT ? OFFSET ?
+      )
+      SELECT {select_sql}
+      FROM event_page page
+      JOIN events e ON e.id=page.event_id
+      JOIN event_sightings m ON m.id=page.sighting_id
+      LEFT JOIN event_enrichments ai ON ai.event_id=e.id
+      ORDER BY page.order_key DESC, page.event_id DESC
     """
     params.extend([limit, offset])
     with conn() as c:
@@ -4945,26 +4993,40 @@ def stats(hours: int = 24) -> dict[str, Any]:
         raise ValueError("hours must be non-negative")
     modifier = f"-{hours} hours"
     with conn() as c:
-        def count(cond: str = "") -> int:
-            return c.execute(
-                "SELECT COUNT(*) n FROM events e "
-                "JOIN event_sightings m ON m.id=("
-                "SELECT s.id FROM event_sightings s "
-                "WHERE s.event_id=e.id AND s.published_at_status='verified' "
-                "AND s.published_at_epoch >= "
-                "CAST(strftime('%s','now',?) AS INTEGER) "
-                f"AND {_event_intelligence_sql('s')} "
-                f"ORDER BY {_preferred_sighting_order_sql('s')} LIMIT 1) "
-                "LEFT JOIN event_enrichments ai ON ai.event_id=e.id "
-                f"WHERE {_event_intelligence_sql('m')} "
-                f"{cond}",
-                (modifier,),
-            ).fetchone()["n"]
-
-        total = count()
-        high = count(f"AND {_public_impact_sql('m')}='high'")
-        med = count(f"AND {_public_impact_sql('m')}='medium'")
-        with_market = count(f"AND {_event_finance_sql('m')}=1")
+        summary = c.execute(
+            f"""
+            WITH representative_events(event_id, sighting_id) AS MATERIALIZED (
+              SELECT e.id, m.id
+              FROM events e
+              JOIN event_sightings m ON m.id=(
+                SELECT s.id
+                FROM event_sightings s INDEXED BY idx_sighting_event
+                WHERE s.event_id=e.id
+                  AND s.published_at_status='verified'
+                  AND s.published_at_epoch >=
+                    CAST(strftime('%s','now',?) AS INTEGER)
+                  AND {_event_intelligence_sql('s')}
+                ORDER BY {_preferred_sighting_order_sql('s')} LIMIT 1
+              )
+            ), scored_events(impact, has_market_kw) AS MATERIALIZED (
+              SELECT {_public_impact_sql('m')}, {_event_finance_sql('m')}
+              FROM representative_events selected
+              JOIN events e ON e.id=selected.event_id
+              JOIN event_sightings m ON m.id=selected.sighting_id
+              LEFT JOIN event_enrichments ai ON ai.event_id=e.id
+            )
+            SELECT COUNT(*) AS total,
+                   COALESCE(SUM(impact='high'), 0) AS high,
+                   COALESCE(SUM(impact='medium'), 0) AS medium,
+                   COALESCE(SUM(has_market_kw=1), 0) AS with_market_kw
+            FROM scored_events
+            """,
+            (modifier,),
+        ).fetchone()
+        total = int(summary["total"] or 0)
+        high = int(summary["high"] or 0)
+        med = int(summary["medium"] or 0)
+        with_market = int(summary["with_market_kw"] or 0)
         active_kols = c.execute(
             "SELECT COUNT(DISTINCT s.kol_key) n FROM event_sightings s "
             "JOIN events e ON e.id=s.event_id "

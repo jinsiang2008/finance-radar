@@ -191,6 +191,7 @@ def _private_response(
 @app.on_event("startup")
 def _init_db() -> None:
     db.init()
+    db.warm_event_relevance_cache()
 
 
 @app.get("/health")

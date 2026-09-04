@@ -121,8 +121,8 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn('stale ? "数据延迟" : ""', self.javascript)
         self.assertIn('"高收益债利差"', self.javascript)
         self.assertIn("cs.hy_oas", self.javascript)
-        self.assertIn('static/app.js?v=22', self.html)
-        self.assertIn('static/style.css?v=22', self.html)
+        self.assertIn('static/app.js?v=23', self.html)
+        self.assertIn('static/style.css?v=23', self.html)
         self.assertNotIn('?v=21', self.html)
         self.assertIn(".metric.is-stale", self.css)
 
@@ -562,6 +562,91 @@ class FrontendContractTests(unittest.TestCase):
         )
         self.assertIn("max-height: 148px", self.css)
         self.assertIn("min-height: 44px", self.css)
+
+    def test_kol_feed_progressively_supplements_high_impact_results(self) -> None:
+        load_start = self.javascript.index("async function loadEvents")
+        load_end = self.javascript.index("// ─── Support", load_start)
+        contract = self.javascript[load_start:load_end]
+
+        # The regular feed owns the critical path; the optional high-impact
+        # supplement must never delay its first successful render.
+        self.assertNotIn("Promise.allSettled", contract)
+        regular_fetch = contract.index(
+            "const regularData = await fetchJSON(url, 12000"
+        )
+        regular_render = contract.index("renderEvents(regularItems)")
+        supplement_fetch = contract.index(
+            "const highData = await fetchJSON(highUrl, 12000"
+        )
+        supplement_render = contract.index("renderEvents(items)", supplement_fetch)
+        self.assertLess(regular_fetch, regular_render)
+        self.assertLess(regular_render, supplement_fetch)
+        self.assertLess(supplement_fetch, supplement_render)
+
+        # A filtered impact view stays a single request. An unfiltered view
+        # only spends the second request when the 150-row page can hide highs.
+        self.assertIn("!state.impact", contract)
+        self.assertIn("regularItems.length >= 150", contract)
+        self.assertIn("regularHighCount < 50", contract)
+        self.assertIn("if (!shouldSupplementHighImpact) {", contract)
+        self.assertEqual(contract.count("await fetchJSON("), 2)
+
+        # A capped feed is only marked filter-complete after its optional
+        # supplement succeeds.  If that request is aborted or fails, a later
+        # view activation may retry instead of treating the partial feed as
+        # fresh.
+        no_supplement_start = contract.index(
+            "if (!shouldSupplementHighImpact) {"
+        )
+        supplement_params = contract.index(
+            "const highParams = new URLSearchParams(p)",
+            no_supplement_start,
+        )
+        self.assertIn(
+            "state.loadedKolFilterSignature = requestFilterSignature",
+            contract[no_supplement_start:supplement_params],
+        )
+        self.assertIn(
+            'state.loadedKolFilterSignature = ""',
+            contract[no_supplement_start:supplement_params],
+        )
+        supplement_success = contract[
+            supplement_fetch:contract.index("} catch (highError) {", supplement_fetch)
+        ]
+        self.assertLess(
+            supplement_success.index("renderEvents(items)"),
+            supplement_success.index(
+                "state.loadedKolFilterSignature = requestFilterSignature"
+            ),
+        )
+
+        # Both render phases are guarded against a superseded generation,
+        # controller, aborted view switch, or changed KOL/filter signature.
+        guard_start = contract.index("const requestIsCurrent")
+        guard_end = contract.index("const feed =", guard_start)
+        guard = contract[guard_start:guard_end]
+        self.assertIn("generation === state.feedRequestGeneration", guard)
+        self.assertIn("state.feedAbortController === requestController", guard)
+        self.assertIn("!requestController.signal.aborted", guard)
+        self.assertIn(
+            "requestFilterSignature === kolFilterSignature()",
+            guard,
+        )
+        self.assertGreaterEqual(
+            contract.count("if (!requestIsCurrent()) return false"),
+            3,
+        )
+
+        # A current supplement failure keeps the already-rendered regular
+        # result successful and never enters the critical-request error path.
+        supplement_catch = contract.index("} catch (highError) {", supplement_fetch)
+        outer_catch = contract.index("} catch (e) {", supplement_catch)
+        failure_contract = contract[supplement_catch:outer_catch]
+        self.assertIn('console.warn("high impact feed", highError)', failure_contract)
+        self.assertIn("return true", failure_contract)
+        self.assertNotIn("setViewLoadError", failure_contract)
+        self.assertNotIn("renderEvents([]", failure_contract)
+        self.assertNotIn("loadedKolFilterSignature", failure_contract)
 
     def test_market_status_prioritizes_applicability_and_pending_before_failure(
         self,

@@ -5416,6 +5416,11 @@
     state.feedAbortController?.abort();
     const requestController = new AbortController();
     state.feedAbortController = requestController;
+    const requestIsCurrent = () =>
+      generation === state.feedRequestGeneration &&
+      state.feedAbortController === requestController &&
+      !requestController.signal.aborted &&
+      requestFilterSignature === kolFilterSignature();
     const feed = $("#feed");
     feed.setAttribute("aria-busy", "true");
     $("#feed-status").textContent = "正在更新信号流…";
@@ -5428,47 +5433,65 @@
     p.set("limit", "150");
     const url = api(`api/events?${p}`);
     try {
-      let regularData;
-      let priorityItems = [];
-      let highPriorityLoaded = false;
-      if (state.impact) {
-        regularData = await fetchJSON(url, 12000, { signal: requestController.signal });
-      } else {
-        const highParams = new URLSearchParams(p);
-        highParams.set("impact", "high");
-        highParams.set("limit", "50");
-        const highUrl = api(`api/events?${highParams}`);
-        const [regularResult, highResult] = await Promise.allSettled([
-          fetchJSON(url, 12000, { signal: requestController.signal }),
-          fetchJSON(highUrl, 12000, { signal: requestController.signal }),
-        ]);
-        if (regularResult.status === "rejected") throw regularResult.reason;
-        regularData = regularResult.value;
-        if (highResult.status === "fulfilled") {
-          priorityItems = highResult.value?.items || [];
-          highPriorityLoaded = true;
-        } else {
-          console.warn("high impact feed", highResult.reason);
-        }
-      }
-      const regularItems = regularData?.items || [];
-      const items = highPriorityLoaded
-        ? mergePriorityEvents(priorityItems, regularItems)
-        : regularItems;
-      if (generation !== state.feedRequestGeneration) return false;
-      state.feedLoadedCount = items.length;
-      state.feedHighPriority = highPriorityLoaded;
+      const regularData = await fetchJSON(url, 12000, {
+        signal: requestController.signal,
+      });
+      if (!requestIsCurrent()) return false;
+      const regularItems = Array.isArray(regularData?.items)
+        ? regularData.items
+        : [];
+      state.feedLoadedCount = regularItems.length;
+      state.feedHighPriority = false;
       state.feedRegularCapped = regularItems.length >= 150;
       recordViewLastGoodDataAt("kol", regularData);
       clearViewLoadError("kol");
-      renderEvents(items);
+      renderEvents(regularItems);
       updateFeedStatus();
-      if (requestFilterSignature === kolFilterSignature()) {
+
+      const regularHighCount = regularItems.filter(
+        (item) => String(item?.impact || "").toLowerCase() === "high"
+      ).length;
+      const shouldSupplementHighImpact =
+        !state.impact &&
+        regularItems.length >= 150 &&
+        regularHighCount < 50;
+      if (!shouldSupplementHighImpact) {
         state.loadedKolFilterSignature = requestFilterSignature;
+        return true;
+      }
+      // The regular page is useful immediately, but it is not yet complete
+      // for this filter.  Clearing a previously identical signature ensures
+      // an aborted or failed supplement is retried on the next view load.
+      state.loadedKolFilterSignature = "";
+
+      const highParams = new URLSearchParams(p);
+      highParams.set("impact", "high");
+      highParams.set("limit", "50");
+      const highUrl = api(`api/events?${highParams}`);
+      try {
+        const highData = await fetchJSON(highUrl, 12000, {
+          signal: requestController.signal,
+        });
+        if (!requestIsCurrent()) return false;
+        const priorityItems = Array.isArray(highData?.items)
+          ? highData.items
+          : [];
+        const items = mergePriorityEvents(priorityItems, regularItems);
+        state.feedLoadedCount = items.length;
+        state.feedHighPriority = true;
+        renderEvents(items);
+        updateFeedStatus();
+        state.loadedKolFilterSignature = requestFilterSignature;
+      } catch (highError) {
+        if (!requestIsCurrent()) return false;
+        if (highError?.name !== "AbortError") {
+          console.warn("high impact feed", highError);
+        }
+        return true;
       }
       return true;
     } catch (e) {
-      if (generation !== state.feedRequestGeneration) return false;
+      if (!requestIsCurrent()) return false;
       if (e?.name === "AbortError") return false;
       setViewLoadError("kol", e, url);
       if (!state.feedItems.length) {
