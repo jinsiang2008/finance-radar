@@ -1766,8 +1766,10 @@
           }
         </header>
         <h3>${esc(title)}</h3>
-        <p class="daily-stream-summary">${esc(summary)}</p>
-        ${why ? `<p class="daily-stream-why"><span>影响</span>${esc(why)}</p>` : ""}
+        <div class="daily-stream-narrative${why ? " has-impact" : ""}">
+          <p class="daily-stream-summary">${esc(summary)}</p>
+          ${why ? `<p class="daily-stream-why"><span>影响</span>${esc(why)}</p>` : ""}
+        </div>
         ${dailyAssetTags(item?.assets, 5)}
         ${
           crossTags.length

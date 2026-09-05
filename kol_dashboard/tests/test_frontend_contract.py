@@ -235,19 +235,39 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn(".daily-status-columns { grid-template-columns: repeat(2", self.css)
         self.assertIn(".daily-section-toggle { grid-column: 1", self.css)
         self.assertIn(".daily-overview-item > a { min-height: 44px", self.css)
-        self.assertIn(".daily-stream-summary { font-size: 13px; }", self.css)
-        self.assertIn(".daily-stream-why { font-size: 12px; }", self.css)
+        self.assertIn(".daily-stream-summary { font-size: 14px; }", self.css)
+        self.assertIn(".daily-stream-why { font-size: 13px; }", self.css)
         self.assertIn("(prefers-reduced-motion: reduce)", self.css)
         self.assertNotIn("DAILY INTELLIGENCE", self.html)
         self.assertNotIn("60 SECOND READ", self.javascript)
         self.assertNotIn("DIRECT SOURCES", self.javascript)
         self.assertNotIn("NEXT CHECK", self.javascript)
 
-    def test_daily_assets_share_the_v30_cachebuster(self) -> None:
-        self.assertIn('static/app.js?v=30', self.html)
-        self.assertIn('static/style.css?v=30', self.html)
-        self.assertEqual(self.html.count("?v=30"), 2)
+    def test_daily_assets_share_the_v31_cachebuster(self) -> None:
+        self.assertIn('static/app.js?v=31', self.html)
+        self.assertIn('static/style.css?v=31', self.html)
+        self.assertEqual(self.html.count("?v=31"), 2)
         self.assertNotIn("?v=26", self.html)
+
+    def test_daily_desktop_reading_layout_has_a_compact_rail_and_split_impact(self) -> None:
+        self.assertIn(
+            "grid-template-columns: clamp(184px, 17vw, 212px) minmax(0, 1fr)",
+            self.css,
+        )
+        self.assertIn("@media (min-width: 1101px)", self.css)
+        self.assertIn(".daily-stream-narrative.has-impact", self.css)
+        self.assertIn(
+            'class="daily-stream-narrative${why ? " has-impact" : ""}"',
+            self.javascript,
+        )
+        self.assertIn("--daily-copy-size: 14px", self.css)
+        self.assertIn("overflow-wrap: anywhere; font-size: 21px", self.css)
+        tablet_start = self.css.index("@media (max-width: 960px)")
+        tablet_end = self.css.index("@media (max-width: 700px)", tablet_start)
+        tablet_contract = self.css[tablet_start:tablet_end]
+        self.assertIn(".daily-stream-copy > header { display: block; }", tablet_contract)
+        self.assertIn(".daily-cluster-marker {", tablet_contract)
+        self.assertIn("text-overflow: clip; white-space: normal", tablet_contract)
 
     def test_daily_discovery_sources_keep_heat_curation_and_time_semantics(self) -> None:
         for contract in (
@@ -389,8 +409,8 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn('stale ? "数据延迟" : ""', self.javascript)
         self.assertIn('"高收益债利差"', self.javascript)
         self.assertIn("cs.hy_oas", self.javascript)
-        self.assertIn('static/app.js?v=30', self.html)
-        self.assertIn('static/style.css?v=30', self.html)
+        self.assertIn('static/app.js?v=31', self.html)
+        self.assertIn('static/style.css?v=31', self.html)
         self.assertNotIn('?v=26', self.html)
         self.assertIn(".metric.is-stale", self.css)
 
