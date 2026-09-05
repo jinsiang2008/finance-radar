@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -342,6 +344,76 @@ class DeploymentContractTests(unittest.TestCase):
             '"$VPS" put "$WORK/auth.env"',
             self.deploy,
         )
+
+    def test_default_auth_rewrite_preserves_cookie_name(self) -> None:
+        rewrite_marker = (
+            'python3 - "$REMOTE_STAGE/auth.env" '
+            "/etc/kol-dashboard.env <<'PY'\n"
+        )
+        rewrite_start = self.deploy.index(rewrite_marker) + len(rewrite_marker)
+        rewrite_end = self.deploy.index(
+            "\nPY\nchmod 600 /etc/kol-dashboard.env",
+            rewrite_start,
+        )
+        rewrite_program = self.deploy[rewrite_start:rewrite_end]
+
+        # COOKIE_NAME must be admitted while reading and emitted in a stable
+        # position; the functional assertions below exercise both contracts.
+        self.assertEqual(
+            rewrite_program.count('"KOL_DASHBOARD_COOKIE_NAME",'),
+            2,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            missing_incoming = directory / "auth.env"
+            target = directory / "kol-dashboard.env"
+            target.write_text(
+                "\n".join(
+                    (
+                        "KOL_DASHBOARD_COOKIE_SECURE=false",
+                        "KOL_DASHBOARD_COOKIE_NAME=zlstreet_private_session",
+                        "KOL_DASHBOARD_SESSION_TTL_SECONDS=3600",
+                        "KOL_DASHBOARD_SESSION_SECRET=session-secret",
+                        "KOL_DASHBOARD_PASSCODE_HASH=passcode-hash",
+                        "KOL_DASHBOARD_COOKIE_PATH=/legacy",
+                        "KOL_DASHBOARD_HOLDINGS_FILE=/legacy/holdings.md",
+                        "UNRELATED_SECRET=must-not-survive",
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-",
+                    str(missing_incoming),
+                    str(target),
+                ],
+                input=rewrite_program,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            rewritten_lines = target.read_text(encoding="utf-8").splitlines()
+
+            self.assertEqual(
+                rewritten_lines,
+                [
+                    "KOL_DASHBOARD_PASSCODE_HASH=passcode-hash",
+                    "KOL_DASHBOARD_SESSION_SECRET=session-secret",
+                    "KOL_DASHBOARD_SESSION_TTL_SECONDS=3600",
+                    "KOL_DASHBOARD_COOKIE_NAME=zlstreet_private_session",
+                    "KOL_DASHBOARD_COOKIE_PATH=/kol",
+                    "KOL_DASHBOARD_COOKIE_SECURE=true",
+                    "KOL_DASHBOARD_HOLDINGS_FILE="
+                    "/opt/kol-dashboard/private/holdings.md",
+                ],
+            )
+            self.assertEqual(target.stat().st_mode & 0o777, 0o600)
 
     def test_noninteractive_passcode_is_unexported_before_child_processes(
         self,
