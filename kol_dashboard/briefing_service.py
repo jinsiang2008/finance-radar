@@ -19,6 +19,11 @@ from typing import Any
 from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
+if __package__:
+    from . import briefing_topics
+else:  # Flat production bundle in /opt/kol-dashboard.
+    import briefing_topics  # type: ignore
+
 
 BEIJING = ZoneInfo("Asia/Shanghai")
 STALE_AFTER_SECONDS = 90 * 60
@@ -523,7 +528,29 @@ _PUBLIC_ITEM_FIELDS = (
     "hn_comments",
     "hn_rank",
     "heat_score",
+    "title_zh",
+    "summary_zh",
+    "summary_basis",
+    "content_category",
+    "content_tags",
+    "taxonomy_version",
+    "translation_status",
 )
+
+_SUMMARY_BASES = frozenset({"title_only", "curated_excerpt", "self_post"})
+_TRANSLATION_STATUSES = frozenset(
+    {"translated", "source_zh", "unavailable"}
+)
+_CONTENT_ENHANCEMENT_FIELDS = (
+    "title_zh",
+    "summary_zh",
+    "summary_basis",
+    "content_category",
+    "content_tags",
+    "taxonomy_version",
+    "translation_status",
+)
+_HAN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 
 
 def _text(value: Any, maximum: int) -> str:
@@ -531,6 +558,120 @@ def _text(value: Any, maximum: int) -> str:
         return ""
     text = re.sub(r"\s+", " ", str(value)).strip()
     return text[:maximum]
+
+
+def _strict_enhancement_text(value: Any, maximum: int) -> str | None:
+    if value is None:
+        return ""
+    if not isinstance(value, str) or "\x00" in value:
+        return None
+    if any(
+        unicodedata.category(char) == "Cc" and char not in "\n\r\t"
+        for char in value
+    ):
+        return None
+    text = " ".join(value.split())
+    return text if len(text) <= maximum else None
+
+
+def _same_normalized_text(left: str, right: str) -> bool:
+    return unicodedata.normalize("NFKC", left).casefold() == unicodedata.normalize(
+        "NFKC", right
+    ).casefold()
+
+
+def _imported_content_enhancement(
+    source: Mapping[str, Any],
+    *,
+    title: str,
+    kind: str,
+    original_url: str,
+) -> dict[str, Any]:
+    """Return a fully revalidated optional display enhancement.
+
+    A bad or partially corrupted enhancement must not remove an otherwise
+    valid source story.  It is therefore discarded as a unit and never feeds
+    source classification, deduplication, ranking or section placement.
+    """
+    if not any(name in source for name in _CONTENT_ENHANCEMENT_FIELDS):
+        return {}
+
+    title_zh = _strict_enhancement_text(source.get("title_zh"), 180)
+    summary_zh = _strict_enhancement_text(source.get("summary_zh"), 420)
+    if title_zh is None or summary_zh is None:
+        return {}
+    if (title_zh and _HAN_RE.search(title_zh) is None) or (
+        summary_zh and _HAN_RE.search(summary_zh) is None
+    ):
+        return {}
+
+    summary_basis = source.get("summary_basis")
+    translation_status = source.get("translation_status")
+    if (
+        not isinstance(summary_basis, str)
+        or summary_basis not in _SUMMARY_BASES
+        or not isinstance(translation_status, str)
+        or translation_status not in _TRANSLATION_STATUSES
+    ):
+        return {}
+    if summary_basis == "title_only" and summary_zh:
+        return {}
+    if summary_basis == "curated_excerpt" and kind not in {
+        "ai_digest",
+        "paper_digest",
+    }:
+        return {}
+    if summary_basis == "self_post" and (
+        kind != "hn_story" or bool(original_url)
+    ):
+        return {}
+
+    if translation_status == "translated":
+        if not title_zh or (summary_basis != "title_only" and not summary_zh):
+            return {}
+    elif translation_status == "source_zh":
+        if title_zh:
+            if not _same_normalized_text(title_zh, title):
+                return {}
+            title_zh = ""
+        if _HAN_RE.search(title) is None and not summary_zh:
+            return {}
+    elif title_zh or summary_zh:
+        return {}
+
+    taxonomy_version = source.get("taxonomy_version")
+    category = source.get("content_category")
+    tags = source.get("content_tags")
+    if taxonomy_version != briefing_topics.TAXONOMY_VERSION:
+        return {}
+    try:
+        assignment = briefing_topics.validate_topic_assignment(
+            category,
+            tags,
+            taxonomy_version=taxonomy_version,
+        )
+    except (TypeError, ValueError):
+        return {}
+    if (
+        assignment.primary != category
+        or assignment.version != taxonomy_version
+        or not isinstance(tags, list)
+        or list(assignment.tags) != tags
+    ):
+        return {}
+
+    output: dict[str, Any] = {
+        "summary_basis": summary_basis,
+        "content_category": assignment.primary,
+        "content_tags": list(assignment.tags),
+        "taxonomy_version": assignment.version,
+        "translation_status": translation_status,
+    }
+    if title_zh:
+        output["title_zh"] = title_zh
+    if summary_zh:
+        output["summary_zh"] = summary_zh
+    return output
 
 
 def _finite_number(value: Any) -> float | None:
@@ -1853,6 +1994,14 @@ def _imported_highlight(
     ):
         return None
 
+    content_kind = _text(discovery_metadata.get("_content_kind"), 32).lower()
+    enhancement = _imported_content_enhancement(
+        source,
+        title=title,
+        kind=content_kind,
+        original_url=_text(discovery_metadata.get("original_url"), 2_048),
+    )
+
     raw_tier = _text(source.get("source_tier"), 24).lower()
     host = _host(source_url)
     if discovery_metadata:
@@ -1873,11 +2022,21 @@ def _imported_highlight(
         )
     # Directness and evidence depth are separate claims.  A first-party or
     # official URL does not prove that the snapshot contains the body/post.
-    evidence_basis = (
-        "title_and_snippet"
-        if _text(source.get("summary"), 420)
-        else "title_only"
-    )
+    summary_basis = _text(enhancement.get("summary_basis"), 32).lower()
+    if summary_basis == "title_only" or (
+        content_kind == "hn_story" and summary_basis != "self_post"
+    ):
+        # HN's legacy summary is an engagement snapshot, not article text.
+        # It must never upgrade a title-only item to snippet evidence.
+        evidence_basis = "title_only"
+    elif summary_basis in {"curated_excerpt", "self_post"}:
+        evidence_basis = "title_and_snippet"
+    else:
+        evidence_basis = (
+            "title_and_snippet"
+            if _text(source.get("summary"), 420)
+            else "title_only"
+        )
 
     summary = _text(source.get("summary"), 420) or title
     item: dict[str, Any] = {
@@ -1923,6 +2082,7 @@ def _imported_highlight(
     if published is not None:
         item["published_at"] = _iso(published)
     item.update(discovery_metadata)
+    item.update(enhancement)
     cross_tags = source.get("cross_tags")
     if isinstance(cross_tags, list):
         item["_cross_tags_hint"] = list(cross_tags[:6])
@@ -2200,6 +2360,35 @@ def _merge_duplicate_group(
     trusted_group = [
         item for item in group if _revision_trust_key(item) == base_trust
     ]
+    base_content_kind = _text(base.get("_content_kind"), 32).lower()
+    enhancement_candidates = [
+        item
+        for item in trusted_group
+        if _text(item.get("_content_kind"), 32).lower() == base_content_kind
+        and item.get("translation_status") in _TRANSLATION_STATUSES
+    ]
+    if enhancement_candidates:
+        status_rank = {"translated": 0, "source_zh": 1, "unavailable": 2}
+        selected_enhancement = min(
+            enhancement_candidates,
+            key=lambda item: (
+                status_rank.get(str(item.get("translation_status")), 9),
+                0
+                if item.get("id") == base.get("id")
+                and item.get("source_url") == base.get("source_url")
+                else 1,
+                _text(item.get("id"), 80),
+            ),
+        )
+        for name in _CONTENT_ENHANCEMENT_FIELDS:
+            base.pop(name, None)
+        base.update(
+            {
+                name: selected_enhancement[name]
+                for name in _CONTENT_ENHANCEMENT_FIELDS
+                if name in selected_enhancement
+            }
+        )
     if prefer_latest_revision and _impact(base.get("impact")) == "unknown":
         base["impact"] = max(
             (_impact(item.get("impact")) for item in trusted_group),
@@ -2718,6 +2907,15 @@ def _lead(
             value = _text(first.get(source), 420)
             if value:
                 output[target] = value
+        enhancement = {
+            name: first[name]
+            for name in _CONTENT_ENHANCEMENT_FIELDS
+            if name in first
+        }
+        if enhancement:
+            # Copy one already-validated bundle from the lead story. Never mix
+            # a translated title, summary basis or taxonomy from other cards.
+            output.update(enhancement)
     composite = macro.get("composite_risk") if isinstance(macro, Mapping) else None
     if isinstance(composite, Mapping):
         score = _finite_number(composite.get("score"))

@@ -36,9 +36,10 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 if __package__:
-    from . import briefing_import, db
+    from . import briefing_import, daily_enrichment, db
 else:  # Flat production bundle in /opt/kol-dashboard.
     import briefing_import  # type: ignore
+    import daily_enrichment  # type: ignore
     import db  # type: ignore
 
 
@@ -253,6 +254,10 @@ class Story:
     summary: str = ""
     why_it_matters: str = ""
     assets: tuple[str, ...] = ()
+    # Private producer evidence.  It is passed to the background localizer but
+    # is deliberately not serialized into the public Daily snapshot.
+    evidence_excerpt: str = field(default="", repr=False, compare=False)
+    summary_basis: str = "title_only"
     hn_id: int | None = None
     hn_rank: int | None = None
     hn_score: int | None = None
@@ -694,6 +699,9 @@ class BriefingCollector:
         hn_item_limit: int = DEFAULT_HN_ITEM_LIMIT,
         rss_scan_limit: int = DEFAULT_RSS_SCAN_LIMIT,
         rss_item_limit: int = DEFAULT_RSS_ITEM_LIMIT,
+        enable_ai_enrichment: bool = False,
+        enrichment_config: Any | None = None,
+        enrichment_transport: Any | None = None,
     ) -> None:
         if (
             isinstance(timeout, bool)
@@ -734,6 +742,13 @@ class BriefingCollector:
         self.hn_item_limit = min(hn_item_limit, MAX_HN_ITEM_LIMIT)
         self.rss_scan_limit = min(rss_scan_limit, MAX_RSS_SCAN_LIMIT)
         self.rss_item_limit = min(rss_item_limit, MAX_RSS_ITEM_LIMIT)
+        self.enable_ai_enrichment = bool(
+            enable_ai_enrichment
+            or enrichment_config is not None
+            or enrichment_transport is not None
+        )
+        self.enrichment_config = enrichment_config
+        self.enrichment_transport = enrichment_transport
         self.errors: list[str] = []
         self.coverage_times: list[datetime] = []
 
@@ -1028,6 +1043,12 @@ class BriefingCollector:
             f"可审计热度分 {heat:.1f}/100；{link_note}"
         )
         section = "ai" if _AI_TOKEN_RE.search(title) else "technology"
+        raw_self_post = payload.get("text")
+        self_post_excerpt = (
+            _html_text(raw_self_post, 4_000)
+            if raw_original is None and isinstance(raw_self_post, str)
+            else ""
+        )
         aliases = {f"hn:{item_id}"}
         if submitted_url:
             url_alias = _url_alias(raw_original)
@@ -1056,6 +1077,8 @@ class BriefingCollector:
             summary=summary,
             why_it_matters=why,
             assets=("THEME:AI",) if section == "ai" else ("THEME:TECH",),
+            evidence_excerpt=self_post_excerpt,
+            summary_basis="self_post" if self_post_excerpt else "title_only",
             hn_id=item_id,
             hn_rank=rank,
             hn_score=score,
@@ -1261,6 +1284,8 @@ class BriefingCollector:
                         if spec.kind == "paper_digest"
                         else ("THEME:AI",)
                     ),
+                    evidence_excerpt=summary,
+                    summary_basis="curated_excerpt",
                     aliases=frozenset(aliases),
                 )
             )
@@ -1298,6 +1323,81 @@ class BriefingCollector:
                 )
             all_stories.extend(feed_stories)
 
+        deduplicated = deduplicate_stories(all_stories)
+        packets = [
+            {
+                "hn_id": story.hn_id,
+                "title": story.title,
+                "source": story.source,
+                "source_url": story.source_url,
+                "summary_basis": story.summary_basis,
+                "evidence_excerpt": story.evidence_excerpt,
+            }
+            for story in deduplicated
+        ]
+        try:
+            if self.enable_ai_enrichment:
+                remaining_budget = (
+                    max(0.0, self.deadline_at - self.monotonic())
+                    if self.deadline_at is not None
+                    else 0.0
+                )
+                localization = daily_enrichment.enrich_batch(
+                    packets,
+                    config=self.enrichment_config,
+                    transport=self.enrichment_transport,
+                    budget_seconds=remaining_budget,
+                )
+            else:
+                localization = {
+                    "configured": False,
+                    "results": {
+                        daily_enrichment.story_identity(packet):
+                        daily_enrichment.local_projection(
+                            packet,
+                            status=(
+                                "source_zh"
+                                if not daily_enrichment.should_enrich(packet)
+                                else "unavailable"
+                            ),
+                        )
+                        for packet in packets
+                    },
+                    "errors": {},
+                }
+        except Exception:
+            # Chinese projection is an assistive layer.  A local/provider bug
+            # must never replace a fresh source snapshot with an older one.
+            localization = {
+                "configured": False,
+                "results": {
+                    daily_enrichment.story_identity(packet):
+                    daily_enrichment.local_projection(
+                        packet,
+                        status="unavailable",
+                    )
+                    for packet in packets
+                },
+                "errors": {"batch": "worker_exception"},
+            }
+        localized_items = localization.get("results")
+        if not isinstance(localized_items, Mapping):
+            localized_items = {}
+        localization_errors = localization.get("errors")
+        if isinstance(localization_errors, Mapping) and localization_errors:
+            codes = sorted(
+                {
+                    _clean_text(code, 48)
+                    for code in localization_errors.values()
+                    if _clean_text(code, 48) not in {"", "provider_unconfigured"}
+                }
+            )
+            if codes:
+                self._error(
+                    "Daily Chinese projection partial: "
+                    + ", ".join(codes[:4])
+                )
+
         generated_at = max(self._now(), *(self.coverage_times or [started_at]))
         source_as_of = min(
             generated_at,
@@ -1306,7 +1406,7 @@ class BriefingCollector:
         sections: dict[str, list[dict[str, Any]]] = {
             section: [] for section in briefing_import.SECTION_KEYS
         }
-        for story in deduplicate_stories(all_stories):
+        for story, packet in zip(deduplicated, packets):
             # Defensive clamp: injected clocks and responses may not move
             # monotonically, but the importer requires every fetch to be at or
             # before the actual coverage instant.
@@ -1319,7 +1419,13 @@ class BriefingCollector:
                     else None
                 ),
             )
-            sections[safe_story.section].append(safe_story.to_v1_item())
+            item = safe_story.to_v1_item()
+            projection = localized_items.get(
+                daily_enrichment.story_identity(packet)
+            )
+            if isinstance(projection, Mapping):
+                item.update(projection)
+            sections[safe_story.section].append(item)
         for section in sections:
             sections[section].sort(key=_payload_story_sort_key, reverse=True)
 
@@ -1609,6 +1715,9 @@ def collect_briefing(
     hn_item_limit: int = DEFAULT_HN_ITEM_LIMIT,
     rss_scan_limit: int = DEFAULT_RSS_SCAN_LIMIT,
     rss_item_limit: int = DEFAULT_RSS_ITEM_LIMIT,
+    enable_ai_enrichment: bool = False,
+    enrichment_config: Any | None = None,
+    enrichment_transport: Any | None = None,
 ) -> CollectionResult:
     clock = (lambda: now) if now is not None else None
     return BriefingCollector(
@@ -1621,6 +1730,9 @@ def collect_briefing(
         hn_item_limit=hn_item_limit,
         rss_scan_limit=rss_scan_limit,
         rss_item_limit=rss_item_limit,
+        enable_ai_enrichment=enable_ai_enrichment,
+        enrichment_config=enrichment_config,
+        enrichment_transport=enrichment_transport,
     ).collect()
 
 
@@ -1671,6 +1783,9 @@ def produce_briefing(
     hn_item_limit: int = DEFAULT_HN_ITEM_LIMIT,
     rss_scan_limit: int = DEFAULT_RSS_SCAN_LIMIT,
     rss_item_limit: int = DEFAULT_RSS_ITEM_LIMIT,
+    enable_ai_enrichment: bool = False,
+    enrichment_config: Any | None = None,
+    enrichment_transport: Any | None = None,
 ) -> tuple[CollectionResult, dict[str, Any] | None]:
     result = collect_briefing(
         opener=opener,
@@ -1682,6 +1797,9 @@ def produce_briefing(
         hn_item_limit=hn_item_limit,
         rss_scan_limit=rss_scan_limit,
         rss_item_limit=rss_item_limit,
+        enable_ai_enrichment=enable_ai_enrichment,
+        enrichment_config=enrichment_config,
+        enrichment_transport=enrichment_transport,
     )
     if output_path is not None:
         write_payload_atomic(result.payload, output_path)
@@ -1727,6 +1845,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--hn-limit", type=int, default=DEFAULT_HN_ITEM_LIMIT)
     parser.add_argument("--rss-scan-limit", type=int, default=DEFAULT_RSS_SCAN_LIMIT)
     parser.add_argument("--rss-limit", type=int, default=DEFAULT_RSS_ITEM_LIMIT)
+    parser.add_argument(
+        "--no-ai-enrichment",
+        action="store_true",
+        help=(
+            "Skip background Chinese title/summary generation; deterministic "
+            "content classification still runs"
+        ),
+    )
     args = parser.parse_args(argv)
     if args.database_path:
         db.DB_PATH = str(Path(args.database_path).expanduser())
@@ -1740,6 +1866,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             hn_item_limit=args.hn_limit,
             rss_scan_limit=args.rss_scan_limit,
             rss_item_limit=args.rss_limit,
+            enable_ai_enrichment=not args.no_ai_enrichment,
         )
     except (
         CollectionError,

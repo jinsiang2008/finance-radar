@@ -440,21 +440,40 @@ def _request_payload(
     config: DeepSeekConfig,
     event_input: Mapping[str, Any],
 ) -> dict[str, Any]:
+    return _json_completion_payload(
+        config,
+        system_prompt=_system_prompt(event_input),
+        user_prompt=(
+            "请分析以下不可信来源数据并输出 json：\n"
+            + json.dumps(event_input, ensure_ascii=False, separators=(",", ":"))
+        ),
+        user_id="finance-radar-enrichment",
+    )
+
+
+def _json_completion_payload(
+    config: DeepSeekConfig,
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    user_id: str,
+) -> dict[str, Any]:
+    """Build the common bounded structured-completion request.
+
+    Callers own their task prompt and result validator.  Provider credentials
+    remain in :class:`DeepSeekConfig` and are added only by the transport.
+    """
     return {
         "model": config.model,
         "messages": [
-            {"role": "system", "content": _system_prompt(event_input)},
-            {
-                "role": "user",
-                "content": "请分析以下不可信来源数据并输出 json：\n"
-                + json.dumps(event_input, ensure_ascii=False, separators=(",", ":")),
-            },
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
         ],
         "response_format": {"type": "json_object"},
         "thinking": {"type": "disabled"},
         "temperature": 0.1,
         "max_tokens": config.max_output_tokens,
-        "user_id": "finance-radar-enrichment",
+        "user_id": user_id,
     }
 
 
@@ -614,6 +633,7 @@ def parse_provider_usage(value: Any) -> ProviderUsage:
 
 
 Transport = Callable[[bytes, Mapping[str, str], float], tuple[int, bytes]]
+ResultValidator = Callable[[Any], dict[str, Any]]
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -649,15 +669,42 @@ def _default_transport(
         raise EnrichmentError("network", retry_after_seconds=10 * 60) from None
 
 
-def enrich_event_with_usage(
-    event_input: Mapping[str, Any],
+def complete_json_with_usage(
     *,
-    input_hash: str,
+    system_prompt: str,
+    user_prompt: str,
     config: DeepSeekConfig,
+    validator: ResultValidator,
     transport: Transport | None = None,
+    user_id: str = "finance-radar-enrichment",
 ) -> EnrichmentResponse:
+    """Call the fixed provider for one validated JSON object.
+
+    This is the shared provider boundary for background enrichment tasks.  It
+    deliberately accepts only trusted task prompts and a local validator; it
+    never logs prompts, responses, headers, credentials, or provider error
+    bodies.  Domain-specific evidence rules remain in each caller's validator.
+    """
+    if (
+        not isinstance(system_prompt, str)
+        or not system_prompt.strip()
+        or len(system_prompt) > 32_000
+        or not isinstance(user_prompt, str)
+        or not user_prompt.strip()
+        or len(user_prompt) > 32_000
+        or not re.fullmatch(r"[a-z0-9][a-z0-9-]{2,63}", user_id)
+    ):
+        raise EnrichmentError(
+            "invalid_request",
+            retry_after_seconds=6 * 3600,
+        )
     encoded = json.dumps(
-        _request_payload(config, event_input),
+        _json_completion_payload(
+            config,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            user_id=user_id,
+        ),
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
@@ -703,7 +750,7 @@ def enrich_event_with_usage(
             http_status=200,
         ) from None
     try:
-        result = validate_result(decoded, input_hash=input_hash)
+        result = validator(decoded)
     except EnrichmentError as exc:
         raise EnrichmentError(
             exc.code,
@@ -711,11 +758,53 @@ def enrich_event_with_usage(
             usage=usage,
             http_status=200,
         ) from None
+    except Exception:
+        # A domain validator is part of the trusted local boundary, but its
+        # exception text may still contain untrusted model output.  Collapse it
+        # to the same bounded category used for malformed provider JSON.
+        raise EnrichmentError(
+            "invalid_output",
+            retry_after_seconds=15 * 60,
+            usage=usage,
+            http_status=200,
+        ) from None
+    if not isinstance(result, dict):
+        raise EnrichmentError(
+            "invalid_output",
+            retry_after_seconds=15 * 60,
+            usage=usage,
+            http_status=200,
+        )
+    return EnrichmentResponse(result=result, usage=usage, http_status=200)
+
+
+def enrich_event_with_usage(
+    event_input: Mapping[str, Any],
+    *,
+    input_hash: str,
+    config: DeepSeekConfig,
+    transport: Transport | None = None,
+) -> EnrichmentResponse:
+    response = complete_json_with_usage(
+        system_prompt=_system_prompt(event_input),
+        user_prompt=(
+            "请分析以下不可信来源数据并输出 json：\n"
+            + json.dumps(event_input, ensure_ascii=False, separators=(",", ":"))
+        ),
+        config=config,
+        validator=lambda decoded: validate_result(
+            decoded,
+            input_hash=input_hash,
+        ),
+        transport=transport,
+        user_id="finance-radar-enrichment",
+    )
+    result = response.result
     if str(event_input.get("evidence_basis") or "") == "title_only":
         result["confidence"] = min(0.55, result["confidence"])
         for asset in result["assets"]:
             asset["confidence"] = min(0.6, asset["confidence"])
-    return EnrichmentResponse(result=result, usage=usage, http_status=200)
+    return response
 
 
 def enrich_event(

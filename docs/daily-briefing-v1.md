@@ -95,6 +95,34 @@ Hacker News、AI Digest 与 AI Brief 属于发现/策展层，不是对原始事
 `discovery`。`news.ycombinator.com`、`hacker-news.firebaseio.com`、
 `ai-digest.liziran.com` 与 `ai-brief.liziran.com` 也始终按聚合/发现域处理。
 
+### 中文阅读增强与内容标签
+
+新采集的 HN、AI Digest 与 AI Brief 条目可带以下完整增强字段。原始 `title`
+始终保留，并继续作为事件身份、去重与排序依据；中文字段只用于阅读展示，不能
+改变来源等级、主栏目、交叉栏目或热度。
+
+| 字段 | 约束与语义 |
+| --- | --- |
+| `title_zh` | 最多 180 字且含中文；`translated` 时必填。`source_zh` 不重复保存与原始标题等值的中文标题 |
+| `summary_zh` | 最多 420 字且含中文；只有确有策展段落或 HN 自帖正文证据时才允许生成 |
+| `summary_basis` | `title_only`、`curated_excerpt`、`self_post` 之一；即使翻译暂不可用也必须保留 |
+| `content_category` | `daily-content-v1` 白名单中的唯一主类别，如 AI、云基础设施、软件开发、系统、管理等 |
+| `content_tags` | 去重白名单数组，最多 2 个，如 `python`、`linux`、`methodology`、`engineering_management` |
+| `taxonomy_version` | 当前必须严格等于 `daily-content-v1` |
+| `translation_status` | `translated`、`source_zh`、`unavailable` 之一 |
+
+证据边界采用 fail closed：`title_only` 禁止提供 `summary_zh`；
+`curated_excerpt` 只适用于 `ai_digest` / `paper_digest`；`self_post` 只适用于没有
+`original_url` 的 HN 自帖。`translated` 至少要有 `title_zh`，且有正文证据时还
+必须有 `summary_zh`；`source_zh` 表示可展示中文来自来源自身，原始标题或来源
+摘要至少一项必须含中文；`unavailable` 不得伪造中文字段，但仍保留证据边界与
+确定性内容标签。
+
+导入器遇到部分字段、未知标签、旧 taxonomy 或关系冲突时拒绝整批新输入。公共
+读取服务会再次校验历史快照；若只发现增强字段损坏，会丢弃整个增强字段组但保留
+核心故事。重复记录合并时只可从同来源信任层、同时间语义与同内容类型的记录原子
+复制一组增强字段，不能把一条的中文标题与另一条的摘要依据或标签拼接。
+
 ## 时效与去重
 
 - `snapshot_date` 必须与 `generated_at` 的北京时间日期一致。
@@ -181,10 +209,15 @@ python3 kol_dashboard/briefing_import.py /path/to/daily-briefing.json \
   --db /path/to/kol_dashboard.db
 ```
 
-内置 producer 只抓 HN Top/Best、AI Digest RSS 与 AI Brief RSS，不调用 LLM。
-HN 两个榜单根接口都必须成功且至少产生一条当前有效 story；两个 AI feed 也必须
-各自产生至少一条当前有效条目。任一完整性门槛失败都会在写文件和导入前退出，
-保留 last-good 快照。网络读取同时受单请求和整批墙钟上限约束。
+内置 producer 的资讯来源只限 HN Top/Best、AI Digest RSS 与 AI Brief RSS。
+CLI 默认在采集后尝试生成中文阅读增强；模型未配置或暂时失败时会保留原始资讯，
+以 `translation_status=unavailable` 明确降级，使用 `--no-ai-enrichment` 可关闭模型
+调用但仍执行确定性内容分类。HN 两个榜单根接口都必须成功且至少产生一条当前
+有效 story；两个 AI feed 也必须各自产生至少一条当前有效条目。任一采集完整性
+门槛失败都会在写文件和导入前退出，保留 last-good 快照。网络读取同时受单请求
+和整批墙钟上限约束。中文增强只能使用采集墙钟的剩余预算，且自身默认最多占用
+24 秒（环境变量 `KOL_DAILY_ENRICHMENT_DEADLINE_SECONDS` 可调但硬上限 40 秒）；
+超时条目按 `unavailable` 降级，不得阻塞新快照。
 
 producer 按一次采集、一次退出的 CLI 运行模型设计；`collect.sh daily` 每次都会启动
 独立进程。不要在常驻 Web 进程内无限循环调用采集 library API，底层 DNS 或系统

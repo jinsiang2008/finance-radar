@@ -26,8 +26,9 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 if __package__:
-    from . import db
+    from . import briefing_topics, db
 else:  # Flat production bundle in /opt/kol-dashboard.
+    import briefing_topics  # type: ignore
     import db  # type: ignore
 
 
@@ -44,6 +45,8 @@ MAX_URL_LENGTH = 2048
 MAX_SOURCE_LENGTH = 120
 MAX_SUMMARY_LENGTH = 800
 MAX_WHY_LENGTH = 600
+MAX_TITLE_ZH_LENGTH = 180
+MAX_SUMMARY_ZH_LENGTH = 420
 MAX_ASSETS = 16
 MAX_ASSET_LENGTH = 64
 MAX_FUTURE_SKEW = timedelta(minutes=5)
@@ -52,6 +55,8 @@ MAX_HN_ENGAGEMENT = 1_000_000
 MAX_HN_RANK = 500
 
 DISCOVERY_KINDS = ("hn_story", "ai_digest", "paper_digest")
+SUMMARY_BASES = ("title_only", "curated_excerpt", "self_post")
+TRANSLATION_STATUSES = ("translated", "source_zh", "unavailable")
 DISCOVERY_CHANNELS = (
     "hacker_news_top",
     "hacker_news_best",
@@ -220,7 +225,25 @@ _ITEM_FIELDS = {
     "hn_comments",
     "hn_rank",
     "heat_score",
+    "title_zh",
+    "summary_zh",
+    "summary_basis",
+    "content_category",
+    "content_tags",
+    "taxonomy_version",
+    "translation_status",
 }
+
+_CONTENT_ENHANCEMENT_FIELDS = (
+    "title_zh",
+    "summary_zh",
+    "summary_basis",
+    "content_category",
+    "content_tags",
+    "taxonomy_version",
+    "translation_status",
+)
+_HAN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 
 
 class BriefingValidationError(ValueError):
@@ -862,6 +885,158 @@ def _assets(value: Any, field: str) -> list[str]:
     return output
 
 
+def _same_normalized_text(left: str, right: str) -> bool:
+    return unicodedata.normalize("NFKC", left).casefold() == unicodedata.normalize(
+        "NFKC", right
+    ).casefold()
+
+
+def _content_enhancement(
+    value: Mapping[str, Any],
+    *,
+    field: str,
+    title: str,
+    kind: str | None,
+    original_url: str | None,
+) -> dict[str, Any]:
+    """Validate one optional Chinese-summary and topic bundle.
+
+    The original title remains the event identity.  These fields are a bounded
+    display enhancement and therefore have no authority over source tier,
+    section placement, deduplication or ordering.
+    """
+    if not any(name in value for name in _CONTENT_ENHANCEMENT_FIELDS):
+        # Preserve compatibility with already-imported v1 snapshots. New
+        # discovery producers write the complete bundle, including an explicit
+        # summary basis even when translation is unavailable.
+        return {}
+
+    title_zh = _text(
+        value.get("title_zh"),
+        f"{field}.title_zh",
+        maximum=MAX_TITLE_ZH_LENGTH,
+        required=False,
+    )
+    summary_zh = _text(
+        value.get("summary_zh"),
+        f"{field}.summary_zh",
+        maximum=MAX_SUMMARY_ZH_LENGTH,
+        required=False,
+    )
+    for name, text in (("title_zh", title_zh), ("summary_zh", summary_zh)):
+        if text and _HAN_RE.search(text) is None:
+            raise BriefingValidationError(
+                f"{field}.{name} must contain Chinese text"
+            )
+
+    summary_basis = _text(
+        value.get("summary_basis"),
+        f"{field}.summary_basis",
+        maximum=32,
+    )
+    if summary_basis not in SUMMARY_BASES:
+        raise BriefingValidationError(
+            f"{field}.summary_basis must be one of {', '.join(SUMMARY_BASES)}"
+        )
+    translation_status = _text(
+        value.get("translation_status"),
+        f"{field}.translation_status",
+        maximum=24,
+    )
+    if translation_status not in TRANSLATION_STATUSES:
+        raise BriefingValidationError(
+            f"{field}.translation_status must be one of "
+            f"{', '.join(TRANSLATION_STATUSES)}"
+        )
+
+    if summary_basis == "title_only" and summary_zh:
+        raise BriefingValidationError(
+            f"{field}.summary_zh is not allowed for title_only evidence"
+        )
+    if summary_basis == "curated_excerpt" and kind not in {
+        "ai_digest",
+        "paper_digest",
+    }:
+        raise BriefingValidationError(
+            f"{field}.summary_basis=curated_excerpt requires a curated kind"
+        )
+    if summary_basis == "self_post" and (
+        kind != "hn_story" or original_url is not None
+    ):
+        raise BriefingValidationError(
+            f"{field}.summary_basis=self_post requires an HN self-post "
+            "without original_url"
+        )
+
+    if translation_status == "translated":
+        if not title_zh:
+            raise BriefingValidationError(
+                f"{field}.title_zh is required when translation_status=translated"
+            )
+        if summary_basis != "title_only" and not summary_zh:
+            raise BriefingValidationError(
+                f"{field}.summary_zh is required for translated excerpt evidence"
+            )
+    elif translation_status == "source_zh":
+        if title_zh:
+            if not _same_normalized_text(title_zh, title):
+                raise BriefingValidationError(
+                    f"{field}.title_zh must match the Chinese source title when "
+                    "translation_status=source_zh"
+                )
+            # Do not persist a duplicate display title.
+            title_zh = ""
+        if _HAN_RE.search(title) is None and not summary_zh:
+            raise BriefingValidationError(
+                f"{field}.translation_status=source_zh requires Chinese source "
+                "content"
+            )
+    elif title_zh or summary_zh:
+        raise BriefingValidationError(
+            f"{field} cannot include Chinese enhancement text when "
+            "translation_status=unavailable"
+        )
+
+    taxonomy_version = _text(
+        value.get("taxonomy_version"),
+        f"{field}.taxonomy_version",
+        maximum=32,
+    )
+    if taxonomy_version != briefing_topics.TAXONOMY_VERSION:
+        raise BriefingValidationError(
+            f"{field}.taxonomy_version must be {briefing_topics.TAXONOMY_VERSION}"
+        )
+    content_category = _text(
+        value.get("content_category"),
+        f"{field}.content_category",
+        maximum=40,
+    )
+    raw_tags = value.get("content_tags")
+    try:
+        topic_assignment = briefing_topics.validate_topic_assignment(
+            content_category,
+            raw_tags,
+            taxonomy_version=taxonomy_version,
+        )
+    except (TypeError, ValueError) as exc:
+        raise BriefingValidationError(
+            f"{field} contains an invalid content topic assignment"
+        ) from exc
+
+    output: dict[str, Any] = {
+        "summary_basis": summary_basis,
+        "content_category": topic_assignment.primary,
+        "content_tags": list(topic_assignment.tags),
+        "taxonomy_version": topic_assignment.version,
+        "translation_status": translation_status,
+    }
+    if title_zh:
+        output["title_zh"] = title_zh
+    if summary_zh:
+        output["summary_zh"] = summary_zh
+    return output
+
+
 def _validate_item(
     value: Any,
     *,
@@ -924,6 +1099,13 @@ def _validate_item(
         published_time=published_time,
         fetched_time=fetched_time,
         now=now,
+    )
+    enhancement = _content_enhancement(
+        value,
+        field=field,
+        title=title,
+        kind=discovery_metadata.get("kind"),
+        original_url=discovery_metadata.get("original_url"),
     )
     canonical_identity_url = (
         discovery_metadata.get("original_url") or canonical_url
@@ -1025,6 +1207,7 @@ def _validate_item(
         "_order": order,
     }
     output.update(discovery_metadata)
+    output.update(enhancement)
     return output
 
 
@@ -1128,6 +1311,34 @@ def _deduplicate(items: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]
             for key, value in representative.items()
             if not key.startswith("_")
         }
+        # A localization/topic assignment is one evidence-bound bundle. If a
+        # stronger factual representative has no usable Chinese projection,
+        # it may inherit one only from the same validated tier, time semantics
+        # and discovery kind. Never splice a translated title from one record
+        # together with another record's summary basis or taxonomy.
+        if clean.get("translation_status") not in {"translated", "source_zh"}:
+            matching_enhancement = next(
+                (
+                    item
+                    for item in ranked_group
+                    if item.get("translation_status")
+                    in {"translated", "source_zh"}
+                    and item["source_tier"] == representative["source_tier"]
+                    and item["time_status"] == representative["time_status"]
+                    and item.get("kind") == representative.get("kind")
+                ),
+                None,
+            )
+            if matching_enhancement is not None:
+                for name in _CONTENT_ENHANCEMENT_FIELDS:
+                    clean.pop(name, None)
+                clean.update(
+                    {
+                        name: matching_enhancement[name]
+                        for name in _CONTENT_ENHANCEMENT_FIELDS
+                        if name in matching_enhancement
+                    }
+                )
         for disclosure_field in ("disclosed_at", "effective_at"):
             if clean.get(disclosure_field) is None:
                 clean[disclosure_field] = next(

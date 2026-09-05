@@ -5,7 +5,7 @@ import unittest
 from datetime import datetime, timezone
 from time import perf_counter
 
-from kol_dashboard import briefing_collect, briefing_service
+from kol_dashboard import briefing_collect, briefing_service, briefing_topics
 
 
 NOW = datetime(2026, 9, 4, 2, 0, tzinfo=timezone.utc)  # 10:00 Beijing
@@ -2175,6 +2175,220 @@ class BriefingBuildTests(unittest.TestCase):
         self.assertNotIn("disclosed_at", investor)
         self.assertNotIn("effective_at", investor)
         self.assertNotIn("account", json.dumps(result, ensure_ascii=False))
+
+    def test_imported_content_enhancement_is_public_and_copied_to_lead(self) -> None:
+        digest = {
+            "section": "ai",
+            "title": "A curated AI engineering management field guide",
+            "source": "AI Digest",
+            "source_url": "https://ai-digest.liziran.com/zh/2026-09-04-guide",
+            "original_url": "https://example.com/guides/ai-engineering-management",
+            "canonical_url": "https://example.com/guides/ai-engineering-management",
+            "story_key": "curated-ai-guide",
+            "published_at": None,
+            "fetched_at": "2026-09-04T01:58:00+00:00",
+            "featured_at": "2026-09-04T01:55:00+00:00",
+            "last_updated_at": "2026-09-04T01:55:00+00:00",
+            "time_status": "featured_only",
+            "publication_time_verified": False,
+            "source_tier": "discovery",
+            "source_count": 1,
+            "summary": "A curated excerpt about managing AI engineering teams.",
+            "cross_tags": [],
+            "assets": [],
+            "kind": "ai_digest",
+            "discovered_via": ["ai_digest_rss"],
+            "title_zh": "AI 工程团队管理实战指南",
+            "summary_zh": "策展摘要梳理了团队分工、评审机制与上线后的复盘边界。",
+            "summary_basis": "curated_excerpt",
+            "content_category": "org_management",
+            "content_tags": ["engineering_management", "methodology"],
+            "taxonomy_version": briefing_topics.TAXONOMY_VERSION,
+            "translation_status": "translated",
+        }
+        snapshot = {
+            "schema_version": 1,
+            "sections": {
+                key: ([digest] if key == "ai" else [])
+                for key in briefing_service.SECTION_KEYS
+            },
+        }
+
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository(),
+            public_macro=None,
+            decision_record=None,
+            imported_snapshot=snapshot,
+            now=NOW,
+        )
+
+        ai = next(section for section in result["sections"] if section["key"] == "ai")
+        item = ai["items"][0]
+        enhancement = {
+            key: digest[key]
+            for key in (
+                "title_zh",
+                "summary_zh",
+                "summary_basis",
+                "content_category",
+                "content_tags",
+                "taxonomy_version",
+                "translation_status",
+            )
+        }
+        self.assertEqual(item["title"], digest["title"])
+        self.assertEqual(item["primary_section"], "ai")
+        self.assertEqual(
+            {key: item[key] for key in enhancement},
+            enhancement,
+        )
+        self.assertEqual(result["lead"]["headline"], digest["title"])
+        self.assertEqual(
+            {key: result["lead"][key] for key in enhancement},
+            enhancement,
+        )
+
+    def test_invalid_persisted_enhancement_drops_only_the_bundle(self) -> None:
+        story = {
+            "section": "technology",
+            "title": "Python concurrency runtime reaches Hacker News",
+            "source": "Hacker News",
+            "source_url": "https://example.com/python-concurrency-runtime",
+            "original_url": "https://example.com/python-concurrency-runtime",
+            "canonical_url": "https://example.com/python-concurrency-runtime",
+            "discussion_url": "https://news.ycombinator.com/item?id=4321",
+            "story_key": "hn-python-runtime",
+            "published_at": "2026-09-04T01:45:00+00:00",
+            "fetched_at": "2026-09-04T01:58:00+00:00",
+            "featured_at": "2026-09-04T01:55:00+00:00",
+            "last_updated_at": "2026-09-04T01:45:00+00:00",
+            "time_status": "verified",
+            "publication_time_verified": True,
+            "source_tier": "discovery",
+            "source_count": 1,
+            "summary": "HN 排名第 2，得分 80，评论 20。",
+            "cross_tags": [],
+            "assets": [],
+            "kind": "hn_story",
+            "discovered_via": ["hacker_news_top"],
+            "hn_id": 4321,
+            "hn_score": 80,
+            "hn_comments": 20,
+            "hn_rank": 2,
+            "heat_score": 50.0,
+            "title_zh": "Python 并发运行时登上 Hacker News",
+            "summary_zh": "这段文字不能由只有标题的证据生成。",
+            "summary_basis": "title_only",
+            "content_category": "software_dev",
+            "content_tags": ["python"],
+            "taxonomy_version": briefing_topics.TAXONOMY_VERSION,
+            "translation_status": "translated",
+        }
+        snapshot = {
+            "schema_version": 1,
+            "sections": {
+                key: ([story] if key == "technology" else [])
+                for key in briefing_service.SECTION_KEYS
+            },
+        }
+
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository(),
+            public_macro=None,
+            decision_record=None,
+            imported_snapshot=snapshot,
+            now=NOW,
+        )
+
+        technology = next(
+            section for section in result["sections"] if section["key"] == "technology"
+        )
+        item = technology["items"][0]
+        self.assertEqual(item["id"], "hn-python-runtime")
+        self.assertEqual(item["evidence_basis"], "title_only")
+        for field in (
+            "title_zh",
+            "summary_zh",
+            "summary_basis",
+            "content_category",
+            "content_tags",
+            "taxonomy_version",
+            "translation_status",
+        ):
+            self.assertNotIn(field, item)
+
+    def test_dedup_keeps_one_same_trust_enhancement_bundle(self) -> None:
+        base = {
+            "section": "technology",
+            "title": "Python concurrency runtime design",
+            "source": "Hacker News",
+            "source_url": "https://example.com/python-runtime-design",
+            "original_url": "https://example.com/python-runtime-design",
+            "canonical_url": "https://example.com/python-runtime-design",
+            "discussion_url": "https://news.ycombinator.com/item?id=9876",
+            "published_at": "2026-09-04T01:45:00+00:00",
+            "fetched_at": "2026-09-04T01:58:00+00:00",
+            "featured_at": "2026-09-04T01:55:00+00:00",
+            "last_updated_at": "2026-09-04T01:45:00+00:00",
+            "time_status": "verified",
+            "publication_time_verified": True,
+            "source_tier": "discovery",
+            "source_count": 1,
+            "summary": "HN title and engagement metadata only.",
+            "cross_tags": [],
+            "assets": [],
+            "kind": "hn_story",
+            "discovered_via": ["hacker_news_top"],
+            "hn_id": 9876,
+            "hn_score": 80,
+            "hn_comments": 20,
+            "hn_rank": 2,
+            "heat_score": 50.0,
+            "summary_basis": "title_only",
+            "taxonomy_version": briefing_topics.TAXONOMY_VERSION,
+        }
+        unavailable = {
+            **base,
+            "story_key": "hn-python-runtime-unavailable",
+            "content_category": "general_interest",
+            "content_tags": [],
+            "translation_status": "unavailable",
+        }
+        translated = {
+            **base,
+            "story_key": "hn-python-runtime-translated",
+            "title_zh": "Python 并发运行时设计",
+            "content_category": "software_dev",
+            "content_tags": ["python", "engineering_practice"],
+            "translation_status": "translated",
+        }
+        snapshot = {
+            "schema_version": 1,
+            "sections": {
+                key: ([unavailable, translated] if key == "technology" else [])
+                for key in briefing_service.SECTION_KEYS
+            },
+        }
+
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository(),
+            public_macro=None,
+            decision_record=None,
+            imported_snapshot=snapshot,
+            now=NOW,
+        )
+
+        technology = next(
+            section for section in result["sections"] if section["key"] == "technology"
+        )
+        item = technology["items"][0]
+        self.assertEqual(technology["total_count"], 1)
+        self.assertEqual(item["translation_status"], "translated")
+        self.assertEqual(item["title_zh"], translated["title_zh"])
+        self.assertEqual(item["content_category"], "software_dev")
+        self.assertEqual(
+            item["content_tags"], ["python", "engineering_practice"]
+        )
 
     def test_imported_snapshot_schema_and_bounds_are_revalidated(self) -> None:
         def payload() -> dict:

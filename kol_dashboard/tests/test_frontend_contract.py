@@ -3,6 +3,8 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
+from kol_dashboard import briefing_topics
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -243,10 +245,10 @@ class FrontendContractTests(unittest.TestCase):
         self.assertNotIn("DIRECT SOURCES", self.javascript)
         self.assertNotIn("NEXT CHECK", self.javascript)
 
-    def test_daily_assets_share_the_v31_cachebuster(self) -> None:
-        self.assertIn('static/app.js?v=31', self.html)
-        self.assertIn('static/style.css?v=31', self.html)
-        self.assertEqual(self.html.count("?v=31"), 2)
+    def test_daily_assets_share_the_v32_cachebuster(self) -> None:
+        self.assertIn('static/app.js?v=32', self.html)
+        self.assertIn('static/style.css?v=32', self.html)
+        self.assertEqual(self.html.count("?v=32"), 2)
         self.assertNotIn("?v=26", self.html)
 
     def test_daily_desktop_reading_layout_has_a_compact_rail_and_split_impact(self) -> None:
@@ -268,6 +270,46 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn(".daily-stream-copy > header { display: block; }", tablet_contract)
         self.assertIn(".daily-cluster-marker {", tablet_contract)
         self.assertIn("text-overflow: clip; white-space: normal", tablet_contract)
+
+    def test_daily_prefers_chinese_copy_and_keeps_content_tags_distinct(self) -> None:
+        for contract in (
+            "function dailyLocalizedCopy(item)",
+            "item?.title_zh",
+            "item?.summary_zh",
+            "当前只取得标题，尚不能可靠概括文章正文",
+            "function dailyOriginalTitleHTML",
+            "function dailyHasChinese",
+            "function dailySourceExcerptHTML",
+            "daily-original-copy",
+            "daily-source-excerpt-copy",
+            'lang="en"',
+            "function dailyContentTagsHTML",
+            "DAILY_CONTENT_CATEGORY_LABELS",
+            "DAILY_CONTENT_TAG_LABELS",
+            "仅根据标题中文整理，未读取全文",
+            "根据策展摘要整理，仍需核对原文",
+            "根据作者自帖整理，不等同外链全文",
+        ):
+            self.assertIn(contract, self.javascript)
+        for selector in (
+            ".daily-original-title",
+            ".daily-content-tags",
+            ".daily-content-category",
+            ".daily-content-tag",
+            ".daily-summary-basis",
+            ".daily-source-excerpt",
+        ):
+            self.assertIn(selector, self.css)
+        self.assertIn('aria-label="内容标签"', self.javascript)
+        self.assertIn('aria-label="可能受影响的资产"', self.javascript)
+        self.assertIn("当前仅有英文标题，中文主旨摘要待取得可靠正文后生成", self.javascript)
+        self.assertIn("来源摘录 · 未翻译", self.javascript)
+        for key, label in {
+            **briefing_topics.CATEGORY_LABELS,
+            **briefing_topics.TAG_LABELS,
+        }.items():
+            self.assertIn(f'{key}: "{label}"', self.javascript)
+
 
     def test_daily_discovery_sources_keep_heat_curation_and_time_semantics(self) -> None:
         for contract in (
@@ -297,8 +339,8 @@ class FrontendContractTests(unittest.TestCase):
             "打开原始来源",
             "HN 讨论",
             "策展条目",
-            "仅有策展标题，本站未二次生成",
-            "策展源摘要，本站未二次生成",
+            "仅根据标题中文整理，未读取全文",
+            "根据策展摘要整理，仍需核对原文",
         ):
             self.assertIn(contract, self.javascript)
         highlight_start = self.javascript.index("function dailyHighlightHTML(item, index)")
@@ -306,9 +348,9 @@ class FrontendContractTests(unittest.TestCase):
             "function dailyFirsthandHTML(items)", highlight_start
         )
         highlight_contract = self.javascript[highlight_start:highlight_end]
-        self.assertIn("dailyItemKind(item)", highlight_contract)
-        self.assertIn('"ai_digest", "paper_digest"', highlight_contract)
-        self.assertIn("curatedSummary", highlight_contract)
+        self.assertIn("dailyLocalizedCopy(item)", highlight_contract)
+        self.assertIn("copy.basis", highlight_contract)
+        self.assertIn("dailyContentTagsHTML(item)", highlight_contract)
         self.assertIn("daily-hn-heat", self.css)
         self.assertIn("daily-curated-dates", self.css)
         self.assertIn("daily-context-link", self.css)
@@ -409,8 +451,8 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn('stale ? "数据延迟" : ""', self.javascript)
         self.assertIn('"高收益债利差"', self.javascript)
         self.assertIn("cs.hy_oas", self.javascript)
-        self.assertIn('static/app.js?v=31', self.html)
-        self.assertIn('static/style.css?v=31', self.html)
+        self.assertIn('static/app.js?v=32', self.html)
+        self.assertIn('static/style.css?v=32', self.html)
         self.assertNotIn('?v=26', self.html)
         self.assertIn(".metric.is-stale", self.css)
 

@@ -2190,6 +2190,33 @@ button:focus-visible, a:focus-visible, [tabindex]:focus-visible, input:focus-vis
   max-inline-size: 43ch; font-family: var(--font-display); font-size: 20px;
   font-weight: 650; line-height: 1.48; letter-spacing: -.02em;
 }
+.daily-original-title {
+  max-inline-size: 76ch; margin: 5px 0 0; color: var(--muted);
+  font: 500 12px/1.55 var(--font-data); overflow-wrap: anywhere;
+}
+.daily-original-title > span {
+  margin-right: 6px; color: var(--text-2); font-size: 10.5px; font-weight: 680;
+}
+.daily-original-title > .daily-original-copy {
+  color: var(--muted); font: inherit;
+}
+.daily-original-title.is-compact { margin-top: 3px; font-size: 11px; line-height: 1.45; }
+.daily-content-tags {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 9px;
+}
+.daily-content-category,
+.daily-content-tag {
+  display: inline-flex; align-items: center; min-height: 25px; padding: 3px 8px;
+  border-radius: 5px; font-size: 12.5px; font-weight: 660; line-height: 1.35;
+}
+.daily-content-category {
+  border-left: 2px solid var(--accent); background: var(--bg-soft); color: var(--text);
+}
+.daily-content-tag { border: 1px solid var(--border); color: var(--text-2); }
+.daily-content-tags.is-compact { display: inline-flex; margin-top: 5px; }
+.daily-content-tags.is-compact .daily-content-category {
+  min-height: 21px; padding: 2px 6px; font-size: 11px;
+}
 .daily-fact, .daily-why {
   display: grid; grid-template-columns: 72px minmax(0, 1fr); gap: 8px;
   max-inline-size: 72ch; margin: 9px 0 0; color: var(--text-2);
@@ -2456,6 +2483,22 @@ button:focus-visible, a:focus-visible, [tabindex]:focus-visible, input:focus-vis
 .daily-stream-summary {
   max-inline-size: 74ch; margin: 0; overflow-wrap: anywhere; color: var(--text-2);
   font-size: var(--daily-copy-size); line-height: 1.75;
+}
+.daily-summary-basis {
+  max-inline-size: 74ch; margin: 6px 0 0; color: var(--muted);
+  font-size: 11.5px; line-height: 1.55;
+}
+.daily-summary-basis::before { content: "依据 · "; color: var(--accent); font-weight: 680; }
+.daily-source-excerpt {
+  max-inline-size: 74ch; margin: 7px 0 0; color: var(--muted);
+  font: 500 12px/1.6 var(--font-data); overflow-wrap: anywhere;
+}
+.daily-source-excerpt > span {
+  display: block; margin-bottom: 2px; color: var(--text-2);
+  font-size: 10.5px; font-weight: 680;
+}
+.daily-source-excerpt > .daily-source-excerpt-copy {
+  margin-bottom: 0; color: var(--muted); font: inherit;
 }
 .daily-stream-why {
   max-inline-size: 74ch; margin: 8px 0 0; padding: 9px 11px; overflow-wrap: anywhere;

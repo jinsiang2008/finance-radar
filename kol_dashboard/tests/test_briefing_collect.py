@@ -948,6 +948,101 @@ class FullProducerTests(unittest.TestCase):
         self.assertEqual(len(normalized["sections"]["ai"]), 2)
         self.assertEqual(result.errors, ())
 
+    def test_default_collection_adds_topics_without_inventing_chinese_copy(
+        self,
+    ) -> None:
+        result = briefing_collect.collect_briefing(
+            opener=FakeOpener(self.routes()),
+            now=self.now,
+        )
+
+        items = [
+            item
+            for section in result.payload["sections"].values()
+            for item in section
+        ]
+        self.assertTrue(items)
+        for item in items:
+            self.assertEqual(item["taxonomy_version"], "daily-content-v1")
+            self.assertIn("content_category", item)
+            self.assertLessEqual(len(item["content_tags"]), 2)
+            self.assertIn(
+                item["summary_basis"],
+                {"title_only", "curated_excerpt", "self_post"},
+            )
+            self.assertEqual(item["translation_status"], "unavailable")
+            self.assertNotIn("title_zh", item)
+            self.assertNotIn("summary_zh", item)
+
+        curated = next(item for item in items if item["kind"] == "ai_digest")
+        self.assertEqual(curated["summary_basis"], "curated_excerpt")
+        self.assertEqual(curated["content_category"], "ai_ml")
+
+    def test_title_only_hn_translation_never_serializes_provider_summary(
+        self,
+    ) -> None:
+        routes = self.routes()
+        routes[briefing_collect.HN_TOP_URL] = json_bytes([102])
+        routes[briefing_collect.HN_BEST_URL] = json_bytes([102])
+        routes[f"{briefing_collect.HN_API_BASE}/item/102.json"] = json_bytes(
+            {
+                "id": 102,
+                "type": "story",
+                "title": "A practical guide to the Rust compiler",
+                "url": "https://example.org/articles/rust-compiler-guide",
+                "time": int((self.now - timedelta(hours=1)).timestamp()),
+                "score": 90,
+                "descendants": 25,
+            }
+        )
+
+        def enrichment_transport(body: bytes, headers, timeout: float):
+            del body, headers, timeout
+            return 200, json_bytes(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "title_zh": "Rust 编译器实践指南",
+                                        "summary_zh": (
+                                            "这段看似完整的中文摘要没有正文证据，"
+                                            "因此绝不能进入快照。"
+                                        ),
+                                    },
+                                    ensure_ascii=False,
+                                )
+                            },
+                        }
+                    ],
+                    "usage": {},
+                }
+            )
+
+        result = briefing_collect.collect_briefing(
+            opener=FakeOpener(routes),
+            now=self.now,
+            enable_ai_enrichment=True,
+            enrichment_config=briefing_collect.daily_enrichment.llm_enrichment.DeepSeekConfig(
+                api_key="test-secret"
+            ),
+            enrichment_transport=enrichment_transport,
+        )
+
+        hn_item = next(
+            item
+            for section in result.payload["sections"].values()
+            for item in section
+            if item.get("hn_id") == 102
+        )
+        self.assertEqual(hn_item["translation_status"], "translated")
+        self.assertEqual(hn_item["title_zh"], "Rust 编译器实践指南")
+        self.assertEqual(hn_item["summary_basis"], "title_only")
+        self.assertNotIn("summary_zh", hn_item)
+        self.assertEqual(hn_item["content_category"], "software_dev")
+
     def test_generic_hn_links_survive_full_collection_as_distinct_discussions(
         self,
     ) -> None:

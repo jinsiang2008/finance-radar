@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
-from kol_dashboard import briefing_import, db
+from kol_dashboard import briefing_import, briefing_topics, db
 
 
 class BriefingImportTests(unittest.TestCase):
@@ -41,6 +41,19 @@ class BriefingImportTests(unittest.TestCase):
         }
         item.update(overrides)
         return item
+
+    @staticmethod
+    def enhancement(**overrides) -> dict:
+        value = {
+            "title_zh": "Python 发布新的并发运行时方案",
+            "summary_basis": "title_only",
+            "content_category": "software_dev",
+            "content_tags": ["python", "engineering_practice"],
+            "taxonomy_version": briefing_topics.TAXONOMY_VERSION,
+            "translation_status": "translated",
+        }
+        value.update(overrides)
+        return value
 
     def test_validation_canonicalizes_and_deduplicates_across_sections(self) -> None:
         payload = self.payload()
@@ -80,6 +93,207 @@ class BriefingImportTests(unittest.TestCase):
             item["why_it_matters"],
             "The decision can change global funding conditions.",
         )
+
+    def test_content_enhancement_is_normalized_without_changing_story_identity(
+        self,
+    ) -> None:
+        plain = self.payload()
+        plain["sections"]["technology"].append(
+            self.item(
+                title="Python publishes a new concurrency runtime design",
+                source="Example Engineering",
+                source_url="https://example.com/engineering/python-runtime-design",
+                source_tier="media",
+            )
+        )
+        enhanced = self.payload()
+        enhanced["sections"]["technology"].append(
+            self.item(
+                title="Python publishes a new concurrency runtime design",
+                source="Example Engineering",
+                source_url="https://example.com/engineering/python-runtime-design",
+                source_tier="media",
+                **self.enhancement(
+                    content_category=" SOFTWARE_DEV ",
+                    content_tags=[" PYTHON ", "engineering_practice"],
+                ),
+            )
+        )
+
+        plain_item = briefing_import.validate_payload(plain, now=self.now)[
+            "sections"
+        ]["technology"][0]
+        enhanced_item = briefing_import.validate_payload(enhanced, now=self.now)[
+            "sections"
+        ]["technology"][0]
+
+        self.assertEqual(enhanced_item["story_key"], plain_item["story_key"])
+        self.assertEqual(enhanced_item["title"], plain_item["title"])
+        self.assertEqual(enhanced_item["title_zh"], "Python 发布新的并发运行时方案")
+        self.assertNotIn("summary_zh", enhanced_item)
+        self.assertEqual(enhanced_item["summary_basis"], "title_only")
+        self.assertEqual(enhanced_item["content_category"], "software_dev")
+        self.assertEqual(
+            enhanced_item["content_tags"],
+            ["python", "engineering_practice"],
+        )
+        self.assertEqual(
+            enhanced_item["taxonomy_version"], briefing_topics.TAXONOMY_VERSION
+        )
+        self.assertEqual(enhanced_item["translation_status"], "translated")
+
+    def test_curated_source_chinese_and_hn_self_post_bases_are_supported(self) -> None:
+        payload = self.payload()
+        payload["sections"]["ai"].append(
+            self.item(
+                title="A curated multimodal model release",
+                source="AI Digest",
+                source_url="https://ai-digest.liziran.com/zh/example",
+                original_url="https://example.com/releases/multimodal-model-2026",
+                published_at=None,
+                fetched_at=self.now.isoformat(),
+                featured_at=(self.now - timedelta(minutes=5)).isoformat(),
+                source_tier="discovery",
+                kind="ai_digest",
+                discovered_via=["ai_digest_rss"],
+                publication_time_verified=False,
+                summary_zh="来源策展段落已用中文概括模型发布及其已知边界。",
+                summary_basis="curated_excerpt",
+                content_category="ai_ml",
+                content_tags=["multimodal", "product_release"],
+                taxonomy_version=briefing_topics.TAXONOMY_VERSION,
+                translation_status="source_zh",
+            )
+        )
+        payload["sections"]["technology"].append(
+            self.item(
+                title="Ask HN: How should teams review production incidents?",
+                source="Hacker News",
+                source_url="https://news.ycombinator.com/item?id=123456",
+                original_url=None,
+                discussion_url="https://news.ycombinator.com/item?id=123456",
+                fetched_at=self.now.isoformat(),
+                featured_at=(self.now - timedelta(minutes=2)).isoformat(),
+                source_tier="discovery",
+                kind="hn_story",
+                discovered_via=["hacker_news_top"],
+                publication_time_verified=True,
+                hn_id=123456,
+                hn_score=20,
+                hn_comments=8,
+                hn_rank=6,
+                heat_score=30.0,
+                title_zh="HN 讨论：团队应如何复盘生产事故",
+                summary_zh="帖子讨论了事故复盘的组织方式、证据边界和后续行动。",
+                summary_basis="self_post",
+                content_category="org_management",
+                content_tags=["incident_review", "engineering_management"],
+                taxonomy_version=briefing_topics.TAXONOMY_VERSION,
+                translation_status="translated",
+            )
+        )
+
+        normalized = briefing_import.validate_payload(payload, now=self.now)
+
+        curated = normalized["sections"]["ai"][0]
+        self.assertEqual(curated["translation_status"], "source_zh")
+        self.assertNotIn("title_zh", curated)
+        self.assertIn("summary_zh", curated)
+        self_post = normalized["sections"]["technology"][0]
+        self.assertEqual(self_post["summary_basis"], "self_post")
+        self.assertEqual(self_post["translation_status"], "translated")
+
+    def test_content_enhancement_relationships_and_taxonomy_fail_closed(self) -> None:
+        invalid_enhancements = (
+            self.enhancement(summary_zh="不能把标题扩写成文章摘要。"),
+            self.enhancement(summary_basis="curated_excerpt"),
+            self.enhancement(summary_basis="self_post"),
+            self.enhancement(title_zh=None),
+            self.enhancement(translation_status="unavailable"),
+            self.enhancement(
+                title_zh=None,
+                translation_status="source_zh",
+            ),
+            self.enhancement(translation_status="pending"),
+            self.enhancement(taxonomy_version="daily-content-v0"),
+            self.enhancement(content_category="unknown_topic"),
+            self.enhancement(content_tags=["python", "python"]),
+            self.enhancement(content_tags=["python", "rust", "go"]),
+            self.enhancement(content_tags="python"),
+            self.enhancement(title_zh="Python concurrency runtime"),
+        )
+        for enhancement in invalid_enhancements:
+            with self.subTest(enhancement=enhancement):
+                payload = self.payload()
+                payload["sections"]["technology"].append(
+                    self.item(
+                        title="Python publishes a concurrency runtime design",
+                        source="Example Engineering",
+                        source_url="https://example.com/engineering/runtime-design",
+                        source_tier="media",
+                        **enhancement,
+                    )
+                )
+                with self.assertRaises(briefing_import.BriefingValidationError):
+                    briefing_import.validate_payload(payload, now=self.now)
+
+    def test_dedup_preserves_one_atomic_same_trust_enhancement_bundle(self) -> None:
+        payload = self.payload()
+        common = {
+            "title": "Python publishes a new concurrency runtime design",
+            "source": "Example Engineering",
+            "source_url": "https://example.com/engineering/python-runtime-design",
+            "source_tier": "media",
+        }
+        payload["sections"]["technology"].extend(
+            [
+                self.item(
+                    **common,
+                    **self.enhancement(
+                        title_zh=None,
+                        translation_status="unavailable",
+                        content_category="general_interest",
+                        content_tags=[],
+                    ),
+                ),
+                self.item(**common, **self.enhancement()),
+            ]
+        )
+
+        item = briefing_import.validate_payload(payload, now=self.now)["sections"][
+            "technology"
+        ][0]
+
+        self.assertEqual(item["translation_status"], "translated")
+        self.assertEqual(item["title_zh"], "Python 发布新的并发运行时方案")
+        self.assertEqual(item["content_category"], "software_dev")
+        self.assertEqual(
+            item["content_tags"], ["python", "engineering_practice"]
+        )
+
+        guarded = self.payload()
+        official_common = {
+            **common,
+            "source": "Federal Reserve",
+            "source_url": (
+                "https://www.federalreserve.gov/newsevents/pressreleases/"
+                "monetary20260905a.htm"
+            ),
+        }
+        guarded["sections"]["technology"].extend(
+            [
+                self.item(**{**official_common, "source_tier": "official"}),
+                self.item(
+                    **{**official_common, "source_tier": "discovery"},
+                    **self.enhancement(),
+                ),
+            ]
+        )
+        guarded_item = briefing_import.validate_payload(guarded, now=self.now)[
+            "sections"
+        ]["technology"][0]
+        self.assertEqual(guarded_item["source_tier"], "official")
+        self.assertNotIn("translation_status", guarded_item)
 
     def test_generic_same_day_titles_on_different_urls_stay_separate(self) -> None:
         payload = self.payload()

@@ -957,6 +957,80 @@
     { key: "investors", label: "投资大师动态", description: "本人表态、持仓披露与重要行动" },
   ];
   const DAILY_SECTION_KEYS = new Set(DAILY_SECTION_META.map((section) => section.key));
+  const DAILY_CONTENT_CATEGORY_LABELS = Object.freeze({
+    ai_ml: "AI 与机器学习",
+    cloud_infra: "云与基础设施",
+    software_dev: "软件开发",
+    systems_os: "系统与操作系统",
+    security_privacy: "安全与隐私",
+    data_database: "数据与数据库",
+    hardware_chips: "芯片与硬件",
+    product_business: "产品与商业",
+    org_management: "组织与管理",
+    policy_society: "政策与社会",
+    science_research: "科学与研究",
+    general_interest: "综合议题",
+  });
+  const DAILY_CONTENT_TAG_LABELS = Object.freeze({
+    llm: "大模型",
+    ai_agent: "AI Agent",
+    ai_application: "AI 应用",
+    ai_service: "AI 服务",
+    multimodal: "多模态",
+    model_training: "模型训练",
+    robotics: "具身智能",
+    kubernetes: "Kubernetes",
+    serverless: "Serverless",
+    distributed_systems: "分布式系统",
+    sre: "SRE",
+    observability: "可观测性",
+    networking: "网络",
+    python: "Python",
+    rust: "Rust",
+    go: "Go",
+    javascript: "JavaScript / TypeScript",
+    java: "Java / JVM",
+    cpp: "C / C++",
+    compiler: "编译器",
+    web_dev: "Web 开发",
+    developer_platform: "开发平台",
+    linux: "Linux",
+    windows: "Windows",
+    apple_platform: "Apple 平台",
+    android: "Android",
+    browser: "浏览器",
+    kernel: "内核",
+    database: "数据库",
+    data_engineering: "数据工程",
+    vector_search: "向量检索",
+    gpu: "GPU / 加速器",
+    cpu: "CPU",
+    semiconductor: "半导体",
+    gaming_hardware: "游戏硬件",
+    edge_device: "边缘设备",
+    open_source: "开源",
+    methodology: "方法论",
+    research_paper: "论文研究",
+    formal_verification: "形式化验证",
+    architecture: "架构设计",
+    engineering_practice: "工程实践",
+    performance: "性能优化",
+    reliability: "可靠性",
+    vulnerability: "安全漏洞",
+    privacy: "隐私",
+    incident_review: "故障复盘",
+    product_release: "产品发布",
+    business_model: "商业模式",
+    engineering_management: "工程管理",
+    regulation: "政策监管",
+    digital_sovereignty: "数字主权",
+    diy_hardware: "DIY 硬件",
+  });
+  const DAILY_SUMMARY_BASIS_LABELS = Object.freeze({
+    title_only: "仅根据标题中文整理，未读取全文",
+    self_post: "根据作者自帖整理，不等同外链全文",
+    curated_excerpt: "根据策展摘要整理，仍需核对原文",
+  });
 
   function dailySourceView(value) {
     const key = String(value || "discovery").toLowerCase();
@@ -978,6 +1052,97 @@
     if (source === "ai digest") return "ai_digest";
     if (source === "ai brief") return "paper_digest";
     return explicit;
+  }
+
+  function dailyHasChinese(value) {
+    return /[\u3400-\u4dbf\u4e00-\u9fff]/u.test(String(value || ""));
+  }
+
+  function dailyLocalizedCopy(item) {
+    const originalTitle = String(
+      item?.title || item?.headline || "标题待补充"
+    ).trim();
+    const status = String(item?.translation_status || "").toLowerCase();
+    const acceptedStatus = ["translated", "source_zh"].includes(status);
+    const localizedTitle = acceptedStatus ? String(item?.title_zh || "").trim() : "";
+    const localizedSummary = acceptedStatus
+      ? String(item?.summary_zh || "").trim()
+      : "";
+    const basis = String(item?.summary_basis || "").toLowerCase();
+    const kind = dailyItemKind(item);
+    const sourceSummary = String(item?.summary || "").trim();
+    const displayTitle = localizedTitle || originalTitle;
+    let summary = localizedSummary;
+    let sourceExcerpt = "";
+    if (!summary && basis === "title_only") {
+      summary = dailyHasChinese(displayTitle)
+        ? "当前只取得标题，尚不能可靠概括文章正文；请打开原文核验。"
+        : kind === "hn_story"
+          ? "当前仅有英文标题与社区热度，中文主旨摘要待取得正文后生成。"
+          : "当前仅有英文标题，中文主旨摘要待取得可靠正文后生成。";
+    } else if (!summary && basis === "self_post") {
+      summary = "已取得作者自帖，但中文主旨摘要暂不可用；请打开讨论页核验。";
+    } else if (!summary && basis && dailyHasChinese(sourceSummary)) {
+      summary = sourceSummary;
+    } else if (!summary && basis) {
+      summary = "中文主旨摘要暂不可用；请打开原始来源核验。";
+      if (
+        sourceSummary &&
+        ["ai_digest", "paper_digest"].includes(kind)
+      ) {
+        sourceExcerpt = sourceSummary;
+      }
+    } else if (!summary) {
+      // Legacy Daily records predate the explicit evidence bundle. Preserve
+      // their existing display contract without presenting it as translated.
+      summary = sourceSummary;
+    }
+    if (!summary && ["hn_story", "ai_digest", "paper_digest"].includes(kind)) {
+      summary = "当前证据不足以形成可靠的中文主旨摘要，请先核对原始来源。";
+    }
+    return {
+      title: displayTitle,
+      originalTitle:
+        localizedTitle && localizedTitle.normalize("NFKC") !== originalTitle.normalize("NFKC")
+          ? originalTitle
+          : "",
+      summary,
+      sourceExcerpt,
+      basis,
+      basisLabel: DAILY_SUMMARY_BASIS_LABELS[basis] || "",
+      status,
+    };
+  }
+
+  function dailyOriginalTitleHTML(copy, { compact = false } = {}) {
+    if (!copy?.originalTitle) return "";
+    return `<p class="daily-original-title${compact ? " is-compact" : ""}"><span>原题</span><span class="daily-original-copy" lang="en">${esc(
+      copy.originalTitle
+    )}</span></p>`;
+  }
+
+  function dailySourceExcerptHTML(copy) {
+    if (!copy?.sourceExcerpt) return "";
+    return `<p class="daily-source-excerpt"><span>来源摘录 · 未翻译</span><span class="daily-source-excerpt-copy" lang="en">${esc(
+      copy.sourceExcerpt
+    )}</span></p>`;
+  }
+
+  function dailyContentTagsHTML(item, { compact = false } = {}) {
+    const categoryKey = String(item?.content_category || "").toLowerCase();
+    const category = DAILY_CONTENT_CATEGORY_LABELS[categoryKey];
+    if (!category) return "";
+    const tags = [];
+    for (const raw of Array.isArray(item?.content_tags) ? item.content_tags : []) {
+      const key = String(raw || "").toLowerCase();
+      const label = DAILY_CONTENT_TAG_LABELS[key];
+      if (label && !tags.includes(label)) tags.push(label);
+      if (tags.length >= 2) break;
+    }
+    return `<div class="daily-content-tags${compact ? " is-compact" : ""}" aria-label="内容标签">
+      <span class="daily-content-category">${esc(category)}</span>
+      ${compact ? "" : tags.map((label) => `<span class="daily-content-tag">${esc(label)}</span>`).join("")}
+    </div>`;
   }
 
   function dailyPrimarySourceUrl(item) {
@@ -1254,8 +1419,9 @@
 
   function dailyHighlightHTML(item, index) {
     const impact = String(item?.impact || "unknown").toLowerCase();
-    const title = String(item?.title || item?.headline || "标题待补充").trim();
-    const summary = String(item?.summary || "当前仅有标题线索，请先核对原文。").trim();
+    const copy = dailyLocalizedCopy(item);
+    const title = copy.title;
+    const summary = copy.summary || "当前仅有标题线索，请先核对原文。";
     const why = String(item?.why_it_matters || "").trim();
     const reason = String(item?.rank_reason || "").trim();
     const sourceUrl = dailyPrimarySourceUrl(item);
@@ -1267,11 +1433,8 @@
       eventId > 0;
     const relatedRecords = Number(item?.related_records);
     const aiReady = item?.ai_summary_used === true;
-    const curatedSummary = ["ai_digest", "paper_digest"].includes(
-      dailyItemKind(item)
-    );
     const evidenceBasis = String(item?.evidence_basis || "").toLowerCase();
-    const basisLabel = {
+    const basisLabel = copy.basisLabel || {
       official_body: "已读取官方正文",
       post_text: "一手原文证据",
       indicator_data: "结构化指标证据",
@@ -1294,17 +1457,30 @@
           ${reason ? `<span class="daily-rank-reason">${esc(reason)}</span>` : ""}
         </header>
         <h3>${esc(title)}</h3>
-        <p class="daily-fact"><span>发生了什么</span>${esc(summary)}</p>
+        ${dailyOriginalTitleHTML(copy)}
+        ${dailyContentTagsHTML(item)}
+        <p class="daily-fact"><span>${
+          copy.basis === "title_only"
+            ? "内容边界"
+            : item?.summary_zh
+              ? "中文主旨"
+              : "发生了什么"
+        }</span>${esc(summary)}</p>
+        ${dailySourceExcerptHTML(copy)}
         ${why ? `<p class="daily-why"><span>为什么重要</span>${esc(why)}</p>` : ""}
         ${dailyAssetTags(item?.assets)}
         <footer class="daily-signal-footer">
           <div class="daily-evidence-notes">
             ${basisLabel ? `<span>${esc(basisLabel)}</span>` : ""}
             <span>${
-              curatedSummary
-                ? evidenceBasis === "title_only"
-                  ? "仅有策展标题，本站未二次生成"
-                  : "策展源摘要，本站未二次生成"
+              copy.basis
+                ? copy.status === "translated"
+                  ? copy.basis === "title_only"
+                    ? "中文标题已生成，未生成正文摘要"
+                    : "中文摘要已绑定当前证据"
+                  : copy.status === "source_zh"
+                    ? "来源已提供中文内容"
+                    : "中文摘要暂不可用"
                 : aiReady
                   ? "AI 摘要已绑定当前证据"
                   : "当前未采用 AI 摘要"
@@ -1342,12 +1518,15 @@
     return `<ol class="daily-firsthand-list">${rows
       .map((item) => {
         const url = dailyPrimarySourceUrl(item);
-        const title = String(item?.title || item?.headline || "标题待补充").trim();
+        const copy = dailyLocalizedCopy(item);
+        const title = copy.title;
         return `<li>
           <div class="daily-firsthand-marker" aria-hidden="true"></div>
           <div class="daily-firsthand-copy">
             <div>${dailySourceBadge(item, { compact: true })}${dailyItemTimeHTML(item)}</div>
             <strong>${esc(title)}</strong>
+            ${dailyOriginalTitleHTML(copy, { compact: true })}
+            ${dailyContentTagsHTML(item, { compact: true })}
             <span>${esc(item?.source_label || item?.source || "发布主体待核验")}</span>
           </div>
           ${
@@ -1693,8 +1872,9 @@
         const sectionMeta =
           DAILY_SECTION_META.find((section) => section.key === primaryKey) ||
           DAILY_SECTION_META[2];
-        const title = String(item?.title || item?.headline || "标题待补充").trim();
-        const summary = String(item?.summary || "").trim();
+        const copy = dailyLocalizedCopy(item);
+        const title = copy.title;
+        const summary = copy.summary;
         const anchor = sectionItem ? dailyStoryAnchor(sectionItem) : "";
         return `<li class="daily-overview-item">
           <span class="daily-overview-rank" aria-hidden="true">${String(index + 1).padStart(
@@ -1710,6 +1890,8 @@
               sectionMeta.label
             )}</span></div>
             <h3>${esc(title)}</h3>
+            ${dailyOriginalTitleHTML(copy, { compact: true })}
+            ${dailyContentTagsHTML(item, { compact: true })}
             ${summary ? `<p>${esc(shortText(summary, 120))}</p>` : ""}
           </div>
           ${
@@ -1726,8 +1908,9 @@
 
   function dailySectionItemHTML(item, index) {
     const impact = String(item?.impact || "unknown").toLowerCase();
-    const title = String(item?.title || item?.headline || "标题待补充").trim();
-    const summary = String(item?.summary || "当前仅有标题线索，请先核对原文。").trim();
+    const copy = dailyLocalizedCopy(item);
+    const title = copy.title;
+    const summary = copy.summary || "当前仅有标题线索，请先核对原文。";
     const why = String(item?.why_it_matters || "").trim();
     const sourceUrl = dailyPrimarySourceUrl(item);
     const eventId = Number(item?.id);
@@ -1766,8 +1949,14 @@
           }
         </header>
         <h3>${esc(title)}</h3>
+        ${dailyOriginalTitleHTML(copy)}
+        ${dailyContentTagsHTML(item)}
         <div class="daily-stream-narrative${why ? " has-impact" : ""}">
-          <p class="daily-stream-summary">${esc(summary)}</p>
+          <div>
+            <p class="daily-stream-summary">${esc(summary)}</p>
+            ${copy.basisLabel ? `<p class="daily-summary-basis">${esc(copy.basisLabel)}</p>` : ""}
+            ${dailySourceExcerptHTML(copy)}
+          </div>
           ${why ? `<p class="daily-stream-why"><span>影响</span>${esc(why)}</p>` : ""}
         </div>
         ${dailyAssetTags(item?.assets, 5)}
@@ -1926,20 +2115,22 @@
     const highlights = dailyOverviewItems(data, sections);
     const lead = data?.lead && typeof data.lead === "object" ? data.lead : {};
     const fallbackLead = highlights[0] || sections.flatMap((section) => section.items)[0] || {};
-    const headline = String(
-      lead.headline ||
-        fallbackLead.title ||
-        (sourceCoverageAsOf && total === 0
-          ? "本轮扫描完成，暂无达到门槛的新事件"
-          : "今日主线仍待确认")
-    ).trim();
-    const summary = String(
-      lead.summary ||
-        fallbackLead.summary ||
-        (sourceCoverageAsOf && total === 0
-          ? "六个栏目已检查；不会使用旧闻或重复转载填充版面。"
-          : "")
-    ).trim();
+    const hasLeadStory = Boolean(lead.headline || fallbackLead.title);
+    const localizedLead = hasLeadStory
+      ? dailyLocalizedCopy({
+          ...fallbackLead,
+          ...lead,
+          title: lead.headline || fallbackLead.title,
+        })
+      : null;
+    const headline = localizedLead?.title ||
+      (sourceCoverageAsOf && total === 0
+        ? "本轮扫描完成，暂无达到门槛的新事件"
+        : "今日主线仍待确认");
+    const summary = localizedLead?.summary ||
+      (sourceCoverageAsOf && total === 0
+        ? "六个栏目已检查；不会使用旧闻或重复转载填充版面。"
+        : "");
     const why = String(lead.why_it_matters || fallbackLead.why_it_matters || "").trim();
     const riskScore =
       typeof lead.risk_score === "number" ? lead.risk_score : Number.NaN;
@@ -1963,7 +2154,11 @@
         <div class="daily-lead-copy">
           <p>本版主线</p>
           <h2 id="daily-lead-title">${esc(headline)}</h2>
+          ${localizedLead ? dailyOriginalTitleHTML(localizedLead) : ""}
+          ${dailyContentTagsHTML({ ...fallbackLead, ...lead })}
           ${summary ? `<p class="daily-lead-summary">${esc(summary)}</p>` : ""}
+          ${localizedLead?.basisLabel ? `<p class="daily-summary-basis">${esc(localizedLead.basisLabel)}</p>` : ""}
+          ${localizedLead ? dailySourceExcerptHTML(localizedLead) : ""}
           ${why ? `<p class="daily-lead-why"><span>为什么重要</span>${esc(why)}</p>` : ""}
         </div>
         <aside class="daily-coverage" aria-labelledby="daily-coverage-title">

@@ -21,6 +21,8 @@ class DeploymentContractTests(unittest.TestCase):
             "briefing_collect.py",
             "briefing_import.py",
             "briefing_service.py",
+            "briefing_topics.py",
+            "daily_enrichment.py",
             "content_quality.py",
             "event_relevance.py",
             "db.py",
