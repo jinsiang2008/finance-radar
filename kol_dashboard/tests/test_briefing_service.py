@@ -5,7 +5,7 @@ import unittest
 from datetime import datetime, timezone
 from time import perf_counter
 
-from kol_dashboard import briefing_service
+from kol_dashboard import briefing_collect, briefing_service
 
 
 NOW = datetime(2026, 9, 4, 2, 0, tzinfo=timezone.utc)  # 10:00 Beijing
@@ -142,6 +142,31 @@ class SourceTierTests(unittest.TestCase):
             "https://example.com/story?a=1&z=2",
         )
 
+    def test_specific_original_url_matches_producer_article_predicate(self) -> None:
+        urls = (
+            "https://openai.com/",
+            "https://openai.com/company-announcements",
+            "https://openai.com/index",
+            "https://openai.com/en/company-announcements",
+            "https://openai.com/product-update",
+            "https://openai.com/team-announcements",
+            "https://openai.com/newsroom?story=123",
+            "https://arxiv.org/abs/2609.01234",
+            "https://huggingface.co/papers/2609.01234",
+            "https://openai.com/index/example-release",
+            "https://openai.com/en/article/new-model",
+            "https://openai.com/launch-model-2026",
+            "https://openai.com/release.html",
+            "https://openai.com/story?id=release",
+        )
+        for url in urls:
+            with self.subTest(url=url):
+                expected = briefing_collect._specific_original_url(url) is not None
+                canonical = briefing_service._public_url(url)
+                self.assertEqual(
+                    briefing_service._specific_original_url(canonical), expected
+                )
+
     def test_conservative_source_tiers(self) -> None:
         official = {
             "source": "Federal Reserve",
@@ -220,6 +245,27 @@ class SourceTierTests(unittest.TestCase):
             ),
             "reporting",
         )
+        for source, source_url in (
+            (
+                "Hacker News",
+                "https://www.reuters.com/technology/community-discovery",
+            ),
+            (
+                "AI Digest",
+                "https://ai-digest.liziran.com/zh/2026-09-04-example",
+            ),
+            (
+                "AI Brief",
+                "https://ai-brief.liziran.com/zh/2026-09-04-example",
+            ),
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(
+                    briefing_service.classify_source(
+                        {"source": source, "source_url": source_url}
+                    ),
+                    "discovery",
+                )
         self.assertEqual(
             briefing_service.classify_source({"source": "Unknown"}),
             "discovery",
@@ -2163,6 +2209,454 @@ class BriefingBuildTests(unittest.TestCase):
                 )
                 self.assertFalse(result["available"])
                 self.assertEqual(result["dedup_stats"]["input_count"], 0)
+
+    def test_curated_paper_uses_featured_time_without_rewriting_publication(self) -> None:
+        paper = {
+            "section": "ai",
+            "title": "A newly selected multimodal reasoning paper",
+            "source": "AI Brief",
+            "source_url": "https://ai-brief.liziran.com/zh/2026-09-04-paper",
+            "original_url": "https://arxiv.org/abs/2609.01234",
+            "canonical_url": "https://arxiv.org/abs/2609.01234",
+            "discussion_url": "https://news.ycombinator.com/item?id=654321",
+            "story_key": "paper-feature",
+            "published_at": "2026-09-01T01:00:00+00:00",
+            "fetched_at": "2026-09-04T01:58:00+00:00",
+            "featured_at": "2026-09-04T01:55:00+00:00",
+            "last_updated_at": "2026-09-01T01:00:00+00:00",
+            "time_status": "verified",
+            "publication_time_verified": True,
+            "source_tier": "discovery",
+            "source_count": 1,
+            "summary": "Selected on T+3; the paper date remains unchanged.",
+            "cross_tags": [],
+            "assets": [],
+            "kind": "paper_digest",
+            "discovered_via": ["ai_brief_rss", "hacker_news_best"],
+            "hn_id": 654321,
+            "hn_score": 120,
+            "hn_comments": 44,
+            "hn_rank": 8,
+            "heat_score": 66.0,
+        }
+        snapshot = {
+            "schema_version": 1,
+            "sections": {
+                key: ([paper] if key == "ai" else [])
+                for key in briefing_service.SECTION_KEYS
+            },
+        }
+
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository(),
+            public_macro=None,
+            decision_record=None,
+            imported_snapshot=snapshot,
+            now=NOW,
+        )
+
+        ai = next(section for section in result["sections"] if section["key"] == "ai")
+        item = ai["items"][0]
+        self.assertEqual(item["kind"], "paper_digest")
+        self.assertEqual(item["published_at"], "2026-09-01T01:00:00+00:00")
+        self.assertEqual(item["featured_at"], "2026-09-04T01:55:00+00:00")
+        self.assertEqual(item["original_url"], "https://arxiv.org/abs/2609.01234")
+        self.assertEqual(item["hn_score"], 120)
+        self.assertEqual(item["source_tier"], "discovery")
+        self.assertTrue(ai["status"] == "fresh" and not ai["stale"])
+        self.assertEqual(ai["source_as_of"], "2026-09-04T01:55:00+00:00")
+        self.assertEqual(result["content_as_of"], "2026-09-04T01:55:00+00:00")
+        self.assertIn("HN 120", item["rank_reason"])
+        self.assertNotIn(item, result["firsthand"])
+
+    def test_featured_only_digest_is_visible_but_not_time_verified(self) -> None:
+        digest = {
+            "section": "ai",
+            "title": "Daily AI source roundup",
+            "source": "AI Digest",
+            "source_url": "https://ai-digest.liziran.com/zh/2026-09-04-digest",
+            "canonical_url": "https://ai-digest.liziran.com/zh/2026-09-04-digest",
+            "story_key": "digest-feature",
+            "published_at": None,
+            "fetched_at": "2026-09-04T01:58:00+00:00",
+            "featured_at": "2026-09-04T01:54:00+00:00",
+            "last_updated_at": "2026-09-04T01:54:00+00:00",
+            "time_status": "featured_only",
+            "publication_time_verified": False,
+            "source_tier": "discovery",
+            "source_count": 1,
+            "summary": "The curation time is known; source publication is not.",
+            "cross_tags": [],
+            "assets": [],
+            "kind": "ai_digest",
+            "discovered_via": ["ai_digest_rss"],
+        }
+        snapshot = {
+            "schema_version": 1,
+            "sections": {
+                key: ([digest] if key == "ai" else [])
+                for key in briefing_service.SECTION_KEYS
+            },
+        }
+
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository(),
+            public_macro=None,
+            decision_record=None,
+            imported_snapshot=snapshot,
+            now=NOW,
+        )
+
+        ai = next(section for section in result["sections"] if section["key"] == "ai")
+        item = ai["items"][0]
+        self.assertEqual(item["kind"], "ai_digest")
+        self.assertNotIn("published_at", item)
+        self.assertFalse(item["publication_time_verified"])
+        self.assertEqual(item["time_status"], "featured_only")
+        self.assertEqual(ai["verified_count"], 0)
+        self.assertEqual(ai["status"], "fresh")
+
+    def test_invalid_or_overheated_discovery_metadata_fails_closed(self) -> None:
+        story = {
+            "section": "technology",
+            "title": "HN discovery story",
+            "source": "Hacker News",
+            "source_url": "https://example.com/hn-story",
+            "original_url": "https://example.com/hn-story",
+            "canonical_url": "https://example.com/hn-story",
+            "discussion_url": "https://news.ycombinator.com/item?id=123",
+            "story_key": "hn-story",
+            "published_at": "2026-09-04T01:45:00+00:00",
+            "fetched_at": "2026-09-04T01:58:00+00:00",
+            "featured_at": "2026-09-04T01:55:00+00:00",
+            "last_updated_at": "2026-09-04T01:45:00+00:00",
+            "time_status": "verified",
+            "publication_time_verified": True,
+            "source_tier": "discovery",
+            "source_count": 1,
+            "summary": "A community-discovered story.",
+            "cross_tags": [],
+            "assets": [],
+            "kind": "hn_story",
+            "discovered_via": ["hacker_news_top"],
+            "hn_id": 123,
+            "hn_score": 500,
+            "hn_comments": 200,
+            "hn_rank": 1,
+            "heat_score": 101.0,
+        }
+        snapshot = {
+            "schema_version": 1,
+            "sections": {
+                key: ([story] if key == "technology" else [])
+                for key in briefing_service.SECTION_KEYS
+            },
+        }
+
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository(),
+            public_macro=None,
+            decision_record=None,
+            imported_snapshot=snapshot,
+            now=NOW,
+        )
+
+        self.assertFalse(result["available"])
+        self.assertEqual(result["highlights"], [])
+
+    def test_hn_heat_is_recomputed_and_current_discovery_beats_stale_reporting(
+        self,
+    ) -> None:
+        def hn_story(
+            item_id: int,
+            *,
+            producer_heat: float,
+            rank: int,
+            score: int,
+            comments: int,
+        ) -> dict:
+            original = f"https://example.com/hn-{item_id}"
+            published = "2026-09-04T01:20:00+00:00"
+            return {
+                "section": "technology",
+                "title": f"Distinct Hacker News story {item_id}",
+                "source": "Hacker News",
+                "source_url": original,
+                "original_url": original,
+                "canonical_url": original,
+                "discussion_url": (
+                    f"https://news.ycombinator.com/item?id={item_id}"
+                ),
+                "story_key": f"hn-{item_id}",
+                "published_at": published,
+                "fetched_at": "2026-09-04T01:59:00+00:00",
+                "featured_at": "2026-09-04T01:59:00+00:00",
+                "last_updated_at": published,
+                "time_status": "verified",
+                "publication_time_verified": True,
+                "source_tier": "discovery",
+                "source_count": 1,
+                "summary": "Community discovery metadata.",
+                "cross_tags": [],
+                "assets": [],
+                "kind": "hn_story",
+                "discovered_via": ["hacker_news_top"],
+                "hn_id": item_id,
+                "hn_score": score,
+                "hn_comments": comments,
+                "hn_rank": rank,
+                "heat_score": producer_heat,
+            }
+
+        def reporting(story_key: str, *, published_at: str) -> dict:
+            return {
+                "section": "technology",
+                "title": f"Verified semiconductor reporting {story_key}",
+                "source": "Reuters",
+                "source_url": f"https://www.reuters.com/technology/{story_key}",
+                "canonical_url": f"https://www.reuters.com/technology/{story_key}",
+                "story_key": story_key,
+                "published_at": published_at,
+                "time_status": "verified",
+                "source_tier": "reporting",
+                "source_count": 1,
+                "summary": "Verified reporting remains higher trust.",
+                "cross_tags": [],
+                "assets": [],
+            }
+
+        stories = [
+            reporting("fresh-reporting", published_at="2026-09-04T01:50:00+00:00"),
+            *[
+                reporting(
+                    f"stale-reporting-{index}",
+                    published_at="2026-09-03T06:00:00+00:00",
+                )
+                for index in range(6)
+            ],
+            hn_story(
+                101,
+                producer_heat=100.0,
+                rank=50,
+                score=1,
+                comments=0,
+            ),
+            hn_story(
+                102,
+                producer_heat=0.0,
+                rank=1,
+                score=500,
+                comments=250,
+            ),
+        ]
+        strong_projection = briefing_service._imported_highlight(
+            stories[-1], section_hint="technology", now=NOW
+        )
+        self.assertIsNotNone(strong_projection)
+        assert strong_projection is not None
+        self.assertEqual(
+            briefing_service._trusted_hn_heat(strong_projection, now=NOW),
+            briefing_collect.hn_heat_score(
+                rank=1,
+                score=500,
+                comments=250,
+                age_hours=40 / 60,
+                appears_in_both=False,
+            ),
+        )
+        snapshot = {
+            "schema_version": 1,
+            "sections": {
+                key: (stories if key == "technology" else [])
+                for key in briefing_service.SECTION_KEYS
+            },
+        }
+
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository(),
+            public_macro=None,
+            decision_record=None,
+            imported_snapshot=snapshot,
+            now=NOW,
+        )
+        technology = next(
+            section for section in result["sections"] if section["key"] == "technology"
+        )
+
+        item_ids = [item["id"] for item in technology["items"]]
+        self.assertEqual(item_ids[:3], ["fresh-reporting", "hn-102", "hn-101"])
+        self.assertEqual(len(item_ids), 6)
+        self.assertEqual(sum(value.startswith("stale-reporting-") for value in item_ids), 3)
+
+    def test_cross_source_curated_heat_without_hn_time_is_display_only(self) -> None:
+        plain = {
+            "section": "ai",
+            "title": "Recent curated model release",
+            "source": "AI Digest",
+            "source_url": "https://ai-digest.liziran.com/zh/recent-release",
+            "canonical_url": "https://example.com/news/recent-release",
+            "original_url": "https://example.com/news/recent-release",
+            "story_key": "recent-curated",
+            "published_at": None,
+            "fetched_at": "2026-09-04T01:58:00+00:00",
+            "featured_at": "2026-09-04T01:55:00+00:00",
+            "last_updated_at": "2026-09-04T01:55:00+00:00",
+            "time_status": "featured_only",
+            "publication_time_verified": False,
+            "source_tier": "discovery",
+            "source_count": 1,
+            "summary": "A recent curated item.",
+            "cross_tags": [],
+            "assets": [],
+            "kind": "ai_digest",
+            "discovered_via": ["ai_digest_rss"],
+        }
+        cross_source = {
+            **plain,
+            "title": "Older curated agent discussion",
+            "source_url": "https://ai-digest.liziran.com/zh/older-agent",
+            "canonical_url": "https://example.com/news/older-agent",
+            "original_url": "https://example.com/news/older-agent",
+            "discussion_url": "https://news.ycombinator.com/item?id=777",
+            "story_key": "older-cross-source",
+            "featured_at": "2026-09-04T01:40:00+00:00",
+            "last_updated_at": "2026-09-04T01:40:00+00:00",
+            "discovered_via": ["ai_digest_rss", "hacker_news_top"],
+            "hn_id": 777,
+            "hn_score": 5_000,
+            "hn_comments": 1_000,
+            "hn_rank": 1,
+            "heat_score": 100.0,
+        }
+        snapshot = {
+            "schema_version": 1,
+            "sections": {
+                key: ([cross_source, plain] if key == "ai" else [])
+                for key in briefing_service.SECTION_KEYS
+            },
+        }
+
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository(),
+            public_macro=None,
+            decision_record=None,
+            imported_snapshot=snapshot,
+            now=NOW,
+        )
+        ai = next(section for section in result["sections"] if section["key"] == "ai")
+
+        self.assertEqual(
+            [item["id"] for item in ai["items"]],
+            ["recent-curated", "older-cross-source"],
+        )
+        self.assertEqual(ai["items"][1]["heat_score"], 100.0)
+
+    def test_generic_original_is_rejected_and_omitted_originals_do_not_merge(
+        self,
+    ) -> None:
+        def digest(story_key: str) -> dict:
+            return {
+                "section": "ai",
+                "title": f"Distinct digest evidence {story_key}",
+                "source": "AI Digest",
+                "source_url": f"https://ai-digest.liziran.com/zh/{story_key}",
+                "canonical_url": f"https://ai-digest.liziran.com/zh/{story_key}",
+                "story_key": story_key,
+                "published_at": None,
+                "fetched_at": "2026-09-04T01:58:00+00:00",
+                "featured_at": "2026-09-04T01:55:00+00:00",
+                "last_updated_at": "2026-09-04T01:55:00+00:00",
+                "time_status": "featured_only",
+                "publication_time_verified": False,
+                "source_tier": "discovery",
+                "source_count": 1,
+                "summary": "No unique underlying original was claimed.",
+                "cross_tags": [],
+                "assets": [],
+                "kind": "ai_digest",
+                "discovered_via": ["ai_digest_rss"],
+            }
+
+        first = digest("digest-one")
+        second = digest("digest-two")
+        invalid = {
+            **digest("digest-invalid"),
+            "original_url": "https://openai.com/",
+            "canonical_url": "https://openai.com/",
+        }
+        snapshot = {
+            "schema_version": 1,
+            "sections": {
+                key: ([first, second, invalid] if key == "ai" else [])
+                for key in briefing_service.SECTION_KEYS
+            },
+        }
+
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository(),
+            public_macro=None,
+            decision_record=None,
+            imported_snapshot=snapshot,
+            now=NOW,
+        )
+        ai = next(section for section in result["sections"] if section["key"] == "ai")
+
+        self.assertEqual(ai["total_count"], 2)
+        self.assertEqual(
+            {item["id"] for item in ai["items"]}, {"digest-one", "digest-two"}
+        )
+
+    def test_old_hn_submission_is_not_refreshed_by_a_new_fetch(self) -> None:
+        old_submission = {
+            "section": "technology",
+            "title": "Old Hacker News submission fetched again",
+            "source": "Hacker News",
+            "source_url": "https://example.com/old-hn-story",
+            "original_url": "https://example.com/old-hn-story",
+            "canonical_url": "https://example.com/old-hn-story",
+            "discussion_url": "https://news.ycombinator.com/item?id=999",
+            "story_key": "old-hn-story",
+            "published_at": "2026-09-02T15:00:00+00:00",
+            "fetched_at": "2026-09-04T01:59:00+00:00",
+            "featured_at": "2026-09-04T01:59:00+00:00",
+            "last_updated_at": "2026-09-02T15:00:00+00:00",
+            "time_status": "verified",
+            "publication_time_verified": True,
+            "source_tier": "discovery",
+            "source_count": 1,
+            "summary": "The HN submission is 35 hours old.",
+            "cross_tags": [],
+            "assets": [],
+            "kind": "hn_story",
+            "discovered_via": ["hacker_news_best"],
+            "hn_id": 999,
+            "hn_score": 800,
+            "hn_comments": 500,
+            "hn_rank": 1,
+            "heat_score": 100.0,
+        }
+        snapshot = {
+            "schema_version": 1,
+            "sections": {
+                key: ([old_submission] if key == "technology" else [])
+                for key in briefing_service.SECTION_KEYS
+            },
+        }
+
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository(),
+            public_macro=None,
+            decision_record=None,
+            imported_snapshot=snapshot,
+            now=NOW,
+        )
+
+        technology = next(
+            section for section in result["sections"] if section["key"] == "technology"
+        )
+        self.assertEqual(technology["items"], [])
+        self.assertEqual(result["highlights"], [])
+        self.assertFalse(result["available"])
 
     def test_dedup_projection_is_bounded_for_large_candidate_page(self) -> None:
         events = [

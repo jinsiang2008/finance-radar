@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import ipaddress
 import json
+import math
 import os
 import re
 import stat
@@ -46,6 +47,80 @@ MAX_WHY_LENGTH = 600
 MAX_ASSETS = 16
 MAX_ASSET_LENGTH = 64
 MAX_FUTURE_SKEW = timedelta(minutes=5)
+MAX_HN_ID = 9_007_199_254_740_991
+MAX_HN_ENGAGEMENT = 1_000_000
+MAX_HN_RANK = 500
+
+DISCOVERY_KINDS = ("hn_story", "ai_digest", "paper_digest")
+DISCOVERY_CHANNELS = (
+    "hacker_news_top",
+    "hacker_news_best",
+    "ai_digest_rss",
+    "ai_brief_rss",
+)
+_KIND_CHANNELS = {
+    "hn_story": {"hacker_news_top", "hacker_news_best"},
+    "ai_digest": {"ai_digest_rss"},
+    "paper_digest": {"ai_brief_rss"},
+}
+_KIND_SOURCE_LABELS = {
+    "hn_story": "hacker news",
+    "ai_digest": "ai digest",
+    "paper_digest": "ai brief",
+}
+_KIND_SOURCE_HOSTS = {
+    "ai_digest": "ai-digest.liziran.com",
+    "paper_digest": "ai-brief.liziran.com",
+}
+_ARTICLE_FILE_SUFFIXES = {".asp", ".aspx", ".htm", ".html", ".pdf", ".php"}
+_GENERIC_URL_TERMINALS = {
+    "about",
+    "ai",
+    "all",
+    "announcement",
+    "announcements",
+    "archive",
+    "archives",
+    "article",
+    "articles",
+    "blog",
+    "blogs",
+    "category",
+    "categories",
+    "company-announcements",
+    "home",
+    "index",
+    "latest",
+    "news",
+    "news-releases",
+    "newsroom",
+    "paper",
+    "papers",
+    "press-release",
+    "press-releases",
+    "publication",
+    "publications",
+    "research",
+    "technology",
+    "topics",
+}
+_GENERIC_URL_SUFFIX_TOKENS = {
+    "announcement",
+    "announcements",
+    "archive",
+    "archives",
+    "category",
+    "categories",
+    "newsroom",
+}
+_IDENTITY_QUERY_KEYS = {"article", "document", "id", "paper", "post", "story"}
+_LOCALE_SEGMENT_RE = re.compile(r"^[a-z]{2}(?:-[a-z]{2})?$", re.IGNORECASE)
+_ARXIV_URL_RE = re.compile(
+    r"(?:https?://)?(?:(?:www\.)?arxiv\.org/(?:abs|pdf)/|"
+    r"huggingface\.co/papers/)"
+    r"(?P<id>[0-9]{4}\.[0-9]{4,5})(?:v[0-9]+)?(?:\.pdf)?(?:[?#].*)?$",
+    re.IGNORECASE,
+)
 
 _BEIJING = ZoneInfo("Asia/Shanghai")
 _TRACKING_PARAMS = {
@@ -98,13 +173,18 @@ _SOCIAL_HOSTS = {
     "x.com",
 }
 _AGGREGATOR_HOSTS = {
+    "ai-brief.liziran.com",
+    "ai-digest.liziran.com",
     "baidu.com",
     "bing.com",
+    "hacker-news.firebaseio.com",
     "news.baidu.com",
     "news.google.com",
+    "news.ycombinator.com",
 }
 _AGGREGATOR_SOURCE_RE = re.compile(
-    r"(?:\bbing\b|\bbaidu\b|\bgoogle\s+news\b|百度(?:新闻|资讯)|必应(?:新闻|资讯))",
+    r"(?:\bbing\b|\bbaidu\b|\bgoogle\s+news\b|\bhacker\s+news\b|"
+    r"\bai\s+(?:digest|brief)\b|百度(?:新闻|资讯)|必应(?:新闻|资讯))",
     re.IGNORECASE,
 )
 _TOP_LEVEL_FIELDS = {
@@ -129,6 +209,17 @@ _ITEM_FIELDS = {
     "why_it_matters",
     "assets",
     "source_tier",
+    "kind",
+    "discovered_via",
+    "publication_time_verified",
+    "featured_at",
+    "original_url",
+    "discussion_url",
+    "hn_id",
+    "hn_score",
+    "hn_comments",
+    "hn_rank",
+    "heat_score",
 }
 
 
@@ -409,13 +500,310 @@ def _original_social_post(source: str, source_url: str) -> bool:
     return False
 
 
-def _validated_source_tier(claimed: str, source: str, source_url: str) -> str:
+def _bounded_integer(
+    value: Any,
+    field: str,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise BriefingValidationError(f"{field} must be an integer")
+    if value < minimum or value > maximum:
+        raise BriefingValidationError(
+            f"{field} must be between {minimum} and {maximum}"
+        )
+    return value
+
+
+def _bounded_number(
+    value: Any,
+    field: str,
+    *,
+    minimum: float,
+    maximum: float,
+) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise BriefingValidationError(f"{field} must be a number")
+    try:
+        number = float(value)
+    except OverflowError as exc:
+        raise BriefingValidationError(f"{field} must be a finite number") from exc
+    if not math.isfinite(number) or number < minimum or number > maximum:
+        raise BriefingValidationError(
+            f"{field} must be a finite number between {minimum:g} and {maximum:g}"
+        )
+    return round(number, 1)
+
+
+def _discovery_channels(value: Any, field: str, *, kind: str) -> list[str]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise BriefingValidationError(f"{field} must be an array of strings")
+    if not value or len(value) > len(DISCOVERY_CHANNELS):
+        raise BriefingValidationError(
+            f"{field} must contain between 1 and {len(DISCOVERY_CHANNELS)} values"
+        )
+    output: list[str] = []
+    for index, raw in enumerate(value):
+        channel = _text(raw, f"{field}[{index}]", maximum=40)
+        if channel not in DISCOVERY_CHANNELS:
+            raise BriefingValidationError(
+                f"{field}[{index}] must be a supported discovery channel"
+            )
+        if channel in output:
+            raise BriefingValidationError(f"{field} must not contain duplicates")
+        output.append(channel)
+    allowed = _KIND_CHANNELS[kind]
+    if not set(output).intersection(allowed):
+        raise BriefingValidationError(
+            f"{field} must include a primary channel for kind={kind}"
+        )
+    return output
+
+
+def _optional_public_url(value: Any, field: str) -> str | None:
+    if value is None:
+        return None
+    return canonicalize_source_url(value, field)
+
+
+def _specific_original_url(value: str) -> bool:
+    """Accept only a conservative, article-like canonical URL."""
+    if _ARXIV_URL_RE.fullmatch(urllib.parse.unquote(value.strip())):
+        return True
+    parsed = urllib.parse.urlsplit(value)
+    segments = [
+        urllib.parse.unquote(segment).casefold()
+        for segment in parsed.path.split("/")
+        if segment
+    ]
+    while segments and _LOCALE_SEGMENT_RE.fullmatch(segments[0]):
+        segments.pop(0)
+    if not segments:
+        return False
+
+    last_segment = segments[-1]
+    suffix = next(
+        (
+            candidate
+            for candidate in _ARTICLE_FILE_SUFFIXES
+            if last_segment.endswith(candidate)
+        ),
+        "",
+    )
+    stem = last_segment[: -len(suffix)] if suffix else last_segment
+    terminal_tokens = [token for token in re.split(r"[-_.]+", stem) if token]
+    if stem in _GENERIC_URL_TERMINALS or (
+        terminal_tokens and terminal_tokens[-1] in _GENERIC_URL_SUFFIX_TOKENS
+    ):
+        return False
+    query_has_identity = any(
+        key.casefold() in _IDENTITY_QUERY_KEYS and bool(query_value)
+        for key, query_value in urllib.parse.parse_qsl(
+            parsed.query,
+            keep_blank_values=False,
+        )
+    )
+    if suffix or query_has_identity or re.search(r"\d", stem):
+        return True
+    return len(segments) >= 2
+
+
+def _validate_discovery_metadata(
+    value: Mapping[str, Any],
+    *,
+    field: str,
+    source: str,
+    source_url: str,
+    published_time: datetime | None,
+    fetched_time: datetime | None,
+    now: datetime,
+) -> dict[str, Any]:
+    """Validate optional discovery provenance without trusting producer labels."""
+    raw_verified = value.get("publication_time_verified")
+    if raw_verified is None:
+        publication_time_verified = published_time is not None
+    elif not isinstance(raw_verified, bool):
+        raise BriefingValidationError(
+            f"{field}.publication_time_verified must be a boolean"
+        )
+    else:
+        publication_time_verified = raw_verified
+    if publication_time_verified != (published_time is not None):
+        raise BriefingValidationError(
+            f"{field}.publication_time_verified must match published_at"
+        )
+
+    raw_kind = value.get("kind")
+    if raw_kind is None:
+        special_fields = {
+            "discovered_via",
+            "featured_at",
+            "original_url",
+            "discussion_url",
+            "hn_id",
+            "hn_score",
+            "hn_comments",
+            "hn_rank",
+            "heat_score",
+        }
+        if any(name in value and value.get(name) is not None for name in special_fields):
+            raise BriefingValidationError(
+                f"{field}.kind is required for discovery metadata"
+            )
+        return {"publication_time_verified": publication_time_verified}
+
+    kind = _text(raw_kind, f"{field}.kind", maximum=32)
+    if kind not in DISCOVERY_KINDS:
+        raise BriefingValidationError(
+            f"{field}.kind must be one of {', '.join(DISCOVERY_KINDS)}"
+        )
+    if fetched_time is None:
+        raise BriefingValidationError(f"{field}.fetched_at is required for {kind}")
+    if raw_verified is None:
+        raise BriefingValidationError(
+            f"{field}.publication_time_verified is required for {kind}"
+        )
+    channels = _discovery_channels(
+        value.get("discovered_via"),
+        f"{field}.discovered_via",
+        kind=kind,
+    )
+    expected_source = _KIND_SOURCE_LABELS[kind]
+    if source.casefold() != expected_source:
+        raise BriefingValidationError(
+            f"{field}.source must be {_KIND_SOURCE_LABELS[kind]!r} for {kind}"
+        )
+    featured_at, featured_time = _timestamp(
+        value.get("featured_at"),
+        f"{field}.featured_at",
+        now=now,
+    )
+    assert featured_at is not None and featured_time is not None
+    if featured_time > fetched_time + MAX_FUTURE_SKEW:
+        raise BriefingValidationError(
+            f"{field}.featured_at cannot be after fetched_at"
+        )
+    if published_time is not None and published_time > featured_time + MAX_FUTURE_SKEW:
+        raise BriefingValidationError(
+            f"{field}.featured_at cannot be before published_at"
+        )
+
+    original_url = _optional_public_url(
+        value.get("original_url"), f"{field}.original_url"
+    )
+    discussion_url = _optional_public_url(
+        value.get("discussion_url"), f"{field}.discussion_url"
+    )
+    output: dict[str, Any] = {
+        "kind": kind,
+        "discovered_via": channels,
+        "publication_time_verified": publication_time_verified,
+        "featured_at": featured_at,
+        "original_url": original_url,
+        "discussion_url": discussion_url,
+    }
+
+    has_hn_channel = bool(
+        set(channels).intersection({"hacker_news_top", "hacker_news_best"})
+    )
+    if has_hn_channel:
+        hn_id = _bounded_integer(
+            value.get("hn_id"),
+            f"{field}.hn_id",
+            minimum=1,
+            maximum=MAX_HN_ID,
+        )
+        if discussion_url != f"https://news.ycombinator.com/item?id={hn_id}":
+            raise BriefingValidationError(
+                f"{field}.discussion_url must match hn_id on news.ycombinator.com"
+            )
+        output.update(
+            {
+                "hn_id": hn_id,
+                "hn_score": _bounded_integer(
+                    value.get("hn_score"),
+                    f"{field}.hn_score",
+                    minimum=0,
+                    maximum=MAX_HN_ENGAGEMENT,
+                ),
+                "hn_comments": _bounded_integer(
+                    value.get("hn_comments"),
+                    f"{field}.hn_comments",
+                    minimum=0,
+                    maximum=MAX_HN_ENGAGEMENT,
+                ),
+                "hn_rank": _bounded_integer(
+                    value.get("hn_rank"),
+                    f"{field}.hn_rank",
+                    minimum=1,
+                    maximum=MAX_HN_RANK,
+                ),
+                "heat_score": _bounded_number(
+                    value.get("heat_score"),
+                    f"{field}.heat_score",
+                    minimum=0,
+                    maximum=100,
+                ),
+            }
+        )
+    else:
+        if discussion_url is not None:
+            raise BriefingValidationError(
+                f"{field}.discussion_url requires a Hacker News discovery channel"
+            )
+        for hn_field in ("hn_id", "hn_score", "hn_comments", "hn_rank", "heat_score"):
+            if value.get(hn_field) is not None:
+                raise BriefingValidationError(
+                    f"{field}.{hn_field} requires a Hacker News discovery channel"
+                )
+
+    if kind == "hn_story":
+        if not publication_time_verified or published_time is None:
+            raise BriefingValidationError(
+                f"{field}.published_at must contain the verified HN submission time"
+            )
+        if original_url is None:
+            if source_url != discussion_url:
+                raise BriefingValidationError(
+                    f"{field}.source_url must be the HN discussion when original_url is absent"
+                )
+        elif source_url != original_url:
+            raise BriefingValidationError(
+                f"{field}.source_url must match original_url for an HN external story"
+            )
+    else:
+        expected_host = _KIND_SOURCE_HOSTS[kind]
+        if urllib.parse.urlsplit(source_url).hostname != expected_host:
+            raise BriefingValidationError(
+                f"{field}.source_url must use {expected_host} for {kind}"
+            )
+        if original_url is not None and (
+            original_url == source_url
+            or urllib.parse.urlsplit(original_url).hostname == expected_host
+            or not _specific_original_url(original_url)
+        ):
+            raise BriefingValidationError(
+                f"{field}.original_url must be a distinct underlying source for {kind}"
+            )
+    return output
+
+
+def _validated_source_tier(
+    claimed: str,
+    source: str,
+    source_url: str,
+    *,
+    force_discovery: bool = False,
+) -> str:
     """Return only a source tier established by the supplied public evidence.
 
     The producer's tier is a claim, not authority.  A failed official,
     first-party or media claim falls all the way back to discovery instead of
     being silently reinterpreted into a more favourable tier.
     """
+    if force_discovery:
+        return "discovery"
     parsed = urllib.parse.urlsplit(source_url)
     host = (parsed.hostname or "").lower().rstrip(".")
     if claimed == "official":
@@ -528,6 +916,18 @@ def _validate_item(
         raise BriefingValidationError(
             f"{field} requires published_at or fetched_at"
         )
+    discovery_metadata = _validate_discovery_metadata(
+        value,
+        field=field,
+        source=source,
+        source_url=canonical_url,
+        published_time=published_time,
+        fetched_time=fetched_time,
+        now=now,
+    )
+    canonical_identity_url = (
+        discovery_metadata.get("original_url") or canonical_url
+    )
     disclosed_at, disclosed_time = _timestamp(
         value.get("disclosed_at"),
         f"{field}.disclosed_at",
@@ -567,23 +967,46 @@ def _validate_item(
         raise BriefingValidationError(
             f"{field} cannot provide conflicting why and why_it_matters values"
         )
-    updated = published_time if published_time is not None else fetched_time
+    normalized_featured_at = discovery_metadata.get("featured_at")
+    featured_time = (
+        datetime.fromisoformat(normalized_featured_at)
+        if isinstance(normalized_featured_at, str)
+        else None
+    )
+    updated = (
+        published_time
+        if published_time is not None
+        else featured_time
+        if featured_time is not None
+        else fetched_time
+    )
     assert updated is not None
     normalized_title = _story_title(title)
     if not normalized_title:
         raise BriefingValidationError(f"{field}.title has no searchable content")
-    return {
+    output = {
         "section": section,
         "title": title,
         "source": source,
         "source_url": canonical_url,
-        "canonical_url": canonical_url,
+        "canonical_url": canonical_identity_url,
         "published_at": published_at,
         "fetched_at": fetched_at,
         "disclosed_at": disclosed_at,
         "effective_at": effective_at,
-        "time_status": "verified" if published_at is not None else "fetched_only",
-        "source_tier": _validated_source_tier(tier, source, canonical_url),
+        "time_status": (
+            "verified"
+            if published_at is not None
+            else "featured_only"
+            if featured_time is not None
+            else "fetched_only"
+        ),
+        "source_tier": _validated_source_tier(
+            tier,
+            source,
+            canonical_url,
+            force_discovery=bool(discovery_metadata.get("kind")),
+        ),
         "summary": _text(
             value.get("summary"),
             f"{field}.summary",
@@ -601,6 +1024,8 @@ def _validate_item(
         "_normalized_title": normalized_title,
         "_order": order,
     }
+    output.update(discovery_metadata)
+    return output
 
 
 def _deduplicate(items: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
@@ -612,7 +1037,11 @@ def _deduplicate(items: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]
     groups_by_signature: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     for item in items:
         event_day = (
-            datetime.fromisoformat(item["published_at"] or item["fetched_at"])
+            datetime.fromisoformat(
+                item["published_at"]
+                or item.get("featured_at")
+                or item["fetched_at"]
+            )
             .astimezone(_BEIJING)
             .date()
             .isoformat()
@@ -679,7 +1108,9 @@ def _deduplicate(items: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]
         if url_group_counts[story_identity] > 1:
             event_day = (
                 datetime.fromisoformat(
-                    representative["published_at"] or representative["fetched_at"]
+                    representative["published_at"]
+                    or representative.get("featured_at")
+                    or representative["fetched_at"]
                 )
                 .astimezone(_BEIJING)
                 .date()
@@ -835,6 +1266,7 @@ def validate_payload(
         for timestamp_field in (
             "published_at",
             "fetched_at",
+            "featured_at",
             "last_updated_at",
             "disclosed_at",
         ):

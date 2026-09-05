@@ -63,6 +63,38 @@
 域名，`first_party` 仅信任来源账号与链接账号一致的 X / Truth Social 原帖，
 普通非聚合文章可标为 `media`，其余降为 `discovery`。
 
+### HN 与 AI 策展来源元数据
+
+Hacker News、AI Digest 与 AI Brief 属于发现/策展层，不是对原始事实的独立
+确认。三类记录必须使用以下严格元数据，公共 API 会逐字段二次校验；字段不一致
+时整条记录 fail closed，不会只隐藏坏字段后继续展示：
+
+| 字段 | 约束与语义 |
+| --- | --- |
+| `kind` | `hn_story`、`ai_digest`、`paper_digest` 之一 |
+| `discovered_via` | 去重数组；值限于 `hacker_news_top`、`hacker_news_best`、`ai_digest_rss`、`ai_brief_rss`；必须包含与 `kind` 对应的主渠道，允许保留跨源合并后的其他渠道 |
+| `publication_time_verified` | 布尔值；为 `true` 时必须有 `published_at`，为 `false` 时必须省略 `published_at` |
+| `featured_at` | 带时区的精选/入榜时间，不能晚于 `fetched_at` 或本批 `source_as_of` |
+| `original_url` | 可选的底层原始文章、官方发布或 arXiv 链；不能拿策展页冒充原链 |
+| `discussion_url` | 仅在含 HN 渠道时使用，必须是与 `hn_id` 一致的 `https://news.ycombinator.com/item?id=...` |
+| `hn_id`、`hn_score`、`hn_comments`、`hn_rank` | 含 HN 渠道时成套必填的非负有界整数；`hn_rank` 为 top/best 中的最优名次 |
+| `heat_score` | 含 HN 渠道时必填，范围 `0..100`；只是同一发现层内的有界排序信号 |
+
+`hn_story` 的 `source_url` 优先指向外部文章，Ask HN 等无外链帖子则指向
+`discussion_url`；有外部文章时 `original_url` 必须和 `source_url` 一致。
+`ai_digest` / `paper_digest` 的 `source_url` 必须分别指向
+`ai-digest.liziran.com` / `ai-brief.liziran.com` 的策展条目；只有确认到唯一底层
+来源时才填写一个不同的 `original_url`。主页、`/news`、`/blog`、`/research`、
+`/papers`、`/company-announcements` 等通用落地页，以及没有 ID、日期、文档后缀
+或结构上下文的单段 slug，不能作为事件原链；arXiv、带 identity query/数字 ID/
+文档后缀的链接和至少两段的非泛化文章路径可以接受。无法确认唯一原链时必须
+省略，让每个策展条目用自己的 `source_url` 保持独立。页面应把原链作为主要
+核验入口、策展页作为“发现自”入口，不能互换标签。
+
+三类记录无论链接最终落在媒体、官方或 arXiv，`source_tier` 都强制降为
+`discovery`。`news.ycombinator.com`、`hacker-news.firebaseio.com`、
+`ai-digest.liziran.com` 与 `ai-brief.liziran.com` 也始终按聚合/发现域处理。
+
 ## 时效与去重
 
 - `snapshot_date` 必须与 `generated_at` 的北京时间日期一致。
@@ -72,8 +104,18 @@
   相互冒充：新扫描不能把旧文章标新，空扫描也应明确显示“已扫描、暂无新增”。
   每条记录的抓取时间不得晚于本批覆盖时间；发布时间与披露时间只容许 5 分钟
   时钟偏差。
-- 只有 `published_at` 存在且位于最近 24 小时内的记录能进入新闻栏目；只有
-  `fetched_at` 的记录标为 `fetched_only`，不得冒充发布时间。
+- 普通记录只有在 `published_at` 存在且位于最近 24 小时内时才能进入新闻栏目；
+  只有 `fetched_at` 的普通记录标为 `fetched_only`，不得冒充发布时间。严格校验
+  的 AI Digest/Brief 策展记录可用最近 24 小时内的 `featured_at` 进入栏目：未
+  核验原始发布时间时标为 `featured_only`，页面只能显示“精选/发现时间”。HN
+  不适用这个例外，必须始终按 `published_at` 中的帖子提交时间执行 24 小时门禁。
+- HN 的 `published_at` 是官方 HN API 提供的帖子提交时间，
+  `publication_time_verified=true` 只表示这个提交时间已核验，不代表外部原文的
+  发布日期。AI Digest/Brief 页面或 RSS 的 datePublished/dateModified 只放入
+  `featured_at`；除非另行核验到底层文章/论文时间，否则不得复制到
+  `published_at`。AI Brief 的 T+3 论文当前只写入简报 `featured_at`；若日后
+  另行核验论文真实发布时间，应把该旧时间保留在 `published_at`，以新的
+  `featured_at` 表达“今天入选”，绝不能把论文重写成今天发布。
 - 抓取、宏观快照生成或重新导入时间不会更新新闻的发布时间/证据截至时间，也
   不会把旧闻伪装成最新进展。
 - 导入器移除常见跟踪参数；相同 canonical URL 也只有在北京时间事件日与保守
@@ -87,6 +129,14 @@
   主栏目；每栏默认显示 3 条，可展开至 6 条，不使用旧闻或低质量转载凑数。
   当前且发布时间已核验的官方/一手/媒体报道优先，陈旧官方记录不能挤掉当前
   媒体报道。
+- 公共服务不直接信任生产者提交的 HN `heat_score`。独立 `hn_story` 排序时，会用
+  已校验的 `hn_rank`、`hn_score`、`hn_comments`、top/best 双榜状态、HN 提交时间
+  和当前时间按 8 小时半衰期指数衰减公式重新计算有界热度；生产者给出的
+  `heat_score` 仅供展示。缺少独立 HN 提交时间的跨源策展代表仅展示社区指标，
+  热度不参与排序。分数和评论数是社区热度，不是事实可信度或独立确认数。
+- 最近 90 分钟内的官方/一手/媒体证据始终优先；最近 24 小时内且契约完整的 HN /
+  AI 策展线索排在超过 90 分钟的旧媒体报道之前，避免 6 条旧报道完全隐藏当前
+  热点。栏目“新鲜/陈旧”标签仍严格按最近 90 分钟计算。
 - 页面显示的是“事件簇关联记录”，不把转载条数表述为独立确认数。
 - 同一天、同一 schema 的再次导入只有在 `generated_at` 与 `source_as_of` 都不
   回退时才会更新；内容发生修订时至少推进其中一个时间，相同双时间的不同内容
@@ -123,10 +173,23 @@
 ## 运行边界
 
 ```bash
+python3 kol_dashboard/briefing_collect.py \
+  --output /path/to/daily-briefing-latest.json \
+  --import --db /path/to/kol_dashboard.db
+
 python3 kol_dashboard/briefing_import.py /path/to/daily-briefing.json \
   --db /path/to/kol_dashboard.db
 ```
 
-应先写入同目录临时文件，完成 JSON 校验后再原子改名，再执行导入。恢复或新建
-OpenClaw/Hermes 定时任务、跨主机传输和 Slack 通知属于独立运维变更；仅部署
-本导入器不会自动启用这些行为。
+内置 producer 只抓 HN Top/Best、AI Digest RSS 与 AI Brief RSS，不调用 LLM。
+HN 两个榜单根接口都必须成功且至少产生一条当前有效 story；两个 AI feed 也必须
+各自产生至少一条当前有效条目。任一完整性门槛失败都会在写文件和导入前退出，
+保留 last-good 快照。网络读取同时受单请求和整批墙钟上限约束。
+
+producer 按一次采集、一次退出的 CLI 运行模型设计；`collect.sh daily` 每次都会启动
+独立进程。不要在常驻 Web 进程内无限循环调用采集 library API，底层 DNS 或系统
+网络调用若无法取消，应交给下一次独立任务重试。
+
+输出先写入同目录临时文件，完成 JSON 校验后再原子改名，然后执行导入。恢复或
+新建 OpenClaw/Hermes 定时任务、跨主机传输和 Slack 通知属于独立运维变更；仅
+部署 producer 与导入器不会自动启用这些行为。

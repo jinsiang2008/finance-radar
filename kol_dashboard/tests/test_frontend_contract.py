@@ -69,7 +69,8 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn('rel="noopener noreferrer"', self.javascript)
         self.assertIn('source.key === "first_party"', self.javascript)
         self.assertNotIn("本人原文", self.javascript)
-        self.assertIn("条发布时间已核验", self.javascript)
+        self.assertIn("条时间语义已核验", self.javascript)
+        self.assertNotIn("条发布时间已核验", self.javascript)
         self.assertNotIn("${section.verified_count} 条已核验", self.javascript)
         self.assertIn("`${view.short} 北京时间", self.javascript)
         self.assertIn("const visible = compact", self.javascript)
@@ -242,11 +243,56 @@ class FrontendContractTests(unittest.TestCase):
         self.assertNotIn("DIRECT SOURCES", self.javascript)
         self.assertNotIn("NEXT CHECK", self.javascript)
 
-    def test_daily_assets_share_the_v29_cachebuster(self) -> None:
-        self.assertIn('static/app.js?v=29', self.html)
-        self.assertIn('static/style.css?v=29', self.html)
-        self.assertEqual(self.html.count("?v=29"), 2)
+    def test_daily_assets_share_the_v30_cachebuster(self) -> None:
+        self.assertIn('static/app.js?v=30', self.html)
+        self.assertIn('static/style.css?v=30', self.html)
+        self.assertEqual(self.html.count("?v=30"), 2)
         self.assertNotIn("?v=26", self.html)
+
+    def test_daily_discovery_sources_keep_heat_curation_and_time_semantics(self) -> None:
+        for contract in (
+            '"hn_story", "ai_digest", "paper_digest"',
+            '"HN 社区热点"',
+            '"策展/发现源"',
+            "function dailyHnHeatHTML(item",
+            "function dailyHasHnSignal(item)",
+            "hacker_news_",
+            "item?.hn_rank",
+            "item?.hn_score",
+            "item?.hn_comments",
+            "Hacker News 社区热度",
+            "function dailyHnSubmittedTimeHTML(item)",
+            "HN 提交",
+            "不是原文发布时间",
+            "function dailyCuratedDatesHTML(item)",
+            "item?.featured_at",
+            "publication_time_verified",
+            "入选简报",
+            "论文发布",
+            "论文发布时间待核验",
+            "入选不等于今日发表",
+            "function dailyExternalActionsHTML(item)",
+            "item?.original_url",
+            "item?.discussion_url",
+            "打开原始来源",
+            "HN 讨论",
+            "策展条目",
+            "仅有策展标题，本站未二次生成",
+            "策展源摘要，本站未二次生成",
+        ):
+            self.assertIn(contract, self.javascript)
+        highlight_start = self.javascript.index("function dailyHighlightHTML(item, index)")
+        highlight_end = self.javascript.index(
+            "function dailyFirsthandHTML(items)", highlight_start
+        )
+        highlight_contract = self.javascript[highlight_start:highlight_end]
+        self.assertIn("dailyItemKind(item)", highlight_contract)
+        self.assertIn('"ai_digest", "paper_digest"', highlight_contract)
+        self.assertIn("curatedSummary", highlight_contract)
+        self.assertIn("daily-hn-heat", self.css)
+        self.assertIn("daily-curated-dates", self.css)
+        self.assertIn("daily-context-link", self.css)
+        self.assertIn("原始来源优先", self.html)
 
     def test_daily_event_clusters_do_not_claim_independent_sources(self) -> None:
         self.assertIn("事件簇 · ${sourceCount} 条关联记录 · 不代表独立确认", self.javascript)
@@ -343,8 +389,8 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn('stale ? "数据延迟" : ""', self.javascript)
         self.assertIn('"高收益债利差"', self.javascript)
         self.assertIn("cs.hy_oas", self.javascript)
-        self.assertIn('static/app.js?v=29', self.html)
-        self.assertIn('static/style.css?v=29', self.html)
+        self.assertIn('static/app.js?v=30', self.html)
+        self.assertIn('static/style.css?v=30', self.html)
         self.assertNotIn('?v=26', self.html)
         self.assertIn(".metric.is-stale", self.css)
 

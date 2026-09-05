@@ -322,6 +322,240 @@ class BriefingImportTests(unittest.TestCase):
         self.assertEqual(item["fetched_at"], self.now.isoformat())
         self.assertEqual(item["last_updated_at"], published.isoformat())
 
+    def test_hacker_news_metadata_is_bounded_and_forced_to_discovery(self) -> None:
+        payload = self.payload()
+        original_url = "https://example.com/chromium-sandbox-rce"
+        payload["sections"]["technology"].append(
+            self.item(
+                source="Hacker News",
+                source_url=original_url,
+                original_url=original_url,
+                discussion_url="https://news.ycombinator.com/item?id=123456",
+                source_tier="media",
+                kind="hn_story",
+                discovered_via=["hacker_news_top", "hacker_news_best"],
+                publication_time_verified=True,
+                featured_at=(self.now - timedelta(minutes=5)).isoformat(),
+                fetched_at=self.now.isoformat(),
+                hn_id=123456,
+                hn_score=574,
+                hn_comments=304,
+                hn_rank=2,
+                heat_score=88.74,
+            )
+        )
+
+        item = briefing_import.validate_payload(payload, now=self.now)["sections"][
+            "technology"
+        ][0]
+
+        self.assertEqual(item["kind"], "hn_story")
+        self.assertEqual(
+            item["discovered_via"],
+            ["hacker_news_top", "hacker_news_best"],
+        )
+        self.assertEqual(item["source_tier"], "discovery")
+        self.assertEqual(item["heat_score"], 88.7)
+        self.assertEqual(item["canonical_url"], original_url)
+        self.assertEqual(item["time_status"], "verified")
+
+    def test_curated_feed_time_is_not_relabelled_as_publication(self) -> None:
+        payload = self.payload()
+        featured_at = self.now - timedelta(minutes=10)
+        digest_url = "https://ai-digest.liziran.com/zh/2026-09-05-example"
+        payload["sections"]["ai"].append(
+            self.item(
+                source="AI Digest",
+                source_url=digest_url,
+                original_url="https://openai.com/index/example-release",
+                source_tier="official",
+                kind="ai_digest",
+                discovered_via=["ai_digest_rss"],
+                publication_time_verified=False,
+                published_at=None,
+                featured_at=featured_at.isoformat(),
+                fetched_at=self.now.isoformat(),
+            )
+        )
+
+        item = briefing_import.validate_payload(payload, now=self.now)["sections"][
+            "ai"
+        ][0]
+
+        self.assertIsNone(item["published_at"])
+        self.assertFalse(item["publication_time_verified"])
+        self.assertEqual(item["featured_at"], featured_at.isoformat())
+        self.assertEqual(item["last_updated_at"], featured_at.isoformat())
+        self.assertEqual(item["time_status"], "featured_only")
+        self.assertEqual(item["source_url"], digest_url)
+        self.assertEqual(
+            item["canonical_url"], "https://openai.com/index/example-release"
+        )
+        self.assertEqual(item["source_tier"], "discovery")
+
+    def test_paper_digest_keeps_t_plus_three_publication_and_cross_source_hn(self) -> None:
+        payload = self.payload()
+        paper_url = "https://arxiv.org/abs/2609.01234"
+        brief_url = "https://ai-brief.liziran.com/zh/2026-09-05-example"
+        payload["sections"]["ai"].append(
+            self.item(
+                source="AI Brief",
+                source_url=brief_url,
+                original_url=paper_url,
+                discussion_url="https://news.ycombinator.com/item?id=654321",
+                published_at=(self.now - timedelta(days=3)).isoformat(),
+                fetched_at=self.now.isoformat(),
+                source_tier="media",
+                kind="paper_digest",
+                discovered_via=["ai_brief_rss", "hacker_news_best"],
+                publication_time_verified=True,
+                featured_at=(self.now - timedelta(minutes=15)).isoformat(),
+                hn_id=654321,
+                hn_score=120,
+                hn_comments=44,
+                hn_rank=8,
+                heat_score=66.0,
+            )
+        )
+
+        item = briefing_import.validate_payload(payload, now=self.now)["sections"][
+            "ai"
+        ][0]
+
+        self.assertEqual(
+            item["published_at"], (self.now - timedelta(days=3)).isoformat()
+        )
+        self.assertEqual(item["featured_at"], (self.now - timedelta(minutes=15)).isoformat())
+        self.assertEqual(item["canonical_url"], paper_url)
+        self.assertEqual(item["hn_rank"], 8)
+
+    def test_discovery_metadata_relationships_fail_closed(self) -> None:
+        valid = self.item(
+            source="Hacker News",
+            source_url="https://example.com/story",
+            original_url="https://example.com/story",
+            discussion_url="https://news.ycombinator.com/item?id=123",
+            source_tier="discovery",
+            kind="hn_story",
+            discovered_via=["hacker_news_top"],
+            publication_time_verified=True,
+            featured_at=(self.now - timedelta(minutes=5)).isoformat(),
+            fetched_at=self.now.isoformat(),
+            hn_id=123,
+            hn_score=10,
+            hn_comments=2,
+            hn_rank=5,
+            heat_score=20.0,
+        )
+        invalid_overrides = (
+            {"publication_time_verified": False},
+            {"publication_time_verified": False, "published_at": None},
+            {"discovered_via": ["ai_digest_rss"]},
+            {"discussion_url": "https://news.ycombinator.com/item?id=124"},
+            {"hn_score": -1},
+            {"hn_rank": 501},
+            {"heat_score": 100.1},
+        )
+        for overrides in invalid_overrides:
+            with self.subTest(overrides=overrides):
+                payload = self.payload()
+                payload["sections"]["technology"].append({**valid, **overrides})
+                with self.assertRaises(briefing_import.BriefingValidationError):
+                    briefing_import.validate_payload(payload, now=self.now)
+
+        payload = self.payload()
+        payload["sections"]["ai"].append(
+            self.item(
+                source="AI Digest",
+                source_url="https://ai-digest.liziran.com/zh/example",
+                original_url="https://ai-digest.liziran.com/zh/example",
+                source_tier="discovery",
+                kind="ai_digest",
+                discovered_via=["ai_digest_rss"],
+                publication_time_verified=False,
+                published_at=None,
+                featured_at=(self.now - timedelta(minutes=5)).isoformat(),
+                fetched_at=self.now.isoformat(),
+            )
+        )
+        with self.assertRaisesRegex(
+            briefing_import.BriefingValidationError, "distinct underlying source"
+        ):
+            briefing_import.validate_payload(payload, now=self.now)
+
+        payload = self.payload()
+        payload["sections"]["ai"].append(
+            self.item(
+                source="AI Digest",
+                source_url="https://ai-digest.liziran.com/zh/example",
+                original_url="https://openai.com/",
+                source_tier="discovery",
+                kind="ai_digest",
+                discovered_via=["ai_digest_rss"],
+                publication_time_verified=False,
+                published_at=None,
+                featured_at=(self.now - timedelta(minutes=5)).isoformat(),
+                fetched_at=self.now.isoformat(),
+            )
+        )
+        with self.assertRaisesRegex(
+            briefing_import.BriefingValidationError, "distinct underlying source"
+        ):
+            briefing_import.validate_payload(payload, now=self.now)
+
+    def test_curated_items_without_a_specific_original_stay_distinct(self) -> None:
+        payload = self.payload()
+        for index in range(2):
+            payload["sections"]["ai"].append(
+                self.item(
+                    title=f"Distinct curated story {index}",
+                    source="AI Digest",
+                    source_url=(
+                        f"https://ai-digest.liziran.com/zh/distinct-{index}"
+                    ),
+                    source_tier="discovery",
+                    kind="ai_digest",
+                    discovered_via=["ai_digest_rss"],
+                    publication_time_verified=False,
+                    published_at=None,
+                    featured_at=(self.now - timedelta(minutes=5)).isoformat(),
+                    fetched_at=self.now.isoformat(),
+                )
+            )
+
+        items = briefing_import.validate_payload(payload, now=self.now)["sections"][
+            "ai"
+        ]
+
+        self.assertEqual(len(items), 2)
+        self.assertEqual(len({item["canonical_url"] for item in items}), 2)
+        self.assertEqual(len({item["story_key"] for item in items}), 2)
+
+    def test_specific_original_url_requires_article_like_identity(self) -> None:
+        cases = {
+            "https://openai.com/": False,
+            "https://openai.com/company-announcements": False,
+            "https://openai.com/index": False,
+            "https://openai.com/en/company-announcements": False,
+            "https://openai.com/product-update": False,
+            "https://openai.com/team-announcements": False,
+            "https://openai.com/newsroom?story=123": False,
+            "https://arxiv.org/abs/2609.01234": True,
+            "https://huggingface.co/papers/2609.01234": True,
+            "https://openai.com/index/example-release": True,
+            "https://openai.com/en/article/new-model": True,
+            "https://openai.com/launch-model-2026": True,
+            "https://openai.com/release.html": True,
+            "https://openai.com/story?id=release": True,
+        }
+
+        for url, expected in cases.items():
+            with self.subTest(url=url):
+                canonical = briefing_import.canonicalize_source_url(url)
+                self.assertEqual(
+                    briefing_import._specific_original_url(canonical), expected
+                )
+
     def test_investor_disclosure_timestamps_are_strict_and_not_invented(self) -> None:
         disclosed = self.now - timedelta(hours=2)
         effective = (self.now - timedelta(days=30)).date().isoformat()

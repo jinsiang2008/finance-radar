@@ -18,6 +18,7 @@ class DeploymentContractTests(unittest.TestCase):
         for filename in (
             "app.py",
             "auth.py",
+            "briefing_collect.py",
             "briefing_import.py",
             "briefing_service.py",
             "content_quality.py",
@@ -74,6 +75,17 @@ class DeploymentContractTests(unittest.TestCase):
         self.assertIn("kol-collect-decision.timer", self.deploy)
         self.assertIn("python3 -c 'import db; db.init()'", self.deploy)
         self.assertIn("KOL_DB_WRITE_REQUIRED=1", self.collect)
+
+    def test_daily_collector_is_packaged_and_callable_without_a_new_timer(self) -> None:
+        self.assertIn("briefing_collect.py", self.deploy)
+        daily_start = self.collect.index("  daily)")
+        enrich_start = self.collect.index("  enrich)", daily_start)
+        daily_job = self.collect[daily_start:enrich_start]
+        self.assertIn('briefing_collect.py"', daily_job)
+        self.assertIn('--output "$DAILY_SNAPSHOT"', daily_job)
+        self.assertIn('--import --db "$KOL_DASHBOARD_DB"', daily_job)
+        self.assertNotIn("kol-collect-daily.timer", self.deploy)
+        self.assertNotIn("kol-collect-daily.timer", self.collect)
 
     def test_decision_snapshot_is_prewarmed_before_release_switch(self) -> None:
         prewarm = self.deploy.index(

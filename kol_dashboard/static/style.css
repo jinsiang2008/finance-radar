@@ -1994,6 +1994,7 @@ button:focus-visible, a:focus-visible, [tabindex]:focus-visible, input:focus-vis
 .daily-jump-nav a:focus-visible,
 .daily-evidence-btn:focus-visible,
 .daily-source-link:focus-visible,
+.daily-context-link:focus-visible,
 .daily-firsthand-list a:focus-visible,
 .daily-empty button:focus-visible {
   outline: 2px solid var(--accent); outline-offset: 2px;
@@ -2127,12 +2128,41 @@ button:focus-visible, a:focus-visible, [tabindex]:focus-visible, input:focus-vis
 .daily-source-badge.is-discovery {
   background: color-mix(in srgb, var(--med) 11%, transparent); color: var(--med);
 }
+.daily-source-badge.is-community {
+  border: 1px solid color-mix(in srgb, var(--med) 38%, var(--border));
+  background: color-mix(in srgb, var(--med) 7%, transparent);
+}
+.daily-source-badge.is-curated {
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--border));
+  background: transparent; color: var(--accent);
+}
 .daily-source-name {
   max-width: 22ch; overflow: hidden; color: var(--text-2); font-size: 10.5px;
   text-overflow: ellipsis; white-space: nowrap;
 }
 .daily-time { color: var(--muted); font-size: 10px; white-space: nowrap; }
 .daily-time.is-unverified { color: var(--med); }
+.daily-curated-dates {
+  display: inline-flex; align-items: center; gap: 5px; min-width: 0; flex-wrap: wrap;
+  color: var(--muted); font-size: 10px;
+}
+.daily-curated-dates > * + * {
+  padding-left: 6px; border-left: 1px solid var(--border);
+}
+.daily-curated-dates .is-missing,
+.daily-curated-date-note { color: var(--med); }
+.daily-hn-heat {
+  display: inline-flex; align-items: center; min-height: 22px; overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--med) 34%, var(--border)); border-radius: 6px;
+  color: var(--text-2); font: 650 9.5px/1.35 var(--font-data);
+  font-variant-numeric: tabular-nums;
+}
+.daily-hn-heat > * { padding: 3px 6px; }
+.daily-hn-heat > * + * { border-left: 1px solid var(--border); }
+.daily-hn-heat-label { background: color-mix(in srgb, var(--med) 8%, transparent); color: var(--med); }
+.daily-hn-heat b { font-weight: 690; white-space: nowrap; }
+.daily-hn-heat.is-compact { min-height: 20px; }
+.daily-hn-heat.is-compact > * { padding: 2px 5px; }
 .daily-investor-dates {
   display: inline-flex; align-items: center; gap: 5px; min-width: 0; flex-wrap: wrap;
   color: var(--muted); font-size: 10px;
@@ -2179,8 +2209,11 @@ button:focus-visible, a:focus-visible, [tabindex]:focus-visible, input:focus-vis
 .daily-evidence-notes { display: flex; gap: 5px 10px; flex-wrap: wrap; color: var(--muted); font-size: 9.5px; }
 .daily-evidence-notes span { position: relative; }
 .daily-evidence-notes span + span::before { content: "·"; position: absolute; left: -7px; }
-.daily-signal-actions { display: flex; align-items: center; justify-content: flex-end; gap: 7px; flex: 0 0 auto; }
-.daily-evidence-btn, .daily-source-link {
+.daily-signal-actions {
+  display: flex; align-items: center; justify-content: flex-end; gap: 7px;
+  flex: 0 0 auto; flex-wrap: wrap;
+}
+.daily-evidence-btn, .daily-source-link, .daily-context-link {
   min-height: 34px; display: inline-flex; align-items: center; justify-content: center;
   padding: 6px 10px; border-radius: 8px; font-size: 10.5px; font-weight: 680;
   text-decoration: none;
@@ -2191,6 +2224,10 @@ button:focus-visible, a:focus-visible, [tabindex]:focus-visible, input:focus-vis
 .daily-evidence-btn:hover { border-color: var(--accent); color: var(--accent); }
 .daily-source-link { border: 1px solid var(--accent); background: var(--accent); color: #fff; }
 .daily-source-link:hover { color: #fff; text-decoration: none; filter: brightness(1.06); }
+.daily-context-link {
+  border: 1px solid var(--border); background: transparent; color: var(--text-2);
+}
+.daily-context-link:hover { border-color: var(--accent); color: var(--accent); text-decoration: none; }
 .daily-source-missing { color: var(--muted); font-size: 9.5px; }
 
 .daily-firsthand {
@@ -2423,7 +2460,9 @@ button:focus-visible, a:focus-visible, [tabindex]:focus-visible, input:focus-vis
   display: flex; align-items: center; justify-content: space-between; gap: 12px;
   margin-top: 10px; color: var(--muted); font-size: 9.5px;
 }
-.daily-stream-footer > div { display: flex; align-items: center; justify-content: flex-end; gap: 7px; }
+.daily-stream-footer > div {
+  display: flex; align-items: center; justify-content: flex-end; gap: 7px; flex-wrap: wrap;
+}
 .daily-stale-note {
   margin: 0; padding: 10px 18px; border-bottom: 1px solid var(--border);
   background: color-mix(in srgb, var(--med) 7%, var(--panel)); color: var(--med);
@@ -2609,7 +2648,7 @@ button:focus-visible, a:focus-visible, [tabindex]:focus-visible, input:focus-vis
   .daily-fact > span, .daily-why > span { padding-top: 0; }
   .daily-signal-footer { align-items: stretch; flex-direction: column; }
   .daily-signal-actions { justify-content: stretch; }
-  .daily-evidence-btn, .daily-source-link { min-height: 44px; flex: 1 1 auto; }
+  .daily-evidence-btn, .daily-source-link, .daily-context-link { min-height: 44px; flex: 1 1 auto; }
   .daily-firsthand { position: static; top: auto; padding: 15px; }
   .daily-firsthand-list a { min-height: 44px; }
   .daily-watchpoints { margin-top: 25px; }
@@ -2649,11 +2688,13 @@ button:focus-visible, a:focus-visible, [tabindex]:focus-visible, input:focus-vis
   .daily-stream-footer { align-items: stretch; flex-direction: column; font-size: 10.5px; }
   .daily-stream-footer > div { justify-content: stretch; }
   .daily-stream-footer .daily-evidence-btn,
-  .daily-stream-footer .daily-source-link { flex: 1 1 auto; }
+  .daily-stream-footer .daily-source-link,
+  .daily-stream-footer .daily-context-link { flex: 1 1 auto; }
   .daily-stale-note, .daily-section-empty span { font-size: 11.5px; }
   .daily-cross-tags a { min-height: 44px; display: inline-flex; align-items: center; font-size: 10.5px; }
   .daily-source-badge, .daily-impact, .daily-time,
-  .daily-source-name, .daily-investor-dates { font-size: 10.5px; }
+  .daily-source-name, .daily-investor-dates, .daily-curated-dates { font-size: 10.5px; }
+  .daily-hn-heat { font-size: 10.5px; }
   .daily-section-toggle { grid-column: 1; border-left: 0; padding-inline: 12px; }
   .daily-evidence-desk { margin-top: 31px; }
   .daily-evidence-grid { grid-template-columns: minmax(0, 1fr); }

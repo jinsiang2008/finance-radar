@@ -4,8 +4,9 @@
 #   collect.sh macro   — store one macro risk snapshot
 #   collect.sh decision — refresh relations, market checks, and portfolio
 #   collect.sh enrich  — add cached Chinese intelligence with DeepSeek
+#   collect.sh daily   — collect HN/AI discovery feeds and import one Daily snapshot
 #
-# Both are idempotent; the DB dedups repeat sightings.
+# Jobs are idempotent; the DB dedups repeat sightings.
 
 set -euo pipefail
 umask 077
@@ -27,6 +28,7 @@ LOG_DIR="${KOL_LOG_DIR:-$REPO_DIR/logs}"
 mkdir -p "$(dirname "$KOL_DASHBOARD_DB")" "$LOG_DIR"
 ERROR_LOG="$LOG_DIR/collect.err.log"
 ENRICHMENT_MARKER="${KOL_ENRICH_WAKE_PATH:-$(dirname "$KOL_DASHBOARD_DB")/enrichment.pending}"
+DAILY_SNAPSHOT="${KOL_DAILY_SNAPSHOT_PATH:-$DATA_DIR/daily-briefing-latest.json}"
 
 TRACKER="$LIB_DIR/kol_tracker.py"
 [[ -f "$TRACKER" ]] || {
@@ -85,12 +87,18 @@ case "${1:-kol}" in
     OUT=$(run_capture python3 "$DIR/decision_collect.py" all)
     echo "[$(stamp)] decision: $OUT" >> "$LOG_DIR/collect.log"
     ;;
+  daily)
+    OUT=$(run_capture python3 "$DIR/briefing_collect.py" \
+      --output "$DAILY_SNAPSHOT" --import --db "$KOL_DASHBOARD_DB")
+    [[ -n "$OUT" ]] || OUT="Daily snapshot imported"
+    echo "[$(stamp)] daily: $OUT" >> "$LOG_DIR/collect.log"
+    ;;
   enrich)
     OUT=$(run_capture python3 "$DIR/enrichment_collect.py")
     echo "[$(stamp)] enrich: $OUT" >> "$LOG_DIR/collect.log"
     ;;
   *)
-    echo "usage: collect.sh {kol|macro|decision|enrich}" >&2
+    echo "usage: collect.sh {kol|macro|decision|daily|enrich}" >&2
     exit 2
     ;;
 esac

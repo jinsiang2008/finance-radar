@@ -124,12 +124,76 @@ _TIER_LABELS = {
     "reporting": "媒体报道",
     "discovery": "聚合线索",
 }
+_DISCOVERY_KINDS = {"hn_story", "ai_digest", "paper_digest"}
+_DISCOVERY_CHANNELS = {
+    "hacker_news_top",
+    "hacker_news_best",
+    "ai_digest_rss",
+    "ai_brief_rss",
+}
+_DISCOVERY_KIND_CHANNELS = {
+    "hn_story": {"hacker_news_top", "hacker_news_best"},
+    "ai_digest": {"ai_digest_rss"},
+    "paper_digest": {"ai_brief_rss"},
+}
+_ARTICLE_FILE_SUFFIXES = {".asp", ".aspx", ".htm", ".html", ".pdf", ".php"}
+_GENERIC_URL_TERMINALS = {
+    "about",
+    "ai",
+    "all",
+    "announcement",
+    "announcements",
+    "archive",
+    "archives",
+    "article",
+    "articles",
+    "blog",
+    "blogs",
+    "category",
+    "categories",
+    "company-announcements",
+    "home",
+    "index",
+    "latest",
+    "news",
+    "news-releases",
+    "newsroom",
+    "paper",
+    "papers",
+    "press-release",
+    "press-releases",
+    "publication",
+    "publications",
+    "research",
+    "technology",
+    "topics",
+}
+_GENERIC_URL_SUFFIX_TOKENS = {
+    "announcement",
+    "announcements",
+    "archive",
+    "archives",
+    "category",
+    "categories",
+    "newsroom",
+}
+_IDENTITY_QUERY_KEYS = {"article", "document", "id", "paper", "post", "story"}
+_LOCALE_SEGMENT_RE = re.compile(r"^[a-z]{2}(?:-[a-z]{2})?$", re.IGNORECASE)
+_ARXIV_URL_RE = re.compile(
+    r"(?:https?://)?(?:(?:www\.)?arxiv\.org/(?:abs|pdf)/|"
+    r"huggingface\.co/papers/)"
+    r"(?P<id>[0-9]{4}\.[0-9]{4,5})(?:v[0-9]+)?(?:\.pdf)?(?:[?#].*)?$",
+    re.IGNORECASE,
+)
 _IMPACT_LABELS = {"high": "高影响", "medium": "中影响", "low": "低影响"}
 _AGGREGATOR_SOURCE_RE = re.compile(
-    r"(?:\bbing\b|\bbaidu\b|\bgoogle\s+news\b|百度(?:新闻|资讯)|必应(?:新闻|资讯))",
+    r"(?:\bbing\b|\bbaidu\b|\bgoogle\s+news\b|\bhacker\s+news\b|"
+    r"\bai\s+(?:digest|brief)\b|百度(?:新闻|资讯)|必应(?:新闻|资讯))",
     re.IGNORECASE,
 )
 _AGGREGATOR_HOSTS = {
+    "ai-brief.liziran.com",
+    "ai-digest.liziran.com",
     "bing.com",
     "www.bing.com",
     "cn.bing.com",
@@ -137,6 +201,8 @@ _AGGREGATOR_HOSTS = {
     "www.baidu.com",
     "news.baidu.com",
     "news.google.com",
+    "hacker-news.firebaseio.com",
+    "news.ycombinator.com",
 }
 _OFFICIAL_EXCHANGE_HOSTS = {
     "sse.com.cn",
@@ -447,6 +513,16 @@ _PUBLIC_ITEM_FIELDS = (
     "story_key",
     "primary_section",
     "cross_tags",
+    "featured_at",
+    "original_url",
+    "discussion_url",
+    "discovered_via",
+    "publication_time_verified",
+    "hn_id",
+    "hn_score",
+    "hn_comments",
+    "hn_rank",
+    "heat_score",
 )
 
 
@@ -687,8 +763,51 @@ def _canonical_identity_url(value: Any) -> str:
     return urlunsplit((parsed.scheme.lower(), netloc, path, query, ""))
 
 
+def _specific_original_url(value: str) -> bool:
+    """Accept only a conservative, article-like canonical URL."""
+    if _ARXIV_URL_RE.fullmatch(unquote(value.strip())):
+        return True
+    try:
+        parsed = urlsplit(value)
+    except (TypeError, ValueError):
+        return False
+    segments = [
+        unquote(segment).casefold()
+        for segment in parsed.path.split("/")
+        if segment
+    ]
+    while segments and _LOCALE_SEGMENT_RE.fullmatch(segments[0]):
+        segments.pop(0)
+    if not segments:
+        return False
+
+    last_segment = segments[-1]
+    suffix = next(
+        (
+            candidate
+            for candidate in _ARTICLE_FILE_SUFFIXES
+            if last_segment.endswith(candidate)
+        ),
+        "",
+    )
+    stem = last_segment[: -len(suffix)] if suffix else last_segment
+    terminal_tokens = [token for token in re.split(r"[-_.]+", stem) if token]
+    if stem in _GENERIC_URL_TERMINALS or (
+        terminal_tokens and terminal_tokens[-1] in _GENERIC_URL_SUFFIX_TOKENS
+    ):
+        return False
+    query_has_identity = any(
+        key.casefold() in _IDENTITY_QUERY_KEYS and bool(query_value)
+        for key, query_value in parse_qsl(parsed.query, keep_blank_values=False)
+    )
+    if suffix or query_has_identity or re.search(r"\d", stem):
+        return True
+    return len(segments) >= 2
+
+
 def _observed_time(item: Mapping[str, Any]) -> datetime | None:
     for field in (
+        "featured_at",
         "last_updated_at",
         "last_seen_at",
         "published_at",
@@ -704,6 +823,24 @@ def _publication_time(item: Mapping[str, Any]) -> datetime | None:
     if _text(item.get("time_status"), 24).lower() != "verified":
         return None
     return _datetime(item.get("published_at"))
+
+
+def _featured_time(item: Mapping[str, Any]) -> datetime | None:
+    """Return a curation time only for validated imported discovery records."""
+    if _text(item.get("source_tier"), 24).lower() != "discovery":
+        return None
+    kind = _text(item.get("_content_kind"), 32).lower()
+    # Hacker News `featured_at` is the collector observation time.  It must
+    # never refresh an older submission; HN selection is anchored exclusively
+    # to its verified API submission timestamp in `published_at`.
+    if kind not in {"ai_digest", "paper_digest"}:
+        return None
+    return _datetime(item.get("featured_at"))
+
+
+def _selection_time(item: Mapping[str, Any]) -> datetime | None:
+    """Rank a curated lead by selection time without rewriting publication."""
+    return _featured_time(item) or _publication_time(item)
 
 
 def _latest_timestamp(source: Mapping[str, Any], fields: tuple[str, ...]) -> str:
@@ -1295,12 +1432,28 @@ def _rank_reason(item: Mapping[str, Any]) -> str:
     parts: list[str] = []
     impact = _text(item.get("impact"), 24).lower()
     tier = _text(item.get("source_tier"), 24).lower()
+    content_kind = _text(item.get("_content_kind"), 32).lower()
+    if _strict_integer(item.get("hn_id"), minimum=1, maximum=9_007_199_254_740_991):
+        score = _strict_integer(
+            item.get("hn_score"), minimum=0, maximum=1_000_000
+        )
+        comments = _strict_integer(
+            item.get("hn_comments"), minimum=0, maximum=1_000_000
+        )
+        if score is not None and comments is not None:
+            parts.append(f"HN {score} 分 / {comments} 评论")
     if impact in _IMPACT_LABELS:
         parts.append(_IMPACT_LABELS[impact])
     if tier in _TIER_LABELS:
         parts.append(_TIER_LABELS[tier])
     if item.get("time_status") == "verified":
-        parts.append("发布时间已核验")
+        parts.append(
+            "HN 提交时间已核验"
+            if content_kind == "hn_story"
+            else "发布时间已核验"
+        )
+    elif item.get("time_status") == "featured_only":
+        parts.append("精选时间已核验")
     if item.get("ai_summary_used") is True:
         parts.append("AI 摘要已就绪")
     return " · ".join(parts[:3])
@@ -1490,6 +1643,160 @@ def _macro_highlight(source: Mapping[str, Any], macro: Mapping[str, Any]) -> dic
     return item
 
 
+def _strict_integer(value: Any, *, minimum: int, maximum: int) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if minimum <= value <= maximum else None
+
+
+def _imported_discovery_metadata(
+    source: Mapping[str, Any],
+    *,
+    source_url: str,
+    published: datetime | None,
+    now: datetime,
+) -> dict[str, Any] | None:
+    """Revalidate persisted producer metadata before public projection."""
+    raw_kind = source.get("kind")
+    if raw_kind is None:
+        special_fields = {
+            "discovered_via",
+            "featured_at",
+            "original_url",
+            "discussion_url",
+            "hn_id",
+            "hn_score",
+            "hn_comments",
+            "hn_rank",
+            "heat_score",
+        }
+        if any(source.get(field) is not None for field in special_fields):
+            return None
+        return {}
+    if not isinstance(raw_kind, str) or raw_kind not in _DISCOVERY_KINDS:
+        return None
+    kind = raw_kind
+
+    raw_channels = source.get("discovered_via")
+    if (
+        not isinstance(raw_channels, list)
+        or not 1 <= len(raw_channels) <= len(_DISCOVERY_CHANNELS)
+        or any(not isinstance(value, str) for value in raw_channels)
+        or len(raw_channels) != len(set(raw_channels))
+        or not set(raw_channels).issubset(_DISCOVERY_CHANNELS)
+        or not set(raw_channels).intersection(_DISCOVERY_KIND_CHANNELS[kind])
+    ):
+        return None
+    publication_verified = source.get("publication_time_verified")
+    if not isinstance(publication_verified, bool):
+        return None
+    if publication_verified != (published is not None):
+        return None
+    expected_status = "verified" if publication_verified else "featured_only"
+    if _text(source.get("time_status"), 24).lower() != expected_status:
+        return None
+
+    featured = _datetime(source.get("featured_at"))
+    fetched = _datetime(source.get("fetched_at"))
+    if (
+        featured is None
+        or fetched is None
+        or featured > now
+        or featured > fetched + timedelta(minutes=5)
+        or (published is not None and published > featured + timedelta(minutes=5))
+    ):
+        return None
+    original_raw = source.get("original_url")
+    original_url = _public_url(original_raw) if original_raw is not None else ""
+    if original_raw is not None and not original_url:
+        return None
+    discussion_raw = source.get("discussion_url")
+    discussion_url = _public_url(discussion_raw) if discussion_raw is not None else ""
+    if discussion_raw is not None and not discussion_url:
+        return None
+
+    output: dict[str, Any] = {
+        "_content_kind": kind,
+        "discovered_via": list(raw_channels),
+        "publication_time_verified": publication_verified,
+        "featured_at": _iso(featured),
+    }
+    if original_url:
+        output["original_url"] = original_url
+    if discussion_url:
+        output["discussion_url"] = discussion_url
+
+    has_hn_channel = bool(
+        set(raw_channels).intersection({"hacker_news_top", "hacker_news_best"})
+    )
+    if has_hn_channel:
+        hn_id = _strict_integer(
+            source.get("hn_id"), minimum=1, maximum=9_007_199_254_740_991
+        )
+        hn_score = _strict_integer(
+            source.get("hn_score"), minimum=0, maximum=1_000_000
+        )
+        hn_comments = _strict_integer(
+            source.get("hn_comments"), minimum=0, maximum=1_000_000
+        )
+        hn_rank = _strict_integer(source.get("hn_rank"), minimum=1, maximum=500)
+        heat_score = _finite_number(source.get("heat_score"))
+        if (
+            hn_id is None
+            or hn_score is None
+            or hn_comments is None
+            or hn_rank is None
+            or heat_score is None
+            or not 0 <= heat_score <= 100
+            or discussion_url
+            != f"https://news.ycombinator.com/item?id={hn_id}"
+        ):
+            return None
+        output.update(
+            {
+                "hn_id": hn_id,
+                "hn_score": hn_score,
+                "hn_comments": hn_comments,
+                "hn_rank": hn_rank,
+                "heat_score": round(heat_score, 1),
+            }
+        )
+    elif discussion_url or any(
+        source.get(field) is not None
+        for field in ("hn_id", "hn_score", "hn_comments", "hn_rank", "heat_score")
+    ):
+        return None
+
+    if kind == "hn_story":
+        if _text(source.get("source"), 120).casefold() != "hacker news":
+            return None
+        if not publication_verified or published is None:
+            return None
+        if original_url:
+            if source_url != original_url:
+                return None
+        elif source_url != discussion_url:
+            return None
+    else:
+        expected = (
+            ("ai digest", "ai-digest.liziran.com")
+            if kind == "ai_digest"
+            else ("ai brief", "ai-brief.liziran.com")
+        )
+        if (
+            _text(source.get("source"), 120).casefold() != expected[0]
+            or _host(source_url) != expected[1]
+        ):
+            return None
+        if original_url and (
+            original_url == source_url
+            or _host(original_url) == expected[1]
+            or not _specific_original_url(original_url)
+        ):
+            return None
+    return output
+
+
 def _imported_highlight(
     source: Mapping[str, Any],
     *,
@@ -1498,18 +1805,13 @@ def _imported_highlight(
 ) -> dict[str, Any] | None:
     """Project one already-validated imported snapshot item conservatively.
 
-    A fetch timestamp proves discovery, not publication.  Therefore only rows
-    with a verified, in-window publication time may enter the news rails.
+    A fetch timestamp proves discovery, not publication.  Ordinary rows still
+    require a verified, in-window publication time.  The three explicitly
+    validated discovery kinds may instead use an in-window ``featured_at`` for
+    curation freshness while retaining (or omitting) the original publication
+    timestamp exactly as supplied.
     """
-    if _text(source.get("time_status"), 24).lower() != "verified":
-        return None
     published = _datetime(source.get("published_at"))
-    if (
-        published is None
-        or published > now
-        or published < now - timedelta(hours=EVENT_LOOKBACK_HOURS)
-    ):
-        return None
     title = _text(source.get("title"), 180)
     if not title:
         return None
@@ -1518,10 +1820,44 @@ def _imported_highlight(
     )
     if not source_url:
         return None
+    discovery_metadata = _imported_discovery_metadata(
+        source,
+        source_url=source_url,
+        published=published,
+        now=now,
+    )
+    if discovery_metadata is None:
+        return None
+    if discovery_metadata:
+        content_kind = _text(discovery_metadata.get("_content_kind"), 32).lower()
+        if content_kind == "hn_story":
+            if (
+                published is None
+                or published > now
+                or published < now - timedelta(hours=EVENT_LOOKBACK_HOURS)
+            ):
+                return None
+        else:
+            featured = _datetime(discovery_metadata.get("featured_at"))
+            if (
+                featured is None
+                or featured > now
+                or featured < now - timedelta(hours=EVENT_LOOKBACK_HOURS)
+            ):
+                return None
+    elif (
+        _text(source.get("time_status"), 24).lower() != "verified"
+        or published is None
+        or published > now
+        or published < now - timedelta(hours=EVENT_LOOKBACK_HOURS)
+    ):
+        return None
 
     raw_tier = _text(source.get("source_tier"), 24).lower()
     host = _host(source_url)
-    if raw_tier == "official" and _official_host(host):
+    if discovery_metadata:
+        tier = "discovery"
+    elif raw_tier == "official" and _official_host(host):
         tier = "official"
     elif raw_tier == "first_party" and _original_social_post(
         source.get("source_label") or source.get("source"), source_url
@@ -1560,18 +1896,23 @@ def _imported_highlight(
         or _host(source_url)
         or "导入来源",
         "source_url": source_url,
-        "published_at": _iso(published),
-        "time_status": "verified",
+        "time_status": (
+            "verified" if published is not None else "featured_only"
+        ),
         "ai_status": "ineligible",
         "ai_summary_used": False,
         "evidence_basis": evidence_basis,
         "_trusted_evidence_basis": evidence_basis,
         "_raw_title": title,
         "_canonical_url": _canonical_identity_url(
-            source.get("canonical_url") or source_url
+            discovery_metadata.get("original_url")
+            or source.get("canonical_url")
+            or source_url
         ),
         "_stable_external_id": (
-            f"imported_story:{_text(source.get('story_key'), 120).casefold()}"
+            f"hn:{discovery_metadata['hn_id']}"
+            if discovery_metadata.get("hn_id") is not None
+            else f"imported_story:{_text(source.get('story_key'), 120).casefold()}"
             if _text(source.get("story_key"), 120)
             else ""
         ),
@@ -1579,6 +1920,9 @@ def _imported_highlight(
         "_kind_hint": _text(source.get("kind"), 40),
         "_section_hint": section_hint,
     }
+    if published is not None:
+        item["published_at"] = _iso(published)
+    item.update(discovery_metadata)
     cross_tags = source.get("cross_tags")
     if isinstance(cross_tags, list):
         item["_cross_tags_hint"] = list(cross_tags[:6])
@@ -1606,7 +1950,9 @@ def _imported_highlight(
     # Re-fetching a persisted snapshot does not update the underlying news.
     # Until an upstream revision has its own verified publication timestamp,
     # the public update time is the verified publication time itself.
-    item["last_updated_at"] = _iso(published)
+    evidence_time = published or _datetime(discovery_metadata.get("featured_at"))
+    if evidence_time is not None:
+        item["last_updated_at"] = _iso(evidence_time)
     disclosed_at = _public_temporal(source.get("disclosed_at"))
     if disclosed_at:
         item["disclosed_at"] = disclosed_at
@@ -1684,12 +2030,12 @@ def _imported_source_coverage_as_of(
 
 
 def _highlight_time(item: Mapping[str, Any]) -> datetime:
-    return _publication_time(item) or datetime.min.replace(tzinfo=timezone.utc)
+    return _selection_time(item) or datetime.min.replace(tzinfo=timezone.utc)
 
 
 def _publication_day_bucket(item: Mapping[str, Any]) -> str:
-    published = _publication_time(item)
-    return published.astimezone(BEIJING).date().isoformat() if published else ""
+    anchor = _publication_time(item) or _featured_time(item)
+    return anchor.astimezone(BEIJING).date().isoformat() if anchor else ""
 
 
 def _exact_compatibility_bucket(item: Mapping[str, Any]) -> str:
@@ -2032,39 +2378,123 @@ def _deduplicate(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return _deduplicate_with_stats(items)[0]
 
 
+def _trusted_hn_heat(item: Mapping[str, Any], *, now: datetime) -> float:
+    """Recompute standalone HN heat from validated primitives.
+
+    ``heat_score`` remains useful display metadata, but is producer-controlled
+    and therefore never enters ordering directly.  Curated cross-source
+    representatives do not carry a separately verified HN submission instant,
+    so their HN metrics are deliberately display-only.
+    """
+    if (
+        _text(item.get("_content_kind"), 32).lower() != "hn_story"
+        or item.get("publication_time_verified") is not True
+        or _text(item.get("time_status"), 24).lower() != "verified"
+    ):
+        return 0.0
+    published = _publication_time(item)
+    rank = _strict_integer(item.get("hn_rank"), minimum=1, maximum=500)
+    score = _strict_integer(item.get("hn_score"), minimum=0, maximum=1_000_000)
+    comments = _strict_integer(
+        item.get("hn_comments"), minimum=0, maximum=1_000_000
+    )
+    channels = item.get("discovered_via")
+    if (
+        published is None
+        or published > now
+        or rank is None
+        or score is None
+        or comments is None
+        or not isinstance(channels, list)
+        or any(not isinstance(value, str) for value in channels)
+    ):
+        return 0.0
+    age_hours = (now - published).total_seconds() / 3600.0
+    if age_hours < 0:
+        return 0.0
+    rank_component = 35.0 / (1.0 + 0.08 * (rank - 1))
+    score_component = 20.0 * min(1.0, math.log1p(score) / math.log1p(500))
+    comment_component = 15.0 * min(
+        1.0,
+        math.log1p(comments) / math.log1p(250),
+    )
+    overlap_component = (
+        10.0
+        if {"hacker_news_top", "hacker_news_best"}.issubset(set(channels))
+        else 0.0
+    )
+    time_decay = math.exp(-math.log(2.0) * age_hours / 8.0)
+    engagement = (
+        rank_component + score_component + comment_component + overlap_component
+    )
+    decayed_engagement = engagement * (0.35 + 0.65 * time_decay)
+    freshness_component = 20.0 * time_decay
+    return round(
+        min(
+            100.0,
+            max(
+                0.0,
+                decayed_engagement + freshness_component,
+            ),
+        ),
+        1,
+    )
+
+
 def _section_rank(
     item: Mapping[str, Any],
     *,
     now: datetime,
-) -> tuple[int, int, int, float, str]:
-    publication = _publication_time(item)
+) -> tuple[int, int, int, float, float, str]:
+    selection_time = _selection_time(item)
     tier = _TIER_RANK.get(_text(item.get("source_tier"), 24).lower(), 0)
     is_fresh = (
-        publication is not None
-        and publication <= now
-        and (now - publication).total_seconds() <= SECTION_STALE_AFTER_SECONDS
+        selection_time is not None
+        and selection_time <= now
+        and (now - selection_time).total_seconds() <= SECTION_STALE_AFTER_SECONDS
     )
-    # Recent verified official/first-party/reporting evidence leads.  A stale
-    # primary source still beats a fresh discovery-only lead, but it cannot
-    # saturate all six cards and hide current verified reporting.
+    is_current_curated = (
+        _text(item.get("_content_kind"), 32).lower() in _DISCOVERY_KINDS
+        and selection_time is not None
+        and selection_time <= now
+        and (now - selection_time).total_seconds() <= EVENT_LOOKBACK_HOURS * 3600
+    )
+    # Fresh high-trust evidence leads.  A current, strictly validated HN or
+    # curated lead comes next so six >90-minute reports cannot hide today's
+    # live discovery signal.  Other discovery-only sources remain behind
+    # verified reporting, and the section's stale badge still uses 90 minutes.
     freshness_quality = (
-        0 if is_fresh and tier >= 1 else 1 if tier >= 1 else 2 if is_fresh else 3
+        0
+        if is_fresh and tier >= 1
+        else 1
+        if is_current_curated
+        else 2
+        if tier >= 1
+        else 3
+        if is_fresh
+        else 4
     )
+    trusted_heat = _trusted_hn_heat(item, now=now)
     return (
         freshness_quality,
         -tier,
         -_IMPACT_RANK.get(_text(item.get("impact"), 24).lower(), 0),
+        -trusted_heat,
         -_highlight_time(item).timestamp(),
         _text(item.get("story_key"), 80),
     )
 
 
 def _public_item(item: Mapping[str, Any]) -> dict[str, Any]:
-    return {
+    output = {
         key: item[key]
         for key in _PUBLIC_ITEM_FIELDS
         if key in item
     }
+    content_kind = _text(item.get("_content_kind"), 32).lower()
+    if content_kind in _DISCOVERY_KINDS:
+        output["kind"] = content_kind
+    return output
 
 
 def _section_payloads(
@@ -2087,7 +2517,7 @@ def _section_payloads(
         observed = [
             value
             for item in selected[key]
-            if (value := _publication_time(item)) is not None and value <= now
+            if (value := _selection_time(item)) is not None and value <= now
         ]
         as_of = max(observed) if observed else None
         stale = (
@@ -2317,8 +2747,9 @@ def _source_as_of(
             values.append(parsed)
 
     for item in items:
-        if _text(item.get("time_status"), 24).lower() == "verified":
-            append_if_observed(item.get("published_at"))
+        selected_at = _selection_time(item)
+        if selected_at is not None and selected_at <= now:
+            values.append(selected_at)
     if isinstance(macro, Mapping):
         for field in ("timestamp", "created_at"):
             append_if_observed(macro.get(field))

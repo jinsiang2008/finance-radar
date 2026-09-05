@@ -966,6 +966,45 @@
     };
   }
 
+  function dailyItemKind(item) {
+    const explicit = String(item?.kind || "").trim().toLowerCase();
+    if (["hn_story", "ai_digest", "paper_digest"].includes(explicit)) {
+      return explicit;
+    }
+    const source = String(item?.source_label || item?.source || "")
+      .trim()
+      .toLowerCase();
+    if (source === "hacker news" || source === "hn") return "hn_story";
+    if (source === "ai digest") return "ai_digest";
+    if (source === "ai brief") return "paper_digest";
+    return explicit;
+  }
+
+  function dailyPrimarySourceUrl(item) {
+    return safeExternalUrl(item?.original_url || item?.source_url || item?.url);
+  }
+
+  function dailyPublicationIsVerified(item) {
+    if (item?.publication_time_verified === false) return false;
+    const raw = String(item?.published_at || "").trim();
+    if (!raw) return false;
+    if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return true;
+    const parsed = new Date(raw);
+    if (Number.isNaN(parsed.getTime())) return false;
+    return parsed.getTime() <= Date.now() + 5 * 60 * 1000;
+  }
+
+  function dailyHasHnSignal(item) {
+    if (dailyItemKind(item) === "hn_story") return true;
+    const channels = Array.isArray(item?.discovered_via)
+      ? item.discovered_via.map((value) => String(value).toLowerCase())
+      : [];
+    return (
+      channels.some((value) => value.startsWith("hacker_news_")) ||
+      Boolean(item?.discussion_url || item?.hn_id)
+    );
+  }
+
   function fmtDailyDate(value) {
     if (!value) return "日期待确认";
     const raw = String(value);
@@ -1013,13 +1052,25 @@
 
   function dailySourceBadge(item, { compact = false } = {}) {
     const source = dailySourceView(item?.source_tier);
-    const label =
-      source.key === "first_party"
-        ? source.label
-        : String(item?.source_tier_label || source.label).trim();
+    const kind = dailyItemKind(item);
+    const isCommunity = kind === "hn_story";
+    const isCurated = ["ai_digest", "paper_digest"].includes(kind);
+    const label = isCommunity
+      ? "HN 社区热点"
+      : isCurated
+        ? "策展/发现源"
+        : source.key === "first_party"
+          ? source.label
+          : String(item?.source_tier_label || source.label).trim();
     const sourceLabel = String(item?.source_label || item?.source || "").trim();
-    return `<span class="daily-source-badge is-${esc(source.key)}" title="${esc(
-      source.note
+    const note = isCommunity
+      ? "Hacker News 排名、分数与评论反映社区关注度，不代表事实已确认"
+      : isCurated
+        ? "由 AI Digest 或 AI Brief 策展发现；应优先核对其列明的原始来源"
+        : source.note;
+    const sourceClass = isCommunity ? " is-community" : isCurated ? " is-curated" : "";
+    return `<span class="daily-source-badge is-${esc(source.key)}${sourceClass}" title="${esc(
+      note
     )}">${esc(label)}</span>${
       !compact && sourceLabel
         ? `<span class="daily-source-name">${esc(sourceLabel)}</span>`
@@ -1050,12 +1101,119 @@
 
   function dailyTimeHTML(item) {
     const view = dailyDateView(item?.published_at);
-    if (!view) return `<span class="daily-time is-unverified">发布时间待核验</span>`;
+    if (!view || !dailyPublicationIsVerified(item)) {
+      return `<span class="daily-time is-unverified">发布时间待核验</span>`;
+    }
     return `<time class="daily-time"${
       view.datetime ? ` datetime="${esc(view.datetime)}"` : ""
     } title="发布时间 ${esc(view.exact)}（北京时间）">${esc(
       `${view.short} 北京时间${view.relative ? ` · ${view.relative}` : ""}`
     )}</time>`;
+  }
+
+  function dailyCuratedDatesHTML(item) {
+    const kind = dailyItemKind(item);
+    const featured = dailyDateView(item?.featured_at);
+    const published = dailyPublicationIsVerified(item)
+      ? dailyDateView(item?.published_at)
+      : null;
+    if (kind === "ai_digest") {
+      return featured
+        ? `<span class="daily-curated-dates"><time${
+            featured.datetime ? ` datetime="${esc(featured.datetime)}"` : ""
+          } title="AI Digest 收录日期 ${esc(featured.exact)}">简报收录 ${esc(
+            featured.date
+          )}</time></span>`
+        : `<span class="daily-curated-dates"><span class="is-missing">收录日期待核验</span></span>`;
+    }
+    if (kind !== "paper_digest") return "";
+    const featuredHTML = featured
+      ? `<time${featured.datetime ? ` datetime="${esc(featured.datetime)}"` : ""}
+          title="AI Brief 入选日期 ${esc(featured.exact)}">入选简报 ${esc(
+            featured.date
+          )}</time>`
+      : `<span class="is-missing">入选日期待核验</span>`;
+    const publishedHTML = published
+      ? `<time${published.datetime ? ` datetime="${esc(published.datetime)}"` : ""}
+          title="论文原始发布时间 ${esc(published.exact)}">论文发布 ${esc(
+            published.date
+          )}</time>`
+      : `<span class="is-missing">论文发布时间待核验</span>`;
+    return `<span class="daily-curated-dates is-paper" title="简报入选日期与论文原始发布时间是两个不同时间">${featuredHTML}${publishedHTML}<span class="daily-curated-date-note">入选不等于今日发表</span></span>`;
+  }
+
+  function dailyHnSubmittedTimeHTML(item) {
+    const view = dailyPublicationIsVerified(item)
+      ? dailyDateView(item?.published_at)
+      : null;
+    if (!view) {
+      return `<span class="daily-time is-unverified">HN 提交时间待核验</span>`;
+    }
+    return `<time class="daily-time"${
+      view.datetime ? ` datetime="${esc(view.datetime)}"` : ""
+    } title="Hacker News 提交时间 ${esc(view.exact)}（北京时间），不是原文发布时间">${esc(
+      `HN 提交 ${view.short} 北京时间${view.relative ? ` · ${view.relative}` : ""}`
+    )}</time>`;
+  }
+
+  function dailyHnHeatHTML(item, { compact = false } = {}) {
+    if (!dailyHasHnSignal(item)) return "";
+    const popularity = item?.popularity && typeof item.popularity === "object"
+      ? item.popularity
+      : {};
+    const rank = Number(item?.hn_rank ?? popularity.rank);
+    const score = Number(item?.hn_score ?? popularity.score);
+    const comments = Number(item?.hn_comments ?? popularity.comments);
+    const metrics = [];
+    if (Number.isInteger(rank) && rank > 0) metrics.push(`#${rank}`);
+    if (Number.isFinite(score) && score >= 0) metrics.push(`${Math.round(score)} 分`);
+    if (Number.isFinite(comments) && comments >= 0) {
+      metrics.push(`${Math.round(comments)} 评论`);
+    }
+    if (!metrics.length) return "";
+    return `<span class="daily-hn-heat${compact ? " is-compact" : ""}"
+      aria-label="Hacker News 社区热度：${esc(metrics.join("，"))}"
+      title="社区热度只反映 Hacker News 关注度">${
+        compact ? "" : `<span class="daily-hn-heat-label">社区热度</span>`
+      }${metrics.map((metric) => `<b>${esc(metric)}</b>`).join("")}</span>`;
+  }
+
+  function dailyExternalActionsHTML(item) {
+    const kind = dailyItemKind(item);
+    const originalUrl = safeExternalUrl(item?.original_url);
+    const sourceUrl = safeExternalUrl(item?.source_url || item?.url);
+    const discussionUrl = safeExternalUrl(item?.discussion_url);
+    const isCurated = ["ai_digest", "paper_digest"].includes(kind);
+    const curatedOriginalUrl =
+      isCurated && originalUrl && originalUrl !== sourceUrl ? originalUrl : "";
+    const primaryUrl = isCurated
+      ? curatedOriginalUrl || sourceUrl || originalUrl
+      : originalUrl || sourceUrl;
+    const links = [];
+    if (primaryUrl) {
+      const primaryLabel = curatedOriginalUrl
+        ? "打开原始来源"
+        : kind === "hn_story" && discussionUrl === primaryUrl
+          ? "查看 HN 讨论"
+          : isCurated
+            ? "打开策展条目"
+            : "打开原文";
+      links.push(`<a class="daily-source-link" href="${esc(primaryUrl)}" target="_blank"
+        rel="noopener noreferrer">${primaryLabel} <span aria-hidden="true">↗</span></a>`);
+    }
+    if (discussionUrl && discussionUrl !== primaryUrl) {
+      links.push(`<a class="daily-context-link" href="${esc(discussionUrl)}" target="_blank"
+        rel="noopener noreferrer">HN 讨论 <span aria-hidden="true">↗</span></a>`);
+    }
+    if (
+      curatedOriginalUrl &&
+      sourceUrl &&
+      sourceUrl !== curatedOriginalUrl
+    ) {
+      links.push(`<a class="daily-context-link" href="${esc(sourceUrl)}" target="_blank"
+        rel="noopener noreferrer">策展条目 <span aria-hidden="true">↗</span></a>`);
+    }
+    return links.join("");
   }
 
   function dailyInvestorDatesHTML(item) {
@@ -1084,6 +1242,11 @@
   }
 
   function dailyItemTimeHTML(item) {
+    const kind = dailyItemKind(item);
+    if (kind === "hn_story") return dailyHnSubmittedTimeHTML(item);
+    if (["ai_digest", "paper_digest"].includes(kind)) {
+      return dailyCuratedDatesHTML(item);
+    }
     return String(item?.primary_section || "").toLowerCase() === "investors"
       ? dailyInvestorDatesHTML(item)
       : dailyTimeHTML(item);
@@ -1095,7 +1258,7 @@
     const summary = String(item?.summary || "当前仅有标题线索，请先核对原文。").trim();
     const why = String(item?.why_it_matters || "").trim();
     const reason = String(item?.rank_reason || "").trim();
-    const sourceUrl = safeExternalUrl(item?.source_url || item?.url);
+    const sourceUrl = dailyPrimarySourceUrl(item);
     const eventId = Number(item?.id);
     const itemKind = String(item?.kind || "kol_event");
     const canOpenEvidence =
@@ -1104,6 +1267,9 @@
       eventId > 0;
     const relatedRecords = Number(item?.related_records);
     const aiReady = item?.ai_summary_used === true;
+    const curatedSummary = ["ai_digest", "paper_digest"].includes(
+      dailyItemKind(item)
+    );
     const evidenceBasis = String(item?.evidence_basis || "").toLowerCase();
     const basisLabel = {
       official_body: "已读取官方正文",
@@ -1120,6 +1286,7 @@
           <div class="daily-signal-provenance">
             ${dailySourceBadge(item)}
             ${dailyItemTimeHTML(item)}
+            ${dailyHnHeatHTML(item)}
             <span class="daily-impact is-${esc(impact)}">${esc(
               DAILY_IMPACT_LABEL[impact] || DAILY_IMPACT_LABEL.unknown
             )}</span>
@@ -1133,7 +1300,15 @@
         <footer class="daily-signal-footer">
           <div class="daily-evidence-notes">
             ${basisLabel ? `<span>${esc(basisLabel)}</span>` : ""}
-            <span>${aiReady ? "AI 摘要已绑定当前证据" : "当前未采用 AI 摘要"}</span>
+            <span>${
+              curatedSummary
+                ? evidenceBasis === "title_only"
+                  ? "仅有策展标题，本站未二次生成"
+                  : "策展源摘要，本站未二次生成"
+                : aiReady
+                  ? "AI 摘要已绑定当前证据"
+                  : "当前未采用 AI 摘要"
+            }</span>
             ${
               Number.isFinite(relatedRecords) && relatedRecords > 1
                 ? `<span>${relatedRecords} 条关联记录，不代表独立确认</span>`
@@ -1149,12 +1324,7 @@
                      data-event-source-url="${esc(sourceUrl)}">核验证据</button>`
                 : ""
             }
-            ${
-              sourceUrl
-                ? `<a class="daily-source-link" href="${esc(sourceUrl)}" target="_blank"
-                     rel="noopener noreferrer">打开原文 <span aria-hidden="true">↗</span></a>`
-                : `<span class="daily-source-missing">原文链接待补充</span>`
-            }
+            ${dailyExternalActionsHTML(item) || `<span class="daily-source-missing">原文链接待补充</span>`}
           </div>
         </footer>
       </article>
@@ -1171,7 +1341,7 @@
     }
     return `<ol class="daily-firsthand-list">${rows
       .map((item) => {
-        const url = safeExternalUrl(item?.source_url || item?.url);
+        const url = dailyPrimarySourceUrl(item);
         const title = String(item?.title || item?.headline || "标题待补充").trim();
         return `<li>
           <div class="daily-firsthand-marker" aria-hidden="true"></div>
@@ -1254,7 +1424,7 @@
     </div>
     <p class="daily-coverage-note">${
       total > 0
-        ? `本版共使用 ${total} 条重点记录，其中 ${verified} 条发布时间已核验。`
+        ? `本版共使用 ${total} 条重点记录，其中 ${verified} 条时间语义已核验。`
         : "当前没有足够记录计算来源覆盖。"
     } 来源直接性不是事实正确率。</p>`;
   }
@@ -1262,13 +1432,15 @@
   function dailyStoryKey(item) {
     const explicit = String(item?.story_key || "").trim();
     if (explicit) return `story:${explicit}`;
+    const originalUrl = safeExternalUrl(item?.original_url);
+    if (originalUrl) return `original:${originalUrl.split("#")[0]}`;
     const title = String(item?.title || item?.headline || "")
       .normalize("NFKC")
       .toLowerCase()
       .replace(/^(快讯|突发|最新|独家)[：:\s-]*/u, "")
       .replace(/[\s·•，。、“”‘’：:；;！？!?（）()【】\[\]《》<>—–_-]+/gu, "");
     if (title) return `title:${title}`;
-    const url = safeExternalUrl(item?.source_url || item?.url);
+    const url = dailyPrimarySourceUrl(item);
     if (url) return `url:${url.split("#")[0]}`;
     return `${String(item?.kind || "record")}:${String(item?.id || "unknown")}`;
   }
@@ -1293,7 +1465,7 @@
     return (
       sourceRank * 100 +
       (item?.published_at ? 10 : 0) +
-      (safeExternalUrl(item?.source_url || item?.url) ? 2 : 0) +
+      (dailyPrimarySourceUrl(item) ? 2 : 0) +
       (item?.summary ? 1 : 0)
     );
   }
@@ -1532,7 +1704,9 @@
           <div class="daily-overview-copy">
             <div>${dailySourceBadge(item, { compact: true })}${dailyItemTimeHTML(
               sectionItem || item
-            )}<span class="daily-overview-section">${esc(
+            )}${dailyHnHeatHTML(sectionItem || item, {
+              compact: true,
+            })}<span class="daily-overview-section">${esc(
               sectionMeta.label
             )}</span></div>
             <h3>${esc(title)}</h3>
@@ -1555,7 +1729,7 @@
     const title = String(item?.title || item?.headline || "标题待补充").trim();
     const summary = String(item?.summary || "当前仅有标题线索，请先核对原文。").trim();
     const why = String(item?.why_it_matters || "").trim();
-    const sourceUrl = safeExternalUrl(item?.source_url || item?.url);
+    const sourceUrl = dailyPrimarySourceUrl(item);
     const eventId = Number(item?.id);
     const itemKind = String(item?.kind || "kol_event");
     const canOpenEvidence =
@@ -1576,6 +1750,7 @@
         <header>
           <div class="daily-stream-provenance">
             ${dailySourceBadge(item)}${dailyItemTimeHTML(item)}
+            ${dailyHnHeatHTML(item)}
             <span class="daily-impact is-${esc(impact)}">${esc(
               DAILY_IMPACT_LABEL[impact] || DAILY_IMPACT_LABEL.unknown
             )}</span>
@@ -1614,12 +1789,7 @@
                      data-event-source-url="${esc(sourceUrl)}">核验证据</button>`
                 : ""
             }
-            ${
-              sourceUrl
-                ? `<a class="daily-source-link" href="${esc(sourceUrl)}" target="_blank"
-                     rel="noopener noreferrer">打开原文 <span aria-hidden="true">↗</span></a>`
-                : `<span class="daily-source-missing">原文链接待补充</span>`
-            }
+            ${dailyExternalActionsHTML(item) || `<span class="daily-source-missing">原文链接待补充</span>`}
           </div>
         </footer>
       </div>
@@ -1645,7 +1815,7 @@
         </div>
         <div class="daily-stream-health is-${esc(status.key)}">
           <strong>${esc(status.label)}</strong>
-          <span>${section.total_count} 条 · ${section.verified_count} 条发布时间已核验</span>
+          <span>${section.total_count} 条 · ${section.verified_count} 条时间语义已核验</span>
           ${dailySectionTimeHTML(section)}
         </div>
       </header>
