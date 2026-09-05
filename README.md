@@ -24,6 +24,8 @@ Finance Radar 是一个面向投资研究的 FastAPI 仪表盘，组合了 KOL �
 
 - `kol_dashboard/`：FastAPI 应用、前端、采集入口、部署脚本和单元测试。
 - `lib/`：KOL、Serenity、宏观数据与风险雷达采集模块。
+- `research/`：不访问生产数据库的可复现离线研究工具；期权实验室方案与官方
+  指数基线见 [`docs/options-lab-research-v1.md`](docs/options-lab-research-v1.md)。
 - `private/holdings.example.md`：完全虚构的持仓文件格式示例。
 - `data/`、`logs/`、`private/`、`.cache/`：本地运行数据，默认不纳入 Git。
 
@@ -123,7 +125,7 @@ export KOL_DASHBOARD_COOKIE_SECURE=false
 ```bash
 python3 -m unittest discover -s kol_dashboard/tests -v
 python3 -m unittest tests.test_repository_contract -v
-python3 -m compileall -q kol_dashboard lib
+python3 -m compileall -q kol_dashboard lib research
 node --check kol_dashboard/static/app.js
 bash -n kol_dashboard/collect.sh
 bash -n kol_dashboard/run.sh
