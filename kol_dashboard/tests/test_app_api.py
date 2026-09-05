@@ -1504,6 +1504,62 @@ class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(dashboard_app._macro_coverage(), 0.5)
 
+    async def test_macro_api_exposes_market_alerts_without_private_state(self) -> None:
+        generated_at = datetime.now(timezone.utc).isoformat()
+        db.save_macro_snapshot(
+            {
+                "public_schema_version": 1,
+                "timestamp": "2026-09-06T01:00:00+00:00",
+                "composite_risk": {"score": 50, "level": "medium"},
+                "market_alerts": {
+                    "schema_version": 1,
+                    "method_version": "macro-de-risk-trial-v1",
+                    "generated_at": generated_at,
+                    "mode": "trial",
+                    "human_review_required": True,
+                    "automatic_execution": False,
+                    "markets": [
+                        {
+                            "market": "US",
+                            "action": "prepare_reduce",
+                            "risk_level": "medium",
+                            "abstain": False,
+                            "data_status": "ok",
+                            "summary": "等待第二个收盘日确认",
+                            "gates": [],
+                            "account": "PRIVATE-ACCOUNT",
+                            "confirmation": {"reduce_dates": ["2026-09-05"]},
+                        },
+                        {
+                            "market": "CN",
+                            "action": "observe",
+                            "risk_level": "insufficient",
+                            "abstain": True,
+                            "data_status": "insufficient",
+                            "summary": "数据不足",
+                            "gates": [],
+                        },
+                    ],
+                },
+            }
+        )
+
+        response = await self.client.get("/api/macro")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["available"])
+        self.assertEqual(
+            [item["market"] for item in payload["market_alerts"]["markets"]],
+            ["US", "CN"],
+        )
+        self.assertEqual(
+            payload["market_alerts"]["markets"][0]["action"],
+            "prepare_reduce",
+        )
+        self.assertNotIn("confirmation", response.text)
+        self.assertNotIn("PRIVATE-ACCOUNT", response.text)
+
     async def test_macro_api_exposes_only_current_whitelisted_ai_analysis(
         self,
     ) -> None:

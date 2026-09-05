@@ -69,6 +69,7 @@ MARKET_REASON_CODES = frozenset(
         "follow_up_unavailable",
         "insufficient_follow_up",
         "invalid_event_time",
+        "invalid_count",
         "invalid_interval",
         "invalid_range",
         "invalid_timeout",
@@ -107,6 +108,7 @@ _TENCENT_VALUE_RE = re.compile(
     re.IGNORECASE,
 )
 _MARKET_CLOSE_LOCAL = {
+    "America/Chicago": (15, 15),
     "America/New_York": (16, 0),
     "America/Toronto": (16, 0),
     "Asia/Shanghai": (15, 0),
@@ -120,6 +122,7 @@ _US_CLOSING_INDEXES = {
     "INDEX:SPX",
     "INDEX:VIX",
 }
+_CN_CLOSING_INDEXES = {"INDEX:CSI300"}
 
 
 def _split_asset_key(asset_key: Any) -> tuple[str, str] | None:
@@ -346,17 +349,44 @@ def _daily_observation_timestamp(
     asset_key: Any,
     interval: str,
     exchange_timezone: Any,
-) -> tuple[int, str]:
+) -> tuple[int | None, str]:
     canonical_asset = str(asset_key or "").strip().upper()
     timezone_name = str(exchange_timezone or "").strip()
+    if (
+        str(interval or "").strip().lower() == "1d"
+        and canonical_asset.startswith("FX:")
+    ):
+        try:
+            provider_zone = ZoneInfo(timezone_name or "UTC")
+            trading_day = datetime.fromtimestamp(
+                timestamp,
+                tz=provider_zone,
+            ).date()
+            if trading_day.weekday() >= 5:
+                return None, "market_close"
+            new_york = ZoneInfo("America/New_York")
+            close_at = datetime.combine(
+                trading_day,
+                datetime_time(17, 0),
+                tzinfo=new_york,
+            )
+        except (KeyError, ValueError, OverflowError, OSError):
+            return timestamp, "provider"
+        return int(close_at.astimezone(timezone.utc).timestamp()), "market_close"
     is_known_equity_session = (
         (
             canonical_asset.startswith("US:")
-            or canonical_asset in _US_CLOSING_INDEXES
+            and timezone_name == "America/New_York"
         )
-        and timezone_name == "America/New_York"
+        or (
+            canonical_asset in _US_CLOSING_INDEXES
+            and timezone_name in {"America/New_York", "America/Chicago"}
+        )
     ) or (
-        canonical_asset.startswith("CN:")
+        (
+            canonical_asset.startswith("CN:")
+            or canonical_asset in _CN_CLOSING_INDEXES
+        )
         and timezone_name == "Asia/Shanghai"
     )
     if str(interval or "").strip().lower() != "1d" or not is_known_equity_session:
@@ -447,6 +477,8 @@ def parse_yahoo_chart(
             interval,
             meta.get("exchangeTimezoneName"),
         )
+        if timestamp is None:
+            continue
         if semantics == "market_close":
             timestamp_semantics = semantics
         volume = (
@@ -478,6 +510,99 @@ def parse_yahoo_chart(
         "currency": meta.get("currency"),
         "exchange_timezone": meta.get("exchangeTimezoneName"),
         "timestamp_semantics": timestamp_semantics,
+        "bars": bars,
+    }
+
+
+def parse_tencent_daily_history(
+    payload: Any,
+    *,
+    asset_key: str = "INDEX:CSI300",
+    symbol: str = "sh000300",
+) -> dict[str, Any]:
+    """Parse Tencent's bounded daily k-line response for the CSI 300.
+
+    Tencent rows use ``date, open, close, high, low, volume``.  Only the one
+    explicitly configured index is accepted; this adapter must not guess a
+    symbol or silently proxy another market.
+    """
+    if asset_key != "INDEX:CSI300" or symbol != "sh000300":
+        return _unavailable(
+            "tencent",
+            asset_key=asset_key,
+            symbol=symbol,
+            reason="unsupported_asset",
+            bars=True,
+        )
+    try:
+        decoded = _decode_json_payload(payload)
+        instrument = decoded["data"][symbol]
+        rows = instrument.get("day") or instrument.get("qfqday")
+        if not isinstance(rows, list):
+            raise ValueError("daily rows are missing")
+    except (
+        AttributeError,
+        KeyError,
+        TypeError,
+        ValueError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ) as exc:
+        return _unavailable(
+            "tencent",
+            asset_key=asset_key,
+            symbol=symbol,
+            reason=f"bad_payload:{type(exc).__name__}",
+            bars=True,
+        )
+
+    bars_by_timestamp: dict[int, dict[str, Any]] = {}
+    shanghai = ZoneInfo("Asia/Shanghai")
+    for row in rows:
+        if not isinstance(row, list) or len(row) < 3:
+            continue
+        try:
+            trading_day = date.fromisoformat(str(row[0]).strip())
+        except ValueError:
+            continue
+        close = _safe_float(row[2], minimum=0.000000000001, maximum=1e15)
+        if close is None:
+            continue
+        observed = datetime.combine(
+            trading_day,
+            datetime_time(15, 0),
+            tzinfo=shanghai,
+        ).astimezone(timezone.utc)
+        volume = (
+            _safe_float(row[5], minimum=0, maximum=1e20)
+            if len(row) > 5
+            else None
+        )
+        timestamp = int(observed.timestamp())
+        bars_by_timestamp[timestamp] = {
+            "timestamp": timestamp,
+            "close": close,
+            "volume": volume,
+        }
+    bars = [bars_by_timestamp[key] for key in sorted(bars_by_timestamp)]
+    if not bars:
+        return _unavailable(
+            "tencent",
+            asset_key=asset_key,
+            symbol=symbol,
+            reason="no_valid_bars",
+            bars=True,
+        )
+    return {
+        "status": "available",
+        "provider": "tencent",
+        "asset_key": asset_key,
+        "price_asset_key": asset_key,
+        "proxy_for": None,
+        "symbol": symbol,
+        "currency": "CNY",
+        "exchange_timezone": "Asia/Shanghai",
+        "timestamp_semantics": "market_close",
         "bars": bars,
     }
 
@@ -616,6 +741,62 @@ def fetch_yahoo_history(
                 reason=f"request_failed:{type(exc).__name__}",
                 bars=True,
             )
+        )
+
+
+def fetch_tencent_daily_history(
+    asset_key: str,
+    *,
+    count: Any = 120,
+    opener: Callable[..., Any] | Any = None,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Fetch a bounded CSI 300 daily history as the domestic fallback."""
+    if asset_key != "INDEX:CSI300":
+        return _unavailable(
+            "tencent",
+            asset_key=asset_key,
+            reason="unsupported_asset",
+            bars=True,
+        )
+    timeout_value = _safe_float(timeout, minimum=0.001, maximum=60.0)
+    if timeout_value is None:
+        return _unavailable(
+            "tencent",
+            asset_key=asset_key,
+            symbol="sh000300",
+            reason="invalid_timeout",
+            bars=True,
+        )
+    count_value = _safe_float(count, minimum=60, maximum=240)
+    if count_value is None or int(count_value) != count_value:
+        return _unavailable(
+            "tencent",
+            asset_key=asset_key,
+            symbol="sh000300",
+            reason="invalid_count",
+            bars=True,
+        )
+    query = urllib.parse.urlencode(
+        {"param": f"sh000300,day,,,{int(count_value)},qfq"}
+    )
+    request = urllib.request.Request(
+        "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?" + query,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "kol-dashboard-market-validation/1.0",
+        },
+    )
+    try:
+        body = _call_opener(opener or urllib.request.urlopen, request, timeout_value)
+        return parse_tencent_daily_history(body)
+    except Exception:
+        return _unavailable(
+            "tencent",
+            asset_key=asset_key,
+            symbol="sh000300",
+            reason="request_failed",
+            bars=True,
         )
 
 

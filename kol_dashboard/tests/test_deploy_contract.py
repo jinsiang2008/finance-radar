@@ -34,6 +34,7 @@ class DeploymentContractTests(unittest.TestCase):
             "market_data.py",
             "portfolio.py",
             "relation_engine.py",
+            "macro_alert_service.py",
             "macro_collect.py",
             "llm_enrichment.py",
             "enrichment_collect.py",

@@ -118,6 +118,110 @@ class MarketParsingTests(unittest.TestCase):
         self.assertEqual(result["bars"][1]["close"], 102.5)
         self.assertEqual(result["bars"][1]["volume"], 30.0)
 
+    def test_csi300_daily_bar_uses_completed_shanghai_close_semantics(self) -> None:
+        raw_timestamp = int(
+            datetime(2026, 9, 4, 0, 0, tzinfo=timezone.utc).timestamp()
+        )
+        payload = {
+            "chart": {
+                "result": [
+                    {
+                        "meta": {
+                            "currency": "CNY",
+                            "exchangeTimezoneName": "Asia/Shanghai",
+                        },
+                        "timestamp": [raw_timestamp],
+                        "indicators": {
+                            "quote": [{"close": [4000.0], "volume": [5]}]
+                        },
+                    }
+                ],
+                "error": None,
+            }
+        }
+
+        result = market_data.parse_yahoo_chart(
+            payload,
+            asset_key="INDEX:CSI300",
+            symbol="000300.SS",
+            interval="1d",
+        )
+
+        expected = int(
+            datetime(2026, 9, 4, 7, 0, tzinfo=timezone.utc).timestamp()
+        )
+        self.assertEqual(result["bars"][0]["timestamp"], expected)
+        self.assertEqual(result["timestamp_semantics"], "market_close")
+
+    def test_parses_tencent_csi300_daily_history_with_close_timestamps(self) -> None:
+        payload = {
+            "code": 0,
+            "data": {
+                "sh000300": {
+                    "day": [
+                        ["2026-09-03", "4570", "4552.58", "4585", "4536", "10"],
+                        ["bad-date", "1", "2", "3", "0", "4"],
+                        ["2026-09-04", "4575", "4548.05", "4602", "4530", "20"],
+                    ]
+                }
+            },
+        }
+
+        result = market_data.parse_tencent_daily_history(payload)
+
+        self.assertEqual(result["status"], "available")
+        self.assertEqual(result["provider"], "tencent")
+        self.assertEqual(result["symbol"], "sh000300")
+        self.assertEqual(result["currency"], "CNY")
+        self.assertEqual(result["timestamp_semantics"], "market_close")
+        self.assertEqual([bar["close"] for bar in result["bars"]], [4552.58, 4548.05])
+        self.assertEqual(
+            result["bars"][-1]["timestamp"],
+            int(datetime(2026, 9, 4, 7, 0, tzinfo=timezone.utc).timestamp()),
+        )
+
+    def test_fetches_tencent_csi300_history_with_injected_opener(self) -> None:
+        payload = {
+            "code": 0,
+            "data": {
+                "sh000300": {
+                    "day": [
+                        ["2026-09-04", "4575", "4548.05", "4602", "4530", "20"]
+                    ]
+                }
+            },
+        }
+        calls = []
+
+        def opener(request, timeout):
+            calls.append((request.full_url, timeout))
+            return _Response(json.dumps(payload).encode("utf-8"))
+
+        result = market_data.fetch_tencent_daily_history(
+            "INDEX:CSI300",
+            count=120,
+            opener=opener,
+            timeout=2.0,
+        )
+
+        self.assertEqual(result["status"], "available")
+        self.assertIn("web.ifzq.gtimg.cn/appstock/app/fqkline/get", calls[0][0])
+        self.assertIn("sh000300%2Cday%2C%2C%2C120%2Cqfq", calls[0][0])
+        self.assertEqual(calls[0][1], 2.0)
+
+        unsupported = market_data.fetch_tencent_daily_history(
+            "CN:600519",
+            opener=opener,
+        )
+        invalid_count = market_data.fetch_tencent_daily_history(
+            "INDEX:CSI300",
+            count=12,
+            opener=opener,
+        )
+        self.assertEqual(unsupported["reason_code"], "unsupported_asset")
+        self.assertEqual(invalid_count["reason_code"], "invalid_count")
+        self.assertEqual(len(calls), 1)
+
     def test_yahoo_parser_prefers_adjusted_close_and_fails_closed(self) -> None:
         payload = {
             "chart": {
@@ -190,6 +294,82 @@ class MarketParsingTests(unittest.TestCase):
         self.assertEqual(
             result["bars"][0]["timestamp"],
             int(datetime(2026, 1, 2, 21, tzinfo=timezone.utc).timestamp()),
+        )
+        self.assertEqual(result["timestamp_semantics"], "market_close")
+
+    def test_vix_daily_bar_uses_completed_chicago_close_semantics(self) -> None:
+        raw_timestamp = int(
+            datetime(2026, 9, 4, 7, 0, tzinfo=timezone.utc).timestamp()
+        )
+        payload = {
+            "chart": {
+                "result": [
+                    {
+                        "meta": {
+                            "currency": "USD",
+                            "exchangeTimezoneName": "America/Chicago",
+                        },
+                        "timestamp": [raw_timestamp],
+                        "indicators": {
+                            "quote": [{"close": [14.53], "volume": [0]}]
+                        },
+                    }
+                ],
+                "error": None,
+            }
+        }
+
+        result = market_data.parse_yahoo_chart(
+            payload,
+            asset_key="INDEX:VIX",
+            symbol="^VIX",
+            interval="1d",
+        )
+
+        expected = int(
+            datetime(2026, 9, 4, 20, 15, tzinfo=timezone.utc).timestamp()
+        )
+        self.assertEqual(result["bars"][0]["timestamp"], expected)
+        self.assertEqual(result["timestamp_semantics"], "market_close")
+
+    def test_fx_daily_bar_uses_new_york_close_and_drops_weekend_quote(self) -> None:
+        friday_marker = int(
+            datetime(2026, 9, 3, 23, 0, tzinfo=timezone.utc).timestamp()
+        )
+        weekend_quote = int(
+            datetime(2026, 9, 5, 16, 4, tzinfo=timezone.utc).timestamp()
+        )
+        payload = {
+            "chart": {
+                "result": [
+                    {
+                        "meta": {
+                            "currency": "CNY",
+                            "exchangeTimezoneName": "Europe/London",
+                        },
+                        "timestamp": [friday_marker, weekend_quote],
+                        "indicators": {
+                            "quote": [
+                                {"close": [6.72, 6.70], "volume": [0, 0]}
+                            ]
+                        },
+                    }
+                ],
+                "error": None,
+            }
+        }
+
+        result = market_data.parse_yahoo_chart(
+            payload,
+            asset_key="FX:USD/CNY",
+            symbol="CNY=X",
+            interval="1d",
+        )
+
+        self.assertEqual(len(result["bars"]), 1)
+        self.assertEqual(
+            result["bars"][0]["timestamp"],
+            int(datetime(2026, 9, 4, 21, 0, tzinfo=timezone.utc).timestamp()),
         )
         self.assertEqual(result["timestamp_semantics"], "market_close")
 

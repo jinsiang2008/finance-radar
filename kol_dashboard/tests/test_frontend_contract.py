@@ -249,10 +249,10 @@ class FrontendContractTests(unittest.TestCase):
         self.assertNotIn("DIRECT SOURCES", self.javascript)
         self.assertNotIn("NEXT CHECK", self.javascript)
 
-    def test_daily_assets_share_the_v33_cachebuster(self) -> None:
-        self.assertIn('static/app.js?v=33', self.html)
-        self.assertIn('static/style.css?v=33', self.html)
-        self.assertEqual(self.html.count("?v=33"), 2)
+    def test_daily_assets_share_the_v34_cachebuster(self) -> None:
+        self.assertIn('static/app.js?v=34', self.html)
+        self.assertIn('static/style.css?v=34', self.html)
+        self.assertEqual(self.html.count("?v=34"), 2)
         self.assertNotIn("?v=26", self.html)
 
     def test_other_views_share_the_daily_editorial_reading_system(self) -> None:
@@ -473,8 +473,8 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn('stale ? "数据延迟" : ""', self.javascript)
         self.assertIn('"高收益债利差"', self.javascript)
         self.assertIn("cs.hy_oas", self.javascript)
-        self.assertIn('static/app.js?v=33', self.html)
-        self.assertIn('static/style.css?v=33', self.html)
+        self.assertIn('static/app.js?v=34', self.html)
+        self.assertIn('static/style.css?v=34', self.html)
         self.assertNotIn('?v=26', self.html)
         self.assertIn(".metric.is-stale", self.css)
 
@@ -1277,6 +1277,88 @@ class FrontendContractTests(unittest.TestCase):
             "if (state.decisionData) renderDecisionHero(state.decisionData)",
             self.javascript,
         )
+
+    def test_macro_position_alerts_are_between_hero_and_trend(self) -> None:
+        hero = self.html.index('id="macro-hero"')
+        alerts = self.html.index('id="macro-alerts-block"')
+        trend = self.html.index('id="macro-trend-block"')
+        self.assertLess(hero, alerts)
+        self.assertLess(alerts, trend)
+        self.assertIn('id="macro-alerts-title"', self.html)
+        self.assertIn("减仓与清仓预警", self.html)
+        self.assertIn("规则试运行", self.html)
+        self.assertIn("所有候选行动均需人工确认，系统不会执行任何订单", self.html)
+        self.assertIn('id="macro-alert-live-status" role="status"', self.html)
+        alerts_host = self.html[
+            self.html.index('id="macro-alerts"') :
+            self.html.index('id="macro-alert-live-status"')
+        ]
+        self.assertNotIn("aria-live", alerts_host)
+
+    def test_macro_position_alerts_render_only_the_strict_public_contract(
+        self,
+    ) -> None:
+        self.assertIn("function renderMarketAlerts(payload)", self.javascript)
+        self.assertIn("renderMarketAlerts(d.market_alerts)", self.javascript)
+        self.assertNotIn("renderMarketAlerts(d)", self.javascript)
+        for contract_check in (
+            'payload.schema_version === 1',
+            'payload.method_version === "macro-de-risk-trial-v1"',
+            'payload.mode === "trial"',
+            'payload.human_review_required === true',
+            'payload.automatic_execution === false',
+            'candidate?.market === marketCode',
+        ):
+            self.assertIn(contract_check, self.javascript)
+        for action in (
+            "observe",
+            "prepare_reduce",
+            "reduce_candidate",
+            "exit_candidate",
+        ):
+            self.assertIn(f'key: "{action}"', self.javascript)
+        for field in (
+            "gate_progress",
+            "gates",
+            "triggered_signals",
+            "counter_signals",
+            "upgrade_conditions",
+            "invalidation_conditions",
+            "missing_sources",
+            "rule_version",
+        ):
+            self.assertIn(f"market.{field}", self.javascript)
+        render_start = self.javascript.index("function renderMarketAlerts(payload)")
+        render_end = self.javascript.index("function renderHero(d)", render_start)
+        render_contract = self.javascript[render_start:render_end]
+        self.assertNotIn("composite_risk", render_contract)
+        self.assertNotIn("market_data", render_contract)
+
+    def test_macro_position_alerts_fail_closed_and_are_accessible(self) -> None:
+        for copy in (
+            "预警数据尚未形成，等待下一次宏观采集",
+            "暂不形成减仓或清仓判断",
+            "证据不足，系统保持观望",
+            "触发证据",
+            "反向证据",
+            "升级条件",
+            "解除条件",
+            "时间待核验",
+        ):
+            self.assertIn(copy, self.javascript)
+        self.assertIn("macroAlertAnnouncementSignature: null", self.javascript)
+        self.assertIn(
+            "if (state.macroAlertAnnouncementSignature === signature) return",
+            self.javascript,
+        )
+        self.assertIn('aria-current="step"', self.javascript)
+        self.assertIn('rel="noopener noreferrer"', self.javascript)
+        self.assertIn("safeExternalUrl(signal.source_url)", self.javascript)
+        self.assertIn(".macro-alert-grid {", self.css)
+        self.assertIn("grid-template-columns: repeat(2, minmax(0, 1fr))", self.css)
+        self.assertIn(".macro-alert-grid { grid-template-columns: 1fr; }", self.css)
+        self.assertIn(".macro-alert-evidence > summary {", self.css)
+        self.assertIn("min-height: 44px", self.css)
 
     def test_decision_queue_and_matrix_default_to_priority_slices(self) -> None:
         self.assertIn("decisionQueueExpanded: false", self.javascript)

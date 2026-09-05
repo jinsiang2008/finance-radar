@@ -35,6 +35,7 @@
     watchAssets: new Set(),
     macroData: null,
     macroHistory: [],
+    macroAlertAnnouncementSignature: null,
     macroRequestGeneration: 0,
     macroHistoryRequestGeneration: 0,
     stats: null,
@@ -4707,6 +4708,395 @@
 
   // ─── Macro view ───────────────────────────
 
+  const MACRO_ALERT_STAGES = [
+    { key: "observe", label: "观察" },
+    { key: "prepare_reduce", label: "减仓准备" },
+    { key: "reduce_candidate", label: "减仓候选" },
+    { key: "exit_candidate", label: "清仓候选" },
+  ];
+  const MACRO_ALERT_ACTIONS = new Set(
+    MACRO_ALERT_STAGES.map((stage) => stage.key)
+  );
+  const MACRO_ALERT_GATE_STATUS = {
+    met: "已满足",
+    partial: "部分满足",
+    unmet: "未满足",
+    unavailable: "数据不可用",
+  };
+  const MACRO_ALERT_DATA_STATUS = {
+    ok: "数据正常",
+    fresh: "数据正常",
+    partial: "数据不完整",
+    stale: "数据延迟",
+    insufficient: "数据不足",
+    unavailable: "数据不可用",
+  };
+  const MACRO_ALERT_RISK_LEVEL = {
+    insufficient: "证据不足",
+    unknown: "风险待核验",
+    low: "风险较低",
+    elevated: "风险抬升",
+    medium: "中等风险",
+    high: "高风险",
+    critical: "极高风险",
+  };
+  const MACRO_ALERT_SEVERITY = {
+    watch: "关注",
+    strong: "强信号",
+    critical: "临界信号",
+  };
+  const MACRO_ALERT_TIME_BASIS = {
+    observed_at: "观测",
+    source_observed: "观测",
+    market_close: "收盘",
+    completed_market_close: "收盘",
+    official_release: "发布",
+    official_daily_observation: "官方观测",
+    fetched_at: "采集",
+    collector_snapshot: "采集",
+  };
+
+  function macroAlertText(value) {
+    return typeof value === "string" || typeof value === "number"
+      ? String(value)
+      : "";
+  }
+
+  function macroAlertTime(value) {
+    const raw = macroAlertText(value).trim();
+    if (!raw) return null;
+    const parsed = new Date(raw);
+    if (Number.isNaN(parsed.getTime())) return null;
+    return {
+      datetime: parsed.toISOString(),
+      label: `${fmtBeijingDateTime(parsed.toISOString())} 北京时间`,
+    };
+  }
+
+  function macroAlertList(value, limit = 8) {
+    return Array.isArray(value)
+      ? value
+          .filter((item) => typeof item === "string" && item.trim())
+          .slice(0, limit)
+      : [];
+  }
+
+  function isMacroAlertContract(payload) {
+    return Boolean(
+      payload &&
+        typeof payload === "object" &&
+        payload.schema_version === 1 &&
+        payload.method_version === "macro-de-risk-trial-v1" &&
+        payload.mode === "trial" &&
+        payload.human_review_required === true &&
+        payload.automatic_execution === false &&
+        Array.isArray(payload.markets)
+    );
+  }
+
+  function macroAlertStageRail(action, active = true) {
+    const activeIndex = MACRO_ALERT_STAGES.findIndex(
+      (stage) => stage.key === action
+    );
+    return `<ol class="macro-alert-stage-rail" aria-label="仓位风险预警四级轨道">
+      ${MACRO_ALERT_STAGES.map((stage, index) => {
+        const current = active && index === activeIndex;
+        const past = active && activeIndex >= 0 && index < activeIndex;
+        return `<li class="macro-alert-stage ${current ? "is-current" : ""} ${
+          past ? "is-past" : ""
+        }" ${current ? 'aria-current="step"' : ""}>
+          <span class="macro-alert-stage-dot" aria-hidden="true"></span>
+          <span>${esc(stage.label)}</span>
+        </li>`;
+      }).join("")}
+    </ol>`;
+  }
+
+  function macroAlertPlaceholder(market, reason) {
+    const label = market === "US" ? "美股" : "A股";
+    return `<article class="macro-alert-card is-placeholder" data-market="${esc(
+      market
+    )}">
+      <header class="macro-alert-card-head">
+        <div><span class="macro-alert-market-code">${esc(market)}</span><h3>${esc(
+          label
+        )}</h3></div>
+        <span class="macro-alert-action is-waiting">等待采集</span>
+      </header>
+      ${macroAlertStageRail("", false)}
+      <div class="macro-alert-abstain" role="note">
+        <strong>暂不形成减仓或清仓判断</strong>
+        <span>${esc(reason)}</span>
+      </div>
+    </article>`;
+  }
+
+  function macroAlertConditions(title, items, className) {
+    const conditions = macroAlertList(items);
+    return `<section class="macro-alert-condition ${esc(className)}">
+      <h4>${esc(title)}</h4>
+      ${conditions.length
+        ? `<ul>${conditions.map((item) => `<li>${esc(item)}</li>`).join("")}</ul>`
+        : `<p>本轮未提供可核验条件。</p>`}
+    </section>`;
+  }
+
+  function macroAlertSignals(title, value, kind) {
+    const allowedSeverities = new Set(["watch", "strong", "critical"]);
+    const signals = Array.isArray(value)
+      ? value
+          .filter((signal) => signal && typeof signal === "object")
+          .slice(0, 12)
+      : [];
+    if (!signals.length) {
+      return `<section class="macro-alert-signal-section is-empty">
+        <h4>${esc(title)}</h4><p>本轮没有可展示的${esc(title)}。</p>
+      </section>`;
+    }
+    return `<section class="macro-alert-signal-section">
+      <h4>${esc(title)}</h4>
+      <ul class="macro-alert-signal-list">${signals
+        .map((signal) => {
+          const severity = allowedSeverities.has(signal.severity)
+            ? signal.severity
+            : "watch";
+          const sourceUrl = safeExternalUrl(signal.source_url);
+          const observed = macroAlertTime(signal.observed_at);
+          const basis = MACRO_ALERT_TIME_BASIS[signal.time_basis] || "时间";
+          const valueText = macroAlertText(signal.value);
+          const unit = macroAlertText(signal.unit);
+          const threshold = macroAlertText(signal.threshold);
+          return `<li class="macro-alert-signal is-${esc(severity)} is-${esc(kind)}">
+            <div class="macro-alert-signal-head">
+              <span class="macro-alert-signal-severity">${esc(
+                MACRO_ALERT_SEVERITY[severity]
+              )}</span>
+              <strong>${esc(macroAlertText(signal.label) || "未命名证据")}</strong>
+              ${macroAlertText(signal.pillar)
+                ? `<span class="macro-alert-pillar">${esc(
+                    macroAlertText(signal.pillar)
+                  )}</span>`
+                : ""}
+            </div>
+            ${macroAlertText(signal.detail) ? `<p>${esc(macroAlertText(signal.detail))}</p>` : ""}
+            <div class="macro-alert-signal-meta">
+              ${valueText ? `<span>观测值 ${esc(valueText)}${unit ? ` ${esc(unit)}` : ""}</span>` : ""}
+              ${threshold ? `<span>规则 ${esc(threshold)}</span>` : ""}
+              ${observed
+                ? `<time datetime="${esc(observed.datetime)}">${esc(basis)}于 ${esc(
+                    observed.label
+                  )}</time>`
+                : `<span>时间待核验</span>`}
+              ${sourceUrl
+                ? `<a href="${esc(sourceUrl)}" target="_blank" rel="noopener noreferrer">${esc(
+                    macroAlertText(signal.source) || "查看来源"
+                  )} ↗</a>`
+                : `<span>${esc(macroAlertText(signal.source) || "来源待核验")}</span>`}
+            </div>
+          </li>`;
+        })
+        .join("")}</ul>
+    </section>`;
+  }
+
+  function macroAlertGates(value, progress) {
+    const allowedStatuses = new Set(Object.keys(MACRO_ALERT_GATE_STATUS));
+    const gates = Array.isArray(value)
+      ? value
+          .filter((gate) => gate && typeof gate === "object")
+          .slice(0, 8)
+      : [];
+    const met = Number.isInteger(progress?.met) ? progress.met : null;
+    const total = Number.isInteger(progress?.total) ? progress.total : null;
+    const progressLabel = met !== null && total !== null
+      ? `${met} / ${total} 个闸门满足`
+      : "闸门进度待核验";
+    return `<div class="macro-alert-gates">
+      <div class="macro-alert-gates-head"><h4>行动闸门</h4><span>${esc(progressLabel)}</span></div>
+      ${gates.length
+        ? `<ul>${gates.map((gate) => {
+            const status = allowedStatuses.has(gate.status)
+              ? gate.status
+              : "unavailable";
+            return `<li class="macro-alert-gate is-${esc(status)}">
+              <span class="macro-alert-gate-mark" aria-hidden="true"></span>
+              <div><strong>${esc(macroAlertText(gate.label) || "未命名闸门")}</strong>
+              <span>${esc(MACRO_ALERT_GATE_STATUS[status])}${macroAlertText(gate.detail)
+                ? ` · ${esc(macroAlertText(gate.detail))}`
+                : ""}</span></div>
+            </li>`;
+          }).join("")}</ul>`
+        : `<p class="macro-alert-gates-empty">本轮闸门数据不可用，不能形成行动判断。</p>`}
+    </div>`;
+  }
+
+  function macroAlertCard(market, alertPayload) {
+    const marketCode = market.market;
+    const expectedLabel = marketCode === "US" ? "美股" : "A股";
+    const action = MACRO_ALERT_ACTIONS.has(market.action) ? market.action : "";
+    if (!action) {
+      return macroAlertPlaceholder(marketCode, "行动字段未通过契约校验，等待下一轮重新采集。");
+    }
+    const abstain = market.abstain === true;
+    const dataStatusKey = Object.prototype.hasOwnProperty.call(
+      MACRO_ALERT_DATA_STATUS,
+      market.data_status
+    )
+      ? market.data_status
+      : "unknown";
+    const dataStatus = MACRO_ALERT_DATA_STATUS[market.data_status] || "状态待核验";
+    const dataAsOf = macroAlertTime(market.data_as_of);
+    const nextEvaluation = macroAlertTime(market.next_evaluation_at);
+    const generatedAt = macroAlertTime(alertPayload.generated_at);
+    const riskLabel = MACRO_ALERT_RISK_LEVEL[market.risk_level] || "风险待核验";
+    const missingSources = macroAlertList(market.missing_sources, 12);
+    const summary = macroAlertText(market.summary) || "本轮未提供判断摘要。";
+    const actionLabel = abstain
+      ? "数据不足 · 等待复核"
+      : macroAlertText(market.action_label) ||
+        MACRO_ALERT_STAGES.find((stage) => stage.key === action)?.label ||
+        "观察";
+
+    return `<article class="macro-alert-card action-${esc(action)} ${
+      abstain ? "is-abstaining" : ""
+    }" data-market="${esc(marketCode)}">
+      <header class="macro-alert-card-head">
+        <div><span class="macro-alert-market-code">${esc(marketCode)}</span><h3>${esc(
+          macroAlertText(market.label) || expectedLabel
+        )}</h3></div>
+        <div class="macro-alert-card-status">
+          <span class="macro-alert-risk">${esc(riskLabel)}</span>
+          <span class="macro-alert-data-status is-${esc(dataStatusKey)}">${esc(
+            dataStatus
+          )}</span>
+        </div>
+      </header>
+      ${macroAlertStageRail(action, !abstain)}
+      <div class="macro-alert-verdict">
+        <span>当前预警</span><strong>${esc(actionLabel)}</strong>
+        <p>${esc(summary)}</p>
+      </div>
+      ${abstain
+        ? `<div class="macro-alert-abstain" role="note">
+            <strong>证据不足，系统保持观望</strong>
+            <span>当前数据不能支持减仓或清仓候选；请等待缺失来源恢复并人工复核。</span>
+          </div>`
+        : ""}
+      ${missingSources.length
+        ? `<p class="macro-alert-missing"><strong>缺失来源</strong> ${missingSources
+            .map((source) => esc(source))
+            .join("、")}</p>`
+        : ""}
+      ${macroAlertGates(market.gates, market.gate_progress)}
+      <details class="macro-alert-evidence">
+        <summary>
+          <span>展开证据、反向信号与条件</span>
+          <span class="macro-alert-disclosure-mark" aria-hidden="true">＋</span>
+        </summary>
+        <div class="macro-alert-evidence-body">
+          ${macroAlertSignals("触发证据", market.triggered_signals, "trigger")}
+          ${macroAlertSignals("反向证据", market.counter_signals, "counter")}
+          <div class="macro-alert-condition-grid">
+            ${macroAlertConditions("升级条件", market.upgrade_conditions, "is-upgrade")}
+            ${macroAlertConditions("解除条件", market.invalidation_conditions, "is-invalidation")}
+          </div>
+          <dl class="macro-alert-audit">
+            <div><dt>数据截至</dt><dd>${dataAsOf
+              ? `<time datetime="${esc(dataAsOf.datetime)}">${esc(dataAsOf.label)}</time>`
+              : "时间待核验"}</dd></div>
+            <div><dt>下次复核</dt><dd>${nextEvaluation
+              ? `<time datetime="${esc(nextEvaluation.datetime)}">${esc(nextEvaluation.label)}</time>`
+              : "由下一份小时快照复核"}</dd></div>
+            <div><dt>引擎生成</dt><dd>${generatedAt
+              ? `<time datetime="${esc(generatedAt.datetime)}">${esc(generatedAt.label)}</time>`
+              : "时间待核验"}</dd></div>
+            <div><dt>规则版本</dt><dd>${esc(macroAlertText(market.rule_version) || "版本待核验")}</dd></div>
+            <div><dt>方法版本</dt><dd>${esc(macroAlertText(alertPayload.method_version) || "版本待核验")}</dd></div>
+          </dl>
+        </div>
+      </details>
+    </article>`;
+  }
+
+  function announceMacroAlertChange(markets, signatureState) {
+    const signature = signatureState || markets
+      .map((market) =>
+        [
+          market.market,
+          market.action,
+          market.risk_level,
+          market.abstain,
+          market.data_status,
+        ].join(":")
+      )
+      .join("|");
+    if (state.macroAlertAnnouncementSignature === null) {
+      state.macroAlertAnnouncementSignature = signature;
+      return;
+    }
+    if (state.macroAlertAnnouncementSignature === signature) return;
+    state.macroAlertAnnouncementSignature = signature;
+    const live = $("#macro-alert-live-status");
+    if (!live) return;
+    live.textContent = signatureState
+      ? "仓位风险预警状态已变化，请查看美股与 A 股预警卡。"
+      : `仓位风险预警已更新：${markets
+          .map((market) => {
+            const label = market.market === "US" ? "美股" : "A股";
+            const action = market.abstain === true
+              ? "数据不足，等待复核"
+              : macroAlertText(market.action_label) || "状态已更新";
+            return `${label}${action}`;
+          })
+          .join("；")}。`;
+  }
+
+  function renderMarketAlerts(payload) {
+    const host = $("#macro-alerts");
+    if (!host) return;
+    if (!payload) {
+      host.innerHTML = ["US", "CN"]
+        .map((market) =>
+          macroAlertPlaceholder(
+            market,
+            "当前为旧版宏观快照，预警数据尚未形成，等待下一次宏观采集。"
+          )
+        )
+        .join("");
+      announceMacroAlertChange([], "legacy-snapshot");
+      return;
+    }
+    if (!isMacroAlertContract(payload)) {
+      host.innerHTML = ["US", "CN"]
+        .map((market) =>
+          macroAlertPlaceholder(
+            market,
+            "预警安全边界字段未通过校验，本轮不展示行动，等待下一次宏观采集。"
+          )
+        )
+        .join("");
+      announceMacroAlertChange([], "invalid-contract");
+      return;
+    }
+    const markets = ["US", "CN"].map((marketCode) => {
+      const item = payload.markets.find(
+        (candidate) => candidate?.market === marketCode
+      );
+      return item && typeof item === "object" ? item : null;
+    });
+    host.innerHTML = markets
+      .map((market, index) =>
+        market
+          ? macroAlertCard(market, payload)
+          : macroAlertPlaceholder(
+              index === 0 ? "US" : "CN",
+              "该市场的预警数据缺失，等待下一次宏观采集。"
+            )
+      )
+      .join("");
+    announceMacroAlertChange(markets.filter(Boolean));
+  }
+
   function renderHero(d) {
     const cr = d.composite_risk || {};
     const level = cr.level || "unknown";
@@ -5566,8 +5956,10 @@
         <span class="empty-icon">📡</span>${esc(d.reason || "暂无宏观快照")}
         <div class="empty-hint">首次采集约需 45 秒</div>
       </div>`;
+      renderMarketAlerts(null);
     } else {
       renderHero(d);
+      renderMarketAlerts(d.market_alerts);
       renderSubscores(d);
       renderMetrics(d);
       renderMonitoredEvents(d);

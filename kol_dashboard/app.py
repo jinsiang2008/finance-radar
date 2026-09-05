@@ -501,6 +501,7 @@ def _public_macro_snapshot(
     return decision_service.project_public_macro(
         snap,
         macro_event_enrichments=matching,
+        now=datetime.now(timezone.utc),
     )
 
 

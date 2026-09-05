@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from collections import Counter
 from copy import deepcopy
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -1468,6 +1469,201 @@ class PublicDecisionTests(unittest.TestCase):
             projected["black_swan_scenarios"][0]["hedge"],
             "公开对冲说明",
         )
+
+    def test_public_macro_projects_alerts_through_a_strict_fail_closed_schema(self) -> None:
+        projected = decision_service.project_public_macro(
+            {
+                "public_schema_version": 1,
+                "market_data": {
+                    "alert_inputs": {
+                        "us_equity": {
+                            "status": "available",
+                            "data_status": "ok",
+                            "stale": False,
+                            "asset_key": "US:SPY",
+                            "source": "Yahoo Finance",
+                            "source_url": "https://finance.yahoo.com/quote/SPY/history/",
+                            "observed_at": "2026-09-05T20:00:00Z",
+                            "market_date": "2026-09-05",
+                            "close": 650.0,
+                            "sma20": 655.0,
+                            "bars": [{"close": 650.0}],
+                            "account": "private-account",
+                        },
+                        "cn_equity": {
+                            "status": "available",
+                            "data_status": "ok",
+                            "stale": False,
+                            "asset_key": "INDEX:CSI300",
+                            "provider": "tencent",
+                            "source": "腾讯行情",
+                            "source_url": "https://gu.qq.com/sh000300",
+                            "observed_at": "2026-09-05T07:00:00Z",
+                            "market_date": "2026-09-05",
+                            "close": 4548.05,
+                        }
+                    }
+                },
+                "market_alerts": {
+                    "schema_version": 1,
+                    "method_version": "macro-de-risk-trial-v1",
+                    "generated_at": "2026-09-06T01:00:00Z",
+                    "mode": "trial",
+                    "human_review_required": True,
+                    "automatic_execution": False,
+                    "markets": [
+                        {
+                            "market": "US",
+                            "label": "forged label",
+                            "action": "reduce_candidate",
+                            "action_label": "立即清仓",
+                            "risk_level": "high",
+                            "abstain": False,
+                            "data_status": "ok",
+                            "data_as_of": "2026-09-04T00:00:00Z",
+                            "next_evaluation_at": "2026-09-06T02:00:00Z",
+                            "summary": "趋势与压力共振",
+                            "gates": [
+                                {
+                                    "key": "price_confirmation",
+                                    "label": "价格确认",
+                                    "status": "met",
+                                    "detail": "完成日线",
+                                    "shares": 999,
+                                },
+                                {
+                                    "key": "unknown",
+                                    "label": "unknown",
+                                    "status": "forged",
+                                },
+                            ],
+                            "triggered_signals": [
+                                {
+                                    "key": "vix_strong",
+                                    "pillar": "volatility",
+                                    "label": "VIX 抬升",
+                                    "severity": "strong",
+                                    "value": 30.0,
+                                    "unit": "index",
+                                    "threshold": "VIX >= 28",
+                                    "observed_at": "2026-09-05T20:00:00Z",
+                                    "time_basis": "completed_market_close",
+                                    "source": "Yahoo Finance",
+                                    "source_url": "https://finance.yahoo.com/quote/%5EVIX/history/",
+                                    "detail": "public evidence",
+                                    "portfolio": "must-not-leak",
+                                },
+                                {
+                                    "key": "evil",
+                                    "pillar": "made_up",
+                                    "label": "forged",
+                                    "severity": "strong",
+                                },
+                            ],
+                            "counter_signals": [],
+                            "upgrade_conditions": ["等待下一收盘"],
+                            "invalidation_conditions": ["连续两日解除"],
+                            "missing_sources": [],
+                            "rule_version": "forged",
+                            "confirmation": {"reduce_dates": ["private"]},
+                            "account": "must-not-leak",
+                        }
+                    ],
+                },
+            }
+        )
+
+        alert_input = projected["market_data"]["alert_inputs"]["us_equity"]
+        self.assertNotIn("bars", alert_input)
+        self.assertEqual(
+            projected["market_data"]["alert_inputs"]["cn_equity"]["source_url"],
+            "https://gu.qq.com/sh000300",
+        )
+        alert = projected["market_alerts"]["markets"][0]
+        self.assertEqual(alert["label"], "美股")
+        self.assertEqual(alert["action_label"], "减仓候选")
+        self.assertEqual(alert["gate_progress"], {"met": 1, "total": 1})
+        self.assertEqual(len(alert["triggered_signals"]), 1)
+        self.assertNotIn("confirmation", alert)
+        encoded = json.dumps(projected, ensure_ascii=False)
+        self.assertNotIn("must-not-leak", encoded)
+        self.assertNotIn("private-account", encoded)
+        self.assertNotIn("shares", encoded)
+
+    def test_public_macro_alerts_reject_invalid_contract_and_force_abstain(self) -> None:
+        base = {
+            "schema_version": 1,
+            "method_version": "macro-de-risk-trial-v1",
+            "generated_at": "2026-09-06T01:00:00Z",
+            "mode": "trial",
+            "human_review_required": True,
+            "automatic_execution": False,
+            "markets": [
+                {
+                    "market": "CN",
+                    "action": "exit_candidate",
+                    "risk_level": "critical",
+                    "abstain": True,
+                    "data_status": "insufficient",
+                    "summary": "信息不足",
+                    "gates": [],
+                }
+            ],
+        }
+        projected = decision_service.project_public_macro(
+            {"public_schema_version": 1, "market_alerts": base}
+        )
+        alert = projected["market_alerts"]["markets"][0]
+        self.assertEqual(alert["action"], "observe")
+        self.assertEqual(alert["risk_level"], "insufficient")
+
+        forged = dict(base)
+        forged["automatic_execution"] = True
+        rejected = decision_service.project_public_macro(
+            {"public_schema_version": 1, "market_alerts": forged}
+        )
+        self.assertNotIn("market_alerts", rejected)
+
+    def test_public_macro_alerts_expire_after_collection_stops(self) -> None:
+        projected = decision_service.project_public_macro(
+            {
+                "public_schema_version": 1,
+                "market_alerts": {
+                    "schema_version": 1,
+                    "method_version": "macro-de-risk-trial-v1",
+                    "generated_at": "2026-09-06T01:00:00Z",
+                    "mode": "trial",
+                    "human_review_required": True,
+                    "automatic_execution": False,
+                    "markets": [
+                        {
+                            "market": "US",
+                            "action": "exit_candidate",
+                            "risk_level": "critical",
+                            "abstain": False,
+                            "data_status": "ok",
+                            "summary": "old action",
+                            "gates": [
+                                {
+                                    "key": "data_freshness",
+                                    "label": "核心数据新鲜度",
+                                    "status": "met",
+                                }
+                            ],
+                        }
+                    ],
+                },
+            },
+            now=datetime(2026, 9, 6, 3, 0, tzinfo=timezone.utc),
+        )
+
+        alert = projected["market_alerts"]["markets"][0]
+        self.assertEqual(alert["action"], "observe")
+        self.assertTrue(alert["abstain"])
+        self.assertEqual(alert["risk_level"], "insufficient")
+        self.assertIn("超过90分钟", alert["summary"])
+        self.assertIn("宏观采集快照已过期", alert["missing_sources"])
+        self.assertEqual(alert["gates"][0]["status"], "unavailable")
 
     def test_public_macro_projects_sanitized_official_body_evidence(self) -> None:
         projected = decision_service.project_public_macro(

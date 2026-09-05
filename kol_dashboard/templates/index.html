@@ -18,7 +18,7 @@
     } catch (e) {}
   })();
 </script>
-  <link rel="stylesheet" href="static/style.css?v=33" />
+  <link rel="stylesheet" href="static/style.css?v=34" />
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ccircle cx='50' cy='50' r='42' fill='%230b1720' stroke='%2331d69b' stroke-width='6'/%3E%3Ccircle cx='50' cy='50' r='20' fill='none' stroke='%234ab8d8' stroke-width='5'/%3E%3Cpath d='M50 50L82 24' stroke='%23f4b942' stroke-width='6' stroke-linecap='round'/%3E%3Ccircle cx='50' cy='50' r='7' fill='%23eef4f2'/%3E%3C/svg%3E" />
 </head>
 <body>
@@ -202,6 +202,27 @@
 
     <section class="hero" id="macro-hero">
       <div class="skeleton skeleton-hero"></div>
+    </section>
+
+    <section class="block macro-alerts-block" id="macro-alerts-block"
+             aria-labelledby="macro-alerts-title">
+      <div class="block-head macro-alerts-head">
+        <div>
+          <p class="section-kicker">POSITION RISK GATES</p>
+          <h2 id="macro-alerts-title">减仓与清仓预警</h2>
+          <p class="block-sub">价格确认、领先压力与连续收盘共同过闸；新闻只作背景，不直接触发行动。</p>
+        </div>
+        <span class="macro-alert-trial">规则试运行</span>
+      </div>
+      <p class="macro-alert-boundary">
+        仅用于提前复核风险，不构成投资建议；所有候选行动均需人工确认，系统不会执行任何订单。
+      </p>
+      <div class="macro-alert-grid" id="macro-alerts">
+        <div class="macro-alert-card is-placeholder"><div class="skeleton skeleton-card"></div></div>
+        <div class="macro-alert-card is-placeholder"><div class="skeleton skeleton-card"></div></div>
+      </div>
+      <span class="sr-only" id="macro-alert-live-status" role="status"
+            aria-live="polite" aria-atomic="true"></span>
     </section>
 
     <section class="block trend-block" id="macro-trend-block" hidden>
@@ -420,6 +441,6 @@
   </div>
 </div>
 
-<script src="static/app.js?v=33"></script>
+<script src="static/app.js?v=34"></script>
 </body>
 </html>

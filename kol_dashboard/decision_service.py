@@ -275,6 +275,75 @@ _PUBLIC_MACRO_MARKET_SCALARS = (
     "unit",
 )
 
+_PUBLIC_MACRO_ALERT_INPUT_KEYS = (
+    "us_equity",
+    "cn_equity",
+    "vix_daily",
+    "usd_cny_daily",
+)
+_PUBLIC_MACRO_ALERT_INPUT_FIELDS = (
+    "status",
+    "data_status",
+    "stale",
+    "asset_key",
+    "label",
+    "provider",
+    "source",
+    "source_url",
+    "symbol",
+    "currency",
+    "observed_at",
+    "market_date",
+    "timestamp_semantics",
+    "bars_available",
+    "reason",
+    "close",
+    "sma20",
+    "sma60",
+    "sma20_slope_5d_pct",
+    "return_5d_pct",
+    "drawdown_60d_pct",
+    "data_hash",
+)
+_PUBLIC_MACRO_ALERT_ACTIONS = {
+    "observe": "继续观察",
+    "prepare_reduce": "减仓准备",
+    "reduce_candidate": "减仓候选",
+    "exit_candidate": "防御 / 清仓审查",
+}
+_PUBLIC_MACRO_ALERT_RISK_LEVELS = {
+    "insufficient",
+    "low",
+    "medium",
+    "high",
+    "critical",
+}
+_PUBLIC_MACRO_ALERT_DATA_STATUSES = {"ok", "insufficient"}
+_PUBLIC_MACRO_ALERT_GATE_STATUSES = {
+    "met",
+    "partial",
+    "unmet",
+    "unavailable",
+}
+_PUBLIC_MACRO_ALERT_SIGNAL_SEVERITIES = {"watch", "strong", "critical"}
+_PUBLIC_MACRO_ALERT_PILLARS = {
+    "trend",
+    "volatility",
+    "financial_stress",
+    "fx_liquidity",
+}
+_PUBLIC_MACRO_ALERT_TIME_BASES = {
+    "completed_market_close",
+    "official_daily_observation",
+}
+_PUBLIC_MACRO_ALERT_METHOD_VERSION = "macro-de-risk-trial-v1"
+_PUBLIC_MACRO_ALERT_MAX_AGE = timedelta(minutes=90)
+_PUBLIC_MACRO_ALERT_SOURCE_HOSTS = {
+    "finance.yahoo.com",
+    "gu.qq.com",
+    "www.financialresearch.gov",
+}
+
 _PUBLIC_MACRO_COVERAGE_SOURCE_FIELDS = (
     "key",
     "label",
@@ -286,6 +355,9 @@ _PUBLIC_MACRO_COVERAGE_SOURCE_FIELDS = (
     "stale",
     "is_stale",
     "note",
+    "source",
+    "provider",
+    "market_date",
 )
 _PRIVATE_MACRO_RELATION_FIELDS = {
     "affected_positions",
@@ -1246,12 +1318,346 @@ def _project_macro_market_data(
                 if nested:
                     projected[nested_key] = nested
         output[key] = projected
+    alert_inputs = value.get("alert_inputs")
+    if include_text and isinstance(alert_inputs, Mapping):
+        projected_inputs: dict[str, Any] = {}
+        for key in _PUBLIC_MACRO_ALERT_INPUT_KEYS:
+            item = alert_inputs.get(key)
+            if not isinstance(item, Mapping):
+                continue
+            projected: dict[str, Any] = {}
+            for field in _PUBLIC_MACRO_ALERT_INPUT_FIELDS:
+                if field not in item or not _is_public_scalar(item[field]):
+                    continue
+                if field == "source_url":
+                    safe_url = _project_macro_alert_source_url(item[field])
+                    if safe_url:
+                        projected[field] = safe_url
+                    continue
+                projected[field] = _public_sanitize(
+                    item[field],
+                    field_name=field,
+                )
+            projected_inputs[key] = projected
+        output["alert_inputs"] = projected_inputs
     return output
+
+
+def _project_macro_alert_source_url(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    try:
+        parsed = urlsplit(candidate)
+        port = parsed.port
+    except (TypeError, ValueError):
+        return None
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if (
+        parsed.scheme.lower() != "https"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or parsed.fragment
+        or host not in _PUBLIC_MACRO_ALERT_SOURCE_HOSTS
+    ):
+        return None
+    return candidate[:500]
+
+
+def _project_macro_alert_time(value: Any, *, allow_date: bool = False) -> str | None:
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if allow_date and len(candidate) == 10:
+        try:
+            date.fromisoformat(candidate)
+        except ValueError:
+            return None
+        return candidate
+    parsed = _verified_event_time(candidate)
+    if parsed is None:
+        return None
+    return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _project_macro_alert_signal(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    key = _macro_event_plain_text(value.get("key"), 80)
+    pillar = str(value.get("pillar") or "").strip().lower()
+    severity = str(value.get("severity") or "").strip().lower()
+    label = _macro_event_plain_text(value.get("label"), 160)
+    if (
+        not key
+        or pillar not in _PUBLIC_MACRO_ALERT_PILLARS
+        or severity not in _PUBLIC_MACRO_ALERT_SIGNAL_SEVERITIES
+        or not label
+    ):
+        return None
+    output: dict[str, Any] = {
+        "key": key,
+        "pillar": pillar,
+        "label": label,
+        "severity": severity,
+    }
+    number = _finite_number(value.get("value"))
+    if number is not None:
+        output["value"] = number
+    for field, maximum in (
+        ("unit", 40),
+        ("threshold", 240),
+        ("source", 100),
+        ("detail", 500),
+    ):
+        text = _macro_event_plain_text(value.get(field), maximum)
+        if text:
+            output[field] = text
+    observed_at = _project_macro_alert_time(
+        value.get("observed_at"),
+        allow_date=True,
+    )
+    if observed_at:
+        output["observed_at"] = observed_at
+    time_basis = str(value.get("time_basis") or "").strip().lower()
+    if time_basis in _PUBLIC_MACRO_ALERT_TIME_BASES:
+        output["time_basis"] = time_basis
+    source_url = _project_macro_alert_source_url(value.get("source_url"))
+    if source_url:
+        output["source_url"] = source_url
+    return output
+
+
+def _project_macro_alert_gates(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    output: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in value[:8]:
+        if not isinstance(item, Mapping):
+            continue
+        key = _macro_event_plain_text(item.get("key"), 80)
+        label = _macro_event_plain_text(item.get("label"), 160)
+        status = str(item.get("status") or "").strip().lower()
+        if (
+            not key
+            or key in seen
+            or not label
+            or status not in _PUBLIC_MACRO_ALERT_GATE_STATUSES
+        ):
+            continue
+        seen.add(key)
+        projected = {"key": key, "label": label, "status": status}
+        detail = _macro_event_plain_text(item.get("detail"), 500)
+        if detail:
+            projected["detail"] = detail
+        output.append(projected)
+    return output
+
+
+def _project_macro_alert_text_list(
+    value: Any,
+    *,
+    maximum_items: int = 8,
+    maximum_length: int = 500,
+) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    output: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        text = _macro_event_plain_text(item, maximum_length)
+        folded = text.casefold()
+        if text and folded not in seen:
+            seen.add(folded)
+            output.append(text)
+        if len(output) >= maximum_items:
+            break
+    return output
+
+
+def _project_macro_market_alert(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    market = str(value.get("market") or "").strip().upper()
+    if market not in {"US", "CN"}:
+        return None
+    action = str(value.get("action") or "").strip().lower()
+    data_status = str(value.get("data_status") or "").strip().lower()
+    if (
+        action not in _PUBLIC_MACRO_ALERT_ACTIONS
+        or data_status not in _PUBLIC_MACRO_ALERT_DATA_STATUSES
+    ):
+        return None
+    abstain = value.get("abstain") is True or data_status != "ok"
+    if abstain:
+        action = "observe"
+        data_status = "insufficient"
+    risk_level = str(value.get("risk_level") or "").strip().lower()
+    if risk_level not in _PUBLIC_MACRO_ALERT_RISK_LEVELS:
+        risk_level = "insufficient" if abstain else "low"
+    if abstain:
+        risk_level = "insufficient"
+    gates = _project_macro_alert_gates(value.get("gates"))
+    signals: list[dict[str, Any]] = []
+    for item in value.get("triggered_signals", [])[:12] if isinstance(value.get("triggered_signals"), list) else []:
+        projected = _project_macro_alert_signal(item)
+        if projected:
+            signals.append(projected)
+    counters: list[dict[str, Any]] = []
+    for item in value.get("counter_signals", [])[:12] if isinstance(value.get("counter_signals"), list) else []:
+        projected = _project_macro_alert_signal(item)
+        if projected:
+            counters.append(projected)
+    output: dict[str, Any] = {
+        "market": market,
+        "label": "美股" if market == "US" else "A股",
+        "action": action,
+        "action_label": _PUBLIC_MACRO_ALERT_ACTIONS[action],
+        "risk_level": risk_level,
+        "abstain": abstain,
+        "data_status": data_status,
+        "summary": _macro_event_plain_text(value.get("summary"), 600),
+        "gate_progress": {
+            "met": sum(1 for gate in gates if gate["status"] == "met"),
+            "total": len(gates),
+        },
+        "gates": gates,
+        "triggered_signals": signals,
+        "counter_signals": counters,
+        "upgrade_conditions": _project_macro_alert_text_list(
+            value.get("upgrade_conditions")
+        ),
+        "invalidation_conditions": _project_macro_alert_text_list(
+            value.get("invalidation_conditions")
+        ),
+        "missing_sources": _project_macro_alert_text_list(
+            value.get("missing_sources"),
+            maximum_items=8,
+            maximum_length=160,
+        ),
+        "rule_version": _PUBLIC_MACRO_ALERT_METHOD_VERSION,
+    }
+    for field in ("data_as_of", "next_evaluation_at"):
+        projected_time = _project_macro_alert_time(value.get(field))
+        if projected_time:
+            output[field] = projected_time
+    return output
+
+
+def _project_macro_market_alerts(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    if (
+        value.get("schema_version") != 1
+        or isinstance(value.get("schema_version"), bool)
+        or value.get("method_version") != _PUBLIC_MACRO_ALERT_METHOD_VERSION
+        or value.get("mode") != "trial"
+        or value.get("human_review_required") is not True
+        or value.get("automatic_execution") is not False
+    ):
+        return {}
+    generated_at = _project_macro_alert_time(value.get("generated_at"))
+    if not generated_at:
+        return {}
+    raw_markets = value.get("markets")
+    if not isinstance(raw_markets, list):
+        return {}
+    by_market: dict[str, dict[str, Any]] = {}
+    for item in raw_markets:
+        projected = _project_macro_market_alert(item)
+        if projected and projected["market"] not in by_market:
+            by_market[projected["market"]] = projected
+    return {
+        "schema_version": 1,
+        "method_version": _PUBLIC_MACRO_ALERT_METHOD_VERSION,
+        "generated_at": generated_at,
+        "mode": "trial",
+        "human_review_required": True,
+        "automatic_execution": False,
+        "markets": [
+            by_market[market]
+            for market in ("US", "CN")
+            if market in by_market
+        ],
+    }
+
+
+def _expire_stale_macro_alerts(
+    alerts: dict[str, Any],
+    *,
+    now: datetime,
+) -> dict[str, Any]:
+    """Fail closed when collection stops but an old action remains cached."""
+    generated = _verified_event_time(alerts.get("generated_at"))
+    if generated is None:
+        return {}
+    current = now.astimezone(timezone.utc)
+    age = current - generated
+    if -timedelta(minutes=5) <= age <= _PUBLIC_MACRO_ALERT_MAX_AGE:
+        return alerts
+
+    expired = deepcopy(alerts)
+    reason = (
+        "宏观快照时间异常，系统停止升级仓位动作。"
+        if age < -timedelta(minutes=5)
+        else "宏观快照已超过90分钟，系统停止升级仓位动作。"
+    )
+    for market in expired.get("markets", []):
+        if not isinstance(market, dict):
+            continue
+        market["action"] = "observe"
+        market["action_label"] = _PUBLIC_MACRO_ALERT_ACTIONS["observe"]
+        market["risk_level"] = "insufficient"
+        market["abstain"] = True
+        market["data_status"] = "insufficient"
+        market["summary"] = reason + "这不是低风险结论。"
+        market.pop("next_evaluation_at", None)
+        missing = market.get("missing_sources")
+        missing = missing if isinstance(missing, list) else []
+        if "宏观采集快照已过期" not in missing:
+            missing.append("宏观采集快照已过期")
+        market["missing_sources"] = missing
+        gates = market.get("gates")
+        gates = gates if isinstance(gates, list) else []
+        freshness = next(
+            (
+                gate
+                for gate in gates
+                if isinstance(gate, dict) and gate.get("key") == "data_freshness"
+            ),
+            None,
+        )
+        if freshness is None:
+            gates.insert(
+                0,
+                {
+                    "key": "data_freshness",
+                    "label": "核心数据新鲜度",
+                    "status": "unavailable",
+                    "detail": reason,
+                },
+            )
+        else:
+            freshness["status"] = "unavailable"
+            freshness["detail"] = reason
+        market["gates"] = gates
+        market["gate_progress"] = {
+            "met": sum(
+                1
+                for gate in gates
+                if isinstance(gate, Mapping) and gate.get("status") == "met"
+            ),
+            "total": len(gates),
+        }
+    return expired
 
 
 def project_public_macro(
     snapshot: Any,
     macro_event_enrichments: Mapping[str, Any] | None = None,
+    *,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     """Project a macro snapshot without legacy portfolio-specific fields."""
     if not isinstance(snapshot, Mapping):
@@ -1291,6 +1697,19 @@ def project_public_macro(
         snapshot.get("market_data"),
         include_text=trusted,
     )
+    if trusted:
+        projected_alerts = _project_macro_market_alerts(
+            snapshot.get("market_alerts")
+        )
+        if projected_alerts:
+            if now is not None:
+                current = _utc_datetime(now)
+                if current is not None:
+                    projected_alerts = _expire_stale_macro_alerts(
+                        projected_alerts,
+                        now=current,
+                    )
+            output["market_alerts"] = projected_alerts
     coverage = snapshot.get("data_coverage")
     if isinstance(coverage, Mapping):
         projected_coverage = {
