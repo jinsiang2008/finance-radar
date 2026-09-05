@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import json
 import sys
 import types
 import unittest
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
@@ -36,6 +37,26 @@ TRUTH_FEED = """<?xml version="1.0" encoding="UTF-8"?>
     <truth:originalUrl>https://truthsocial.com/@realDonaldTrump/117039691</truth:originalUrl>
   </item>
 </channel></rss>"""
+
+
+class TickerExtractionTests(unittest.TestCase):
+    def test_contextual_stock_and_share_symbols_are_extracted_in_source_order(
+        self,
+    ) -> None:
+        text = (
+            "Read why SPCX stock is a strong buy before $NVDA moves; "
+            "later, RKLB shares also rose and SPCX shares held firm."
+        )
+
+        self.assertEqual(
+            kol_tracker.extract_tickers(text),
+            ["SPCX", "NVDA", "RKLB"],
+        )
+
+    def test_contextual_stopwords_are_not_treated_as_symbols(self) -> None:
+        text = "AI stock coverage, IPO shares and CEO stock comments; $AI and $A rose."
+
+        self.assertEqual(kol_tracker.extract_tickers(text), ["AI", "A"])
 
 
 class TruthSocialTests(unittest.TestCase):
@@ -536,6 +557,117 @@ class PublishedAtParsingTests(unittest.TestCase):
             items = kol_tracker.search_x("aleabitoreddit")
 
         self.assertEqual(items[0]["published_at"], "2026-07-31T09:15:30+00:00")
+
+    def test_x_uses_handle_aware_fetch_and_validated_canonical_url(self) -> None:
+        fetched_handles: list[str] = []
+
+        def fetch_tweets(handle: str) -> list[dict[str, str]]:
+            fetched_handles.append(handle)
+            return [{
+                "tid": "2096149203278037407",
+                "handle": "aleabitoreddit",
+                "url": (
+                    "https://x.com/aleabitoreddit/status/"
+                    "2096149203278037407"
+                ),
+                "published_at": "2026-09-05T08:11:29Z",
+                "text": "A sufficiently long post about $MU memory demand.",
+            }]
+
+        fake_tracker = types.SimpleNamespace(fetch_tweets=fetch_tweets)
+        with mock.patch.dict(sys.modules, {"serenity_tracker": fake_tracker}):
+            items = kol_tracker.search_x("aleabitoreddit")
+
+        self.assertEqual(fetched_handles, ["aleabitoreddit"])
+        self.assertEqual(len(items), 1)
+        self.assertEqual(
+            items[0]["url"],
+            "https://x.com/aleabitoreddit/status/2096149203278037407",
+        )
+
+    def test_x_empty_parse_is_observable_without_raising_to_other_kols(self) -> None:
+        class ParseEmpty(RuntimeError):
+            code = "source_parse_empty"
+
+        fetch_tweets = mock.Mock(side_effect=ParseEmpty("source_parse_empty"))
+        fake_tracker = types.SimpleNamespace(fetch_tweets=fetch_tweets)
+        stderr = StringIO()
+
+        with mock.patch.dict(sys.modules, {"serenity_tracker": fake_tracker}):
+            with mock.patch.object(kol_tracker.time, "sleep"):
+                with redirect_stderr(stderr):
+                    items = kol_tracker.search_x("aleabitoreddit")
+
+        self.assertEqual(items, [])
+        self.assertEqual(fetch_tweets.call_count, kol_tracker.X_FETCH_ATTEMPTS)
+        self.assertEqual(
+            kol_tracker.X_SOURCE_WARNINGS["aleabitoreddit"]["code"],
+            "source_parse_empty",
+        )
+        self.assertIn("code=source_parse_empty", stderr.getvalue())
+
+    def test_x_empty_list_is_observable_for_legacy_parser_contract(self) -> None:
+        fetch_tweets = mock.Mock(return_value=[])
+        fake_tracker = types.SimpleNamespace(fetch_tweets=fetch_tweets)
+
+        with mock.patch.dict(sys.modules, {"serenity_tracker": fake_tracker}):
+            with mock.patch.object(kol_tracker.time, "sleep"):
+                items = kol_tracker.search_x("aleabitoreddit")
+
+        self.assertEqual(items, [])
+        self.assertEqual(fetch_tweets.call_count, kol_tracker.X_FETCH_ATTEMPTS)
+        self.assertEqual(
+            kol_tracker.X_SOURCE_WARNINGS["aleabitoreddit"]["code"],
+            "source_parse_empty",
+        )
+
+    def test_x_truthy_non_list_payload_degrades_to_source_warning(self) -> None:
+        fetch_tweets = mock.Mock(return_value={"bad": "payload"})
+        fake_tracker = types.SimpleNamespace(fetch_tweets=fetch_tweets)
+
+        with mock.patch.dict(sys.modules, {"serenity_tracker": fake_tracker}):
+            with mock.patch.object(kol_tracker.time, "sleep"):
+                items = kol_tracker.search_x("aleabitoreddit")
+
+        self.assertEqual(items, [])
+        self.assertEqual(fetch_tweets.call_count, kol_tracker.X_FETCH_ATTEMPTS)
+        self.assertEqual(
+            kol_tracker.X_SOURCE_WARNINGS["aleabitoreddit"]["code"],
+            "source_bad_payload",
+        )
+
+    def test_collect_keeps_other_items_and_reports_x_source_warning(self) -> None:
+        retained = {
+            "title": "Other KOL market event",
+            "url": "https://example.com/event",
+        }
+
+        def scan(kol_key: str, _max_results: int) -> list[dict[str, str]]:
+            if kol_key == "serenity":
+                kol_tracker._set_x_source_warning(
+                    "aleabitoreddit", "source_parse_empty"
+                )
+                return []
+            return [retained] if kol_key == "musk" else []
+
+        stdout = StringIO()
+        with mock.patch.object(kol_tracker, "scan_kol", side_effect=scan):
+            with mock.patch.object(
+                kol_tracker, "_write_to_db", return_value=(1, 0)
+            ) as write:
+                with redirect_stdout(stdout):
+                    kol_tracker.cmd_collect([])
+
+        payload = json.loads(stdout.getvalue())
+        write.assert_called_once_with([retained])
+        self.assertEqual(payload["inserted"], 1)
+        self.assertEqual(
+            payload["source_warnings"],
+            [{
+                "source": "X @aleabitoreddit",
+                "code": "source_parse_empty",
+            }],
+        )
 
 
 class CollectorFailureTests(unittest.TestCase):

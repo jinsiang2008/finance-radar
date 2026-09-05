@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import tempfile
@@ -2734,6 +2735,82 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(summary["high"], 0)
         self.assertEqual(summary["medium"], 1)
         self.assertEqual(kols[0]["high_24h"], 0)
+
+    def test_spacex_security_master_selectively_invalidates_v1_cache(self) -> None:
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        ordinary = self.event(
+            published_at=(now - timedelta(hours=1)).isoformat(),
+            url="https://example.com/nvidia-v1-cache",
+        )
+        spacex = self.event(
+            title="Elon Musk's SpaceX Offers Exponential Upside And Extreme Risk",
+            snippet="Read why SPCX stock is a strong buy.",
+            tickers=[],
+            kol_key="musk",
+            kol_name="Elon Musk",
+            kol_name_cn="马斯克",
+            published_at=(now - timedelta(hours=1)).isoformat(),
+            url="https://example.com/spacex-v1-cache",
+        )
+        db.insert_events([ordinary, spacex])
+
+        with db.conn() as connection:
+            rows = [dict(row) for row in connection.execute(
+                "SELECT e.id, s.title, s.snippet, s.source, s.kol_name_cn, "
+                "s.kol_name, s.tickers, s.source_url "
+                "FROM events e JOIN event_sightings s ON s.event_id=e.id "
+                "ORDER BY e.id"
+            )]
+
+        for row in rows:
+            event_input, current_hash = llm_enrichment.build_event_input(row)
+            cache_hash = current_hash
+            if "SpaceX" in row["title"]:
+                legacy_payload = {
+                    key: value
+                    for key, value in event_input.items()
+                    if key != "trusted_asset_facts"
+                }
+                legacy_encoded = json.dumps(
+                    legacy_payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                cache_hash = hashlib.sha256(
+                    legacy_encoded.encode("utf-8")
+                ).hexdigest()
+                self.assertNotEqual(cache_hash, current_hash)
+            claim_token = db.claim_event_enrichment(
+                row["id"],
+                input_hash=cache_hash,
+                prompt_version="event-intelligence-v1",
+                model=llm_enrichment.DEFAULT_MODEL,
+                evidence_basis=event_input["evidence_basis"],
+                now=now,
+            )
+            self.assertIsInstance(claim_token, str)
+            self.assertTrue(
+                db.save_event_enrichment(
+                    row["id"],
+                    input_hash=cache_hash,
+                    prompt_version="event-intelligence-v1",
+                    model=llm_enrichment.DEFAULT_MODEL,
+                    claim_token=claim_token,
+                    evidence_basis=event_input["evidence_basis"],
+                    result=ready_enrichment(),
+                    generated_at=now.isoformat(),
+                )
+            )
+
+        public = {
+            item["title"]: item
+            for item in db.query_events(hours=24, now=now, limit=10)
+        }
+        self.assertEqual(public[ordinary["title"]]["ai_status"], "ready")
+        self.assertIsNotNone(public[ordinary["title"]]["ai_enrichment"])
+        self.assertEqual(public[spacex["title"]]["ai_status"], "pending")
+        self.assertIsNone(public[spacex["title"]]["ai_enrichment"])
 
     def test_supported_worker_model_is_valid_without_web_model_env(self) -> None:
         now = datetime.now(timezone.utc).replace(microsecond=0)

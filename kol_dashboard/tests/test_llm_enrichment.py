@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -112,6 +113,83 @@ class EventInputTests(unittest.TestCase):
 
         self.assertEqual(payload["mentioned_tickers"], ["AMD", "NVDA"])
         self.assertEqual(base_hash, equivalent_hash)
+
+    def test_ordinary_event_preserves_v1_payload_and_hash(self) -> None:
+        event = {
+            "title": "Chip demand rises",
+            "snippet": "",
+            "source": "Bing News",
+            "kol_name": "Jensen Huang",
+            "tickers": ["NVDA", "AMD"],
+        }
+        expected_payload = {
+            "title": "Chip demand rises",
+            "snippet": "",
+            "source": "Bing News",
+            "kol": "Jensen Huang",
+            "mentioned_tickers": ["AMD", "NVDA"],
+            "evidence_basis": "title_only",
+        }
+        encoded = json.dumps(
+            expected_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        expected_hash = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+        payload, digest = llm_enrichment.build_event_input(event)
+
+        self.assertEqual(llm_enrichment.PROMPT_VERSION, "event-intelligence-v1")
+        self.assertEqual(payload, expected_payload)
+        self.assertEqual(digest, expected_hash)
+        self.assertNotIn(
+            "trusted_asset_facts",
+            llm_enrichment._system_prompt(payload),
+        )
+
+    def test_spacex_mentions_receive_verified_current_listing_facts(self) -> None:
+        payload, digest = llm_enrichment.build_event_input(
+            {
+                "title": "SpaceX Offers Exponential Upside And Extreme Risk",
+                "snippet": "Read why SPCX stock is a strong buy.",
+                # Existing rows collected before contextual ticker extraction
+                # can still be repaired from the issuer mention itself.
+                "tickers": [],
+            }
+        )
+
+        self.assertEqual(payload["mentioned_tickers"], [])
+        self.assertEqual(len(payload["trusted_asset_facts"]), 1)
+        fact = payload["trusted_asset_facts"][0]
+        self.assertEqual(fact["asset_key"], "US:SPCX")
+        self.assertEqual(fact["name_zh"], "SpaceX")
+        self.assertEqual(fact["listing_status"], "listed")
+        self.assertEqual(fact["listed_since"], "2026-06-12")
+        legacy_payload = {
+            key: value
+            for key, value in payload.items()
+            if key != "trusted_asset_facts"
+        }
+        legacy_encoded = json.dumps(
+            legacy_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        legacy_hash = hashlib.sha256(legacy_encoded.encode("utf-8")).hexdigest()
+        self.assertNotEqual(digest, legacy_hash)
+
+    def test_similar_spx_symbol_does_not_receive_spacex_listing_facts(self) -> None:
+        payload, _ = llm_enrichment.build_event_input(
+            {
+                "title": "S&P 500 index update",
+                "snippet": "The SPX index closed higher.",
+                "tickers": ["SPX"],
+            }
+        )
+
+        self.assertNotIn("trusted_asset_facts", payload)
 
     def test_truth_repost_profile_shell_is_not_eligible_for_ai(self) -> None:
         event = {
@@ -1159,6 +1237,59 @@ class ResultValidationTests(unittest.TestCase):
 
         self.assertEqual(result["cluster_key"], "event-0123456789abcdef")
 
+    def test_verified_asset_name_overrides_model_supplied_display_name(self) -> None:
+        result = llm_enrichment.validate_result(
+            valid_result(
+                assets=[
+                    {
+                        "asset_key": "US:SPCX",
+                        "name_zh": "太空探索技术公司股票",
+                        "direction": "positive",
+                        "horizon": "long",
+                        "reason_zh": "上市公司长期增长仍取决于执行与资本效率。",
+                        "confidence": 0.7,
+                    }
+                ]
+            ),
+            input_hash="a" * 64,
+        )
+
+        self.assertEqual(result["assets"][0]["name_zh"], "SpaceX")
+
+    def test_verified_listing_fact_rejects_stale_unlisted_claims(self) -> None:
+        trusted_facts = llm_enrichment.build_event_input(
+            {
+                "title": "SpaceX stock update",
+                "snippet": "SPCX shares moved after the company update.",
+            }
+        )[0]["trusted_asset_facts"]
+        stale_outputs = (
+            valid_result(summary_zh="SpaceX尚未上市，其估值只能参考私募市场交易。"),
+            valid_result(why_it_matters_zh="SpaceX并非上市公司，对公开市场影响有限。"),
+            valid_result(
+                assets=[
+                    {
+                        "asset_key": "US:SPCX",
+                        "name_zh": "SpaceX（未上市）",
+                        "direction": "positive",
+                        "horizon": "long",
+                        "reason_zh": "文章看好其长期增长，但未上市，实际交易受限。",
+                        "confidence": 0.3,
+                    }
+                ]
+            ),
+        )
+
+        for raw in stale_outputs:
+            with self.subTest(raw=raw):
+                with self.assertRaises(llm_enrichment.EnrichmentError) as caught:
+                    llm_enrichment.validate_result(
+                        raw,
+                        input_hash="b" * 64,
+                        trusted_asset_facts=trusted_facts,
+                    )
+                self.assertEqual(caught.exception.code, "invalid_output")
+
 
 class DeepSeekRequestTests(unittest.TestCase):
     def test_config_defaults_to_current_model_and_hides_api_key(self) -> None:
@@ -1219,6 +1350,57 @@ class DeepSeekRequestTests(unittest.TestCase):
         self.assertEqual(headers["Authorization"], "Bearer secret-token")
         self.assertEqual(captured["timeout"], 45.0)
         self.assertEqual(result["headline_zh"], provider_result["headline_zh"])
+
+    def test_spacex_listing_fact_is_system_authoritative_and_guarded(self) -> None:
+        captured: dict[str, object] = {}
+        event_input, input_hash = llm_enrichment.build_event_input(
+            {
+                "title": "SpaceX Offers Exponential Upside And Extreme Risk",
+                "snippet": "Read why SPCX stock is a strong buy.",
+            }
+        )
+        stale = valid_result(
+            summary_zh="SpaceX尚未上市，其股票只能在私募市场交易。",
+            assets=[
+                {
+                    "asset_key": "US:SPCX",
+                    "name_zh": "SpaceX（未上市）",
+                    "direction": "positive",
+                    "horizon": "long",
+                    "reason_zh": "文章看好公司，但未上市。",
+                    "confidence": 0.3,
+                }
+            ],
+        )
+
+        def transport(body: bytes, headers, timeout: float):
+            captured["payload"] = json.loads(body)
+            return 200, json.dumps(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {"content": json.dumps(stale)},
+                        }
+                    ]
+                }
+            ).encode()
+
+        with self.assertRaises(llm_enrichment.EnrichmentError) as caught:
+            llm_enrichment.enrich_event(
+                event_input,
+                input_hash=input_hash,
+                config=llm_enrichment.DeepSeekConfig(api_key="secret-token"),
+                transport=transport,
+            )
+
+        payload = captured["payload"]
+        assert isinstance(payload, dict)
+        system_prompt = payload["messages"][0]["content"]
+        self.assertIn('"asset_key":"US:SPCX"', system_prompt)
+        self.assertIn('"listing_status":"listed"', system_prompt)
+        self.assertIn("2026-06-12", system_prompt)
+        self.assertEqual(caught.exception.code, "invalid_output")
 
     def test_provider_usage_is_returned_without_changing_the_legacy_contract(self) -> None:
         usage = {

@@ -80,7 +80,7 @@ class DeploymentContractTests(unittest.TestCase):
         self.assertIn("python3 -c 'import db; db.init()'", self.deploy)
         self.assertIn("KOL_DB_WRITE_REQUIRED=1", self.collect)
 
-    def test_daily_collector_is_packaged_and_callable_without_a_new_timer(self) -> None:
+    def test_daily_collector_is_packaged_and_scheduled_hourly(self) -> None:
         self.assertIn("briefing_collect.py", self.deploy)
         daily_start = self.collect.index("  daily)")
         enrich_start = self.collect.index("  enrich)", daily_start)
@@ -88,8 +88,136 @@ class DeploymentContractTests(unittest.TestCase):
         self.assertIn('briefing_collect.py"', daily_job)
         self.assertIn('--output "$DAILY_SNAPSHOT"', daily_job)
         self.assertIn('--import --db "$KOL_DASHBOARD_DB"', daily_job)
-        self.assertNotIn("kol-collect-daily.timer", self.deploy)
-        self.assertNotIn("kol-collect-daily.timer", self.collect)
+
+        timer_start = self.deploy.index(
+            'cat > "$REMOTE_STAGE/kol-collect-daily.timer"'
+        )
+        timer_end = self.deploy.index(
+            'cat > "$REMOTE_STAGE/kol-collect-enrich.timer"', timer_start
+        )
+        timer = self.deploy[timer_start:timer_end]
+        self.assertIn("OnCalendar=*-*-* *:05:00", timer)
+        self.assertIn("RandomizedDelaySec=90s", timer)
+        self.assertIn("AccuracySec=30s", timer)
+        self.assertIn("Persistent=true", timer)
+        self.assertIn("Unit=kol-collect-daily.service", timer)
+        self.assertNotIn("OnUnitActiveSec=", timer)
+
+    def test_daily_worker_receives_schedule_and_deepseek_environment(self) -> None:
+        self.assertEqual(
+            self.deploy.count("Environment=KOL_DAILY_REFRESH_SCHEDULE=hourly"),
+            2,
+        )
+        self.assertIn(
+            'if [[ "$job" == "daily" || "$job" == "enrich" ]]; then',
+            self.deploy,
+        )
+        self.assertIn(
+            'EXTRA_ENVIRONMENT="EnvironmentFile=-/etc/kol-dashboard/deepseek.env"',
+            self.deploy,
+        )
+        self.assertIn(
+            'if [[ "$job" == "daily" ]]; then',
+            self.deploy,
+        )
+        self.assertIn(
+            'EXTRA_SCHEDULE="Environment=KOL_DAILY_REFRESH_SCHEDULE=hourly"',
+            self.deploy,
+        )
+        self.assertNotIn("DEEPSEEK_API_KEY=", self.deploy)
+
+    def test_daily_candidate_is_imported_and_accepted_before_commit(self) -> None:
+        candidate_start = self.deploy.index(
+            'systemctl start kol-collect-daily.service'
+        )
+        snapshot_acceptance = self.deploy.index(
+            'validate_daily_snapshot "$DAILY_ACCEPTANCE_NOT_BEFORE"',
+            candidate_start,
+        )
+        api_acceptance = self.deploy.index(
+            "validate_daily_api", snapshot_acceptance
+        )
+        timer_start = self.deploy.index(
+            "systemctl start kol-collect-kol.timer", api_acceptance
+        )
+        committed = self.deploy.index("COMMITTED=1", timer_start)
+
+        self.assertLess(candidate_start, snapshot_acceptance)
+        self.assertLess(snapshot_acceptance, api_acceptance)
+        self.assertLess(api_acceptance, timer_start)
+        self.assertLess(timer_start, committed)
+        for required in (
+            '("Hacker News", "hn_story")',
+            '("AI Digest", "ai_digest")',
+            '("AI Brief", "paper_digest")',
+            'payload.get("refresh_schedule_status") not in {"configured", "active"}',
+            'payload.get("next_refresh_at")',
+            "database_integrity \"$DB_PATH\"",
+            "https://zlstreet.xyz/kol/api/briefings/latest",
+        ):
+            self.assertIn(required, self.deploy)
+
+    def test_daily_units_are_quiesced_enabled_and_rollback_safe(self) -> None:
+        self.assertGreaterEqual(
+            self.deploy.count("for job in kol macro decision daily enrich; do"),
+            3,
+        )
+        self.assertIn(
+            'backup_path "/etc/systemd/system/kol-collect-${job}.service"',
+            self.deploy,
+        )
+        self.assertIn(
+            'restore_path "/etc/systemd/system/kol-collect-${job}.service"',
+            self.deploy,
+        )
+        self.assertIn(
+            'DAILY_SNAPSHOT_PATH="$DATA_DIR/daily-briefing-latest.json"',
+            self.deploy,
+        )
+        self.assertIn(
+            'backup_path "$DAILY_SNAPSHOT_PATH" daily-briefing-latest.json',
+            self.deploy,
+        )
+        self.assertIn("rollback_daily_snapshot()", self.deploy)
+        self.assertIn(
+            "rollback_daily_snapshot || rollback_failed=1",
+            self.deploy,
+        )
+        self.assertIn(
+            '[[ -f "$DAILY_SNAPSHOT_PATH" && ! -L "$DAILY_SNAPSHOT_PATH" ]]',
+            self.deploy,
+        )
+
+        rollback_start = self.deploy.index("cleanup_remote()")
+        rollback_end = self.deploy.index("\n}\ntrap cleanup_remote", rollback_start)
+        rollback = self.deploy[rollback_start:rollback_end]
+        self.assertIn("kol-collect-daily.timer", rollback)
+        self.assertIn("kol-collect-daily.service", rollback)
+
+        quiesce_start = self.deploy.index("systemctl stop kol-enrich-wakeup.path")
+        quiesce_end = self.deploy.index("SERVICES_STOPPED=1", quiesce_start)
+        quiesce = self.deploy[quiesce_start:quiesce_end]
+        self.assertIn("kol-collect-daily.timer", quiesce)
+        self.assertIn("kol-collect-daily.service", quiesce)
+
+        enable_start = self.deploy.index("systemctl enable -q kol-dashboard")
+        enable_end = self.deploy.index("nginx -t", enable_start)
+        self.assertIn(
+            "kol-collect-daily.timer",
+            self.deploy[enable_start:enable_end],
+        )
+        timer_start = self.deploy.index(
+            "systemctl start kol-collect-kol.timer", enable_end
+        )
+        timer_acceptance = self.deploy.index(
+            'systemctl is-enabled --quiet "$unit"', timer_start
+        )
+        start_block = self.deploy[timer_start:timer_acceptance]
+        self.assertIn("kol-collect-daily.timer", start_block)
+        self.assertIn(
+            "for unit in kol-collect-kol.timer kol-collect-macro.timer",
+            self.deploy[timer_start:],
+        )
 
     def test_decision_snapshot_is_prewarmed_before_release_switch(self) -> None:
         prewarm = self.deploy.index(
@@ -111,7 +239,10 @@ class DeploymentContractTests(unittest.TestCase):
             'cat > "$REMOTE_STAGE/kol-collect-enrich.timer"',
             self.deploy,
         )
-        self.assertIn('if [[ "$job" == "enrich" ]]; then', self.deploy)
+        self.assertIn(
+            'if [[ "$job" == "daily" || "$job" == "enrich" ]]; then',
+            self.deploy,
+        )
         self.assertIn(
             'EXTRA_ENVIRONMENT="EnvironmentFile=-/etc/kol-dashboard/deepseek.env"',
             self.deploy,
@@ -178,10 +309,8 @@ class DeploymentContractTests(unittest.TestCase):
             self.deploy,
         )
         self.assertIn("systemctl stop kol-enrich-wakeup.path", self.deploy)
-        self.assertIn(
-            "kol-collect-enrich.timer kol-enrich-wakeup.path; do",
-            self.deploy,
-        )
+        self.assertIn("kol-collect-enrich.timer", self.deploy)
+        self.assertIn("kol-enrich-wakeup.path; do", self.deploy)
 
         enable = self.deploy.index("systemctl enable -q kol-dashboard")
         nginx_test = self.deploy.index("nginx -t", enable)
@@ -523,6 +652,7 @@ class DeploymentContractTests(unittest.TestCase):
             "kol-collect-kol.service",
             "kol-collect-macro.service",
             "kol-collect-decision.service",
+            "kol-collect-daily.service",
             "kol-collect-enrich.service",
         ):
             self.assertIn(unit, self.deploy)
@@ -557,10 +687,12 @@ class DeploymentContractTests(unittest.TestCase):
             "kol-collect-kol.timer",
             "kol-collect-macro.timer",
             "kol-collect-decision.timer",
+            "kol-collect-daily.timer",
             "kol-collect-enrich.timer",
             "kol-collect-kol.service",
             "kol-collect-macro.service",
             "kol-collect-decision.service",
+            "kol-collect-daily.service",
             "kol-collect-enrich.service",
             "kol-dashboard.service",
         ):

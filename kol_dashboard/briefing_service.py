@@ -34,6 +34,8 @@ MAX_SECTION_ITEMS = 6
 EVENT_LOOKBACK_HOURS = 24
 EVENT_QUERY_LIMIT = 240
 MACRO_HISTORY_LIMIT = 72
+DAILY_REFRESH_MINUTE = 5
+DAILY_REFRESH_DISPATCH_GRACE_SECONDS = 120
 
 SECTION_KEYS = ("macro", "world", "finance", "technology", "ai", "investors")
 SECTION_DEFINITIONS: dict[str, tuple[str, str]] = {
@@ -229,6 +231,9 @@ _TOPIC_LABELS = {
     "china_markets": "中国市场",
     "market_risk": "市场风险",
 }
+_SECURITY_MASTER_LABELS = {
+    "US:SPCX": "SpaceX",
+}
 _ASSET_LABELS = {
     "US:NVDA": "英伟达",
     "US:TSM": "台积电",
@@ -241,6 +246,7 @@ _ASSET_LABELS = {
     "US:AMD": "AMD",
     "US:AVGO": "博通",
     "US:BABA": "阿里巴巴",
+    **_SECURITY_MASTER_LABELS,
     "US:SPY": "标普 500 ETF",
     "US:QQQ": "纳斯达克 100 ETF",
     "CRYPTO:BTC": "比特币",
@@ -712,6 +718,47 @@ def _now(value: Any = None) -> datetime:
 
 def _iso(value: datetime) -> str:
     return value.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _refresh_schedule(
+    *,
+    now: datetime,
+    configured_schedule: str,
+    coverage_age_seconds: float | None,
+) -> tuple[str | None, str]:
+    """Project the deploy-owned schedule without claiming timer liveness.
+
+    The web process cannot inspect systemd.  The deployment contract injects
+    ``hourly`` only when it installs the timer; fresh imported coverage then
+    proves recent execution, while overdue coverage is reported as delayed.
+    """
+    schedule = _text(configured_schedule, 32).lower()
+    if schedule != "hourly":
+        return None, "unconfigured"
+
+    scheduled_refresh = now.replace(
+        minute=DAILY_REFRESH_MINUTE,
+        second=0,
+        microsecond=0,
+    )
+    dispatch_deadline = scheduled_refresh + timedelta(
+        seconds=DAILY_REFRESH_DISPATCH_GRACE_SECONDS
+    )
+    if now < scheduled_refresh:
+        next_refresh = scheduled_refresh
+    elif now <= dispatch_deadline:
+        # systemd may legally coalesce the :05 timer and add its randomized
+        # delay during this window. Keep the current run visible as pending.
+        next_refresh = dispatch_deadline
+    else:
+        next_refresh = scheduled_refresh + timedelta(hours=1)
+    if coverage_age_seconds is None:
+        status = "configured"
+    elif coverage_age_seconds > STALE_AFTER_SECONDS:
+        status = "delayed"
+    else:
+        status = "active"
+    return _iso(next_refresh), status
 
 
 def _public_temporal(value: Any) -> str:
@@ -1558,8 +1605,11 @@ def _assets(enrichment: Mapping[str, Any] | None) -> list[dict[str, Any]]:
         item = {"asset_key": asset_key}
         name = _text(raw.get("name_zh"), 40)
         direction = _text(raw.get("direction"), 24).lower()
-        if name:
-            item["name_zh"] = name
+        canonical_name = _SECURITY_MASTER_LABELS.get(asset_key)
+        if canonical_name or name:
+            # Known security-master labels outrank replaceable model prose. This
+            # also repairs old cached names such as "SpaceX（未上市）" at read time.
+            item["name_zh"] = canonical_name or name
         if direction in {"positive", "negative", "mixed", "unclear"}:
             item["direction"] = direction
         output.append(item)
@@ -2977,6 +3027,7 @@ def build_latest_briefing(
     public_macro: Mapping[str, Any] | None,
     decision_record: Mapping[str, Any] | None,
     imported_snapshot: Mapping[str, Any] | None = None,
+    refresh_schedule: str = "",
     now: Any = None,
 ) -> dict[str, Any]:
     """Build one stable Daily payload from already-persisted public data."""
@@ -3049,6 +3100,11 @@ def build_latest_briefing(
         if source_coverage_as_of is not None
         else None
     )
+    next_refresh_at, refresh_schedule_status = _refresh_schedule(
+        now=current,
+        configured_schedule=refresh_schedule,
+        coverage_age_seconds=coverage_age_seconds,
+    )
     public_as_of = _iso(as_of) if as_of is not None else None
     return {
         "available": available,
@@ -3057,10 +3113,10 @@ def build_latest_briefing(
         "edition_label": edition_label,
         "generated_at": _iso(current),
         "coverage_window_hours": EVENT_LOOKBACK_HOURS,
-        # The historical OpenClaw 10:00 job is only a migrated contract, not
-        # an active scheduler.  Do not present a guessed refresh promise.
-        "next_refresh_at": None,
-        "refresh_schedule_status": "unconfigured",
+        # The application reports a schedule only when deploy.sh injected its
+        # contract. Imported scan coverage determines active versus delayed.
+        "next_refresh_at": next_refresh_at,
+        "refresh_schedule_status": refresh_schedule_status,
         # ``source_as_of`` remains as a compatibility alias for the latest
         # displayed evidence.  The imported batch coverage has a separate
         # field so an empty successful scan is not confused with cron failure.

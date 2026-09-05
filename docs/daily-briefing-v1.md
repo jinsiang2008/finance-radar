@@ -220,9 +220,12 @@ CLI 默认在采集后尝试生成中文阅读增强；模型未配置或暂时�
 超时条目按 `unavailable` 降级，不得阻塞新快照。
 
 producer 按一次采集、一次退出的 CLI 运行模型设计；`collect.sh daily` 每次都会启动
-独立进程。不要在常驻 Web 进程内无限循环调用采集 library API，底层 DNS 或系统
-网络调用若无法取消，应交给下一次独立任务重试。
+独立进程。生产 `deploy.sh` 会安装应用自管的 `kol-collect-daily.service/.timer`，
+在每小时第 5 分钟加不超过 90 秒随机延迟后运行，并通过 `Persistent=true` 补跑
+错过的周期。不要在常驻 Web 进程内无限循环调用采集 library API，底层 DNS 或
+系统网络调用若无法取消，应交给下一次独立任务重试。
 
-输出先写入同目录临时文件，完成 JSON 校验后再原子改名，然后执行导入。恢复或
-新建 OpenClaw/Hermes 定时任务、跨主机传输和 Slack 通知属于独立运维变更；仅
-部署 producer 与导入器不会自动启用这些行为。
+输出先写入同目录临时文件，完成 JSON 校验后再原子改名，然后执行导入。自定义
+OpenClaw/Hermes producer、跨主机传输和 Slack 通知仍属于独立运维变更；若启用
+外部 producer，应先与应用自管 timer 合并为单一写入链路或停用其中一个，避免
+两个 producer 竞争覆盖同一天的完整快照。

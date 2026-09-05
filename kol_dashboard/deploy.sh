@@ -177,6 +177,7 @@ DATA_DIR="$BASE_DIR/data"
 PRIVATE_DIR="$BASE_DIR/private"
 BACKUPS_DIR="$BASE_DIR/backups"
 DB_PATH="$DATA_DIR/kol_dashboard.db"
+DAILY_SNAPSHOT_PATH="$DATA_DIR/daily-briefing-latest.json"
 CURRENT_LINK="$BASE_DIR/current"
 CURRENT_NEXT="$BASE_DIR/current.next.$RELEASE_ID"
 DB_NEXT="$DATA_DIR/kol_dashboard.db.next.$RELEASE_ID"
@@ -230,7 +231,8 @@ prepare_unit_state_rollback() {
   local unit enabled active failed=0
   for unit in kol-dashboard.service kol-collect-kol.timer \
     kol-collect-macro.timer kol-collect-decision.timer \
-    kol-collect-enrich.timer kol-enrich-wakeup.path; do
+    kol-collect-daily.timer kol-collect-enrich.timer \
+    kol-enrich-wakeup.path; do
     read -r enabled active < "$ROLLBACK_DIR/config/$unit.state" || {
       failed=1
       continue
@@ -247,7 +249,8 @@ restore_unit_states() {
   local unit enabled active failed=0
   for unit in kol-dashboard.service kol-collect-kol.timer \
     kol-collect-macro.timer kol-collect-decision.timer \
-    kol-collect-enrich.timer kol-enrich-wakeup.path; do
+    kol-collect-daily.timer kol-collect-enrich.timer \
+    kol-enrich-wakeup.path; do
     read -r enabled active < "$ROLLBACK_DIR/config/$unit.state" || {
       failed=1
       continue
@@ -283,6 +286,101 @@ finally:
 PY
 }
 
+validate_daily_snapshot() {
+  local acceptance_not_before=$1
+  python3 - "$DB_PATH" "$acceptance_not_before" <<'PY'
+from datetime import datetime, timedelta, timezone
+import json
+import sqlite3
+import sys
+
+database_path = sys.argv[1]
+not_before = datetime.fromtimestamp(int(sys.argv[2]), timezone.utc)
+now = datetime.now(timezone.utc)
+connection = sqlite3.connect(f"file:{database_path}?mode=ro", uri=True)
+try:
+    row = connection.execute(
+        """
+        SELECT generated_at, source_as_of, payload_json
+        FROM daily_briefing_snapshots
+        WHERE schema_version=1
+        ORDER BY source_as_of DESC, generated_at DESC, imported_at DESC, id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+finally:
+    connection.close()
+
+if row is None:
+    raise SystemExit("Daily candidate did not import a snapshot")
+generated_at, source_as_of, encoded = row
+try:
+    coverage_time = datetime.fromisoformat(source_as_of)
+    payload = json.loads(encoded)
+except (TypeError, ValueError, json.JSONDecodeError) as exc:
+    raise SystemExit(f"Daily candidate snapshot is invalid: {exc}") from exc
+if coverage_time.tzinfo is None or coverage_time.utcoffset() is None:
+    raise SystemExit("Daily candidate source_as_of must be timezone-aware")
+coverage_time = coverage_time.astimezone(timezone.utc)
+if coverage_time < not_before - timedelta(minutes=5):
+    raise SystemExit("Daily candidate snapshot did not advance during deployment")
+if coverage_time > now + timedelta(minutes=5):
+    raise SystemExit("Daily candidate source_as_of is in the future")
+
+sections = payload.get("sections")
+expected_sections = {"macro", "world", "finance", "technology", "ai", "investors"}
+if not isinstance(sections, dict) or set(sections) != expected_sections:
+    raise SystemExit("Daily candidate snapshot does not contain all six sections")
+observed = {
+    (item.get("source"), item.get("kind"))
+    for values in sections.values()
+    if isinstance(values, list)
+    for item in values
+    if isinstance(item, dict)
+}
+required = {
+    ("Hacker News", "hn_story"),
+    ("AI Digest", "ai_digest"),
+    ("AI Brief", "paper_digest"),
+}
+missing = sorted(required - observed)
+if missing:
+    raise SystemExit(f"Daily candidate is missing required discovery sources: {missing}")
+print(
+    "daily candidate: accepted "
+    f"generated_at={generated_at} source_as_of={source_as_of}"
+)
+PY
+}
+
+validate_daily_api() {
+  python3 - <<'PY'
+import json
+from urllib.request import Request, urlopen
+
+request = Request(
+    "http://127.0.0.1:8088/api/briefings/latest",
+    headers={"Accept": "application/json"},
+)
+with urlopen(request, timeout=8) as response:
+    if response.status != 200:
+        raise SystemExit(f"Daily API returned HTTP {response.status}")
+    payload = json.load(response)
+
+if not payload.get("source_coverage_as_of"):
+    raise SystemExit("Daily API did not expose imported source coverage")
+if payload.get("refresh_schedule_status") not in {"configured", "active"}:
+    raise SystemExit("Daily API did not expose the configured hourly schedule")
+if not payload.get("next_refresh_at"):
+    raise SystemExit("Daily API did not expose the next hourly refresh")
+print(
+    "daily api: accepted "
+    f"status={payload['refresh_schedule_status']} "
+    f"next={payload['next_refresh_at']}"
+)
+PY
+}
+
 activate_nginx() {
   nginx -t || return 1
   if systemctl is-active --quiet nginx; then
@@ -312,12 +410,21 @@ rollback_database() {
   return 0
 }
 
+rollback_daily_snapshot() {
+  restore_path "$DAILY_SNAPSHOT_PATH" daily-briefing-latest.json || return 1
+  if [[ -f "$DAILY_SNAPSHOT_PATH" ]]; then
+    chown kol-dashboard:kol-dashboard "$DAILY_SNAPSHOT_PATH" || return 1
+    chmod 600 "$DAILY_SNAPSHOT_PATH" || return 1
+  fi
+  return 0
+}
+
 rollback_configuration() {
   local failed=0
   restore_path /etc/kol-dashboard.env kol-dashboard.env || failed=1
   restore_path /etc/systemd/system/kol-dashboard.service \
     kol-dashboard.service || failed=1
-  for job in kol macro decision enrich; do
+  for job in kol macro decision daily enrich; do
     restore_path "/etc/systemd/system/kol-collect-${job}.service" \
       "kol-collect-${job}.service" || failed=1
     restore_path "/etc/systemd/system/kol-collect-${job}.timer" \
@@ -343,9 +450,11 @@ cleanup_remote() {
     local -a rollback_units=(
       kol-enrich-wakeup.path
       kol-collect-kol.timer kol-collect-macro.timer
-      kol-collect-decision.timer kol-collect-enrich.timer
+      kol-collect-decision.timer kol-collect-daily.timer
+      kol-collect-enrich.timer
       kol-collect-kol.service kol-collect-macro.service
-      kol-collect-decision.service kol-collect-enrich.service
+      kol-collect-decision.service kol-collect-daily.service
+      kol-collect-enrich.service
       kol-dashboard.service
     )
     echo "部署失败，恢复上一版本、数据库和配置" >&2
@@ -374,6 +483,7 @@ cleanup_remote() {
 
     if [[ $rollback_safe == 1 ]]; then
       rollback_database || rollback_failed=1
+      rollback_daily_snapshot || rollback_failed=1
       prepare_unit_state_rollback || rollback_failed=1
       rollback_configuration || rollback_failed=1
       if [[ -n "$PREVIOUS_TARGET" && -d "$PREVIOUS_TARGET" ]]; then
@@ -549,9 +659,16 @@ fi
 
 install -d -m 700 "$ROLLBACK_DIR/config"
 backup_path /etc/kol-dashboard.env kol-dashboard.env
+if [[ -e "$DAILY_SNAPSHOT_PATH" || -L "$DAILY_SNAPSHOT_PATH" ]]; then
+  [[ -f "$DAILY_SNAPSHOT_PATH" && ! -L "$DAILY_SNAPSHOT_PATH" ]] || {
+    echo "Daily 快照必须是普通文件，不能是符号链接" >&2
+    exit 1
+  }
+fi
+backup_path "$DAILY_SNAPSHOT_PATH" daily-briefing-latest.json
 backup_path /etc/systemd/system/kol-dashboard.service \
   kol-dashboard.service
-for job in kol macro decision enrich; do
+for job in kol macro decision daily enrich; do
   backup_path "/etc/systemd/system/kol-collect-${job}.service" \
     "kol-collect-${job}.service"
   backup_path "/etc/systemd/system/kol-collect-${job}.timer" \
@@ -561,7 +678,8 @@ backup_path /etc/systemd/system/kol-enrich-wakeup.path \
   kol-enrich-wakeup.path
 for unit in kol-dashboard.service kol-collect-kol.timer \
   kol-collect-macro.timer kol-collect-decision.timer \
-  kol-collect-enrich.timer kol-enrich-wakeup.path; do
+  kol-collect-daily.timer kol-collect-enrich.timer \
+  kol-enrich-wakeup.path; do
   record_unit_state "$unit"
 done
 backup_path /etc/nginx/snippets/kol-dashboard.conf \
@@ -572,17 +690,21 @@ ROLLBACK_READY=1
 
 systemctl stop kol-enrich-wakeup.path \
   kol-collect-kol.timer kol-collect-macro.timer \
-  kol-collect-decision.timer kol-collect-enrich.timer 2>/dev/null || true
+  kol-collect-decision.timer kol-collect-daily.timer \
+  kol-collect-enrich.timer 2>/dev/null || true
 for unit in kol-collect-kol.service kol-collect-macro.service \
-  kol-collect-decision.service kol-collect-enrich.service \
+  kol-collect-decision.service kol-collect-daily.service \
+  kol-collect-enrich.service \
   kol-dashboard.service; do
   systemctl stop "$unit" 2>/dev/null || true
 done
 for unit in kol-enrich-wakeup.path \
   kol-collect-kol.timer kol-collect-macro.timer \
-  kol-collect-decision.timer kol-collect-kol.service \
+  kol-collect-decision.timer kol-collect-daily.timer \
+  kol-collect-kol.service \
   kol-collect-macro.service kol-collect-decision.service \
-  kol-collect-enrich.timer kol-collect-enrich.service \
+  kol-collect-daily.service kol-collect-enrich.timer \
+  kol-collect-enrich.service \
   kol-dashboard.service; do
   if systemctl is-active --quiet "$unit"; then
     echo "active database writer remains: $unit" >&2
@@ -774,6 +896,7 @@ EnvironmentFile=-/etc/kol-dashboard.env
 Environment=KOL_DASHBOARD_PORT=8088
 Environment=KOL_DASHBOARD_HOST=127.0.0.1
 Environment=KOL_DASHBOARD_DB=/opt/kol-dashboard/data/kol_dashboard.db
+Environment=KOL_DAILY_REFRESH_SCHEDULE=hourly
 Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStart=/usr/bin/python3 /opt/kol-dashboard/current/app.py
 Restart=always
@@ -808,13 +931,18 @@ if [[ -e /etc/kol-dashboard/deepseek.env || \
   }
 fi
 
-for job in kol macro decision enrich; do
+for job in kol macro decision daily enrich; do
   EXTRA_ENVIRONMENT=""
+  EXTRA_SCHEDULE=""
   EXTRA_HARDENING=""
   EXTRA_EXEC_START_PRE=""
-  if [[ "$job" == "enrich" ]]; then
+  if [[ "$job" == "daily" || "$job" == "enrich" ]]; then
     EXTRA_ENVIRONMENT="EnvironmentFile=-/etc/kol-dashboard/deepseek.env"
     EXTRA_HARDENING="LimitCORE=0"
+  fi
+  if [[ "$job" == "daily" ]]; then
+    EXTRA_SCHEDULE="Environment=KOL_DAILY_REFRESH_SCHEDULE=hourly"
+  elif [[ "$job" == "enrich" ]]; then
     EXTRA_EXEC_START_PRE="ExecStartPre=/usr/bin/rm -f /opt/kol-dashboard/data/enrichment.pending"
   fi
   cat > "$REMOTE_STAGE/kol-collect-${job}.service" <<UNIT
@@ -829,6 +957,7 @@ Group=kol-dashboard
 WorkingDirectory=/opt/kol-dashboard/current
 EnvironmentFile=-/etc/kol-dashboard.env
 ${EXTRA_ENVIRONMENT}
+${EXTRA_SCHEDULE}
 Environment=KOL_DASHBOARD_DB=/opt/kol-dashboard/data/kol_dashboard.db
 Environment=KOL_LOG_DIR=/var/log/kol-dashboard
 Environment=PYTHONDONTWRITEBYTECODE=1
@@ -904,6 +1033,21 @@ Persistent=true
 WantedBy=timers.target
 UNIT
 
+cat > "$REMOTE_STAGE/kol-collect-daily.timer" <<'UNIT'
+[Unit]
+Description=Refresh Hacker News and curated AI Daily briefing hourly
+
+[Timer]
+OnCalendar=*-*-* *:05:00
+RandomizedDelaySec=90s
+AccuracySec=30s
+Persistent=true
+Unit=kol-collect-daily.service
+
+[Install]
+WantedBy=timers.target
+UNIT
+
 cat > "$REMOTE_STAGE/kol-collect-enrich.timer" <<'UNIT'
 [Unit]
 Description=Enrich recent KOL events with Chinese intelligence
@@ -918,7 +1062,7 @@ Persistent=true
 WantedBy=timers.target
 UNIT
 
-for job in kol macro decision enrich; do
+for job in kol macro decision daily enrich; do
   install -m 644 "$REMOTE_STAGE/kol-collect-${job}.timer" \
     "/etc/systemd/system/kol-collect-${job}.timer"
 done
@@ -982,7 +1126,8 @@ fi
 systemctl daemon-reload
 systemctl enable -q kol-dashboard kol-collect-kol.timer \
   kol-collect-macro.timer kol-collect-decision.timer \
-  kol-collect-enrich.timer kol-enrich-wakeup.path
+  kol-collect-daily.timer kol-collect-enrich.timer \
+  kol-enrich-wakeup.path
 nginx -t
 systemctl restart kol-dashboard.service
 
@@ -1016,9 +1161,28 @@ done
   exit 1
 }
 
+echo "→ 验收 Daily 候选采集"
+DAILY_ACCEPTANCE_NOT_BEFORE=$(date -u +%s)
+systemctl start kol-collect-daily.service
+database_integrity "$DB_PATH"
+validate_daily_snapshot "$DAILY_ACCEPTANCE_NOT_BEFORE"
+validate_daily_api
+
 systemctl start kol-collect-kol.timer kol-collect-macro.timer \
-  kol-collect-decision.timer kol-collect-enrich.timer \
-  kol-enrich-wakeup.path
+  kol-collect-decision.timer kol-collect-daily.timer \
+  kol-collect-enrich.timer kol-enrich-wakeup.path
+for unit in kol-collect-kol.timer kol-collect-macro.timer \
+  kol-collect-decision.timer kol-collect-daily.timer \
+  kol-collect-enrich.timer; do
+  systemctl is-enabled --quiet "$unit" || {
+    echo "采集定时器未启用: $unit" >&2
+    exit 1
+  }
+  systemctl is-active --quiet "$unit" || {
+    echo "采集定时器未运行: $unit" >&2
+    exit 1
+  }
+done
 systemctl is-enabled --quiet kol-enrich-wakeup.path || {
   echo "enrichment 唤醒 path 未启用" >&2
   exit 1
@@ -1065,4 +1229,7 @@ echo "→ 公网验证"
 curl -sf --max-time 12 https://zlstreet.xyz/kol/health && echo "  ← /kol/health"
 curl -sf --max-time 12 -o /dev/null \
   -w "  /kol/ → HTTP %{http_code}\n" https://zlstreet.xyz/kol/
+curl -sf --max-time 12 -o /dev/null \
+  -w "  /kol/api/briefings/latest → HTTP %{http_code}\n" \
+  https://zlstreet.xyz/kol/api/briefings/latest
 echo "✓ 完成 — https://zlstreet.xyz/kol/"

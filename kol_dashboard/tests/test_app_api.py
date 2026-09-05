@@ -1341,7 +1341,10 @@ class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
         )
         briefing_import.import_payload(snapshot, now=generated)
 
-        with patch.object(
+        with patch.dict(
+            os.environ,
+            {"KOL_DAILY_REFRESH_SCHEDULE": "hourly"},
+        ), patch.object(
             dashboard_app.briefing_service,
             "build_latest_briefing",
             return_value={"available": True},
@@ -1351,6 +1354,7 @@ class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         imported = build.call_args.kwargs["imported_snapshot"]
         self.assertIsNotNone(imported)
+        self.assertEqual(build.call_args.kwargs["refresh_schedule"], "hourly")
         self.assertEqual(
             imported["sections"]["ai"][0]["title"],
             "AI lab publishes a new model system card",

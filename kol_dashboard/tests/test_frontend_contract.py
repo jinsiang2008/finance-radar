@@ -204,7 +204,11 @@ class FrontendContractTests(unittest.TestCase):
         )
         unavailable_contract = self.javascript[unavailable_start:unavailable_end]
         self.assertIn("const unavailableSections = sections.map", unavailable_contract)
-        self.assertIn('refresh_schedule_status: "unconfigured"', unavailable_contract)
+        self.assertIn(
+            'refresh_schedule_status: data?.refresh_schedule_status || "unconfigured"',
+            unavailable_contract,
+        )
+        self.assertIn("next_refresh_at: data?.next_refresh_at || null", unavailable_contract)
         self.assertIn(
             "dailyStatusBandHTML(unavailableData, unavailableSections",
             unavailable_contract,
@@ -245,11 +249,29 @@ class FrontendContractTests(unittest.TestCase):
         self.assertNotIn("DIRECT SOURCES", self.javascript)
         self.assertNotIn("NEXT CHECK", self.javascript)
 
-    def test_daily_assets_share_the_v32_cachebuster(self) -> None:
-        self.assertIn('static/app.js?v=32', self.html)
-        self.assertIn('static/style.css?v=32', self.html)
-        self.assertEqual(self.html.count("?v=32"), 2)
+    def test_daily_assets_share_the_v33_cachebuster(self) -> None:
+        self.assertIn('static/app.js?v=33', self.html)
+        self.assertIn('static/style.css?v=33', self.html)
+        self.assertEqual(self.html.count("?v=33"), 2)
         self.assertNotIn("?v=26", self.html)
+
+    def test_other_views_share_the_daily_editorial_reading_system(self) -> None:
+        self.assertIn(".wrap { max-width: 1240px", self.css)
+        self.assertIn("#view-kol .card-title {", self.css)
+        self.assertIn("font-size: 20px; line-height: 1.5", self.css)
+        self.assertIn("#view-kol .card-snippet {", self.css)
+        self.assertIn("font-size: 14px; line-height: 1.75", self.css)
+        self.assertIn("#view-macro .event-title {", self.css)
+        self.assertIn("font-family: var(--font-display); font-size: 19px", self.css)
+        self.assertIn("#view-decision .decision-card-trigger", self.css)
+        self.assertIn("#view-decision .spine-step-head h3", self.css)
+
+    def test_spacex_uses_canonical_listed_asset_label(self) -> None:
+        self.assertIn('"US:SPCX": "SpaceX"', self.javascript)
+        self.assertIn(
+            "const label = ASSET_CN[key] ? assetLabel(key) : suppliedLabel",
+            self.javascript,
+        )
 
     def test_daily_desktop_reading_layout_has_a_compact_rail_and_split_impact(self) -> None:
         self.assertIn(
@@ -451,8 +473,8 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn('stale ? "数据延迟" : ""', self.javascript)
         self.assertIn('"高收益债利差"', self.javascript)
         self.assertIn("cs.hy_oas", self.javascript)
-        self.assertIn('static/app.js?v=32', self.html)
-        self.assertIn('static/style.css?v=32', self.html)
+        self.assertIn('static/app.js?v=33', self.html)
+        self.assertIn('static/style.css?v=33', self.html)
         self.assertNotIn('?v=26', self.html)
         self.assertIn(".metric.is-stale", self.css)
 

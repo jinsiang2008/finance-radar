@@ -407,6 +407,44 @@ class BriefingBuildTests(unittest.TestCase):
         self.assertEqual(repository.event_query["time_status"], "verified")
         self.assertEqual(repository.event_query["use_ai_impact"], True)
 
+    def test_hourly_schedule_is_configured_before_its_first_import(self) -> None:
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository(),
+            public_macro=None,
+            decision_record=None,
+            refresh_schedule="hourly",
+            now=NOW,
+        )
+
+        self.assertEqual(result["refresh_schedule_status"], "configured")
+        self.assertEqual(result["next_refresh_at"], "2026-09-04T02:05:00+00:00")
+        self.assertIsNone(result["source_coverage_as_of"])
+
+    def test_hourly_schedule_keeps_the_current_dispatch_window_pending(self) -> None:
+        during_dispatch = briefing_service.build_latest_briefing(
+            repository=FakeRepository(),
+            public_macro=None,
+            decision_record=None,
+            refresh_schedule="hourly",
+            now="2026-09-04T02:05:30+00:00",
+        )
+        after_dispatch = briefing_service.build_latest_briefing(
+            repository=FakeRepository(),
+            public_macro=None,
+            decision_record=None,
+            refresh_schedule="hourly",
+            now="2026-09-04T02:07:01+00:00",
+        )
+
+        self.assertEqual(
+            during_dispatch["next_refresh_at"],
+            "2026-09-04T02:07:00+00:00",
+        )
+        self.assertEqual(
+            after_dispatch["next_refresh_at"],
+            "2026-09-04T03:05:00+00:00",
+        )
+
     def test_current_empty_import_reports_scan_coverage_without_fake_news(self) -> None:
         snapshot = {
             "schema_version": 1,
@@ -420,6 +458,7 @@ class BriefingBuildTests(unittest.TestCase):
             public_macro=None,
             decision_record=None,
             imported_snapshot=snapshot,
+            refresh_schedule="hourly",
             now=NOW,
         )
 
@@ -431,8 +470,31 @@ class BriefingBuildTests(unittest.TestCase):
             "2026-09-04T01:58:00+00:00",
         )
         self.assertFalse(result["source_coverage_stale"])
+        self.assertEqual(result["refresh_schedule_status"], "active")
+        self.assertEqual(result["next_refresh_at"], "2026-09-04T02:05:00+00:00")
         self.assertTrue(result["stale"])
         self.assertEqual(result["coverage"]["total"], 0)
+
+    def test_hourly_schedule_reports_overdue_coverage_as_delayed(self) -> None:
+        snapshot = {
+            "schema_version": 1,
+            "generated_at": "2026-09-04T00:20:00+00:00",
+            "source_as_of": "2026-09-04T00:20:00+00:00",
+            "sections": {key: [] for key in briefing_service.SECTION_KEYS},
+        }
+
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository(),
+            public_macro=None,
+            decision_record=None,
+            imported_snapshot=snapshot,
+            refresh_schedule="hourly",
+            now=NOW,
+        )
+
+        self.assertTrue(result["source_coverage_stale"])
+        self.assertEqual(result["refresh_schedule_status"], "delayed")
+        self.assertEqual(result["next_refresh_at"], "2026-09-04T02:05:00+00:00")
 
     def test_batch_coverage_does_not_freshen_old_displayed_evidence(self) -> None:
         snapshot = {
@@ -589,6 +651,39 @@ class BriefingBuildTests(unittest.TestCase):
         self.assertEqual(result["coverage"]["official"], 1)
         self.assertEqual(result["coverage"]["first_party"], 1)
         self.assertEqual(result["coverage"]["ai_ready"], 1)
+
+    def test_daily_assets_use_canonical_name_over_stale_model_label(self) -> None:
+        event = self.event(
+            15413,
+            "SpaceX Offers Exponential Upside And Extreme Risk",
+            ai_enrichment=ready_ai(
+                headline_zh="SpaceX增长潜力与风险并存",
+                summary_zh="文章讨论SpaceX上市后的增长潜力与执行风险。",
+                why_it_matters_zh="SPCX的表现可能影响商业航天板块情绪。",
+                assets=[
+                    {
+                        "asset_key": "US:SPCX",
+                        "name_zh": "SpaceX（未上市）",
+                        "direction": "positive",
+                    }
+                ],
+            ),
+        )
+
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository([event]),
+            public_macro=None,
+            decision_record=None,
+            now=NOW,
+        )
+
+        self.assertEqual(result["highlights"][0]["assets"], [
+            {
+                "asset_key": "US:SPCX",
+                "name_zh": "SpaceX",
+                "direction": "positive",
+            }
+        ])
 
     def test_macro_history_builds_risk_delta_and_freshness(self) -> None:
         macro = {

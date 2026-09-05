@@ -177,6 +177,7 @@
     "US:GOOGL": "谷歌",
     "US:AMZN": "亚马逊",
     "US:BABA": "阿里巴巴",
+    "US:SPCX": "SpaceX",
     "US:TLT": "长期美国国债 ETF",
     "BOND:UST_LONG": "长期美国国债",
     "BOND:UST_INTERMEDIATE": "中期美国国债",
@@ -1195,7 +1196,8 @@
         }
         if (!item || typeof item !== "object") return null;
         const key = String(item.asset_key || item.key || "").trim();
-        const label = String(item.name_zh || item.label || "").trim();
+        const suppliedLabel = String(item.name_zh || item.label || "").trim();
+        const label = ASSET_CN[key] ? assetLabel(key) : suppliedLabel;
         if (!key && !label) return null;
         return {
           key,
@@ -1806,7 +1808,7 @@
           Number.isFinite(coverageHours) && coverageHours > 0
             ? `滚动观察最近 ${coverageHours} 小时`
             : "滚动观察当日可核验信息"
-        }${nextRefresh ? ` · 下次刷新 ${esc(nextRefresh)}` : ""}${
+        }${nextRefresh ? ` · 下轮约 ${esc(nextRefresh)}` : ""}${
           sourceCoverage
             ? ` · ${
                 data?.source_coverage_stale ? "采集覆盖延迟至" : "采集覆盖至"
@@ -2092,8 +2094,8 @@
       }));
       const unavailableData = {
         ...(data && typeof data === "object" ? data : {}),
-        next_refresh_at: null,
-        refresh_schedule_status: "unconfigured",
+        next_refresh_at: data?.next_refresh_at || null,
+        refresh_schedule_status: data?.refresh_schedule_status || "unconfigured",
       };
       stage.innerHTML = `${dailyStatusBandHTML(unavailableData, unavailableSections, {
         linkable: false,

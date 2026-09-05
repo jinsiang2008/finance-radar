@@ -25,6 +25,7 @@ Environment:
   KOL_DASHBOARD_PORT        — default 8088
   KOL_DASHBOARD_HOST        — default 127.0.0.1
   KOL_DASHBOARD_DB          — sqlite path
+  KOL_DAILY_REFRESH_SCHEDULE — deploy-owned Daily timer contract (hourly)
 """
 
 from __future__ import annotations
@@ -537,6 +538,7 @@ def api_latest_briefing() -> JSONResponse:
         public_macro=_public_macro_snapshot(),
         decision_record=decision_record,
         imported_snapshot=imported_snapshot,
+        refresh_schedule=os.environ.get("KOL_DAILY_REFRESH_SCHEDULE", ""),
     )
     return JSONResponse(payload, headers=_BRIEFING_CACHE_HEADERS)
 

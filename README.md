@@ -47,6 +47,7 @@ cp private/holdings.example.md private/holdings.md
 ./kol_dashboard/collect.sh kol
 ./kol_dashboard/collect.sh macro
 ./kol_dashboard/collect.sh decision
+./kol_dashboard/collect.sh daily
 ```
 
 采集过程需要访问公开新闻和市场数据源。所有命令均可重复执行；数据库层会
@@ -74,6 +75,11 @@ python3 kol_dashboard/briefing_import.py /path/to/daily-briefing.json \
 API 还会分开返回内容证据时间与批次采集覆盖时间：空批次代表“扫描完成但暂无
 新增”，不会被误报成任务未运行；重新抓取也不会把旧文章的证据时间刷新。
 该命令不会运行 OpenClaw/Hermes、访问网络或调用 LLM，也没有对应的公网写 API。
+
+生产部署会安装并启用应用自管的 `kol-collect-daily.timer`：每小时第 5 分钟触发，
+附加不超过 90 秒的随机延迟，并在错过执行后自动补跑。它调用 `collect.sh daily`
+采集 Hacker News Top/Best、AI Digest 与 AI Brief，校验后原子导入同一份 Daily
+快照；DeepSeek 已配置时同时生成有证据边界的中文阅读增强。
 
 ## 私人模式
 

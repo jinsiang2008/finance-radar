@@ -45,7 +45,7 @@ for _cand in _DASHBOARD_CANDIDATES:
             sys.path.insert(0, _cand)
         break
 
-from content_quality import has_substantive_social_text
+from content_quality import has_substantive_social_text  # noqa: E402
 
 try:
     from kol_dashboard.event_relevance import (
@@ -594,14 +594,41 @@ def search_kol(key: str, query: str, max_results: int = 5) -> list[dict[str, str
 
 
 _TICKER_RE = re.compile(r"\$([A-Z]{1,5})\b")
+_CONTEXT_TICKER_RE = re.compile(
+    r"(?<![A-Za-z0-9])([A-Z][A-Z0-9.-]{0,5})\s+"
+    r"(?:(?:class\s+[A-Z]\s+|common\s+)?stock|shares?)\b"
+)
+_CONTEXT_TICKER_STOPWORDS = {
+    "A",
+    "AI",
+    "CEO",
+    "CFO",
+    "ETF",
+    "GDP",
+    "IPO",
+    "SEC",
+    "THE",
+    "US",
+    "USD",
+}
 
 
 def extract_tickers(text: str, limit: int = 8) -> list[str]:
-    """提取 $TICKER 形式的股票代码，保持出现顺序去重。"""
+    """提取明确的 $TICKER 或 ``TICKER stock/shares``，按出现顺序去重。"""
+    source = text or ""
+    candidates = [
+        (match.start(), match.group(1), False)
+        for match in _TICKER_RE.finditer(source)
+    ] + [
+        (match.start(), match.group(1), True)
+        for match in _CONTEXT_TICKER_RE.finditer(source)
+    ]
     seen: list[str] = []
-    for t in _TICKER_RE.findall(text or ""):
-        if t not in seen:
-            seen.append(t)
+    for _, ticker, is_contextual in sorted(candidates, key=lambda item: item[0]):
+        if is_contextual and ticker in _CONTEXT_TICKER_STOPWORDS:
+            continue
+        if ticker not in seen:
+            seen.append(ticker)
         if len(seen) >= limit:
             break
     return seen
@@ -624,10 +651,40 @@ _SCRIPTS_DIRS = [
 
 X_FETCH_ATTEMPTS = 3
 X_RETRY_BACKOFF_SECONDS = 2
+_X_HANDLE_RE = re.compile(r"^[A-Za-z0-9_]{1,15}$")
+_X_TWEET_ID_RE = re.compile(r"^[1-9]\d{0,19}$")
+X_SOURCE_WARNINGS: dict[str, dict[str, str]] = {}
+
+
+class XSourceError(RuntimeError):
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(code)
+
+
+def _set_x_source_warning(handle: str, code: str) -> None:
+    X_SOURCE_WARNINGS[handle.casefold()] = {
+        "source": f"X @{handle}",
+        "code": code,
+    }
+
+
+def _x_error_code(error: Exception | None) -> str:
+    code = str(getattr(error, "code", "") or "").strip()
+    if re.fullmatch(r"[a-z][a-z0-9_]{2,63}", code):
+        return code
+    if str(error or "").strip() == "source_parse_empty":
+        return "source_parse_empty"
+    return "source_fetch_failed"
 
 
 def search_x(handle: str, max_results: int = 10) -> list[dict[str, Any]]:
     """抓取 X 账号最新推文。复用 serenity_tracker 的解析逻辑。"""
+    handle = str(handle or "").strip().lstrip("@")
+    if not _X_HANDLE_RE.fullmatch(handle):
+        sys.stderr.write("[kol_tracker] x source warning code=invalid_x_handle\n")
+        return []
+    X_SOURCE_WARNINGS.pop(handle.casefold(), None)
     for d in _SCRIPTS_DIRS:
         if d and os.path.isfile(os.path.join(d, "serenity_tracker.py")):
             if d not in sys.path:
@@ -635,8 +692,12 @@ def search_x(handle: str, max_results: int = 10) -> list[dict[str, Any]]:
             break
     try:
         import serenity_tracker as st  # type: ignore
-    except Exception as e:
-        sys.stderr.write(f"[kol_tracker] x source unavailable: {e}\n")
+    except Exception:
+        _set_x_source_warning(handle, "source_unavailable")
+        sys.stderr.write(
+            f"[kol_tracker] x source warning @{handle} "
+            "code=source_unavailable\n"
+        )
         return []
 
     # x.com returns intermittent 5xx responses; a couple of retries recovers
@@ -645,21 +706,42 @@ def search_x(handle: str, max_results: int = 10) -> list[dict[str, Any]]:
     last_error: Exception | None = None
     for attempt in range(X_FETCH_ATTEMPTS):
         try:
-            tweets = st.parse_tweets(st.fetch_page())
+            fetch_tweets = getattr(st, "fetch_tweets", None)
+            if callable(fetch_tweets):
+                tweets = fetch_tweets(handle)
+            else:
+                tweets = st.parse_tweets(st.fetch_page())
+            if not isinstance(tweets, list):
+                raise XSourceError("source_bad_payload")
+            if not tweets:
+                raise XSourceError("source_parse_empty")
             break
         except Exception as e:
             last_error = e
+            tweets = None
             if attempt < X_FETCH_ATTEMPTS - 1:
                 time.sleep(X_RETRY_BACKOFF_SECONDS * (attempt + 1))
-    if tweets is None:
+    if not tweets:
+        code = _x_error_code(last_error)
+        _set_x_source_warning(handle, code)
         sys.stderr.write(
-            f"[kol_tracker] x fetch failed for @{handle} after "
-            f"{X_FETCH_ATTEMPTS} attempts: {last_error}\n"
+            f"[kol_tracker] x source warning @{handle} code={code} after "
+            f"{X_FETCH_ATTEMPTS} attempts\n"
         )
         return []
 
     results = []
     for t in tweets[:max_results]:
+        tid = str(t.get("tid") or "").strip()
+        if not _X_TWEET_ID_RE.fullmatch(tid):
+            continue
+        observed_handle = str(t.get("handle") or "").strip().lstrip("@")
+        if observed_handle and observed_handle.casefold() != handle.casefold():
+            continue
+        expected_url = f"https://x.com/{handle}/status/{tid}"
+        source_url = str(t.get("url") or expected_url).strip()
+        if source_url != expected_url:
+            continue
         text = re.sub(r"\s+", " ", (t.get("text") or "").strip())
         if not text:
             continue
@@ -684,10 +766,16 @@ def search_x(handle: str, max_results: int = 10) -> list[dict[str, Any]]:
             {
                 "title": title,
                 "snippet": text,
-                "url": f"https://x.com/{handle}/status/{t['tid']}",
+                "url": expected_url,
                 "source": f"X @{handle}",
                 "published_at": published_at,
             }
+        )
+    if tweets and not results:
+        _set_x_source_warning(handle, "source_items_invalid")
+        sys.stderr.write(
+            f"[kol_tracker] x source warning @{handle} "
+            "code=source_items_invalid\n"
         )
     return results
 
@@ -757,6 +845,7 @@ def scan_kol(kol_key: str, max_results: int = 5) -> list[dict[str, Any]]:
 
 def scan_all(max_results: int = 5) -> dict[str, list[Any]]:
     """扫描所有 KOL 的近期动态"""
+    X_SOURCE_WARNINGS.clear()
     data = {}
     for kol_key in KOLS:
         items = scan_kol(kol_key, max_results)
@@ -875,21 +964,20 @@ def cmd_collect(args: list[str]) -> None:
     all_items: list[dict[str, Any]] = []
     for items in data.values():
         all_items.extend(items)
+    result = {
+        "kols": len(data),
+        "scanned": len(all_items),
+        "inserted": 0,
+        "skipped": 0,
+    }
     if all_items:
         ins, skip = _write_to_db(all_items)
-        print(
-            json.dumps(
-                {
-                    "kols": len(data),
-                    "scanned": len(all_items),
-                    "inserted": ins,
-                    "skipped": skip,
-                },
-                ensure_ascii=False,
-            )
-        )
-    else:
-        print(json.dumps({"kols": 0, "scanned": 0, "inserted": 0, "skipped": 0}))
+        result.update({"inserted": ins, "skipped": skip})
+    if X_SOURCE_WARNINGS:
+        result["source_warnings"] = [
+            X_SOURCE_WARNINGS[key] for key in sorted(X_SOURCE_WARNINGS)
+        ]
+    print(json.dumps(result, ensure_ascii=False))
 
 
 # ─── Dispatcher ────────────────────────────────────────

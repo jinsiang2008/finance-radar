@@ -70,7 +70,7 @@ a { color: var(--link); text-decoration: none; }
 a:hover { text-decoration: underline; }
 button { font: inherit; cursor: pointer; }
 
-.wrap { max-width: 1180px; margin: 0 auto; padding: 0 24px; }
+.wrap { max-width: 1240px; margin: 0 auto; padding: 0 24px; }
 
 .sr-only {
   position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
@@ -78,7 +78,7 @@ button { font: inherit; cursor: pointer; }
 }
 .section-kicker {
   margin: 0 0 4px; color: var(--accent); font-family: var(--font-data);
-  font-size: 9.5px; font-weight: 700; letter-spacing: .13em; line-height: 1.4;
+  font-size: 10.5px; font-weight: 700; letter-spacing: .13em; line-height: 1.4;
 }
 
 /* ─── Top bar ─────────────────────────────── */
@@ -181,9 +181,9 @@ button { font: inherit; cursor: pointer; }
 
 .block { margin-top: 34px; }
 .block-head { margin-bottom: 12px; }
-.block-head h2 { font-size: 17px; }
+.block-head h2 { font-family: var(--font-display); font-size: 20px; line-height: 1.4; }
 .block-head-row { display: flex; align-items: flex-end; justify-content: space-between; gap: 18px; }
-.block-sub { margin: 3px 0 0; font-size: 12.5px; color: var(--muted); }
+.block-sub { margin: 4px 0 0; font-size: 13.5px; line-height: 1.65; color: var(--muted); }
 
 /* A failed refresh never erases the last useful screen. */
 .view-load-state {
@@ -2585,6 +2585,129 @@ button:focus-visible, a:focus-visible, [tabindex]:focus-visible, input:focus-vis
   }
 }
 
+/* ─── Shared editorial rhythm ───────────────
+   Daily establishes the reading system. The other three views reuse its
+   serif narrative hierarchy and 14px reading copy while dense data labels,
+   timestamps and matrices remain compact. */
+#view-decision .decision-hero,
+#view-decision .decision-panel,
+#view-decision .decision-lenses,
+#view-macro .hero,
+#view-macro .trend-card,
+#view-macro .subscore,
+#view-macro .metric,
+#view-macro .scenario,
+#view-macro .event,
+#view-macro .opp,
+#view-kol .stat,
+#view-kol .card {
+  border-radius: 10px;
+  box-shadow: none;
+}
+
+/* KOL is a reading surface first, a filter console second. */
+#view-kol .kol-intro { padding-top: 9px; padding-bottom: 20px; }
+#view-kol .kol-intro h1 { font-size: clamp(28px, 3vw, 40px); }
+#view-kol .kol-intro > p {
+  max-width: 48ch; color: var(--text-2); font-size: 13.5px; line-height: 1.7;
+}
+#view-kol .stat-label,
+#view-kol .time-window-basis { font-size: 12px; }
+#view-kol .filter-label { font-size: 10px; }
+#view-kol .search { min-height: 42px; font-size: 14px; }
+#view-kol .chip { font-size: 13px; }
+#view-kol .kol-filter-status,
+#view-kol .feed-status { font-size: 11.5px; line-height: 1.6; }
+#view-kol .feed { gap: 12px; }
+#view-kol .card { padding: 17px 19px; }
+#view-kol .card-head,
+#view-kol .card-kol { font-size: 12px; }
+#view-kol .card-title {
+  max-inline-size: 46em; font-size: 20px; line-height: 1.5;
+}
+#view-kol .card-title-body,
+#view-kol .card-snippet {
+  max-inline-size: 72ch; color: var(--text-2); font-size: 14px; line-height: 1.75;
+}
+#view-kol .card-original { max-inline-size: 76ch; font-size: 12.5px; line-height: 1.65; }
+#view-kol .heat,
+#view-kol .card-link-unavailable,
+#view-kol .ai-request-note { font-size: 11.5px; }
+#view-kol .card-evidence-btn,
+#view-kol .card-original-link,
+#view-kol .ai-request-btn { font-size: 12.5px; }
+
+/* Macro keeps numerical density, but narrative evidence follows Daily. */
+#view-macro .hero-label { font-family: var(--font-display); font-size: 19px; }
+#view-macro .hero-note { font-size: 14px; line-height: 1.7; }
+#view-macro .subscore-name { font-size: 15px; }
+#view-macro .signal-list li,
+#view-macro .signal-empty { font-size: 13px; line-height: 1.65; }
+#view-macro .metric-label,
+#view-macro .metric-sub { font-size: 12.5px; line-height: 1.6; }
+#view-macro .scenario-title {
+  font-family: var(--font-display); font-size: 17px; line-height: 1.5;
+}
+#view-macro .scenario-desc,
+#view-macro .detail-val { font-size: 14px; line-height: 1.7; }
+#view-macro .detail-key { font-size: 12px; }
+#view-macro .macro-ai-digest h3 { font-family: var(--font-display); font-size: 18px; line-height: 1.4; }
+#view-macro .macro-ai-points strong { font-size: 14px; line-height: 1.55; }
+#view-macro .macro-ai-points p { font-size: 13.5px; line-height: 1.65; }
+#view-macro .event { padding: 17px 19px; }
+#view-macro .event-source,
+#view-macro .event-time { font-size: 12px; }
+#view-macro .event-title {
+  max-inline-size: 48em; font-family: var(--font-display); font-size: 19px; line-height: 1.5;
+}
+#view-macro .event-summary {
+  max-inline-size: 74ch; margin-top: 7px; font-size: 14px; line-height: 1.72;
+}
+#view-macro .event-original,
+#view-macro .event-note { font-size: 12.5px; line-height: 1.6; }
+#view-macro .event-source-evidence > summary,
+#view-macro .event-insight > summary { font-size: 12.5px; }
+#view-macro .event-source-evidence-body,
+#view-macro .event-insight-body p,
+#view-macro .event-impact-path { font-size: 13.5px; line-height: 1.7; }
+#view-macro .event-ai-asset-head strong { font-size: 13px; }
+#view-macro .opp-asset { font-family: var(--font-display); font-size: 17px; }
+#view-macro .opp-signal { font-size: 14px; line-height: 1.7; }
+#view-macro .opp-foot { font-size: 12px; }
+
+/* Decision remains information-dense, with larger action copy and evidence. */
+#view-decision .brief-eyebrow,
+#view-decision .brief-kicker { font-size: 10.5px; }
+#view-decision .brief-narrative { font-size: 14px; line-height: 1.75; }
+#view-decision .brief-statline,
+#view-decision .brief-freshness { font-size: 12px; line-height: 1.65; }
+#view-decision .decision-boundary-rail > p,
+#view-decision .lead-context-item strong { font-size: 13.5px; line-height: 1.65; }
+#view-decision .brief-policy { font-size: 13px; line-height: 1.7; }
+#view-decision .decision-lenses-copy h2 {
+  font-family: var(--font-display); font-size: 17px;
+}
+#view-decision .decision-lens { font-size: 12.5px; }
+#view-decision .decision-lens-status,
+#view-decision .decision-watchlist-privacy { font-size: 12px; line-height: 1.6; }
+#view-decision .decision-asset { font-size: 14px; }
+#view-decision .decision-topic { font-size: 12.5px; }
+#view-decision .decision-card-trigger { font-size: 13.5px; line-height: 1.7; }
+#view-decision .decision-card-meta { font-size: 12px; line-height: 1.6; }
+#view-decision .evidence-subtitle,
+#view-decision .spine-step-head p { font-size: 13px; line-height: 1.7; }
+#view-decision .spine-step-head h3 { font-size: 19px; line-height: 1.45; }
+#view-decision .source-record-card h4 { font-size: 15px; line-height: 1.6; }
+#view-decision .spine-meta-grid dd,
+#view-decision .evidence-source,
+#view-decision .position-match-summary span,
+#view-decision .market-observation-head span,
+#view-decision .decision-disclaimer { font-size: 12.5px; line-height: 1.65; }
+#view-decision .contrary-evidence li,
+#view-decision .validation-boundary,
+#view-decision .model-path-list li,
+#view-decision .review-gates > div p { font-size: 14px; line-height: 1.75; }
+
 .auth-modal {
   position: fixed; inset: 0; z-index: 110; display: grid; place-items: center;
   padding: 20px; background: rgba(5, 8, 14, .72); backdrop-filter: blur(5px);
@@ -2900,7 +3023,12 @@ button:focus-visible, a:focus-visible, [tabindex]:focus-visible, input:focus-vis
   .chip { min-height: 44px; padding: 7px 11px; }
   .card { padding: 13px 14px; }
   .card-time { width: 100%; margin-left: 0; white-space: normal; }
-  .card-title { font-size: 16.5px; }
+  #view-kol .card-title { font-size: 18px; }
+  #view-kol .card-title-body,
+  #view-kol .card-snippet { font-size: 14px; }
+  #view-macro .event-title { font-size: 18px; }
+  #view-macro .event { padding: 14px; }
+  #view-decision .decision-card-trigger { font-size: 13.5px; }
   .card-actions { align-items: stretch; }
   .card-evidence-btn { flex: 1 1 auto; }
   .card-original-link { flex: 0 0 auto; }
