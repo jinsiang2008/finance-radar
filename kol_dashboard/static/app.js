@@ -20,6 +20,10 @@
     logoutPending: false,
     dailyData: null,
     dailyRequestGeneration: 0,
+    optionsData: null,
+    optionsRequestGeneration: 0,
+    selectedOptionIndex: 0,
+    optionsPanel: "candidates",
     decisionData: null,
     selectedDecisionKey: "",
     decisionLens: "all",
@@ -55,12 +59,18 @@
     feedRegularCapped: false,
     feedRequestGeneration: 0,
     feedAbortController: null,
-    viewLoadedAt: { decision: 0, daily: 0, macro: 0, kol: 0 },
-    viewLastGoodAt: { decision: 0, daily: 0, macro: 0, kol: 0 },
-    viewLastGoodDataAt: { decision: "", daily: "", macro: "", kol: "" },
+    viewLoadedAt: { decision: 0, daily: 0, macro: 0, options: 0, kol: 0 },
+    viewLastGoodAt: { decision: 0, daily: 0, macro: 0, options: 0, kol: 0 },
+    viewLastGoodDataAt: {
+      decision: "",
+      daily: "",
+      macro: "",
+      options: "",
+      kol: "",
+    },
     viewLoadErrors: {},
     viewLoadPromises: {},
-    viewLoadGeneration: { decision: 0, daily: 0, macro: 0, kol: 0 },
+    viewLoadGeneration: { decision: 0, daily: 0, macro: 0, options: 0, kol: 0 },
     systemSignals: { macro: null, decision: null },
     refreshTimer: null,
     supportFactsLoaded: false,
@@ -893,11 +903,13 @@
     host.setAttribute("aria-live", "assertive");
     const lastGoodDataAt = state.viewLastGoodDataAt[view];
     const hasLastGood = Number(state.viewLastGoodAt[view] || 0) > 0;
-    const lastGoodCopy = lastGoodDataAt
-      ? `继续显示数据截至 ${fmtAbsoluteTime(lastGoodDataAt)} 的上次成功结果，内容可能已过期。`
-      : hasLastGood
-        ? "继续显示上次成功结果；数据时间未提供，内容可能已过期。"
-        : "当前没有可继续显示的成功数据。";
+    const lastGoodCopy = view === "options"
+      ? "旧私人结果已隐藏；不会把历史候选继续显示为当前结论。"
+      : lastGoodDataAt
+        ? `继续显示数据截至 ${fmtAbsoluteTime(lastGoodDataAt)} 的上次成功结果，内容可能已过期。`
+        : hasLastGood
+          ? "继续显示上次成功结果；数据时间未提供，内容可能已过期。"
+          : "当前没有可继续显示的成功数据。";
     host.innerHTML = `<span class="view-load-mark" aria-hidden="true">!</span>
       <div class="view-load-copy">
         <strong>当前视图刷新失败</strong>
@@ -4436,6 +4448,7 @@
     delete state.viewLoadPromises.decision;
     state.aiRequestStates.clear();
     clearAllAiRequestPolls();
+    clearOptionsView("私人会话已过期；重新解锁后才会读取期权研究");
     clearDecisionView("私人会话已过期；已切换到公开视图");
     updatePrivateModeButton();
     Array.from(state.aiRequestSubjects.keys()).forEach(updateAiRequestControls);
@@ -4476,8 +4489,13 @@
       return true;
     } catch (error) {
       if (requestGeneration !== state.decisionRequestGeneration) return false;
-      if (requestedPrivate && [401, 503].includes(error.status)) {
+      if (requestedPrivate && error.status === 401) {
+        handlePrivateSessionExpired();
+        return loadDecisions({ autoSelect });
+      }
+      if (requestedPrivate && error.status === 503) {
         state.authenticated = false;
+        clearOptionsView("私人期权研究暂不可用；重新解锁后再读取");
         clearDecisionView();
         updatePrivateModeButton();
         return loadDecisions({ autoSelect });
@@ -4602,6 +4620,7 @@
   }
 
   async function loadAuthStatus() {
+    const wasAuthenticated = state.authenticated;
     try {
       const status = await requestJSON(api("api/auth/status"));
       state.authConfigured = Boolean(status?.configured);
@@ -4612,6 +4631,9 @@
       state.authenticated = false;
     }
     state.authStatusLoaded = true;
+    if (wasAuthenticated && !state.authenticated) {
+      clearOptionsView("私人会话已结束；重新解锁后才会读取期权研究");
+    }
     updatePrivateModeButton();
     Array.from(state.aiRequestSubjects.keys()).forEach(updateAiRequestControls);
   }
@@ -4619,21 +4641,30 @@
   function openAuth(returnFocus = null, { purpose = "private" } = {}) {
     const modal = $("#auth-modal");
     const aiPurpose = purpose === "ai";
+    const optionsPurpose = purpose === "options";
     state.authReturnFocus = returnFocus || document.activeElement;
     $("#auth-error").textContent = "";
     $("#auth-passcode").value = "";
     modal.querySelector(".support-kicker").textContent = aiPurpose
       ? "AI 解读权限"
-      : "私人持仓覆盖层";
+      : optionsPurpose
+        ? "私人期权研究"
+        : "私人持仓覆盖层";
     $("#auth-modal-title").textContent = aiPurpose
       ? "解锁后请求 AI 解读"
-      : "解锁私人模式";
+      : optionsPurpose
+        ? "解锁期权实验室"
+        : "解锁私人模式";
     modal.querySelector(".auth-desc").textContent = aiPurpose
       ? "解锁后返回当前证据；系统不会自动提交 AI 请求，需由你再次确认。"
-      : "口令只用于服务端验证。解锁后，具体持仓与个性化影响通过安全 Cookie 临时显示。";
+      : optionsPurpose
+        ? "口令只用于服务端验证。解锁后读取研究准备度与账户风控状态；页面不会提交订单。"
+        : "口令只用于服务端验证。解锁后，具体持仓与个性化影响通过安全 Cookie 临时显示。";
     modal.querySelector(".auth-submit").textContent = aiPurpose
       ? "解锁并返回证据"
-      : "解锁私人模式";
+      : optionsPurpose
+        ? "解锁期权研究"
+        : "解锁私人模式";
     modal.inert = false;
     modal.hidden = false;
     document.body.style.overflow = "hidden";
@@ -4659,6 +4690,7 @@
     state.decisionLensLoading = false;
     if (state.decisionLens === "portfolio") state.decisionLens = "all";
     state.decisionRequestGeneration += 1;
+    clearOptionsView("私人期权研究已从当前页面清除");
     clearDecisionView();
     updatePrivateModeButton();
     Array.from(state.aiRequestSubjects.keys()).forEach(updateAiRequestControls);
@@ -4689,10 +4721,16 @@
       state.logoutPending = false;
       state.authenticated = true;
       state.selectedDecisionKey = "";
+      state.viewLoadedAt.options = 0;
       updatePrivateModeButton();
       Array.from(state.aiRequestSubjects.keys()).forEach(updateAiRequestControls);
       closeAuth();
-      await loadDecisions();
+      if (state.view === "options") {
+        state.viewLoadedAt.decision = 0;
+        await ensureViewLoaded("options", { force: true });
+      } else {
+        await loadDecisions();
+      }
     } catch (error) {
       $("#auth-error").textContent =
         error.status === 429
@@ -4703,6 +4741,916 @@
       $("#auth-passcode").select();
     } finally {
       button.disabled = false;
+    }
+  }
+
+  // ─── Options research lab ─────────────────
+
+  const OPTIONS_PANELS = new Set(["candidates", "readiness", "benchmark"]);
+  const OPTIONS_READY_DATA_STATES = new Set([
+    "fresh",
+    "current",
+    "ready",
+    "complete",
+    "ok",
+  ]);
+  const OPTIONS_PASS_STATES = new Set([
+    "pass",
+    "passed",
+    "ready",
+    "ok",
+    "fresh",
+    "available",
+  ]);
+  const OPTIONS_BLOCK_STATES = new Set([
+    "block",
+    "blocked",
+    "failed",
+    "error",
+    "unavailable",
+    "off",
+  ]);
+
+  function optionsAnnounce(message) {
+    const live = $("#options-live-status");
+    if (live) live.textContent = String(message || "");
+  }
+
+  function optionsSetNavEnabled(enabled) {
+    $$("#options-subnav [data-options-panel]").forEach((button) => {
+      button.disabled = !enabled;
+    });
+  }
+
+  function optionsApplyPanel(panel, { focus = false } = {}) {
+    const next = OPTIONS_PANELS.has(panel) ? panel : "candidates";
+    state.optionsPanel = next;
+    $$("#options-subnav [data-options-panel]").forEach((button) => {
+      const active = button.dataset.optionsPanel === next;
+      button.classList.toggle("is-active", active);
+      button.setAttribute("aria-selected", String(active));
+      button.tabIndex = active ? 0 : -1;
+      if (active && focus) button.focus();
+    });
+    $$("#options-stage [data-options-panel-view]").forEach((panelNode) => {
+      panelNode.hidden = panelNode.dataset.optionsPanelView !== next;
+    });
+  }
+
+  function renderOptionsLocked(
+    message = "登录后才读取研究准备度与账户风控状态"
+  ) {
+    state.optionsData = null;
+    state.selectedOptionIndex = 0;
+    state.optionsPanel = "candidates";
+    optionsSetNavEnabled(false);
+    const session = $("#options-session");
+    if (session) {
+      session.className = "options-session is-locked";
+      session.innerHTML = `<strong>私人研究已锁定</strong><span>${esc(message)}</span>`;
+    }
+    const unlockDisabled = !state.authConfigured || state.logoutPending;
+    const unlockLabel = state.logoutPending
+      ? "服务端注销待重试"
+      : state.authConfigured
+        ? "解锁期权研究"
+        : "私人模式尚未配置";
+    const stage = $("#options-stage");
+    if (stage) {
+      stage.setAttribute("aria-busy", "false");
+      stage.innerHTML = `<section class="options-locked" aria-labelledby="options-locked-title">
+        <span class="options-lock-mark" aria-hidden="true">│</span>
+        <div>
+          <h2 id="options-locked-title">登录后查看私人研究结果</h2>
+          <p>${esc(message)}。未登录时不会请求期权接口，也不会把标的、候选或账户信息写入静态页面、网址或本机存储。</p>
+        </div>
+        <button type="button" data-options-unlock${unlockDisabled ? " disabled" : ""}>${esc(
+          unlockLabel
+        )}</button>
+      </section>`;
+    }
+    optionsAnnounce("期权研究已锁定，私人数据已从当前页面清除。");
+  }
+
+  function clearOptionsView(message = "私人期权研究已从当前页面清除") {
+    state.optionsRequestGeneration += 1;
+    state.viewLoadedAt.options = 0;
+    state.viewLastGoodAt.options = 0;
+    state.viewLastGoodDataAt.options = "";
+    delete state.viewLoadErrors.options;
+    delete state.viewLoadPromises.options;
+    renderOptionsLocked(message);
+  }
+
+  function optionNumberFrom(value, keys = []) {
+    const raw = keys.length
+      ? keys.map((key) => value?.[key]).find((candidate) => candidate != null)
+      : value;
+    if (raw === "" || raw == null || typeof raw === "boolean") return null;
+    const parsed = Number(raw);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  function optionTextFrom(value, keys = []) {
+    const raw = keys.map((key) => value?.[key]).find((candidate) => {
+      return typeof candidate === "string" && candidate.trim();
+    });
+    return raw ? raw.trim() : "";
+  }
+
+  function optionMoney(value, currency = "") {
+    const amount = optionNumberFrom(value);
+    if (amount == null) return "";
+    const formatted = new Intl.NumberFormat("zh-CN", {
+      maximumFractionDigits: 2,
+      minimumFractionDigits: 0,
+    }).format(amount);
+    const unit = String(currency || "").trim().toUpperCase();
+    if (unit === "USD") return `$${formatted}`;
+    if (unit === "CNY" || unit === "RMB") return `¥${formatted}`;
+    return unit ? `${formatted} ${unit}` : formatted;
+  }
+
+  function optionPercent(value) {
+    const numeric = optionNumberFrom(value);
+    return numeric == null ? "" : `${numeric.toFixed(2)}%`;
+  }
+
+  function optionRatioPercent(value) {
+    const numeric = optionNumberFrom(value);
+    return numeric == null ? "" : `${(numeric * 100).toFixed(2)}%`;
+  }
+
+  function optionStatusTone(status, blocking = false) {
+    const key = String(status || "").trim().toLowerCase();
+    if (blocking === true || OPTIONS_BLOCK_STATES.has(key)) return "block";
+    if (OPTIONS_PASS_STATES.has(key)) return "pass";
+    return "caution";
+  }
+
+  function optionStatusLabel(status, blocking = false) {
+    const tone = optionStatusTone(status, blocking);
+    if (tone === "pass") return "通过";
+    if (tone === "block") return "阻断";
+    const key = String(status || "").trim().toLowerCase();
+    if (key === "stale" || key === "delayed" || key === "expired") return "数据延迟";
+    if (key === "pending") return "等待核验";
+    return "待补齐";
+  }
+
+  function optionsBoundaryIsValid(data) {
+    const candidates = Array.isArray(data?.candidates)
+      ? data.candidates.filter((item) => item && typeof item === "object")
+      : [];
+    const candidateCount = optionNumberFrom(data?.candidate_count);
+    return Boolean(
+      data &&
+        data.schema_version === 1 &&
+        data.method_version === "options-research-readiness-v1" &&
+        data.available === true &&
+        data.mode === "research_only" &&
+        data.decision_state === "abstain" &&
+        candidateCount === 0 &&
+        candidates.length === 0 &&
+        data.human_review_required === true &&
+        data.automatic_execution === false &&
+        data.trade_execution_available === false
+    );
+  }
+
+  function optionsReadinessItems(data) {
+    return Array.isArray(data?.readiness?.items)
+      ? data.readiness.items.filter((item) => item && typeof item === "object")
+      : [];
+  }
+
+  function optionsGateGroups(data) {
+    const readiness = optionsReadinessItems(data);
+    const byKey = new Map(readiness.map((item) => [String(item.key || ""), item]));
+    const marketGate = data?.market_gate && typeof data.market_gate === "object"
+      ? {
+          ...data.market_gate,
+          label: data.market_gate.action_label || "宏观环境",
+          blocking: data.market_gate.blocks_new_short_puts === true,
+        }
+      : byKey.get("macro_gate");
+    return [
+      { key: "data", label: "数据", items: [byKey.get("option_market_data")] },
+      { key: "market", label: "市场", items: [marketGate] },
+      { key: "underlying", label: "标的", items: [byKey.get("event_calendar")] },
+      {
+        key: "funding",
+        label: "资金",
+        items: [
+          byKey.get("funding_capacity"),
+          byKey.get("portfolio_freshness"),
+          byKey.get("options_permission"),
+        ],
+      },
+    ].map((group) => {
+      const items = group.items.filter(Boolean);
+      const tones = items.map((item) =>
+        optionStatusTone(item.status || item.data_status, item.blocking === true)
+      );
+      const tone = !items.length
+        ? "caution"
+        : tones.includes("block")
+          ? "block"
+          : tones.every((item) => item === "pass")
+            ? "pass"
+            : "caution";
+      const details = items
+        .map((item) => optionTextFrom(item, ["detail", "note"]))
+        .filter(Boolean);
+      return { ...group, items, tone, details };
+    });
+  }
+
+  function optionsGateRailHTML(data) {
+    return `<ol class="options-gate-rail" aria-label="承保闸门：数据、市场、标的、资金">
+      ${optionsGateGroups(data)
+        .map(
+          (gate, index) => `<li class="options-gate is-${gate.tone}">
+            <span class="options-gate-index" aria-hidden="true">0${index + 1}</span>
+            <div><strong>${esc(gate.label)}</strong><span>${esc(
+              gate.tone === "pass" ? "通过" : gate.tone === "block" ? "阻断" : "待补齐"
+            )}</span></div>
+            <p>${esc(gate.details[0] || "尚未提供可核验依据")}</p>
+          </li>`
+        )
+        .join("")}
+    </ol>`;
+  }
+
+  function optionsDataNotice(data) {
+    const dataStatus = String(data?.data_status || "insufficient").toLowerCase();
+    const marketBlocked = data?.market_gate?.blocks_new_short_puts === true;
+    const stale = ["stale", "delayed", "expired"].includes(dataStatus);
+    let tone = "caution";
+    let title = "研究输入尚未补齐";
+    let detail = "候选保持为零，不会使用旧报价或推测值补位。";
+    if (marketBlocked) {
+      tone = "block";
+      title = "已停止新增卖 Put";
+      detail = optionTextFrom(data.market_gate, ["detail"]) ||
+        "宏观风控正在阻断新增下行暴露；只保留研究与复核。";
+    } else if (stale) {
+      title = "报价过期，候选已暂停";
+      detail = "行情超过允许时限；历史快照不会被包装成当前可执行候选。";
+    } else if (OPTIONS_READY_DATA_STATES.has(dataStatus)) {
+      tone = "pass";
+      title = "研究输入已通过基础检查";
+      detail = "候选仍需逐项核验接货意愿、现金占用、事件与流动性。";
+    }
+    const dataAsOf = optionTextFrom(data?.market_gate || {}, ["data_as_of"]);
+    const servedAt = optionTextFrom(data || {}, ["served_at"]);
+    const timeCopy = dataAsOf
+      ? `证据截至 ${fmtAbsoluteTime(dataAsOf)}`
+      : servedAt
+        ? `响应生成 ${fmtAbsoluteTime(servedAt)}`
+        : "证据时间待确认";
+    return { tone, title, detail, timeCopy, stale, marketBlocked };
+  }
+
+  function optionCandidateTitle(candidate, index) {
+    const name = optionTextFrom(candidate, ["name_zh", "name", "underlying_name"]);
+    const symbol = optionTextFrom(candidate, ["symbol", "underlying_symbol"]);
+    if (name && symbol && name !== symbol) return `${name} · ${symbol}`;
+    return name || symbol || `候选 ${index + 1}`;
+  }
+
+  function optionCandidateFacts(candidate) {
+    const currency = optionTextFrom(candidate, ["currency"]);
+    const facts = [];
+    const addMoney = (label, keys) => {
+      const value = optionNumberFrom(candidate, keys);
+      if (value != null) facts.push({ label, value: optionMoney(value, currency) });
+    };
+    const addText = (label, keys) => {
+      const value = optionTextFrom(candidate, keys);
+      if (value) facts.push({ label, value });
+    };
+    const addNumber = (label, keys, digits = 2) => {
+      const value = optionNumberFrom(candidate, keys);
+      if (value != null) facts.push({ label, value: value.toFixed(digits) });
+    };
+    addMoney("有效买入价", ["effective_buy_price", "breakeven"]);
+    addMoney("需预留现金", ["cash_required", "gross_cash_reserved"]);
+    addText("到期日", ["expiry", "expiration"]);
+    addNumber("DTE", ["dte"], 0);
+    addNumber("Delta", ["delta"], 2);
+    addMoney("净权利金", ["premium_received", "option_credit", "premium"]);
+    addText("报价时间", ["quote_as_of", "provider_timestamp"]);
+    return facts;
+  }
+
+  function optionExpiryPayoffHTML(candidate) {
+    const spot = optionNumberFrom(candidate, ["spot"]);
+    const strike = optionNumberFrom(candidate, ["strike"]);
+    const credit = optionNumberFrom(candidate, ["option_credit", "premium"]);
+    const multiplier = optionNumberFrom(candidate, ["contract_multiplier"]);
+    if (
+      spot == null ||
+      strike == null ||
+      credit == null ||
+      multiplier == null ||
+      spot <= 0 ||
+      strike <= 0 ||
+      credit < 0 ||
+      multiplier <= 0
+    ) {
+      return `<div class="options-chart-empty">
+        <strong>损益曲线尚未生成</strong>
+        <span>响应未同时提供现价、行权价、权利金和合约乘数；系统不会补造数据。</span>
+      </div>`;
+    }
+    const width = 720;
+    const height = 260;
+    const inset = { left: 52, right: 24, top: 24, bottom: 38 };
+    const xMin = 0;
+    const xMax = Math.max(spot, strike) * 1.25;
+    const points = Array.from({ length: 51 }, (_, index) => {
+      const price = xMin + ((xMax - xMin) * index) / 50;
+      const payoff = (credit - Math.max(strike - price, 0)) * multiplier;
+      return { price, payoff };
+    });
+    const yMin = Math.min(...points.map((point) => point.payoff));
+    const yMax = Math.max(...points.map((point) => point.payoff));
+    const ySpan = Math.max(1, yMax - yMin);
+    const x = (value) =>
+      inset.left + ((value - xMin) / (xMax - xMin)) * (width - inset.left - inset.right);
+    const y = (value) =>
+      inset.top + ((yMax - value) / ySpan) * (height - inset.top - inset.bottom);
+    const path = points
+      .map((point, index) => `${index ? "L" : "M"}${x(point.price).toFixed(1)},${y(
+        point.payoff
+      ).toFixed(1)}`)
+      .join(" ");
+    const zeroY = yMin <= 0 && yMax >= 0 ? y(0) : height - inset.bottom;
+    const currency = optionTextFrom(candidate, ["currency"]);
+    const maxProfit = credit * multiplier;
+    const stockZeroLoss = (credit - strike) * multiplier;
+    return `<figure class="options-payoff">
+      <figcaption>
+        <strong>每份合约到期损益</strong>
+        <span>最大权利金 ${esc(optionMoney(maxProfit, currency))} · 标的跌至 0：${esc(
+          optionMoney(stockZeroLoss, currency)
+        )}</span>
+      </figcaption>
+      <svg viewBox="0 0 ${width} ${height}" role="img"
+           aria-label="基于服务端提供输入计算的每份合约到期损益曲线">
+        <line class="options-chart-axis" x1="${inset.left}" y1="${zeroY.toFixed(
+          1
+        )}" x2="${width - inset.right}" y2="${zeroY.toFixed(1)}"></line>
+        <line class="options-chart-strike" x1="${x(strike).toFixed(1)}" y1="${inset.top}"
+              x2="${x(strike).toFixed(1)}" y2="${height - inset.bottom}"></line>
+        <line class="options-chart-spot" x1="${x(spot).toFixed(1)}" y1="${inset.top}"
+              x2="${x(spot).toFixed(1)}" y2="${height - inset.bottom}"></line>
+        <path class="options-chart-path" d="${path}"></path>
+        <text class="options-chart-label" x="${x(strike).toFixed(1)}" y="${height - 12}"
+              text-anchor="middle">行权价</text>
+        <text class="options-chart-label" x="${x(spot).toFixed(1)}" y="14"
+              text-anchor="middle">当前价</text>
+      </svg>
+      <p>只使用本次响应中的输入，不含提前指派、波动率变化、盘后跳空、税费、价差和滑点；当前估值线在服务端未提供定价模型前不绘制。</p>
+    </figure>`;
+  }
+
+  function optionsCandidateDetailHTML(candidate, index, data) {
+    if (!candidate) {
+      const nextSteps = (Array.isArray(data?.next_steps) ? data.next_steps : [])
+        .filter((step) => typeof step === "string" && step.trim())
+        .slice(0, 4);
+      return `<div class="options-empty-detail">
+        <div class="options-empty-intro">
+          <span aria-hidden="true">│</span>
+          <h2>没有可进入测算的候选</h2>
+          <p>零候选是当前风控结论。先补齐承保闸门，不会用旧行情或虚构合约填充页面。</p>
+        </div>
+        <section class="options-empty-next" aria-labelledby="options-empty-next-title">
+          <h3 id="options-empty-next-title">把研究推进到候选，需要</h3>
+          ${
+            nextSteps.length
+              ? `<ol>${nextSteps.map((step) => `<li>${esc(step)}</li>`).join("")}</ol>`
+              : `<p>先在承保闸门中补齐行情、账户、事件日历和接货政策。</p>`
+          }
+          <p>完成输入也不代表一定入选；宏观、财报、流动性与集中度仍可否决交易。</p>
+        </section>
+      </div>`;
+    }
+    const facts = optionCandidateFacts(candidate);
+    const status = optionTextFrom(candidate, ["status_label", "status"]);
+    const why = optionTextFrom(candidate, ["why", "reason", "summary"]);
+    const contrary = optionTextFrom(candidate, [
+      "risk_reason",
+      "contrary_reason",
+      "caution",
+    ]);
+    const multiplier = optionNumberFrom(candidate, ["contract_multiplier"]);
+    return `<article class="options-candidate-detail">
+      <header>
+        <div>
+          <p>当前复核</p>
+          <h2 id="options-candidate-detail-title" tabindex="-1">${esc(
+            optionCandidateTitle(candidate, index)
+          )}</h2>
+        </div>
+        ${status ? `<span class="options-candidate-status">${esc(status)}</span>` : ""}
+      </header>
+      ${
+        facts.length
+          ? `<dl class="options-metric-grid">${facts
+              .map(
+                (fact) => `<div><dt>${esc(fact.label)}</dt><dd>${esc(fact.value)}</dd></div>`
+              )
+              .join("")}</dl>`
+          : `<p class="options-inline-boundary">合约明细尚未随响应提供；不会显示推测的行权价、Delta 或权利金。</p>`
+      }
+      ${optionExpiryPayoffHTML(candidate)}
+      <div class="options-assignment-note">
+        <strong>指派是预期路径，不是异常事故</strong>
+        <p>${
+          multiplier != null
+            ? `服务端提供的合约乘数为 ${esc(multiplier)}；接货影响仍须结合可用现金与组合集中度复核。`
+            : "合约乘数尚未提供，因此不推算接货股数或建议张数。"
+        }</p>
+      </div>
+      <div class="options-thesis-grid">
+        <section><h3>为什么进入复核</h3><p>${esc(why || "尚未提供入选依据")}</p></section>
+        <section><h3>为什么可能不做</h3><p>${esc(
+          contrary || "尚未提供反对理由；在补齐前保持观察。"
+        )}</p></section>
+      </div>
+      <footer>
+        <span>研究结果必须人工确认；本页面不会提交订单。</span>
+        <button type="button" disabled>保存模拟方案（待接入）</button>
+      </footer>
+    </article>`;
+  }
+
+  function optionsUniverseHTML(data) {
+    const universe = Array.isArray(data?.research_universe)
+      ? data.research_universe.filter((item) => item && typeof item === "object")
+      : [];
+    if (!universe.length) {
+      return `<div class="options-universe-empty">通用研究池尚未返回；系统不会使用示例代码补足候选。</div>`;
+    }
+    const grouped = new Map();
+    universe.forEach((item) => {
+      const tier = optionTextFrom(item, ["tier"]) || "其他研究";
+      if (!grouped.has(tier)) grouped.set(tier, []);
+      grouped.get(tier).push(item);
+    });
+    return `<p class="options-universe-boundary">全部项目均待用户确认；通用研究池不表示当前持有、熟悉、支持期权或适合卖 Put。</p>
+      <div class="options-universe-groups">${Array.from(grouped, ([tier, items]) =>
+        `<section><h4>${esc(tier)}</h4><ul>${items
+          .map((item) => {
+            const name = optionTextFrom(item, ["name_zh", "name"]);
+            const symbol = optionTextFrom(item, ["symbol"]);
+            return `<li><strong>${esc(symbol || name || "未命名")}</strong>${
+              name && name !== symbol ? `<span>${esc(name)}</span>` : ""
+            }</li>`;
+          })
+          .join("")}</ul></section>`
+      ).join("")}</div>`;
+  }
+
+  function optionsCandidatesPanelHTML(data, notice) {
+    const sourceCandidates = Array.isArray(data?.candidates)
+      ? data.candidates.filter((item) => item && typeof item === "object")
+      : [];
+    const dataStatus = String(data?.data_status || "").toLowerCase();
+    const canUseCandidates =
+      OPTIONS_READY_DATA_STATES.has(dataStatus) && !notice.marketBlocked && !notice.stale;
+    const candidates = canUseCandidates ? sourceCandidates : [];
+    const reportedCount = optionNumberFrom(data?.candidate_count);
+    const count = reportedCount == null ? sourceCandidates.length : Math.max(0, reportedCount);
+    if (state.selectedOptionIndex >= candidates.length) state.selectedOptionIndex = 0;
+    const selected = candidates[state.selectedOptionIndex] || null;
+    let emptyTitle = "今天没有通过全部门槛的卖 Put";
+    let emptyCopy = "这是风控结论，不是页面故障；不会为了填满列表而放宽标准。";
+    if (notice.marketBlocked) {
+      emptyTitle = "新增候选已被宏观风控停止";
+      emptyCopy = "只保留研究与复核，不展示可行动合约。";
+    } else if (notice.stale) {
+      emptyTitle = "报价过期，候选已暂停";
+      emptyCopy = "刷新并通过数据闸门后才会重新显示合约。";
+    } else if (count > 0 && !candidates.length) {
+      emptyTitle = "候选明细暂不可用";
+      emptyCopy = "摘要计数与可核验明细不一致，系统已失败关闭。";
+    }
+    return `<section id="options-panel-candidates" role="tabpanel"
+             aria-labelledby="options-tab-candidates" data-options-panel-view="candidates">
+      <div class="options-workbench">
+        <section class="options-ledger" aria-labelledby="options-candidates-title">
+          <header class="options-section-head">
+            <div><p>通用研究池 · 待用户确认</p><h2 id="options-candidates-title">今日候选</h2></div>
+            <strong>${esc(String(candidates.length))}</strong>
+          </header>
+          ${
+            candidates.length
+              ? `<div class="options-candidate-list">${candidates
+                  .map((candidate, index) => {
+                    const facts = optionCandidateFacts(candidate).slice(0, 3);
+                    const selectedRow = index === state.selectedOptionIndex;
+                    return `<button type="button" class="options-candidate-row${
+                      selectedRow ? " is-selected" : ""
+                    }" data-options-candidate-index="${index}" aria-pressed="${String(
+                      selectedRow
+                    )}">
+                      <span class="options-candidate-rank">${String(index + 1).padStart(
+                        2,
+                        "0"
+                      )}</span>
+                      <span class="options-candidate-copy"><strong>${esc(
+                        optionCandidateTitle(candidate, index)
+                      )}</strong><span>${esc(
+                        optionTextFrom(candidate, ["summary", "why", "reason"]) ||
+                          "等待逐项复核"
+                      )}</span></span>
+                      <span class="options-candidate-facts">${facts
+                        .map(
+                          (fact) => `<span><small>${esc(fact.label)}</small>${esc(
+                            fact.value
+                          )}</span>`
+                        )
+                        .join("")}</span>
+                    </button>`;
+                  })
+                  .join("")}</div>`
+              : `<div class="options-zero-state"><span aria-hidden="true">0</span><div><strong>${esc(
+                  emptyTitle
+                )}</strong><p>${esc(emptyCopy)}</p></div></div>`
+          }
+        </section>
+        <aside class="options-analysis" aria-label="当前候选风险测算">
+          ${optionsCandidateDetailHTML(selected, state.selectedOptionIndex, data)}
+        </aside>
+        <section class="options-universe" aria-labelledby="options-universe-title">
+          <header><h3 id="options-universe-title">通用研究池</h3><span>不表示持有或适合交易</span></header>
+          ${optionsUniverseHTML(data)}
+        </section>
+      </div>
+    </section>`;
+  }
+
+  function optionsReadinessPanelHTML(data) {
+    const readiness = data?.readiness && typeof data.readiness === "object"
+      ? data.readiness
+      : {};
+    const items = optionsReadinessItems(data);
+    const rejections = Array.isArray(data?.rejections)
+      ? data.rejections.filter((item) => item && typeof item === "object")
+      : [];
+    const nextSteps = Array.isArray(data?.next_steps) ? data.next_steps : [];
+    const met = optionNumberFrom(readiness.met);
+    const total = optionNumberFrom(readiness.total);
+    return `<section id="options-panel-readiness" role="tabpanel"
+             aria-labelledby="options-tab-readiness" data-options-panel-view="readiness" hidden>
+      <header class="options-page-head">
+        <div><p>逐项失败关闭</p><h2>承保闸门明细</h2></div>
+        <span>${met != null && total != null ? `${esc(met)} / ${esc(total)} 已满足` : "完成度待确认"}</span>
+      </header>
+      <div class="options-readiness-layout">
+        <div class="options-readiness-list">
+          ${
+            items.length
+              ? items
+                  .map((item) => {
+                    const tone = optionStatusTone(item.status, item.blocking === true);
+                    const asOf = optionTextFrom(item, ["evidence_as_of"]);
+                    return `<article class="options-readiness-row is-${tone}">
+                      <span class="options-readiness-mark" aria-hidden="true"></span>
+                      <div><header><h3>${esc(
+                        optionTextFrom(item, ["label"]) || "未命名闸门"
+                      )}</h3><strong>${esc(
+                        optionStatusLabel(item.status, item.blocking === true)
+                      )}</strong></header>
+                      <p>${esc(
+                        optionTextFrom(item, ["detail"]) || "尚未提供可核验依据"
+                      )}</p>${
+                        asOf ? `<time datetime="${esc(asOf)}">证据截至 ${esc(
+                          fmtAbsoluteTime(asOf)
+                        )}</time>` : ""
+                      }</div>
+                    </article>`;
+                  })
+                  .join("")
+              : `<div class="options-no-records">尚未返回闸门明细；保持零候选。</div>`
+          }
+        </div>
+        <aside class="options-exclusions">
+          <section><h3>本轮排除原因</h3>${
+            rejections.length
+              ? `<ul>${rejections
+                  .map(
+                    (item) => `<li><strong>${esc(
+                      optionTextFrom(item, ["label"]) || "未命名原因"
+                    )}</strong><span>${esc(
+                      optionTextFrom(item, ["detail"]) || "尚无补充说明"
+                    )}</span></li>`
+                  )
+                  .join("")}</ul>`
+              : `<p>当前没有独立排除记录；零候选仍以闸门状态为准。</p>`
+          }</section>
+          <section><h3>下一步补齐</h3>${
+            nextSteps.length
+              ? `<ol>${nextSteps
+                  .map((step) => {
+                    const text = typeof step === "string"
+                      ? step
+                      : optionTextFrom(step, ["label", "detail", "action"]);
+                    return text ? `<li>${esc(text)}</li>` : "";
+                  })
+                  .join("")}</ol>`
+              : `<p>等待数据源返回明确补齐项。</p>`
+          }</section>
+        </aside>
+      </div>
+    </section>`;
+  }
+
+  const OPTION_BENCHMARK_METRICS = [
+    ["cagr", "区间 CAGR", optionRatioPercent],
+    ["cagr_pct", "区间 CAGR", optionPercent],
+    ["daily_max_drawdown", "日度最大回撤", optionRatioPercent],
+    ["max_drawdown", "最大回撤", optionRatioPercent],
+    ["max_drawdown_pct", "最大回撤", optionPercent],
+    ["annualized_daily_volatility", "日度年化波动", optionRatioPercent],
+    ["annualized_volatility", "年化波动", optionRatioPercent],
+    ["monthly_beta_to_spx", "月度 Beta", (value) => {
+      const number = optionNumberFrom(value);
+      return number == null ? "" : number.toFixed(3);
+    }],
+    ["beta", "Beta", (value) => {
+      const number = optionNumberFrom(value);
+      return number == null ? "" : number.toFixed(3);
+    }],
+  ];
+
+  function optionsBenchmarkSeries(data) {
+    const raw = data?.benchmark?.series;
+    if (Array.isArray(raw)) return raw.filter((item) => item && typeof item === "object");
+    if (!raw || typeof raw !== "object") return [];
+    return Object.entries(raw).map(([key, value]) =>
+      value && typeof value === "object" ? { series_key: key, ...value } : { series_key: key }
+    );
+  }
+
+  function optionsStressWindowsHTML(benchmark) {
+    const windows = Array.isArray(benchmark?.stress_windows)
+      ? benchmark.stress_windows.filter((item) => item && typeof item === "object")
+      : [];
+    if (!windows.length) {
+      return `<div class="options-no-records">压力期数据尚未随响应提供；不使用推测收益填充。</div>`;
+    }
+    return `<section class="options-stress" aria-labelledby="options-stress-title">
+      <header><div><p>左尾检验</p><h3 id="options-stress-title">压力期表现</h3></div>
+      <span>窗口收益 · 不是未来预测</span></header>
+      <div class="options-stress-grid">${windows
+        .map((window) => {
+          const label = optionTextFrom(window, ["label", "name"]);
+          const start = optionTextFrom(window, ["start"]);
+          const end = optionTextFrom(window, ["end"]);
+          const returns = window.returns && typeof window.returns === "object"
+            ? Object.entries(window.returns).flatMap(([key, value]) => {
+                const formatted = optionRatioPercent(value);
+                return formatted ? [{ key, value: formatted }] : [];
+              })
+            : [];
+          return `<article><header><h4>${esc(label || "未命名压力窗口")}</h4><span>${esc(
+            start && end ? `${start} — ${end}` : "窗口日期待确认"
+          )}</span></header>${
+            returns.length
+              ? `<dl>${returns
+                  .map(
+                    (item) => `<div><dt>${esc(item.key)}</dt><dd>${esc(item.value)}</dd></div>`
+                  )
+                  .join("")}</dl>`
+              : `<p>本窗口没有通过有限数校验的收益。</p>`
+          }</article>`;
+        })
+        .join("")}</div>
+    </section>`;
+  }
+
+  function optionsBenchmarkPanelHTML(data) {
+    const benchmark = data?.benchmark && typeof data.benchmark === "object"
+      ? data.benchmark
+      : {};
+    const series = optionsBenchmarkSeries(data);
+    const limitations = Array.isArray(benchmark.limitations) ? benchmark.limitations : [];
+    const sources = Array.isArray(benchmark.sources) ? benchmark.sources : [];
+    const rangeStart = optionTextFrom(benchmark?.range || {}, ["start"]);
+    const rangeEnd = optionTextFrom(benchmark?.range || {}, ["end"]);
+    const range = rangeStart && rangeEnd ? `${rangeStart} — ${rangeEnd}` : "";
+    const sourceAsOf = optionTextFrom(benchmark, ["source_as_of"]);
+    const reportDate = optionTextFrom(benchmark, ["report_date"]);
+    const calculationVersion = optionTextFrom(benchmark, ["calculation_version"]);
+    const inputHashes = benchmark?.input_sha256 && typeof benchmark.input_sha256 === "object"
+      ? Object.entries(benchmark.input_sha256).filter(
+          ([key, value]) => key && typeof value === "string" && /^[a-f0-9]{64}$/i.test(value)
+        )
+      : [];
+    return `<section id="options-panel-benchmark" role="tabpanel"
+             aria-labelledby="options-tab-benchmark" data-options-panel-view="benchmark" hidden>
+      <header class="options-page-head">
+        <div><p>只作风险基线</p><h2>Put-write 官方指数复算</h2></div>
+        <span>${esc(range || reportDate || "区间待确认")}</span>
+      </header>
+      <p class="options-benchmark-boundary">指数历史只能验证风险口径，不能推出今天该卖哪只股票、哪个行权价或多少张。</p>
+      <dl class="options-benchmark-meta">
+        <div><dt>回测区间</dt><dd>${esc(range || "待确认")}</dd></div>
+        <div><dt>数据截至</dt><dd>${esc(sourceAsOf || reportDate || "待确认")}</dd></div>
+        <div><dt>计算版本</dt><dd>${esc(calculationVersion || "待确认")}</dd></div>
+      </dl>
+      ${
+        series.length
+          ? `<div class="options-benchmark-grid">${series
+              .map((row) => {
+                const title = optionTextFrom(row, ["label", "name", "series_key"]);
+                const seen = new Set();
+                const metrics = OPTION_BENCHMARK_METRICS.flatMap(([key, label, formatter]) => {
+                  if (seen.has(label) || row[key] == null) return [];
+                  const value = formatter(row[key]);
+                  if (!value) return [];
+                  seen.add(label);
+                  return [{ label, value }];
+                });
+                return `<article><h3>${esc(title || "未命名序列")}</h3>${
+                  metrics.length
+                    ? `<dl>${metrics
+                        .map(
+                          (metric) => `<div><dt>${esc(metric.label)}</dt><dd>${esc(
+                            metric.value
+                          )}</dd></div>`
+                        )
+                        .join("")}</dl>`
+                    : `<p>本响应未提供可展示的数值。</p>`
+                }</article>`;
+              })
+              .join("")}</div>`
+          : `<div class="options-no-records">研究基线尚未随响应提供；不使用示例收益填充。</div>`
+      }
+      ${optionsStressWindowsHTML(benchmark)}
+      <div class="options-method-grid">
+        <section><h3>证据边界</h3>${
+          limitations.length
+            ? `<ul>${limitations
+                .map((item) => typeof item === "string" ? `<li>${esc(item)}</li>` : "")
+                .join("")}</ul>`
+            : `<p>正式候选仍需逐合约、点时数据、买卖价差和样本外验证。</p>`
+        }</section>
+        <section><h3>来源</h3>${
+          sources.length
+            ? `<ul>${sources
+                .map((item) => {
+                  const label = typeof item === "string"
+                    ? item
+                    : optionTextFrom(item, ["label", "name", "title"]);
+                  const rawUrl = typeof item === "object" ? optionTextFrom(item, ["url"]) : "";
+                  const url = safeExternalUrl(rawUrl);
+                  if (!label) return "";
+                  return `<li>${
+                    url
+                      ? `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(
+                          label
+                        )}</a>`
+                      : esc(label)
+                  }</li>`;
+                })
+                .join("")}</ul>`
+            : `<p>来源链接待返回。</p>`
+        }</section>
+      </div>
+      ${
+        inputHashes.length
+          ? `<details class="options-input-hashes"><summary>查看输入文件校验值</summary><dl>${inputHashes
+              .map(
+                ([key, value]) => `<div><dt>${esc(key)}</dt><dd><code>${esc(value)}</code></dd></div>`
+              )
+              .join("")}</dl></details>`
+          : ""
+      }
+    </section>`;
+  }
+
+  function renderOptions(data) {
+    if (!state.authenticated) {
+      renderOptionsLocked();
+      return;
+    }
+    const stage = $("#options-stage");
+    if (!stage) return;
+    if (!optionsBoundaryIsValid(data)) {
+      state.optionsData = null;
+      state.selectedOptionIndex = 0;
+      state.viewLastGoodAt.options = 0;
+      state.viewLastGoodDataAt.options = "";
+      optionsSetNavEnabled(false);
+      const session = $("#options-session");
+      if (session) {
+        session.className = "options-session is-block";
+        session.innerHTML = "<strong>研究边界异常</strong><span>候选与私人结果已隐藏</span>";
+      }
+      stage.setAttribute("aria-busy", "false");
+      stage.innerHTML = `<section class="options-integrity-block" role="alert">
+        <strong>研究边界校验未通过</strong>
+        <p>响应没有同时确认“仅研究、人工复核、无自动执行”。候选已全部隐藏。</p>
+      </section>`;
+      optionsAnnounce("期权研究边界校验未通过，候选已隐藏。");
+      return;
+    }
+    state.optionsData = data;
+    const notice = optionsDataNotice(data);
+    const session = $("#options-session");
+    if (session) {
+      session.className = `options-session is-${notice.tone}`;
+      session.innerHTML = `<strong>研究模式 · 不会自动下单</strong><span>${esc(
+        notice.timeCopy
+      )}</span>`;
+    }
+    optionsSetNavEnabled(true);
+    stage.setAttribute("aria-busy", "false");
+    stage.innerHTML = `<section class="options-notice is-${notice.tone}" role="status">
+        <div><strong>${esc(notice.title)}</strong><p>${esc(notice.detail)}</p></div>
+        <span>${esc(notice.timeCopy)}</span>
+      </section>
+      <section class="options-gate-section" aria-labelledby="options-gate-title">
+        <header><div><p>承保闸门轨迹</p><h2 id="options-gate-title">先判断能不能研究，再比较收益</h2></div>
+        <span>数据 → 市场 → 标的 → 资金</span></header>
+        ${optionsGateRailHTML(data)}
+      </section>
+      ${optionsCandidatesPanelHTML(data, notice)}
+      ${optionsReadinessPanelHTML(data)}
+      ${optionsBenchmarkPanelHTML(data)}
+      <p class="options-risk-notice">${esc(
+        optionTextFrom(data, ["risk_notice"]) ||
+          "期权可能造成重大损失；研究结果不构成投资建议，所有决定必须人工确认。"
+      )}</p>`;
+    optionsApplyPanel(state.optionsPanel);
+    const announcedCount = optionNumberFrom(data?.candidate_count) ?? 0;
+    optionsAnnounce(
+      `期权研究已更新；${announcedCount} 个候选。${notice.title}`
+    );
+  }
+
+  async function loadOptions() {
+    if (!state.authenticated) {
+      renderOptionsLocked();
+      return true;
+    }
+    const requestedPrivate = state.authenticated;
+    const requestGeneration = ++state.optionsRequestGeneration;
+    const url = api("api/private/options/overview");
+    const stage = $("#options-stage");
+    if (stage && !state.optionsData) {
+      stage.setAttribute("aria-busy", "true");
+      stage.innerHTML = `<div class="options-loading"><div class="skeleton skeleton-hero"></div><div class="skeleton skeleton-card"></div></div>`;
+    }
+    try {
+      const data = await requestJSON(url);
+      if (
+        requestGeneration !== state.optionsRequestGeneration ||
+        requestedPrivate !== state.authenticated
+      ) {
+        return false;
+      }
+      if (optionsBoundaryIsValid(data)) {
+        recordViewLastGoodDataAt("options", data);
+      } else {
+        state.viewLastGoodAt.options = 0;
+        state.viewLastGoodDataAt.options = "";
+      }
+      clearViewLoadError("options");
+      renderOptions(data || {});
+      return optionsBoundaryIsValid(data);
+    } catch (error) {
+      if (requestGeneration !== state.optionsRequestGeneration) return false;
+      if (error?.status === 401) {
+        handlePrivateSessionExpired();
+        return true;
+      }
+      state.optionsData = null;
+      state.selectedOptionIndex = 0;
+      state.viewLastGoodAt.options = 0;
+      state.viewLastGoodDataAt.options = "";
+      optionsSetNavEnabled(false);
+      const session = $("#options-session");
+      if (session) {
+        session.className = "options-session is-block";
+        session.innerHTML = "<strong>期权研究暂不可用</strong><span>旧私人结果已隐藏</span>";
+      }
+      if (stage) {
+        stage.setAttribute("aria-busy", "false");
+        stage.innerHTML = `<section class="options-integrity-block" role="alert">
+          <strong>期权研究暂不可用</strong>
+          <p>当前响应未通过，旧候选已隐藏；请使用上方“重试当前视图”。</p>
+        </section>`;
+      }
+      setViewLoadError("options", error, url);
+      optionsAnnounce("期权研究加载失败，旧候选已隐藏。");
+      return false;
     }
   }
 
@@ -7538,6 +8486,20 @@
         ]);
         criticalSucceeded =
           macroResult.status === "fulfilled" && macroResult.value === true;
+      } else if (view === "options") {
+        if (!state.authStatusLoaded) await loadAuthStatus();
+        if (!state.authenticated) {
+          renderOptionsLocked(
+            state.authConfigured
+              ? "登录后才读取研究准备度与账户风控状态"
+              : "服务端尚未配置私人模式"
+          );
+          criticalSucceeded = true;
+        } else {
+          const [optionsResult] = await Promise.allSettled([loadOptions()]);
+          criticalSucceeded =
+            optionsResult.status === "fulfilled" && optionsResult.value === true;
+        }
       } else if (view === "kol") {
         const statsPromise = loadStats();
         // The KOL catalog is authoritative for pruning stale browser selections,
@@ -7575,7 +8537,7 @@
   }
 
   function switchView(view, { load = true } = {}) {
-    if (!["decision", "daily", "macro", "kol"].includes(view)) return;
+    if (!["decision", "daily", "macro", "options", "kol"].includes(view)) return;
     if (state.view !== view) clearAllAiRequestPolls();
     if (state.view === "kol" && view !== "kol") {
       state.feedAbortController?.abort();
@@ -7598,6 +8560,9 @@
       history.replaceState(null, "", `#${view}`);
     } catch (e) {}
     if (view === "macro") renderMacroView();
+    if (view === "options" && !state.authenticated && state.authStatusLoaded) {
+      renderOptionsLocked();
+    }
     if (load) {
       void ensureViewLoaded(view).finally(resumeAiRequestPolls);
     } else {
@@ -7653,6 +8618,40 @@
     bindSupport();
     bindIntelDrawer();
     bindViewRetries();
+    $("#view-options")?.addEventListener("click", (event) => {
+      const unlock = event.target.closest("[data-options-unlock]");
+      if (unlock) {
+        if (!unlock.disabled && state.authConfigured && !state.logoutPending) {
+          openAuth(unlock, { purpose: "options" });
+        }
+        return;
+      }
+      const panelButton = event.target.closest("[data-options-panel]");
+      if (panelButton && !panelButton.disabled) {
+        optionsApplyPanel(panelButton.dataset.optionsPanel);
+        return;
+      }
+      const candidateButton = event.target.closest("[data-options-candidate-index]");
+      if (!candidateButton || !state.authenticated || !state.optionsData) return;
+      const index = Number(candidateButton.dataset.optionsCandidateIndex);
+      if (!Number.isInteger(index) || index < 0) return;
+      state.selectedOptionIndex = index;
+      renderOptions(state.optionsData);
+      requestAnimationFrame(() => $("#options-candidate-detail-title")?.focus());
+    });
+    $("#options-subnav")?.addEventListener("keydown", (event) => {
+      const buttons = $$("#options-subnav [data-options-panel]:not(:disabled)");
+      const current = event.target.closest("[data-options-panel]");
+      if (!current || !buttons.length) return;
+      let index = buttons.indexOf(current);
+      if (event.key === "ArrowRight") index = (index + 1) % buttons.length;
+      else if (event.key === "ArrowLeft") index = (index - 1 + buttons.length) % buttons.length;
+      else if (event.key === "Home") index = 0;
+      else if (event.key === "End") index = buttons.length - 1;
+      else return;
+      event.preventDefault();
+      optionsApplyPanel(buttons[index].dataset.optionsPanel, { focus: true });
+    });
     $("#daily-stage")?.addEventListener("click", (event) => {
       const viewTarget = event.target.closest("[data-daily-view]");
       if (viewTarget) {
@@ -7814,6 +8813,7 @@
     if (location.hash === "#daily") switchView("daily", { load: false });
     else if (location.hash === "#kol") switchView("kol", { load: false });
     else if (location.hash === "#macro") switchView("macro", { load: false });
+    else if (location.hash === "#options") switchView("options", { load: false });
     else switchView("decision", { load: false });
 
     $(".brand")?.addEventListener("click", (event) => {
@@ -7868,7 +8868,7 @@
       }, 250);
     });
 
-    if (state.view !== "decision") void loadAuthStatus();
+    if (state.view !== "decision" && state.view !== "options") void loadAuthStatus();
     await ensureViewLoaded(state.view);
     scheduleRefresh();
 

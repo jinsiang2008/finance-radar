@@ -249,11 +249,208 @@ class FrontendContractTests(unittest.TestCase):
         self.assertNotIn("DIRECT SOURCES", self.javascript)
         self.assertNotIn("NEXT CHECK", self.javascript)
 
-    def test_daily_assets_share_the_v34_cachebuster(self) -> None:
-        self.assertIn('static/app.js?v=34', self.html)
-        self.assertIn('static/style.css?v=34', self.html)
-        self.assertEqual(self.html.count("?v=34"), 2)
+    def test_daily_assets_share_the_v35_cachebuster(self) -> None:
+        self.assertIn('static/app.js?v=35', self.html)
+        self.assertIn('static/style.css?v=35', self.html)
+        self.assertEqual(self.html.count("?v=35"), 2)
         self.assertNotIn("?v=26", self.html)
+
+    def test_options_lab_is_an_accessible_login_only_research_view(self) -> None:
+        for contract in (
+            'id="tab-options"',
+            'data-view="options"',
+            'aria-label="期权实验室"',
+            'aria-controls="view-options"',
+            'id="view-options" role="tabpanel"',
+            'aria-labelledby="tab-options"',
+            'id="options-subnav" role="tablist"',
+            'aria-label="期权研究栏目"',
+            'id="options-live-status" role="status"',
+            "研究模式",
+            "不会自动下单",
+            "未登录时不会请求期权接口",
+            "data-options-unlock",
+        ):
+            self.assertIn(contract, self.html)
+
+        options_html_start = self.html.index('id="view-options"')
+        options_html_end = self.html.index("<!-- ══════════════ KOL", options_html_start)
+        static_options = self.html[options_html_start:options_html_end]
+        self.assertNotIn("US:", static_options)
+        self.assertNotIn("SPY", static_options)
+        self.assertNotIn("熟悉标的", static_options)
+
+        load_start = self.javascript.index("async function loadOptions()")
+        load_end = self.javascript.index("// ─── Macro view", load_start)
+        load_contract = self.javascript[load_start:load_end]
+        self.assertLess(
+            load_contract.index("if (!state.authenticated)"),
+            load_contract.index('api("api/private/options/overview")'),
+        )
+        self.assertIn("renderOptionsLocked();", load_contract)
+        self.assertIn("return true;", load_contract)
+        self.assertIn("const data = await requestJSON(url)", load_contract)
+
+        ensure_start = self.javascript.index("async function ensureViewLoaded(view")
+        ensure_end = self.javascript.index("function switchView", ensure_start)
+        ensure_contract = self.javascript[ensure_start:ensure_end]
+        self.assertIn('view === "options"', ensure_contract)
+        self.assertIn("if (!state.authStatusLoaded) await loadAuthStatus()", ensure_contract)
+        self.assertIn("if (!state.authenticated)", ensure_contract)
+        self.assertIn("loadOptions()", ensure_contract)
+
+    def test_options_private_state_is_cleared_on_logout_and_unauthorized(self) -> None:
+        clear_start = self.javascript.index("function clearOptionsView")
+        clear_end = self.javascript.index("function optionNumberFrom", clear_start)
+        clear_contract = self.javascript[clear_start:clear_end]
+        self.assertIn("state.optionsData = null", self.javascript)
+        self.assertIn("state.optionsRequestGeneration += 1", clear_contract)
+        self.assertIn("state.viewLastGoodAt.options = 0", clear_contract)
+        self.assertIn("renderOptionsLocked(message)", clear_contract)
+
+        expired_start = self.javascript.index("function handlePrivateSessionExpired")
+        expired_end = self.javascript.index("async function loadDecisions", expired_start)
+        self.assertIn(
+            'clearOptionsView("私人会话已过期；重新解锁后才会读取期权研究")',
+            self.javascript[expired_start:expired_end],
+        )
+
+        logout_start = self.javascript.index("async function lockPrivateMode")
+        logout_end = self.javascript.index("async function submitAuth", logout_start)
+        logout_contract = self.javascript[logout_start:logout_end]
+        self.assertLess(
+            logout_contract.index("clearOptionsView("),
+            logout_contract.index('requestJSON(api("api/auth/logout")'),
+        )
+
+        load_start = self.javascript.index("async function loadOptions()")
+        load_end = self.javascript.index("// ─── Macro view", load_start)
+        options_contract = self.javascript[load_start:load_end]
+        self.assertIn("if (error?.status === 401)", options_contract)
+        self.assertIn("handlePrivateSessionExpired();", options_contract)
+        self.assertNotIn("localStorage", options_contract)
+        self.assertNotIn("sessionStorage", options_contract)
+        self.assertNotIn("console.", options_contract)
+        self.assertIn(
+            "旧私人结果已隐藏；不会把历史候选继续显示为当前结论。",
+            self.javascript,
+        )
+
+    def test_options_zero_candidates_and_contract_values_fail_closed(self) -> None:
+        start = self.javascript.index("// ─── Options research lab")
+        end = self.javascript.index("// ─── Macro view", start)
+        contract = self.javascript[start:end]
+        for copy in (
+            "今天没有通过全部门槛的卖 Put",
+            "这是风控结论，不是页面故障",
+            "不会为了填满列表而放宽标准",
+            "把研究推进到候选，需要",
+            "完成输入也不代表一定入选",
+            "宏观、财报、流动性与集中度仍可否决交易",
+            "合约明细尚未随响应提供",
+            "不会显示推测的行权价、Delta 或权利金",
+            "响应未同时提供现价、行权价、权利金和合约乘数",
+            "系统不会补造数据",
+            "研究结果必须人工确认；本页面不会提交订单",
+        ):
+            self.assertIn(copy, contract)
+        self.assertIn("data?.next_steps", contract)
+        self.assertIn('class="options-empty-next"', contract)
+        for boundary in (
+            "data.schema_version === 1",
+            'data.method_version === "options-research-readiness-v1"',
+            "data.available === true",
+            'data.mode === "research_only"',
+            'data.decision_state === "abstain"',
+            "candidateCount === 0",
+            "candidates.length === 0",
+            "data.human_review_required === true",
+            "data.automatic_execution === false",
+            "data.trade_execution_available === false",
+            "OPTIONS_READY_DATA_STATES.has(dataStatus)",
+            "Number.isFinite(parsed)",
+            "multiplier == null",
+        ):
+            self.assertIn(boundary, contract)
+        self.assertNotIn("|| 100", contract)
+
+    def test_options_uses_research_universe_without_implying_holdings(self) -> None:
+        self.assertIn("data?.research_universe", self.javascript)
+        self.assertNotIn("familiar_universe", self.javascript)
+        self.assertNotIn("familiar_universe", self.html)
+        for copy in (
+            "通用研究池 · 待用户确认",
+            "通用研究池",
+            "不表示持有或适合交易",
+            "系统不会使用示例代码补足候选",
+            "全部项目均待用户确认",
+            "不表示当前持有、熟悉、支持期权或适合卖 Put",
+        ):
+            self.assertIn(copy, self.javascript)
+        self.assertIn("const grouped = new Map()", self.javascript)
+        self.assertIn('optionTextFrom(item, ["tier"])', self.javascript)
+        self.assertIn('class="options-universe-groups"', self.javascript)
+        self.assertIn(".options-universe-groups > section", self.css)
+        self.assertIn('grid-template-areas: "ledger analysis" "universe analysis"', self.css)
+        self.assertIn('grid-template-areas: "ledger" "analysis" "universe"', self.css)
+
+    def test_options_benchmark_formats_ratios_and_provenance_exactly(self) -> None:
+        start = self.javascript.index("function optionRatioPercent")
+        end = self.javascript.index("function renderOptions(data)", start)
+        contract = self.javascript[start:end]
+        self.assertIn("(numeric * 100).toFixed(2)", contract)
+        for field in (
+            "daily_max_drawdown",
+            "annualized_daily_volatility",
+            "monthly_beta_to_spx",
+            "source_as_of",
+            "calculation_version",
+            "input_sha256",
+        ):
+            self.assertIn(field, contract)
+        self.assertIn('optionTextFrom(benchmark?.range || {}, ["start"])', contract)
+        self.assertIn('optionTextFrom(benchmark?.range || {}, ["end"])', contract)
+        self.assertIn("`${rangeStart} — ${rangeEnd}`", contract)
+        self.assertIn("/^[a-f0-9]{64}$/i.test(value)", contract)
+        self.assertIn("function optionsStressWindowsHTML(benchmark)", contract)
+        self.assertIn("benchmark?.stress_windows", contract)
+        self.assertIn("window.returns", contract)
+        self.assertIn("optionRatioPercent(value)", contract)
+        self.assertIn("压力期表现", contract)
+        self.assertIn("窗口收益 · 不是未来预测", contract)
+        self.assertIn("本窗口没有通过有限数校验的收益", contract)
+        benchmark_start = self.javascript.index("function optionsBenchmarkPanelHTML")
+        benchmark_end = self.javascript.index("function renderOptions(data)", benchmark_start)
+        self.assertNotIn("served_at", self.javascript[benchmark_start:benchmark_end])
+
+    def test_options_layout_is_editorial_responsive_and_readable(self) -> None:
+        for contract in (
+            "#view-options { font-size: 16px; }",
+            ".options-gate-rail",
+            "grid-template-columns: repeat(4, minmax(0, 1fr))",
+            "grid-template-columns: minmax(0, 1.38fr) minmax(340px, 1fr)",
+            ".options-chart-path { fill: none; stroke: var(--accent)",
+            ".options-subnav",
+            ".options-stress-grid",
+            "scroll-snap-type: x proximity",
+        ):
+            self.assertIn(contract, self.css)
+        self.assertIn(
+            ".options-benchmark-grid {\n  display: grid; grid-template-columns: repeat(5, minmax(0, 1fr))",
+            self.css,
+        )
+        self.assertIn(
+            "grid-template-columns: repeat(3, minmax(0, 1fr))",
+            self.css[self.css.index(".options-stress-grid {") :],
+        )
+        mobile_start = self.css.index("@media (max-width: 700px)")
+        mobile = self.css[mobile_start:]
+        self.assertIn(".options-gate-rail { grid-template-columns: 1fr; }", mobile)
+        self.assertIn(".options-stress-grid,", mobile)
+        self.assertIn(".options-masthead { grid-template-columns: 1fr", mobile)
+        self.assertIn(".tabs::-webkit-scrollbar { display: none; }", mobile)
+        self.assertIn("flex: 0 0 auto; min-width: 74px; min-height: 44px", mobile)
+        self.assertIn("font-size: 12px; scroll-snap-align: start", mobile)
 
     def test_other_views_share_the_daily_editorial_reading_system(self) -> None:
         self.assertIn(".wrap { max-width: 1240px", self.css)
@@ -473,8 +670,8 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn('stale ? "数据延迟" : ""', self.javascript)
         self.assertIn('"高收益债利差"', self.javascript)
         self.assertIn("cs.hy_oas", self.javascript)
-        self.assertIn('static/app.js?v=34', self.html)
-        self.assertIn('static/style.css?v=34', self.html)
+        self.assertIn('static/app.js?v=35', self.html)
+        self.assertIn('static/style.css?v=35', self.html)
         self.assertNotIn('?v=26', self.html)
         self.assertIn(".metric.is-stale", self.css)
 
@@ -871,7 +1068,7 @@ class FrontendContractTests(unittest.TestCase):
             'loadedKolFilterSignature: ""',
             "kolSelectionPersisted: true",
             "kolCatalogLoaded: false",
-            "viewLoadGeneration: { decision: 0, daily: 0, macro: 0, kol: 0 }",
+            "viewLoadGeneration: { decision: 0, daily: 0, macro: 0, options: 0, kol: 0 }",
             "已选 ${selectedCount} 位 · 仅看所选 KOL",
             "最多选择 ${KOL_SELECTION_LIMIT} 位 KOL",
         ):
@@ -1130,7 +1327,16 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn('behavior: reduceMotion ? "auto" : "smooth"', self.javascript)
         self.assertIn(".decision-lens { min-height: 44px", self.css)
         self.assertIn(".decision-watch-btn { min-height: 44px", self.css)
-        forbidden = self.html + self.javascript
+        decision_html_start = self.html.index('id="view-decision"')
+        decision_html_end = self.html.index('id="view-daily"', decision_html_start)
+        decision_js_start = self.javascript.index("// ─── Decision cockpit")
+        decision_js_end = self.javascript.index(
+            "// ─── Options research lab", decision_js_start
+        )
+        forbidden = (
+            self.html[decision_html_start:decision_html_end]
+            + self.javascript[decision_js_start:decision_js_end]
+        )
         for phrase in ("买入", "卖出", "自动交易", "自动下单", "一键下单"):
             self.assertNotIn(phrase, forbidden)
 

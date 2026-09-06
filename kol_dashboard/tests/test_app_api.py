@@ -259,6 +259,7 @@ class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
         for path in (
             "/api/private/decisions",
             "/api/private/portfolio-impact",
+            "/api/private/options/overview",
         ):
             denied = await self.client.get(path)
             self.assertEqual(denied.status_code, 401)
@@ -267,6 +268,113 @@ class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
 
         prune = await self.client.post("/api/prune")
         self.assertEqual(prune.status_code, 401)
+
+    async def test_options_overview_is_private_no_store_and_research_only(
+        self,
+    ) -> None:
+        private_snapshot = {
+            "snapshot_id": 71,
+            "source_hash": "private-options-source-hash",
+            "as_of": "2026-01-01",
+            "positions": [
+                {
+                    "account": "private-options-account",
+                    "asset_key": "US:PRIVATE",
+                    "symbol": "PRIVATE",
+                    "name": "private-options-name",
+                    "quantity": 987.0,
+                    "avg_cost": 65.43,
+                }
+            ],
+            "staleness": {
+                "is_stale": True,
+                "clock_skew": False,
+                "age_seconds": 999999,
+            },
+        }
+        public_macro = {
+            "market_alerts": {
+                "schema_version": 1,
+                "method_version": "macro-de-risk-trial-v1",
+                "generated_at": "2026-09-06T01:00:00+00:00",
+                "mode": "trial",
+                "human_review_required": True,
+                "automatic_execution": False,
+                "markets": [
+                    {
+                        "market": "US",
+                        "action": "reduce_candidate",
+                        "action_label": "减仓候选",
+                        "risk_level": "high",
+                        "abstain": False,
+                        "data_status": "ok",
+                        "data_as_of": "2026-09-05T20:00:00+00:00",
+                    }
+                ],
+            }
+        }
+        await self._login()
+
+        with (
+            patch.object(
+                dashboard_app.db,
+                "latest_portfolio_snapshot",
+                return_value=private_snapshot,
+            ) as latest_portfolio,
+            patch.object(
+                dashboard_app,
+                "_public_macro_snapshot",
+                return_value=public_macro,
+            ) as latest_macro,
+        ):
+            response = await self.client.get("/api/private/options/overview")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        self.assertEqual(response.headers["pragma"], "no-cache")
+        body = response.json()
+        self.assertTrue(body["available"])
+        self.assertEqual(body["mode"], "research_only")
+        self.assertEqual(body["data_status"], "insufficient")
+        self.assertEqual(body["decision_state"], "abstain")
+        self.assertEqual(body["candidate_count"], 0)
+        self.assertEqual(body["candidates"], [])
+        self.assertEqual(body["market_gate"]["status"], "blocked")
+        self.assertNotIn("familiar_universe", body)
+        self.assertTrue(body["research_universe"])
+        self.assertTrue(
+            all(
+                item["status"] == "needs_user_confirmation"
+                for item in body["research_universe"]
+            )
+        )
+        self.assertTrue(body["human_review_required"])
+        self.assertFalse(body["automatic_execution"])
+        self.assertFalse(body["trade_execution_available"])
+        latest_portfolio.assert_called_once_with()
+        latest_macro.assert_called_once_with()
+
+        encoded = response.text.lower()
+        for private_value in (
+            "private-options-source-hash",
+            "private-options-account",
+            "us:private",
+            "private-options-name",
+            "987.0",
+            "65.43",
+        ):
+            self.assertNotIn(private_value, encoded)
+        for forbidden_field in (
+            '"source_hash"',
+            '"account"',
+            '"quantity"',
+            '"avg_cost"',
+            '"positions"',
+        ):
+            self.assertNotIn(forbidden_field, encoded)
+
+        public_route = await self.client.get("/api/options/overview")
+        self.assertEqual(public_route.status_code, 404)
 
     async def test_manual_ai_request_requires_session_header_and_exact_body(
         self,

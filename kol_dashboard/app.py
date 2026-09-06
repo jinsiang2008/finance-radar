@@ -18,6 +18,7 @@ Routes:
   POST /api/auth/login      — unlock private mode
   GET  /api/auth/status     — private-mode session status
   POST /api/auth/logout     — clear private-mode session
+  GET  /api/private/options/overview — authenticated research-only options readiness
   GET  /api/private/*       — authenticated portfolio overlay
   POST /api/prune           — manual prune (admin)
 
@@ -50,6 +51,7 @@ import db
 import decision_snapshot
 import decision_service
 import llm_enrichment
+import options_research_service
 
 BASE = Path(__file__).parent
 app = FastAPI(title="KOL Dashboard + Macro Risk Radar", version="2.0")
@@ -1065,6 +1067,20 @@ def api_private_portfolio_impact(
             ],
             "human_review_required": True,
         }
+    )
+
+
+@app.get("/api/private/options/overview")
+def api_private_options_overview(
+    _: dict[str, Any] = Depends(require_private_session),
+) -> JSONResponse:
+    """Return a fail-closed Options Lab research view without fetching markets."""
+
+    return _private_response(
+        options_research_service.build_options_overview(
+            portfolio_snapshot=db.latest_portfolio_snapshot(),
+            public_macro=_public_macro_snapshot(),
+        )
     )
 
 

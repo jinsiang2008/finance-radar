@@ -18,7 +18,7 @@
     } catch (e) {}
   })();
 </script>
-  <link rel="stylesheet" href="static/style.css?v=34" />
+  <link rel="stylesheet" href="static/style.css?v=35" />
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ccircle cx='50' cy='50' r='42' fill='%230b1720' stroke='%2331d69b' stroke-width='6'/%3E%3Ccircle cx='50' cy='50' r='20' fill='none' stroke='%234ab8d8' stroke-width='5'/%3E%3Cpath d='M50 50L82 24' stroke='%23f4b942' stroke-width='6' stroke-linecap='round'/%3E%3Ccircle cx='50' cy='50' r='7' fill='%23eef4f2'/%3E%3C/svg%3E" />
 </head>
 <body>
@@ -45,6 +45,11 @@
       <button class="tab" id="tab-macro" data-view="macro" role="tab"
               aria-selected="false" aria-controls="view-macro" tabindex="-1">
         风险图谱
+      </button>
+      <button class="tab" id="tab-options" data-view="options" role="tab"
+              aria-label="期权实验室"
+              aria-selected="false" aria-controls="view-options" tabindex="-1">
+        期权研究
       </button>
       <button class="tab" id="tab-kol" data-view="kol" role="tab"
               aria-selected="false" aria-controls="view-kol" tabindex="-1">
@@ -289,6 +294,57 @@
   </div>
 </main>
 
+<!-- ══════════════ 期权研究 ══════════════ -->
+<main class="view" id="view-options" role="tabpanel" aria-labelledby="tab-options">
+  <div class="wrap options-wrap">
+    <header class="options-masthead">
+      <div class="options-masthead-copy">
+        <span class="options-mode">研究模式</span>
+        <h1>期权实验室</h1>
+        <p>把愿意接货的价格变成可复核的现金担保 Put 研究；这里只展示证据，不会自动下单。</p>
+      </div>
+      <div class="options-session" id="options-session" aria-live="polite">
+        <strong>私人研究</strong>
+        <span>登录后才读取研究准备度与账户风控状态</span>
+      </div>
+    </header>
+
+    <nav class="options-subnav" id="options-subnav" role="tablist"
+         aria-label="期权研究栏目">
+      <button type="button" id="options-tab-candidates" role="tab"
+              data-options-panel="candidates" aria-selected="true"
+              aria-controls="options-panel-candidates" tabindex="0" disabled>
+        今日候选
+      </button>
+      <button type="button" id="options-tab-readiness" role="tab"
+              data-options-panel="readiness" aria-selected="false"
+              aria-controls="options-panel-readiness" tabindex="-1" disabled>
+        承保闸门
+      </button>
+      <button type="button" id="options-tab-benchmark" role="tab"
+              data-options-panel="benchmark" aria-selected="false"
+              aria-controls="options-panel-benchmark" tabindex="-1" disabled>
+        研究基线
+      </button>
+    </nav>
+
+    <p class="sr-only" id="options-live-status" role="status"
+       aria-live="polite" aria-atomic="true">期权研究需要先登录。</p>
+    <section class="options-stage" id="options-stage" aria-busy="false">
+      <section class="options-locked" aria-labelledby="options-locked-title">
+        <span class="options-lock-mark" aria-hidden="true">│</span>
+        <div>
+          <h2 id="options-locked-title">登录后查看私人研究结果</h2>
+          <p>未登录时不会请求期权接口，也不会把标的、候选或账户信息写入静态页面、网址或本机存储。</p>
+        </div>
+        <button type="button" data-options-unlock>解锁期权研究</button>
+      </section>
+    </section>
+
+    <div class="support-slot" data-support-slot></div>
+  </div>
+</main>
+
 <!-- ══════════════ KOL 动态 ══════════════ -->
 <main class="view" id="view-kol" role="tabpanel" aria-labelledby="tab-kol">
   <div class="wrap">
@@ -441,6 +497,6 @@
   </div>
 </div>
 
-<script src="static/app.js?v=34"></script>
+<script src="static/app.js?v=35"></script>
 </body>
 </html>
