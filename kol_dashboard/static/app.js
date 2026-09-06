@@ -4660,11 +4660,12 @@
       state.authConfigured = Boolean(status?.configured);
       state.authenticated = Boolean(status?.authenticated);
       state.logoutPending = false;
+      state.authStatusLoaded = true;
     } catch (error) {
       state.authConfigured = false;
       state.authenticated = false;
+      state.authStatusLoaded = false;
     }
-    state.authStatusLoaded = true;
     if (wasAuthenticated && !state.authenticated) {
       clearOptionsView("私人会话已结束；重新解锁后才会读取期权研究");
       broadcastPrivateSessionLocked("status-check");
@@ -4755,7 +4756,9 @@
         body: JSON.stringify({ passcode }),
       });
       state.logoutPending = false;
+      state.authConfigured = true;
       state.authenticated = true;
+      state.authStatusLoaded = true;
       state.selectedDecisionKey = "";
       state.viewLoadedAt.options = 0;
       updatePrivateModeButton();
@@ -4820,6 +4823,23 @@
     if (live) live.textContent = String(message || "");
   }
 
+  function optionsPolicyBeforeUnload(event) {
+    event.preventDefault();
+    event.returnValue = "";
+  }
+
+  function optionsPolicySyncBeforeUnloadProtection() {
+    const shouldProtect = Boolean(
+      (state.optionsPolicyDraftDirty && state.optionsPolicyDraft) ||
+        state.optionsPolicySaving
+    );
+    if (shouldProtect) {
+      window.addEventListener("beforeunload", optionsPolicyBeforeUnload);
+    } else {
+      window.removeEventListener("beforeunload", optionsPolicyBeforeUnload);
+    }
+  }
+
   function optionsSetNavEnabled(enabled) {
     $$("#options-subnav [data-options-panel]").forEach((button) => {
       button.disabled = !enabled;
@@ -4848,6 +4868,7 @@
     state.optionsPolicyDraft = null;
     state.optionsPolicyDraftDirty = false;
     state.optionsPolicySaving = false;
+    optionsPolicySyncBeforeUnloadProtection();
     state.optionsPolicySaveGeneration += 1;
     state.selectedOptionIndex = 0;
     state.optionsPanel = "candidates";
@@ -5344,6 +5365,7 @@
     }
     if (markChanged) {
       state.optionsPolicyDraftDirty = true;
+      optionsPolicySyncBeforeUnloadProtection();
       optionsPolicySetFeedback(
         selectedCount > OPTIONS_POLICY_MAX_SELECTIONS
           ? `最多确认 ${OPTIONS_POLICY_MAX_SELECTIONS} 项，请把其余标的改回未确认。`
@@ -5532,6 +5554,7 @@
     const requestedPrivate = state.authenticated;
     const saveGeneration = ++state.optionsPolicySaveGeneration;
     state.optionsPolicySaving = true;
+    optionsPolicySyncBeforeUnloadProtection();
     optionsPolicySetFormBusy(form, true);
     optionsPolicySetFeedback("正在由服务端校验修订号与全部护栏。", "pending");
     try {
@@ -5549,6 +5572,7 @@
       state.optionsPanel = "policy";
       state.optionsPolicyDraftDirty = false;
       state.optionsPolicyDraft = null;
+      optionsPolicySyncBeforeUnloadProtection();
       const reloaded = await loadOptions();
       if (saveGeneration !== state.optionsPolicySaveGeneration || !state.authenticated) return;
       if (reloaded) {
@@ -5565,6 +5589,7 @@
         state.optionsPanel = "policy";
         state.optionsPolicyDraftDirty = false;
         state.optionsPolicyDraft = null;
+        optionsPolicySyncBeforeUnloadProtection();
         await loadOptions();
         if (saveGeneration !== state.optionsPolicySaveGeneration || !state.authenticated) return;
         optionsPolicySetFeedback("另一页面已更新，已重新加载。请核对后再保存。", "error");
@@ -5582,6 +5607,7 @@
     } finally {
       if (saveGeneration === state.optionsPolicySaveGeneration) {
         state.optionsPolicySaving = false;
+        optionsPolicySyncBeforeUnloadProtection();
         optionsPolicySetFormBusy($("#options-policy-form"), false);
       }
     }
@@ -6229,6 +6255,7 @@
       state.optionsPolicyDraft = null;
       state.optionsPolicyDraftDirty = false;
       state.optionsPolicySaving = false;
+      optionsPolicySyncBeforeUnloadProtection();
       state.optionsPolicySaveGeneration += 1;
       state.selectedOptionIndex = 0;
       state.viewLastGoodAt.options = 0;
@@ -6311,6 +6338,7 @@
         if (!preserveUnsavedPolicy) {
           state.optionsPolicyDraft = optionsPolicyDraftFromData(data);
           state.optionsPolicyDraftDirty = false;
+          optionsPolicySyncBeforeUnloadProtection();
         }
         recordViewLastGoodDataAt("options", data);
       } else {
@@ -6341,6 +6369,7 @@
         state.optionsPolicyDraft = null;
         state.optionsPolicyDraftDirty = false;
         state.optionsPolicySaving = false;
+        optionsPolicySyncBeforeUnloadProtection();
         state.optionsPolicySaveGeneration += 1;
       }
       state.selectedOptionIndex = 0;
@@ -9327,6 +9356,7 @@
       }
       state.optionsPolicyDraftDirty = false;
       state.optionsPolicyDraft = null;
+      optionsPolicySyncBeforeUnloadProtection();
       optionsAnnounce("已放弃页面内草稿，正在重新加载服务端接货政策。");
     }
     if (showSpinner) button.classList.add("spinning");
@@ -9667,12 +9697,12 @@
       }
       updatePrivateModeButton();
       void (async () => {
-        await loadAuthStatus();
         if (state.view === "options") {
-          if (state.authenticated) await ensureViewLoaded("options", { force: true });
-          else renderOptionsLocked("已重新核验私人会话；登录后才读取期权研究");
+          await ensureViewLoaded("options", { force: true });
         } else if (state.view === "decision" && restoredPrivateSession) {
           await ensureViewLoaded("decision", { force: true });
+        } else {
+          await loadAuthStatus();
         }
       })();
     });

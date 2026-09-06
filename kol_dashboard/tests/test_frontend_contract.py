@@ -249,10 +249,11 @@ class FrontendContractTests(unittest.TestCase):
         self.assertNotIn("DIRECT SOURCES", self.javascript)
         self.assertNotIn("NEXT CHECK", self.javascript)
 
-    def test_daily_assets_share_the_v36_cachebuster(self) -> None:
-        self.assertIn('static/app.js?v=36', self.html)
-        self.assertIn('static/style.css?v=36', self.html)
-        self.assertEqual(self.html.count("?v=36"), 2)
+    def test_daily_assets_share_the_v37_cachebuster(self) -> None:
+        self.assertIn('static/app.js?v=37', self.html)
+        self.assertIn('static/style.css?v=37', self.html)
+        self.assertEqual(self.html.count("?v=37"), 2)
+        self.assertNotIn("?v=36", self.html)
         self.assertNotIn("?v=35", self.html)
         self.assertNotIn("?v=26", self.html)
 
@@ -600,6 +601,116 @@ class FrontendContractTests(unittest.TestCase):
         )
         self.assertIn("await refreshCurrentView();", self.javascript)
         self.assertIn("void refreshCurrentView();", self.javascript)
+
+    def test_auth_status_failure_is_not_cached_and_next_view_load_retries(self) -> None:
+        auth_start = self.javascript.index("async function loadAuthStatus()")
+        auth_end = self.javascript.index("function openAuth", auth_start)
+        auth_contract = self.javascript[auth_start:auth_end]
+        ensure_start = self.javascript.index("async function ensureViewLoaded(view")
+        ensure_end = self.javascript.index("function switchView", ensure_start)
+        ensure_contract = self.javascript[ensure_start:ensure_end]
+        catch_index = auth_contract.index("catch (error)")
+        self.assertIn("state.authStatusLoaded = true", auth_contract[:catch_index])
+        self.assertIn("state.authStatusLoaded = false", auth_contract[catch_index:])
+        self.assertEqual(
+            ensure_contract.count(
+                "if (!state.authStatusLoaded) await loadAuthStatus()"
+            ),
+            2,
+        )
+        self.assertNotIn(
+            "if (force || !state.authStatusLoaded) await loadAuthStatus()",
+            ensure_contract,
+        )
+        submit_start = self.javascript.index("async function submitAuth")
+        submit_end = self.javascript.index("// ─── Options research lab", submit_start)
+        submit_contract = self.javascript[submit_start:submit_end]
+        login_index = submit_contract.index('api("api/auth/login")')
+        force_index = submit_contract.index(
+            'ensureViewLoaded("options", { force: true })'
+        )
+        self.assertIn(
+            "state.authStatusLoaded = true",
+            submit_contract[login_index:force_index],
+        )
+
+    def test_options_policy_dirty_draft_protects_real_page_exit_only_while_dirty(self) -> None:
+        options_start = self.javascript.index("// ─── Options research lab")
+        options_end = self.javascript.index("// ─── Macro view", options_start)
+        options_contract = self.javascript[options_start:options_end]
+        unload_start = options_contract.index("function optionsPolicyBeforeUnload")
+        unload_end = options_contract.index("function optionsSetNavEnabled", unload_start)
+        unload_contract = options_contract[unload_start:unload_end]
+        self.assertIn("event.preventDefault()", unload_contract)
+        self.assertIn('event.returnValue = ""', unload_contract)
+        self.assertIn(
+            "(state.optionsPolicyDraftDirty && state.optionsPolicyDraft) ||",
+            unload_contract,
+        )
+        self.assertIn("state.optionsPolicySaving", unload_contract)
+        self.assertIn(
+            'window.addEventListener("beforeunload", optionsPolicyBeforeUnload)',
+            unload_contract,
+        )
+        self.assertIn(
+            'window.removeEventListener("beforeunload", optionsPolicyBeforeUnload)',
+            unload_contract,
+        )
+        self.assertNotIn(
+            'window.addEventListener("beforeunload"',
+            self.javascript[self.javascript.index('window.addEventListener("pagehide"'):],
+        )
+        self.assertIn(
+            "state.optionsPolicyDraftDirty = true;\n      optionsPolicySyncBeforeUnloadProtection();",
+            options_contract,
+        )
+        locked_start = options_contract.index("function renderOptionsLocked")
+        locked_end = options_contract.index("function clearOptionsView", locked_start)
+        save_start = options_contract.index("async function saveOptionsPolicy")
+        save_end = options_contract.index("function optionsReadinessItems", save_start)
+        self.assertIn(
+            "optionsPolicySyncBeforeUnloadProtection()",
+            options_contract[locked_start:locked_end],
+        )
+        self.assertLess(
+            options_contract[locked_start:locked_end].index(
+                "state.optionsPolicySaving = false"
+            ),
+            options_contract[locked_start:locked_end].index(
+                "optionsPolicySyncBeforeUnloadProtection()"
+            ),
+        )
+        self.assertGreaterEqual(
+            options_contract[save_start:save_end].count(
+                "optionsPolicySyncBeforeUnloadProtection()"
+            ),
+            4,
+        )
+        save_contract = options_contract[save_start:save_end]
+        self.assertIn(
+            "state.optionsPolicySaving = true;\n    optionsPolicySyncBeforeUnloadProtection();",
+            save_contract,
+        )
+        self.assertIn(
+            "state.optionsPolicySaving = false;\n        optionsPolicySyncBeforeUnloadProtection();",
+            save_contract,
+        )
+        render_start = options_contract.index("function renderOptions(data)")
+        load_start = options_contract.index("async function loadOptions()", render_start)
+        render_contract = options_contract[render_start:load_start]
+        self.assertIn(
+            "state.optionsPolicySaving = false;\n      optionsPolicySyncBeforeUnloadProtection();",
+            render_contract,
+        )
+        load_contract = options_contract[load_start:]
+        self.assertIn(
+            "state.optionsPolicySaving = false;\n        optionsPolicySyncBeforeUnloadProtection();",
+            load_contract,
+        )
+        self.assertIn(
+            "clearOptionsView(\"正在重新核验私人会话；旧接货政策已同步清除\")",
+            self.javascript,
+        )
 
     def test_options_policy_dirty_draft_survives_transient_service_failure(self) -> None:
         load_start = self.javascript.index("async function loadOptions()")
@@ -951,8 +1062,8 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn('stale ? "数据延迟" : ""', self.javascript)
         self.assertIn('"高收益债利差"', self.javascript)
         self.assertIn("cs.hy_oas", self.javascript)
-        self.assertIn('static/app.js?v=36', self.html)
-        self.assertIn('static/style.css?v=36', self.html)
+        self.assertIn('static/app.js?v=37', self.html)
+        self.assertIn('static/style.css?v=37', self.html)
         self.assertNotIn('?v=26', self.html)
         self.assertIn(".metric.is-stale", self.css)
 
