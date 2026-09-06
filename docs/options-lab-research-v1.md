@@ -223,7 +223,7 @@ post_assignment_underlying_exposure = current_underlying_market_value
 | 宏观状态 | 期权实验室行为 |
 | --- | --- |
 | `observe / ready` | 正常扫描，但仍受账户、事件和流动性门槛约束 |
-| `prepare_reduce / constrained` | 风险预算减半；首期只保留 SPY / QQQ 候选，并提高现金缓冲 |
+| `prepare_reduce / constrained` | v1 不猜测收紧比例：容量适配层返回 `abstain` 并暂停新增候选；后续政策版本只有在用户显式确认收紧后的现金缓冲、总担保、单一标的和每周新增上限后才可恢复扫描 |
 | `reduce_candidate / blocked` | 停止新增短 Put；只提示已有仓位的平仓 / 展期人工复核 |
 | `exit_candidate / blocked` | 全部新增候选关闭；展示尾部情景、指派和流动性风险 |
 | `abstain` | 数据不足，停止个性化候选；不能把未知解释成低风险 |
@@ -340,6 +340,7 @@ post_assignment_underlying_exposure = current_underlying_market_value
 | `options_domain.py` | 合约、报价、Greeks、账户策略与拒绝原因的严格模型 |
 | `options_market_data.py` | 数据提供方适配、时间语义、重试、限流与快照哈希 |
 | `options_policy.py` | 私人承保政策的严格校验、规范化、版本哈希与安全投影 |
+| `options_capacity.py` | 将经过哈希校验的新鲜政策、单账户快照和美国宏观状态收敛为确定性美元限额；任一语义不清即 `abstain`，当前不接 API、不生成候选 |
 | `options_strategy.py` | CSP 的纯函数硬门槛与 Bid 口径研究指标；校验快照 / 合约身份、纽约交易日、事件覆盖和账户容量；当前不接 API、不生成订单 |
 | `options_collect.py` | 熟悉池定时扫描；失败时保留 last-good，但不刷新证据时间 |
 | `options_backtest.py` | 点时链、Bid/Ask 成交、指派、费用与 walk-forward 引擎 |
@@ -421,6 +422,28 @@ POST /api/private/options/scans       # 可选、限流、只生成研究快照
 验收：私人政策不进入公开 API、静态 HTML、URL、日志或浏览器持久存储；相同内容
 幂等保存，并发冲突可恢复，过期政策需复核；刷新后可从私有 API 恢复，注销后页面
 不残留标的、价格或预算；政策就绪不能让候选数从 0 变为正数。
+
+### Phase 1B-b0：容量适配与证据采购（本地开发切片）
+
+- 增加纯函数容量适配层，只接受规范化、带来源哈希且在时效上有效的政策、单账户
+  快照和美国宏观快照；任何多账户 / 聚合语义、陈旧时间、哈希错配或字段歧义都
+  fail closed；
+- 将金额上限、总担保比例、单一标的比例、现金缓冲和每周新增张数取最保守交集，
+  同时扣除已有短 Put 的全额潜在指派；
+- 单标的美元上限明确标记为“接货后累计暴露上限”，不得误当成单次可新增额度；
+  每周计数在真正接入候选前还必须加入纽约时区的 `week_start` 和日历版本身份，避免
+  跨周边界低估已开合约数；
+- `prepare_reduce` 不再沿用未经用户确认的“减半”假设，而是等待下一版政策显式定义
+  constrained limits；`reduce_candidate`、`exit_candidate` 与宏观 abstain 均阻断；
+- 输出继续固定为 `research_only + abstain + candidate_count=0`；本切片没有 API、DB、
+  定时任务、行情接入、策略调用或订单路径；
+- 数据供应商、授权和 PoC 决策见
+  [美股期权数据采购与生产接入评估](options-data-procurement-2026-09-06.md)，逐合约引擎
+  的发布门槛见 [期权实验室稳健回测验收规范 v1](options-backtest-acceptance-v1.md)。
+
+验收：相同规范化输入产生相同身份和限额；修改任一输入 hash、时间、账户范围、
+宏观状态或风险字段都会得到可定位的稳定拒绝码；在真实账户与合法行情接入并通过
+shadow-run 前，任何调用路径都不能把候选数变为正数。
 
 ### Phase 1B-b：只读候选 MVP
 

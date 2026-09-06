@@ -38,6 +38,7 @@ class DeploymentContractTests(unittest.TestCase):
             "macro_collect.py",
             "llm_enrichment.py",
             "enrichment_collect.py",
+            "options_capacity.py",
             "options_policy.py",
             "options_research_service.py",
             "options_strategy.py",
