@@ -22,6 +22,10 @@
     dailyRequestGeneration: 0,
     optionsData: null,
     optionsRequestGeneration: 0,
+    optionsPolicyDraft: null,
+    optionsPolicyDraftDirty: false,
+    optionsPolicySaveGeneration: 0,
+    optionsPolicySaving: false,
     selectedOptionIndex: 0,
     optionsPanel: "candidates",
     decisionData: null,
@@ -88,6 +92,35 @@
     aiRequestPollTimers: new Map(),
     authReturnFocus: null,
   };
+
+  let privateSessionChannel = null;
+
+  function broadcastPrivateSessionLocked(reason = "logout") {
+    try {
+      privateSessionChannel?.postMessage({ type: "private-session-locked", reason });
+    } catch (error) {}
+  }
+
+  function initializePrivateSessionChannel() {
+    if (privateSessionChannel || typeof BroadcastChannel !== "function") return;
+    try {
+      privateSessionChannel = new BroadcastChannel("finance-radar-private-session");
+      privateSessionChannel.addEventListener("message", (event) => {
+        if (event?.data?.type !== "private-session-locked") return;
+        state.authenticated = false;
+        state.logoutPending = false;
+        state.decisionRequestGeneration += 1;
+        state.decisionLensRequestGeneration += 1;
+        clearOptionsView("另一页面已锁定私人会话；期权政策草稿已清除");
+        clearDecisionView("另一页面已锁定私人会话；已切换到公开视图");
+        updatePrivateModeButton();
+        Array.from(state.aiRequestSubjects.keys()).forEach(updateAiRequestControls);
+        if (state.view === "decision") void loadDecisions();
+      });
+    } catch (error) {
+      privateSessionChannel = null;
+    }
+  }
 
   // ─── Helpers ──────────────────────────────
 
@@ -4450,6 +4483,7 @@
     clearAllAiRequestPolls();
     clearOptionsView("私人会话已过期；重新解锁后才会读取期权研究");
     clearDecisionView("私人会话已过期；已切换到公开视图");
+    if (wasAuthenticated) broadcastPrivateSessionLocked("expired");
     updatePrivateModeButton();
     Array.from(state.aiRequestSubjects.keys()).forEach(updateAiRequestControls);
     if (wasAuthenticated && state.view === "decision") void loadDecisions();
@@ -4633,6 +4667,7 @@
     state.authStatusLoaded = true;
     if (wasAuthenticated && !state.authenticated) {
       clearOptionsView("私人会话已结束；重新解锁后才会读取期权研究");
+      broadcastPrivateSessionLocked("status-check");
     }
     updatePrivateModeButton();
     Array.from(state.aiRequestSubjects.keys()).forEach(updateAiRequestControls);
@@ -4692,6 +4727,7 @@
     state.decisionRequestGeneration += 1;
     clearOptionsView("私人期权研究已从当前页面清除");
     clearDecisionView();
+    broadcastPrivateSessionLocked("logout");
     updatePrivateModeButton();
     Array.from(state.aiRequestSubjects.keys()).forEach(updateAiRequestControls);
     try {
@@ -4746,7 +4782,15 @@
 
   // ─── Options research lab ─────────────────
 
-  const OPTIONS_PANELS = new Set(["candidates", "readiness", "benchmark"]);
+  const OPTIONS_PANELS = new Set(["candidates", "readiness", "benchmark", "policy"]);
+  const OPTIONS_POLICY_ACTION = "update-options-policy";
+  const OPTIONS_POLICY_MAX_SELECTIONS = 8;
+  const OPTIONS_POLICY_DECISIONS = new Set(["unconfirmed", "willing", "exclude"]);
+  const OPTIONS_POLICY_ASSIGNMENT_PLANS = new Set([
+    "hold_for_review",
+    "sell_after_assignment_review",
+    "wheel_after_review",
+  ]);
   const OPTIONS_READY_DATA_STATES = new Set([
     "fresh",
     "current",
@@ -4801,6 +4845,10 @@
     message = "登录后才读取研究准备度与账户风控状态"
   ) {
     state.optionsData = null;
+    state.optionsPolicyDraft = null;
+    state.optionsPolicyDraftDirty = false;
+    state.optionsPolicySaving = false;
+    state.optionsPolicySaveGeneration += 1;
     state.selectedOptionIndex = 0;
     state.optionsPanel = "candidates";
     optionsSetNavEnabled(false);
@@ -4903,10 +4951,12 @@
       ? data.candidates.filter((item) => item && typeof item === "object")
       : [];
     const candidateCount = optionNumberFrom(data?.candidate_count);
+    const capabilities = data?.capabilities;
+    const policy = data?.policy;
     return Boolean(
       data &&
-        data.schema_version === 1 &&
-        data.method_version === "options-research-readiness-v1" &&
+        data.schema_version === 2 &&
+        data.method_version === "options-policy-readiness-v1" &&
         data.available === true &&
         data.mode === "research_only" &&
         data.decision_state === "abstain" &&
@@ -4914,8 +4964,627 @@
         candidates.length === 0 &&
         data.human_review_required === true &&
         data.automatic_execution === false &&
-        data.trade_execution_available === false
+        data.trade_execution_available === false &&
+        capabilities &&
+        capabilities.policy_configuration === true &&
+        capabilities.live_option_chain === false &&
+        capabilities.broker_capacity === false &&
+        capabilities.event_calendar === false &&
+        capabilities.candidate_generation === false &&
+        capabilities.trade_execution === false &&
+        policy &&
+        typeof policy === "object" &&
+        Number.isInteger(policy.revision) &&
+        policy.revision >= 0
     );
+  }
+
+  function optionsPolicyDecision(value) {
+    const key = String(value || "").trim().toLowerCase();
+    if (key === "willing" || key === "confirmed") return "willing";
+    if (key === "exclude" || key === "excluded") return "exclude";
+    return "unconfirmed";
+  }
+
+  function optionsPolicyDecisionMeta(value) {
+    const decision = optionsPolicyDecision(value);
+    if (decision === "willing") {
+      return { decision, label: "愿意研究", tone: "willing" };
+    }
+    if (decision === "exclude") {
+      return { decision, label: "明确不做", tone: "excluded" };
+    }
+    return { decision: "unconfirmed", label: "未确认", tone: "unconfirmed" };
+  }
+
+  function optionsPolicyBpsToPercent(value, fallback = "") {
+    const numeric = optionNumberFrom(value);
+    if (numeric == null || !Number.isInteger(numeric) || numeric < 0) return fallback;
+    return (numeric / 100).toFixed(2).replace(/\.00$/, "").replace(/(\.\d)0$/, "$1");
+  }
+
+  function optionsPolicyUniverseRows(data, policy) {
+    const configured = Array.isArray(policy?.underlyings)
+      ? policy.underlyings.filter((item) => item && typeof item === "object")
+      : [];
+    const configuredByKey = new Map(
+      configured.flatMap((item) => {
+        const assetKey = optionTextFrom(item, ["asset_key"]);
+        return assetKey ? [[assetKey, item]] : [];
+      })
+    );
+    const universe = Array.isArray(data?.research_universe)
+      ? data.research_universe.filter((item) => item && typeof item === "object")
+      : [];
+    const seen = new Set();
+    return universe.flatMap((item) => {
+      const assetKey = optionTextFrom(item, ["asset_key", "key", "symbol"]);
+      if (!assetKey || seen.has(assetKey)) return [];
+      seen.add(assetKey);
+      const saved = configuredByKey.get(assetKey);
+      const decision = optionsPolicyDecision(
+        saved?.decision || item.status || item.decision
+      );
+      return [{
+        assetKey,
+        symbol: optionTextFrom(item, ["symbol"]) || assetTicker(assetKey),
+        name: optionTextFrom(item, ["name_zh", "name"]),
+        tier: optionTextFrom(item, ["tier"]) || "其他研究",
+        decision,
+        maxAssignmentPriceUsd:
+          decision === "willing"
+            ? optionTextFrom(saved || item, ["max_assignment_price_usd"])
+            : "",
+      }];
+    });
+  }
+
+  function optionsPolicyDraftFromData(data) {
+    const policy = data?.policy && typeof data.policy === "object" ? data.policy : {};
+    const limits = policy?.limits && typeof policy.limits === "object" ? policy.limits : {};
+    const acknowledgements =
+      policy?.acknowledgements && typeof policy.acknowledgements === "object"
+        ? policy.acknowledgements
+        : {};
+    return {
+      expectedRevision:
+        Number.isInteger(policy.revision) && policy.revision >= 0 ? policy.revision : 0,
+      strategy: policy.strategy === "cash_secured_put" ? policy.strategy : "cash_secured_put",
+      limits: {
+        assignmentBudgetCeilingUsd:
+          optionTextFrom(limits, ["assignment_budget_ceiling_usd"]),
+        maxTotalReservedPercent: optionsPolicyBpsToPercent(
+          limits.max_total_reserved_bps
+        ),
+        maxSingleUnderlyingPercent: optionsPolicyBpsToPercent(
+          limits.max_single_underlying_bps
+        ),
+        minimumCashBufferPercent: optionsPolicyBpsToPercent(
+          limits.minimum_cash_buffer_bps
+        ),
+        maxNewContractsPerWeek:
+          Number.isInteger(limits.max_new_contracts_per_week) &&
+          limits.max_new_contracts_per_week >= 0
+            ? String(limits.max_new_contracts_per_week)
+            : "",
+      },
+      assignmentPlan: OPTIONS_POLICY_ASSIGNMENT_PLANS.has(policy.assignment_plan)
+        ? policy.assignment_plan
+        : "hold_for_review",
+      underlyings: optionsPolicyUniverseRows(data, policy),
+      acknowledgements: {
+        cashSecuredOnly: acknowledgements.cash_secured_only === true,
+        assignmentRiskReviewed: acknowledgements.assignment_risk_reviewed === true,
+      },
+    };
+  }
+
+  function optionsPolicyStatusLabel(status) {
+    const key = String(status || "").trim().toLowerCase();
+    if (key === "ready" || key === "configured" || key === "active") return "已配置";
+    if (key === "review_due" || key === "stale") return "到期复核";
+    if (key === "acknowledgement_required") return "待风险确认";
+    if (key === "no_willing_underlyings") return "未选愿意研究";
+    return "尚未保存";
+  }
+
+  function optionsPolicyPanelHTML(
+    data,
+    { active = false, serviceUnavailable = false } = {}
+  ) {
+    const policy = data?.policy && typeof data.policy === "object" ? data.policy : {};
+    const draft = state.optionsPolicyDraft || optionsPolicyDraftFromData(data);
+    state.optionsPolicyDraft = draft;
+    const grouped = new Map();
+    draft.underlyings.forEach((item, index) => {
+      const tier = item.tier || "其他研究";
+      if (!grouped.has(tier)) grouped.set(tier, []);
+      grouped.get(tier).push({ ...item, index });
+    });
+    const selectedCount = draft.underlyings.filter(
+      (item) => item.decision === "willing" || item.decision === "exclude"
+    ).length;
+    const willingCount = draft.underlyings.filter(
+      (item) => item.decision === "willing"
+    ).length;
+    const excludedCount = draft.underlyings.filter(
+      (item) => item.decision === "exclude"
+    ).length;
+    const reviewDue = fmtBeijingDateTime(policy.review_due_at);
+    const updatedAt = fmtBeijingDateTime(policy.updated_at);
+    const revision = Number.isInteger(policy.revision) ? policy.revision : 0;
+    const policyStatus = serviceUnavailable
+      ? "服务不可用 · 本页草稿"
+      : optionsPolicyStatusLabel(policy.status);
+    const policyRows = grouped.size
+      ? Array.from(grouped, ([tier, items]) => `<section class="options-policy-tier">
+          <header><h3>${esc(tier)}</h3><span>${items.length} 项</span></header>
+          <div>${items.map((item) => {
+            const meta = optionsPolicyDecisionMeta(item.decision);
+            const inputName = `options-policy-decision-${item.index}`;
+            const priceId = `options-policy-price-${item.index}`;
+            return `<fieldset class="options-policy-underlying is-${meta.tone}"
+                      data-policy-underlying data-policy-asset-key="${esc(item.assetKey)}"
+                      data-policy-index="${item.index}">
+              <legend><strong>${esc(item.symbol || item.assetKey)}</strong>${
+                item.name && item.name !== item.symbol
+                  ? `<span>${esc(item.name)}</span>`
+                  : ""
+              }</legend>
+              <div class="options-policy-decisions" role="radiogroup" aria-label="${esc(
+                `${item.symbol || item.assetKey} 的研究态度`
+              )}">
+                ${[
+                  ["unconfirmed", "未确认"],
+                  ["willing", "愿意研究"],
+                  ["exclude", "明确不做"],
+                ].map(([value, label]) => `<label><input type="radio" name="${inputName}"
+                  value="${value}"${item.decision === value ? " checked" : ""} />
+                  <span>${label}</span></label>`).join("")}
+              </div>
+              <label class="options-policy-price" for="${priceId}"${
+                item.decision === "willing" ? "" : " hidden"
+              }>
+                <span>最高接货价</span>
+                <span class="options-policy-money"><b aria-hidden="true">$</b><input
+                  id="${priceId}" name="max_assignment_price_usd" type="text"
+                  inputmode="decimal" autocomplete="off" placeholder="请自行设定"
+                  value="${esc(item.maxAssignmentPriceUsd)}"${
+                    item.decision === "willing" ? " required" : ""
+                  } aria-label="${esc(`${item.symbol || item.assetKey} 最高接货价，美元`)}" /></span>
+              </label>
+            </fieldset>`;
+          }).join("")}</div>
+        </section>`).join("")
+      : `<div class="options-policy-empty">通用研究池尚未返回，无法配置标的态度；不会使用示例代码代替。</div>`;
+    return `<section id="options-panel-policy" role="tabpanel"
+             aria-labelledby="options-tab-policy" data-options-panel-view="policy"${
+               active ? "" : " hidden"
+             }>
+      <header class="options-page-head options-policy-head">
+        <div><p>人工确认的研究边界</p><h2>接货政策</h2></div>
+        <span>${esc(policyStatus)} · 修订 ${esc(revision)}</span>
+      </header>
+      <dl class="options-policy-meta">
+        <div><dt>愿意研究</dt><dd>${esc(
+          String(optionNumberFrom(policy.confirmed_count) ?? willingCount)
+        )}</dd></div>
+        <div><dt>明确排除</dt><dd>${esc(
+          String(optionNumberFrom(policy.excluded_count) ?? excludedCount)
+        )}</dd></div>
+        <div><dt>上次保存</dt><dd>${esc(
+          serviceUnavailable ? "暂不可核验" : updatedAt || "尚未保存"
+        )}</dd></div>
+        <div><dt>复核日期</dt><dd>${esc(
+          serviceUnavailable ? "暂不可核验" : reviewDue || "首次保存后 30 天"
+        )}</dd></div>
+      </dl>
+      <form id="options-policy-form" class="options-policy-form" novalidate
+            data-policy-revision="${esc(revision)}" aria-busy="${
+              state.optionsPolicySaving ? "true" : "false"
+            }"${state.optionsPolicySaving ? " inert" : ""}>
+        <section class="options-policy-map" aria-labelledby="options-policy-map-title">
+          <header class="options-policy-section-head">
+            <div><p>标的决策</p><h3 id="options-policy-map-title">通用研究池</h3></div>
+            <span class="options-policy-selection-count" data-policy-selection-count>${esc(
+              `${selectedCount} / ${OPTIONS_POLICY_MAX_SELECTIONS} 已确认`
+            )}</span>
+          </header>
+          <p class="options-policy-boundary">三态只表达研究意愿，不表示当前持有、期权可交易或适合卖 Put；未确认项不会提交。</p>
+          <div class="options-policy-tiers">${policyRows}</div>
+        </section>
+        <aside class="options-policy-terms" aria-labelledby="options-policy-terms-title">
+          <header class="options-policy-section-head">
+            <div><p>保单条款</p><h3 id="options-policy-terms-title">资金与指派护栏</h3></div>
+            <span>服务端最终校验</span>
+          </header>
+          <p class="options-policy-budget-warning"><strong>研究预算不是券商可用现金。</strong>这里只记录研究上限，不读取购买力、保证金或实时账户余额。</p>
+          <input type="hidden" name="strategy" value="cash_secured_put" />
+          <div class="options-policy-fields">
+            <label class="options-policy-field">
+              <span>研究预算上限</span>
+              <span class="options-policy-money"><b aria-hidden="true">$</b><input
+                name="assignment_budget_ceiling_usd" type="text" inputmode="decimal"
+                autocomplete="off" placeholder="请自行设定" value="${esc(
+                  draft.limits.assignmentBudgetCeilingUsd
+                )}" aria-describedby="options-policy-budget-help" required /></span>
+              <small id="options-policy-budget-help">现金担保研究的自定上限，单位 USD</small>
+            </label>
+            ${[
+              ["max_total_reserved_percent", "总担保上限", draft.limits.maxTotalReservedPercent],
+              ["max_single_underlying_percent", "单标的上限", draft.limits.maxSingleUnderlyingPercent],
+              ["minimum_cash_buffer_percent", "最低现金缓冲", draft.limits.minimumCashBufferPercent],
+            ].map(([name, label, value]) => `<label class="options-policy-field">
+              <span>${label}（百分比）</span>
+              <span class="options-policy-percent"><input name="${name}" type="text"
+                inputmode="decimal" autocomplete="off" placeholder="请自行设定"
+                aria-label="${label}，百分比" value="${esc(value)}" required /><b aria-hidden="true">%</b></span>
+            </label>`).join("")}
+            <label class="options-policy-field">
+              <span>每周新增合约上限</span>
+              <input name="max_new_contracts_per_week" type="number" inputmode="numeric"
+                min="1" max="100" step="1" autocomplete="off" placeholder="请自行设定" value="${esc(
+                  draft.limits.maxNewContractsPerWeek
+                )}" required />
+              <small>这是研究护栏，不是下单张数</small>
+            </label>
+            <label class="options-policy-field">
+              <span>指派后的复核计划</span>
+              <select name="assignment_plan" required>
+                <option value="hold_for_review"${
+                  draft.assignmentPlan === "hold_for_review" ? " selected" : ""
+                }>持有并重新评估</option>
+                <option value="sell_after_assignment_review"${
+                  draft.assignmentPlan === "sell_after_assignment_review" ? " selected" : ""
+                }>复核后考虑卖出</option>
+                <option value="wheel_after_review"${
+                  draft.assignmentPlan === "wheel_after_review" ? " selected" : ""
+                }>复核后再研究 Wheel</option>
+              </select>
+            </label>
+          </div>
+          <fieldset class="options-policy-acknowledgements">
+            <legend>风险确认</legend>
+            <p>未勾选也可保存为未就绪政策，但不会进入后续候选。</p>
+            <label><input type="checkbox" name="cash_secured_only"${
+              draft.acknowledgements.cashSecuredOnly ? " checked" : ""
+            } /><span><strong>仅研究现金担保 Put</strong>不把融资额度当作现金。</span></label>
+            <label><input type="checkbox" name="assignment_risk_reviewed"${
+              draft.acknowledgements.assignmentRiskReviewed ? " checked" : ""
+            } /><span><strong>已理解指派风险</strong>可能需要按行权价买入 100 股。</span></label>
+          </fieldset>
+          <p class="options-policy-save-boundary">保存也不会生成候选或下单；实时期权链、券商资金、事件日历和执行能力仍未接入。</p>
+          <p class="options-policy-feedback${
+            state.optionsPolicyDraftDirty ? " is-pending" : ""
+          }" data-policy-feedback role="status" aria-live="polite">${
+            serviceUnavailable
+              ? "服务状态不可用；草稿仅保留在本页内存。请勿刷新或关闭页面，可继续修改并尝试保存，或使用上方重试。"
+              : state.optionsPolicyDraftDirty
+              ? "有未保存更改；自动刷新已暂停。请先保存，或点击顶部刷新并确认放弃草稿。"
+              : revision > 0
+                ? "可调整后保存为下一修订。"
+                : "尚未保存；请自行设定全部财务护栏，页面不会预填示例数值。"
+          }</p>
+          <button class="options-policy-save" type="submit" data-options-policy-save>保存接货政策</button>
+        </aside>
+      </form>
+    </section>`;
+  }
+
+  function optionsPolicyRecoveryHTML() {
+    const draft = state.optionsPolicyDraft;
+    if (!draft) return "";
+    const willingCount = draft.underlyings.filter(
+      (item) => item.decision === "willing"
+    ).length;
+    const excludedCount = draft.underlyings.filter(
+      (item) => item.decision === "exclude"
+    ).length;
+    const safeDraftProjection = {
+      policy: {
+        status: "unavailable",
+        revision: draft.expectedRevision,
+        confirmed_count: willingCount,
+        excluded_count: excludedCount,
+      },
+    };
+    return `<section class="options-integrity-block" role="status">
+      <strong>期权研究服务暂不可用，未保存草稿仍在</strong>
+      <p>候选、准备度与旧服务端视图已隐藏。草稿只保留在当前页面内存；请勿刷新或关闭页面，可继续修改并尝试保存。</p>
+      <button type="button" class="view-retry-btn" data-view-retry="options">保留草稿并重试服务</button>
+    </section>${optionsPolicyPanelHTML(safeDraftProjection, {
+      active: true,
+      serviceUnavailable: true,
+    })}`;
+  }
+
+  function optionsCapturePolicyDraft(form, { markChanged = false } = {}) {
+    if (!form || !state.optionsPolicyDraft || state.optionsPolicySaving) return;
+    const valueOf = (name) => String(form.elements.namedItem(name)?.value || "").trim();
+    const draft = state.optionsPolicyDraft;
+    draft.limits.assignmentBudgetCeilingUsd = valueOf("assignment_budget_ceiling_usd");
+    draft.limits.maxTotalReservedPercent = valueOf("max_total_reserved_percent");
+    draft.limits.maxSingleUnderlyingPercent = valueOf("max_single_underlying_percent");
+    draft.limits.minimumCashBufferPercent = valueOf("minimum_cash_buffer_percent");
+    draft.limits.maxNewContractsPerWeek = valueOf("max_new_contracts_per_week");
+    const assignmentPlan = valueOf("assignment_plan");
+    draft.assignmentPlan = OPTIONS_POLICY_ASSIGNMENT_PLANS.has(assignmentPlan)
+      ? assignmentPlan
+      : "";
+    draft.acknowledgements.cashSecuredOnly =
+      form.elements.namedItem("cash_secured_only")?.checked === true;
+    draft.acknowledgements.assignmentRiskReviewed =
+      form.elements.namedItem("assignment_risk_reviewed")?.checked === true;
+    draft.underlyings = draft.underlyings.map((item, index) => {
+      const row = form.querySelector(`[data-policy-index="${index}"]`);
+      if (!row) return item;
+      const selected = row.querySelector('input[type="radio"]:checked')?.value;
+      const decision = OPTIONS_POLICY_DECISIONS.has(selected) ? selected : "unconfirmed";
+      const priceInput = row.querySelector('[name="max_assignment_price_usd"]');
+      const priceWrap = row.querySelector(".options-policy-price");
+      const meta = optionsPolicyDecisionMeta(decision);
+      row.classList.remove("is-willing", "is-excluded", "is-unconfirmed");
+      row.classList.add(`is-${meta.tone}`);
+      if (priceWrap) priceWrap.hidden = decision !== "willing";
+      if (priceInput) priceInput.required = decision === "willing";
+      return {
+        ...item,
+        decision,
+        maxAssignmentPriceUsd:
+          decision === "willing" ? String(priceInput?.value || "").trim() : "",
+      };
+    });
+    const selectedCount = draft.underlyings.filter(
+      (item) => item.decision === "willing" || item.decision === "exclude"
+    ).length;
+    const count = form.querySelector("[data-policy-selection-count]");
+    if (count) {
+      count.textContent = `${selectedCount} / ${OPTIONS_POLICY_MAX_SELECTIONS} 已确认`;
+      count.classList.toggle("is-over", selectedCount > OPTIONS_POLICY_MAX_SELECTIONS);
+    }
+    if (markChanged) {
+      state.optionsPolicyDraftDirty = true;
+      optionsPolicySetFeedback(
+        selectedCount > OPTIONS_POLICY_MAX_SELECTIONS
+          ? `最多确认 ${OPTIONS_POLICY_MAX_SELECTIONS} 项，请把其余标的改回未确认。`
+          : "有未保存更改；自动刷新已暂停。请先保存，或点击顶部刷新并确认放弃草稿。",
+        selectedCount > OPTIONS_POLICY_MAX_SELECTIONS ? "error" : "pending"
+      );
+    }
+  }
+
+  function optionsPolicyPercentToBps(value) {
+    const raw = String(value || "").trim();
+    const match = raw.match(/^(0|[1-9]\d{0,2})(?:\.(\d{1,2}))?$/);
+    if (!match) return null;
+    const fraction = String(match[2] || "").padEnd(2, "0");
+    const bps = Number(match[1]) * 100 + Number(fraction || 0);
+    return Number.isInteger(bps) && bps >= 0 && bps <= 10000 ? bps : null;
+  }
+
+  function optionsPolicyPayloadFromForm(form) {
+    optionsCapturePolicyDraft(form);
+    const draft = state.optionsPolicyDraft;
+    if (!draft) return { error: "草稿已失效，请重新加载期权研究。" };
+    const budget = String(draft.limits.assignmentBudgetCeilingUsd || "").trim();
+    if (
+      !/^(?:0|[1-9]\d*)(?:\.\d{1,2})?$/.test(budget) ||
+      Number(budget) < 0.01 ||
+      Number(budget) > 100000000
+    ) {
+      return {
+        error: "研究预算请输入 0.01–100,000,000 美元，最多保留两位小数。",
+        selector: '[name="assignment_budget_ceiling_usd"]',
+      };
+    }
+    const percentageFields = [
+      ["maxTotalReservedPercent", "总担保上限", "max_total_reserved_percent"],
+      ["maxSingleUnderlyingPercent", "单标的上限", "max_single_underlying_percent"],
+      ["minimumCashBufferPercent", "最低现金缓冲", "minimum_cash_buffer_percent"],
+    ];
+    const parsedPercentages = {};
+    for (const [key, label, inputName] of percentageFields) {
+      const parsed = optionsPolicyPercentToBps(draft.limits[key]);
+      if (parsed == null) {
+        return {
+          error: `${label}请输入 0–100 之间的百分比，最多保留两位小数。`,
+          selector: `[name="${inputName}"]`,
+        };
+      }
+      parsedPercentages[key] = parsed;
+    }
+    if (parsedPercentages.maxTotalReservedPercent < 1) {
+      return {
+        error: "总担保上限至少为 0.01%。",
+        selector: '[name="max_total_reserved_percent"]',
+      };
+    }
+    if (parsedPercentages.maxSingleUnderlyingPercent < 1) {
+      return {
+        error: "单标的上限至少为 0.01%。",
+        selector: '[name="max_single_underlying_percent"]',
+      };
+    }
+    if (parsedPercentages.minimumCashBufferPercent > 9999) {
+      return {
+        error: "最低现金缓冲不能达到或超过 100%。",
+        selector: '[name="minimum_cash_buffer_percent"]',
+      };
+    }
+    if (parsedPercentages.maxSingleUnderlyingPercent > parsedPercentages.maxTotalReservedPercent) {
+      return {
+        error: "单标的上限不能高于总担保上限。",
+        selector: '[name="max_single_underlying_percent"]',
+      };
+    }
+    if (
+      parsedPercentages.maxTotalReservedPercent +
+        parsedPercentages.minimumCashBufferPercent >
+      10000
+    ) {
+      return {
+        error: "总担保上限与最低现金缓冲合计不能超过 100%。",
+        selector: '[name="max_total_reserved_percent"]',
+      };
+    }
+    const weeklyRaw = String(draft.limits.maxNewContractsPerWeek || "").trim();
+    if (
+      !/^\d+$/.test(weeklyRaw) ||
+      !Number.isSafeInteger(Number(weeklyRaw)) ||
+      Number(weeklyRaw) < 1 ||
+      Number(weeklyRaw) > 100
+    ) {
+      return {
+        error: "每周新增合约上限请输入 1–100 的整数。",
+        selector: '[name="max_new_contracts_per_week"]',
+      };
+    }
+    if (!OPTIONS_POLICY_ASSIGNMENT_PLANS.has(draft.assignmentPlan)) {
+      return {
+        error: "请选择指派后的复核计划。",
+        selector: '[name="assignment_plan"]',
+      };
+    }
+    const selected = draft.underlyings.filter(
+      (item) => item.decision === "willing" || item.decision === "exclude"
+    );
+    if (selected.length > OPTIONS_POLICY_MAX_SELECTIONS) {
+      return {
+        error: `最多确认 ${OPTIONS_POLICY_MAX_SELECTIONS} 个标的，其余请保持未确认。`,
+        selector: '[data-policy-selection-count]',
+      };
+    }
+    const underlyings = [];
+    for (const item of selected) {
+      if (item.decision === "willing") {
+        const price = String(item.maxAssignmentPriceUsd || "").trim();
+        if (
+          !/^(?:0|[1-9]\d*)(?:\.\d{1,2})?$/.test(price) ||
+          Number(price) < 0.01 ||
+          Number(price) > 1000000
+        ) {
+          const row = draft.underlyings.indexOf(item);
+          return {
+            error: `${item.symbol || item.assetKey} 的最高接货价请输入 0.01–1,000,000 美元，最多保留两位小数。`,
+            selector: `[data-policy-index="${row}"] [name="max_assignment_price_usd"]`,
+          };
+        }
+        underlyings.push({
+          asset_key: item.assetKey,
+          decision: "willing",
+          max_assignment_price_usd: price,
+        });
+      } else {
+        underlyings.push({ asset_key: item.assetKey, decision: "exclude" });
+      }
+    }
+    return {
+      value: {
+        schema_version: 1,
+        expected_revision: draft.expectedRevision,
+        strategy: "cash_secured_put",
+        limits: {
+          assignment_budget_ceiling_usd: budget,
+          max_total_reserved_bps: parsedPercentages.maxTotalReservedPercent,
+          max_single_underlying_bps: parsedPercentages.maxSingleUnderlyingPercent,
+          minimum_cash_buffer_bps: parsedPercentages.minimumCashBufferPercent,
+          max_new_contracts_per_week: Number(weeklyRaw),
+        },
+        assignment_plan: draft.assignmentPlan,
+        underlyings,
+        acknowledgements: {
+          cash_secured_only: draft.acknowledgements.cashSecuredOnly,
+          assignment_risk_reviewed: draft.acknowledgements.assignmentRiskReviewed,
+        },
+      },
+    };
+  }
+
+  function optionsPolicySetFeedback(message, tone = "neutral") {
+    const feedback = $("#options-policy-form [data-policy-feedback]");
+    if (feedback) {
+      feedback.className = `options-policy-feedback is-${tone}`;
+      feedback.textContent = String(message || "");
+    }
+  }
+
+  function optionsPolicySetFormBusy(form, busy) {
+    if (!form) return;
+    form.setAttribute("aria-busy", busy ? "true" : "false");
+    form.toggleAttribute("inert", busy);
+    form.classList.toggle("is-saving", busy);
+    const button = form.querySelector("[data-options-policy-save]");
+    if (button) {
+      button.disabled = busy;
+      button.textContent = busy ? "正在保存政策…" : "保存接货政策";
+    }
+  }
+
+  async function saveOptionsPolicy(form) {
+    if (!state.authenticated || state.optionsPolicySaving) return;
+    const result = optionsPolicyPayloadFromForm(form);
+    if (!result.value) {
+      optionsPolicySetFeedback(result.error, "error");
+      optionsAnnounce(result.error);
+      form.querySelector(result.selector || "button")?.focus();
+      return;
+    }
+    const requestedPrivate = state.authenticated;
+    const saveGeneration = ++state.optionsPolicySaveGeneration;
+    state.optionsPolicySaving = true;
+    optionsPolicySetFormBusy(form, true);
+    optionsPolicySetFeedback("正在由服务端校验修订号与全部护栏。", "pending");
+    try {
+      await requestJSON(api("api/private/options/policy"), {
+        method: "PUT",
+        headers: { "X-Finance-Radar-Action": OPTIONS_POLICY_ACTION },
+        body: JSON.stringify(result.value),
+      });
+      if (
+        saveGeneration !== state.optionsPolicySaveGeneration ||
+        requestedPrivate !== state.authenticated
+      ) {
+        return;
+      }
+      state.optionsPanel = "policy";
+      state.optionsPolicyDraftDirty = false;
+      state.optionsPolicyDraft = null;
+      const reloaded = await loadOptions();
+      if (saveGeneration !== state.optionsPolicySaveGeneration || !state.authenticated) return;
+      if (reloaded) {
+        optionsPolicySetFeedback("接货政策已保存并重新读取；候选仍保持为零。", "success");
+        optionsAnnounce("接货政策已保存。保存不会生成候选或提交订单。");
+      }
+    } catch (error) {
+      if (saveGeneration !== state.optionsPolicySaveGeneration) return;
+      if (error?.status === 401 || error?.status === 403) {
+        handlePrivateSessionExpired();
+        return;
+      }
+      if (error?.status === 409) {
+        state.optionsPanel = "policy";
+        state.optionsPolicyDraftDirty = false;
+        state.optionsPolicyDraft = null;
+        await loadOptions();
+        if (saveGeneration !== state.optionsPolicySaveGeneration || !state.authenticated) return;
+        optionsPolicySetFeedback("另一页面已更新，已重新加载。请核对后再保存。", "error");
+        optionsAnnounce("另一页面已更新，接货政策已重新加载。");
+        return;
+      }
+      const message =
+        error?.status === 422
+          ? "保存未通过服务端校验，请检查金额、比例、标的选择与风险确认。"
+          : error?.name === "AbortError"
+            ? "保存超时，未确认是否写入；请刷新后核对修订号。"
+            : "接货政策暂时无法保存，请稍后重试。";
+      optionsPolicySetFeedback(message, "error");
+      optionsAnnounce(message);
+    } finally {
+      if (saveGeneration === state.optionsPolicySaveGeneration) {
+        state.optionsPolicySaving = false;
+        optionsPolicySetFormBusy($("#options-policy-form"), false);
+      }
+    }
   }
 
   function optionsReadinessItems(data) {
@@ -5195,21 +5864,34 @@
     if (!universe.length) {
       return `<div class="options-universe-empty">通用研究池尚未返回；系统不会使用示例代码补足候选。</div>`;
     }
+    const configured = Array.isArray(data?.policy?.underlyings)
+      ? new Map(
+          data.policy.underlyings.flatMap((item) => {
+            const assetKey = optionTextFrom(item, ["asset_key"]);
+            return assetKey ? [[assetKey, item]] : [];
+          })
+        )
+      : new Map();
     const grouped = new Map();
     universe.forEach((item) => {
       const tier = optionTextFrom(item, ["tier"]) || "其他研究";
       if (!grouped.has(tier)) grouped.set(tier, []);
       grouped.get(tier).push(item);
     });
-    return `<p class="options-universe-boundary">全部项目均待用户确认；通用研究池不表示当前持有、熟悉、支持期权或适合卖 Put。</p>
+    return `<p class="options-universe-boundary">状态来自接货政策；通用研究池不表示当前持有、支持期权或适合卖 Put，未确认项不会进入后续候选。</p>
       <div class="options-universe-groups">${Array.from(grouped, ([tier, items]) =>
         `<section><h4>${esc(tier)}</h4><ul>${items
           .map((item) => {
             const name = optionTextFrom(item, ["name_zh", "name"]);
             const symbol = optionTextFrom(item, ["symbol"]);
-            return `<li><strong>${esc(symbol || name || "未命名")}</strong>${
-              name && name !== symbol ? `<span>${esc(name)}</span>` : ""
-            }</li>`;
+            const assetKey = optionTextFrom(item, ["asset_key", "key", "symbol"]);
+            const saved = configured.get(assetKey);
+            const meta = optionsPolicyDecisionMeta(saved?.decision || item.status);
+            return `<li class="is-${meta.tone}"><span class="options-universe-identity"><strong>${
+              esc(symbol || name || "未命名")
+            }</strong>${
+              name && name !== symbol ? `<span class="options-universe-name">${esc(name)}</span>` : ""
+            }</span><span class="options-universe-status">${esc(meta.label)}</span></li>`;
           })
           .join("")}</ul></section>`
       ).join("")}</div>`;
@@ -5244,7 +5926,7 @@
       <div class="options-workbench">
         <section class="options-ledger" aria-labelledby="options-candidates-title">
           <header class="options-section-head">
-            <div><p>通用研究池 · 待用户确认</p><h2 id="options-candidates-title">今日候选</h2></div>
+            <div><p>通用研究池 · 用户政策状态</p><h2 id="options-candidates-title">今日候选</h2></div>
             <strong>${esc(String(candidates.length))}</strong>
           </header>
           ${
@@ -5544,6 +6226,10 @@
     if (!stage) return;
     if (!optionsBoundaryIsValid(data)) {
       state.optionsData = null;
+      state.optionsPolicyDraft = null;
+      state.optionsPolicyDraftDirty = false;
+      state.optionsPolicySaving = false;
+      state.optionsPolicySaveGeneration += 1;
       state.selectedOptionIndex = 0;
       state.viewLastGoodAt.options = 0;
       state.viewLastGoodDataAt.options = "";
@@ -5584,6 +6270,7 @@
       ${optionsCandidatesPanelHTML(data, notice)}
       ${optionsReadinessPanelHTML(data)}
       ${optionsBenchmarkPanelHTML(data)}
+      ${optionsPolicyPanelHTML(data)}
       <p class="options-risk-notice">${esc(
         optionTextFrom(data, ["risk_notice"]) ||
           "期权可能造成重大损失；研究结果不构成投资建议，所有决定必须人工确认。"
@@ -5604,7 +6291,7 @@
     const requestGeneration = ++state.optionsRequestGeneration;
     const url = api("api/private/options/overview");
     const stage = $("#options-stage");
-    if (stage && !state.optionsData) {
+    if (stage && !state.optionsData && !state.optionsPolicyDraftDirty) {
       stage.setAttribute("aria-busy", "true");
       stage.innerHTML = `<div class="options-loading"><div class="skeleton skeleton-hero"></div><div class="skeleton skeleton-card"></div></div>`;
     }
@@ -5616,7 +6303,15 @@
       ) {
         return false;
       }
-      if (optionsBoundaryIsValid(data)) {
+      const validBoundary = optionsBoundaryIsValid(data);
+      const preserveUnsavedPolicy = Boolean(
+        validBoundary && state.optionsPolicyDraftDirty && state.optionsPolicyDraft
+      );
+      if (validBoundary) {
+        if (!preserveUnsavedPolicy) {
+          state.optionsPolicyDraft = optionsPolicyDraftFromData(data);
+          state.optionsPolicyDraftDirty = false;
+        }
         recordViewLastGoodDataAt("options", data);
       } else {
         state.viewLastGoodAt.options = 0;
@@ -5624,32 +6319,62 @@
       }
       clearViewLoadError("options");
       renderOptions(data || {});
-      return optionsBoundaryIsValid(data);
+      if (preserveUnsavedPolicy) {
+        optionsPolicySetFeedback(
+          "服务端研究状态已刷新；未保存草稿已保留。保存时如修订冲突，会要求重新核对。",
+          "pending"
+        );
+        optionsAnnounce("服务端研究状态已刷新，未保存的接货政策草稿仍保留在页面内。");
+      }
+      return validBoundary;
     } catch (error) {
       if (requestGeneration !== state.optionsRequestGeneration) return false;
-      if (error?.status === 401) {
+      if (error?.status === 401 || error?.status === 403) {
         handlePrivateSessionExpired();
         return true;
       }
+      const preserveDirtyPolicy = Boolean(
+        state.optionsPolicyDraftDirty && state.optionsPolicyDraft
+      );
       state.optionsData = null;
+      if (!preserveDirtyPolicy) {
+        state.optionsPolicyDraft = null;
+        state.optionsPolicyDraftDirty = false;
+        state.optionsPolicySaving = false;
+        state.optionsPolicySaveGeneration += 1;
+      }
       state.selectedOptionIndex = 0;
       state.viewLastGoodAt.options = 0;
       state.viewLastGoodDataAt.options = "";
       optionsSetNavEnabled(false);
+      if (preserveDirtyPolicy) {
+        const policyTab = $("#options-tab-policy");
+        if (policyTab) policyTab.disabled = false;
+        state.optionsPanel = "policy";
+      }
       const session = $("#options-session");
       if (session) {
         session.className = "options-session is-block";
-        session.innerHTML = "<strong>期权研究暂不可用</strong><span>旧私人结果已隐藏</span>";
+        session.innerHTML = preserveDirtyPolicy
+          ? "<strong>服务暂不可用</strong><span>旧私人结果已隐藏 · 内存草稿已保留</span>"
+          : "<strong>期权研究暂不可用</strong><span>旧私人结果已隐藏</span>";
       }
       if (stage) {
         stage.setAttribute("aria-busy", "false");
-        stage.innerHTML = `<section class="options-integrity-block" role="alert">
-          <strong>期权研究暂不可用</strong>
-          <p>当前响应未通过，旧候选已隐藏；请使用上方“重试当前视图”。</p>
-        </section>`;
+        stage.innerHTML = preserveDirtyPolicy
+          ? optionsPolicyRecoveryHTML()
+          : `<section class="options-integrity-block" role="alert">
+              <strong>期权研究暂不可用</strong>
+              <p>当前响应未通过，旧候选已隐藏；请使用上方“重试当前视图”。</p>
+            </section>`;
       }
       setViewLoadError("options", error, url);
-      optionsAnnounce("期权研究加载失败，旧候选已隐藏。");
+      if (preserveDirtyPolicy) {
+        optionsApplyPanel("policy");
+        optionsAnnounce("期权研究加载失败，旧候选已隐藏；未保存草稿仍保留在本页内存。");
+      } else {
+        optionsAnnounce("期权研究加载失败，旧候选已隐藏。");
+      }
       return false;
     }
   }
@@ -8578,6 +9303,32 @@
 
   async function refreshCurrentView({ showSpinner = false } = {}) {
     const button = $("#refresh-btn");
+    if (state.view === "options" && state.optionsPolicySaving) {
+      optionsPolicySetFeedback("接货政策正在保存，请等待服务端响应后再刷新。", "pending");
+      optionsAnnounce("接货政策正在保存，暂不刷新期权实验室。");
+      return false;
+    }
+    if (state.view === "options" && state.optionsPolicyDraftDirty) {
+      if (!showSpinner) {
+        optionsPolicySetFeedback(
+          "有未保存更改；已暂停自动刷新。保存，或点击顶部刷新并确认放弃草稿。",
+          "pending"
+        );
+        optionsAnnounce("接货政策有未保存更改，已暂停期权实验室自动刷新。");
+        return false;
+      }
+      const discard = window.confirm(
+        "刷新会放弃当前页面内尚未保存的接货政策草稿。确定重新加载服务端版本吗？"
+      );
+      if (!discard) {
+        optionsPolicySetFeedback("已保留未保存草稿，未执行刷新。", "pending");
+        optionsAnnounce("已取消刷新，接货政策草稿仍保留在页面内。");
+        return false;
+      }
+      state.optionsPolicyDraftDirty = false;
+      state.optionsPolicyDraft = null;
+      optionsAnnounce("已放弃页面内草稿，正在重新加载服务端接货政策。");
+    }
     if (showSpinner) button.classList.add("spinning");
     try {
       await ensureViewLoaded(state.view, { force: true });
@@ -8597,6 +9348,7 @@
   }
 
   document.addEventListener("DOMContentLoaded", async () => {
+    initializePrivateSessionChannel();
     loadDecisionWatchlist();
     loadKolSelection();
     updateKolSelectionUi();
@@ -8638,6 +9390,20 @@
       state.selectedOptionIndex = index;
       renderOptions(state.optionsData);
       requestAnimationFrame(() => $("#options-candidate-detail-title")?.focus());
+    });
+    $("#view-options")?.addEventListener("input", (event) => {
+      const form = event.target.closest("#options-policy-form");
+      if (form) optionsCapturePolicyDraft(form, { markChanged: true });
+    });
+    $("#view-options")?.addEventListener("change", (event) => {
+      const form = event.target.closest("#options-policy-form");
+      if (form) optionsCapturePolicyDraft(form, { markChanged: true });
+    });
+    $("#view-options")?.addEventListener("submit", (event) => {
+      const form = event.target.closest("#options-policy-form");
+      if (!form) return;
+      event.preventDefault();
+      void saveOptionsPolicy(form);
     });
     $("#options-subnav")?.addEventListener("keydown", (event) => {
       const buttons = $$("#options-subnav [data-options-panel]:not(:disabled)");
@@ -8889,6 +9655,26 @@
       clearAllAiRequestPolls();
       state.feedAbortController?.abort();
       state.drawerAbortController?.abort();
+    });
+    window.addEventListener("pageshow", (event) => {
+      if (!event.persisted) return;
+      const restoredPrivateSession = state.authenticated;
+      state.authenticated = false;
+      state.authStatusLoaded = false;
+      clearOptionsView("正在重新核验私人会话；旧接货政策已同步清除");
+      if (restoredPrivateSession) {
+        clearDecisionView("正在重新核验私人会话；旧私人决策已同步清除");
+      }
+      updatePrivateModeButton();
+      void (async () => {
+        await loadAuthStatus();
+        if (state.view === "options") {
+          if (state.authenticated) await ensureViewLoaded("options", { force: true });
+          else renderOptionsLocked("已重新核验私人会话；登录后才读取期权研究");
+        } else if (state.view === "decision" && restoredPrivateSession) {
+          await ensureViewLoaded("decision", { force: true });
+        }
+      })();
     });
   });
 })();

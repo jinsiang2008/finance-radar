@@ -19,6 +19,8 @@ Routes:
   GET  /api/auth/status     — private-mode session status
   POST /api/auth/logout     — clear private-mode session
   GET  /api/private/options/overview — authenticated research-only options readiness
+  GET  /api/private/options/policy — authenticated underwriting policy
+  PUT  /api/private/options/policy — versioned underwriting policy update
   GET  /api/private/*       — authenticated portfolio overlay
   POST /api/prune           — manual prune (admin)
 
@@ -34,6 +36,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
@@ -51,6 +54,7 @@ import db
 import decision_snapshot
 import decision_service
 import llm_enrichment
+import options_policy
 import options_research_service
 
 BASE = Path(__file__).parent
@@ -73,6 +77,8 @@ class LoginBody(BaseModel):
 
 _AI_ACTION_HEADER = "X-Finance-Radar-Action"
 _AI_ACTION_VALUE = "request-ai-enrichment"
+_OPTIONS_POLICY_ACTION_VALUE = "update-options-policy"
+_OPTIONS_POLICY_MAX_BODY_BYTES = 16 * 1024
 _AI_SUBJECT_TYPES = {"event", "macro_event"}
 _EVENT_SUBJECT_ID = re.compile(r"^[1-9][0-9]{0,18}$")
 _SQLITE_MAX_INTEGER = (1 << 63) - 1
@@ -799,14 +805,18 @@ def _ai_request_error(status_code: int, detail: str) -> None:
     )
 
 
-def _require_ai_same_origin(request: Request) -> None:
+def _require_same_origin(request: Request, *, error_detail: str) -> None:
     origin = request.headers.get("origin")
     if origin is None:
         return
     try:
         parsed = urlsplit(origin)
     except ValueError:
-        _ai_request_error(403, "ai_same_origin_required")
+        raise HTTPException(
+            status_code=403,
+            detail=error_detail,
+            headers=_NO_STORE_HEADERS,
+        )
     request_host = request.headers.get("host", "").strip().casefold()
     if (
         parsed.scheme not in {"http", "https"}
@@ -817,7 +827,46 @@ def _require_ai_same_origin(request: Request) -> None:
         or parsed.fragment
         or parsed.netloc.casefold() != request_host
     ):
-        _ai_request_error(403, "ai_same_origin_required")
+        raise HTTPException(
+            status_code=403,
+            detail=error_detail,
+            headers=_NO_STORE_HEADERS,
+        )
+
+
+def _require_ai_same_origin(request: Request) -> None:
+    # Preserve the established AI endpoint's exact error contract while the
+    # origin validator is shared by other private mutation routes.
+    _require_same_origin(request, error_detail="ai_same_origin_required")
+
+
+class _DuplicateJsonField(ValueError):
+    pass
+
+
+def _strict_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicateJsonField
+        result[key] = value
+    return result
+
+
+def _options_policy_error(status_code: int, detail: str) -> None:
+    raise HTTPException(
+        status_code=status_code,
+        detail=detail,
+        headers=_NO_STORE_HEADERS,
+    )
+
+
+def _private_option_policy_projection() -> dict[str, Any]:
+    try:
+        record = db.latest_option_policy()
+    except (RuntimeError, sqlite3.Error):
+        _options_policy_error(503, "options_policy_storage_unavailable")
+    return options_policy.project_policy_record(record)
 
 
 def _resolve_ai_request_subject(
@@ -1080,8 +1129,71 @@ def api_private_options_overview(
         options_research_service.build_options_overview(
             portfolio_snapshot=db.latest_portfolio_snapshot(),
             public_macro=_public_macro_snapshot(),
+            policy=_private_option_policy_projection(),
         )
     )
+
+
+@app.get("/api/private/options/policy")
+def api_private_options_policy(
+    _: dict[str, Any] = Depends(require_private_session),
+) -> JSONResponse:
+    """Return only the authenticated user's bounded policy projection."""
+
+    return _private_response(_private_option_policy_projection())
+
+
+@app.put("/api/private/options/policy")
+async def api_update_private_options_policy(
+    request: Request,
+    _: dict[str, Any] = Depends(require_private_session),
+) -> JSONResponse:
+    """Validate and append one optimistic-concurrency policy version."""
+
+    _require_same_origin(
+        request,
+        error_detail="options_policy_same_origin_required",
+    )
+    if request.headers.get(_AI_ACTION_HEADER) != _OPTIONS_POLICY_ACTION_VALUE:
+        _options_policy_error(403, "options_policy_action_header_required")
+    content_type = request.headers.get("content-type", "").split(";", 1)[0]
+    if content_type.strip().lower() != "application/json":
+        _options_policy_error(415, "options_policy_json_body_required")
+    declared_length = request.headers.get("content-length")
+    if declared_length:
+        if not re.fullmatch(r"[0-9]+", declared_length):
+            _options_policy_error(400, "invalid_content_length")
+        normalized_length = declared_length.lstrip("0") or "0"
+        maximum_length = str(_OPTIONS_POLICY_MAX_BODY_BYTES)
+        if len(normalized_length) > len(maximum_length) or (
+            len(normalized_length) == len(maximum_length)
+            and normalized_length > maximum_length
+        ):
+            _options_policy_error(413, "options_policy_request_too_large")
+    body_buffer = bytearray()
+    async for chunk in request.stream():
+        if len(body_buffer) + len(chunk) > _OPTIONS_POLICY_MAX_BODY_BYTES:
+            _options_policy_error(413, "options_policy_request_too_large")
+        body_buffer.extend(chunk)
+    raw = bytes(body_buffer)
+    try:
+        body = json.loads(raw, object_pairs_hook=_strict_json_object)
+    except (UnicodeDecodeError, json.JSONDecodeError, _DuplicateJsonField):
+        _options_policy_error(422, "invalid_options_policy_json")
+    try:
+        expected_revision, canonical = options_policy.normalize_policy_request(body)
+    except options_policy.PolicyValidationError as exc:
+        _options_policy_error(422, f"options_policy_{exc.code}")
+    try:
+        saved = db.save_option_policy(
+            canonical,
+            expected_revision=expected_revision,
+        )
+    except db.OptionPolicyRevisionConflict:
+        _options_policy_error(409, "options_policy_revision_conflict")
+    except (RuntimeError, sqlite3.Error):
+        _options_policy_error(503, "options_policy_storage_unavailable")
+    return _private_response(options_policy.project_policy_record(saved))
 
 
 @app.post("/api/prune")

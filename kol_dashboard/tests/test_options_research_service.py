@@ -5,7 +5,7 @@ import re
 import unittest
 from datetime import datetime, timezone
 
-from kol_dashboard import options_research_service
+from kol_dashboard import options_policy, options_research_service
 
 
 UTC = timezone.utc
@@ -58,14 +58,52 @@ def _portfolio(*, stale: bool = False, clock_skew: bool = False) -> dict:
     }
 
 
+def _ready_policy() -> dict:
+    _, canonical = options_policy.normalize_policy_request(
+        {
+            "schema_version": 1,
+            "expected_revision": 0,
+            "strategy": "cash_secured_put",
+            "limits": {
+                "assignment_budget_ceiling_usd": "50000.00",
+                "max_total_reserved_bps": 3000,
+                "max_single_underlying_bps": 1500,
+                "minimum_cash_buffer_bps": 2000,
+                "max_new_contracts_per_week": 2,
+            },
+            "assignment_plan": "hold_for_review",
+            "underlyings": [
+                {
+                    "asset_key": "US:NVDA",
+                    "decision": "willing",
+                    "max_assignment_price_usd": "150.00",
+                }
+            ],
+            "acknowledgements": {
+                "cash_secured_only": True,
+                "assignment_risk_reviewed": True,
+            },
+        }
+    )
+    return options_policy.project_policy_record(
+        {
+            "revision": 1,
+            "updated_at": "2026-09-06T01:00:00+00:00",
+            "review_due_at": "2026-10-06T01:00:00+00:00",
+            "payload": canonical,
+        },
+        now=datetime(2026, 9, 6, 3, 0, tzinfo=UTC),
+    )
+
+
 class OptionsResearchServiceTests(unittest.TestCase):
     def test_default_overview_fails_closed_without_inventing_candidates(self) -> None:
         result = options_research_service.build_options_overview(
             now=datetime(2026, 9, 6, 3, 0, tzinfo=UTC)
         )
 
-        self.assertEqual(result["schema_version"], 1)
-        self.assertEqual(result["method_version"], "options-research-readiness-v1")
+        self.assertEqual(result["schema_version"], 2)
+        self.assertEqual(result["method_version"], "options-policy-readiness-v1")
         self.assertTrue(result["available"])
         self.assertEqual(result["mode"], "research_only")
         self.assertEqual(result["data_status"], "insufficient")
@@ -77,7 +115,14 @@ class OptionsResearchServiceTests(unittest.TestCase):
         self.assertFalse(result["trade_execution_available"])
         self.assertEqual(result["served_at"], "2026-09-06T03:00:00+00:00")
         self.assertTrue(result["market_gate"]["blocks_new_short_puts"])
-        self.assertGreaterEqual(len(result["rejections"]), 5)
+        self.assertGreaterEqual(len(result["rejections"]), 7)
+        self.assertEqual(result["policy"]["status"], "not_configured")
+        self.assertTrue(result["capabilities"]["policy_configuration"])
+        self.assertFalse(result["capabilities"]["live_option_chain"])
+        self.assertFalse(result["capabilities"]["broker_capacity"])
+        self.assertFalse(result["capabilities"]["event_calendar"])
+        self.assertFalse(result["capabilities"]["candidate_generation"])
+        self.assertFalse(result["capabilities"]["trade_execution"])
 
     def test_private_portfolio_values_never_enter_projection(self) -> None:
         result = options_research_service.build_options_overview(
@@ -184,6 +229,58 @@ class OptionsResearchServiceTests(unittest.TestCase):
         self.assertFalse(result["market_gate"]["blocks_new_short_puts"])
         self.assertEqual(result["decision_state"], "abstain")
         self.assertEqual(result["candidates"], [])
+
+    def test_ready_policy_only_clears_policy_and_familiar_universe_gates(self) -> None:
+        result = options_research_service.build_options_overview(
+            portfolio_snapshot=_portfolio(),
+            public_macro=_macro(),
+            policy=_ready_policy(),
+            now=datetime(2026, 9, 6, 3, 0, tzinfo=UTC),
+        )
+        items = {item["key"]: item for item in result["readiness"]["items"]}
+
+        self.assertEqual(items["underwriting_policy"]["status"], "ready")
+        self.assertFalse(items["underwriting_policy"]["blocking"])
+        self.assertEqual(items["familiar_universe"]["status"], "ready")
+        self.assertFalse(items["familiar_universe"]["blocking"])
+        self.assertEqual(items["portfolio_freshness"]["status"], "ready")
+        self.assertEqual(items["macro_gate"]["status"], "ready")
+        for still_blocked in (
+            "option_market_data",
+            "funding_capacity",
+            "options_permission",
+            "event_calendar",
+        ):
+            self.assertEqual(items[still_blocked]["status"], "unavailable")
+            self.assertTrue(items[still_blocked]["blocking"])
+        self.assertEqual(result["readiness"]["met"], 4)
+        self.assertEqual(result["data_status"], "insufficient")
+        self.assertEqual(result["decision_state"], "abstain")
+        self.assertEqual(result["candidate_count"], 0)
+        self.assertEqual(result["candidates"], [])
+        self.assertFalse(result["trade_execution_available"])
+
+    def test_policy_projection_is_revalidated_and_cannot_leak_extra_fields(self) -> None:
+        hostile = {
+            **_ready_policy(),
+            "account": "private-broker-account",
+            "positions": [{"quantity": 999}],
+        }
+        hostile["limits"] = {
+            **hostile["limits"],
+            "account_secret": "must-not-appear",
+        }
+        result = options_research_service.build_options_overview(
+            policy=hostile,
+            now=datetime(2026, 9, 6, 3, 0, tzinfo=UTC),
+        )
+        encoded = json.dumps(result, ensure_ascii=False)
+
+        self.assertNotIn("private-broker-account", encoded)
+        self.assertNotIn("must-not-appear", encoded)
+        self.assertNotIn('"quantity"', encoded)
+        self.assertEqual(result["policy"]["status"], "not_configured")
+        self.assertEqual(result["candidate_count"], 0)
 
     def test_benchmark_is_versioned_bounded_and_copied_per_response(self) -> None:
         first = options_research_service.build_options_overview()

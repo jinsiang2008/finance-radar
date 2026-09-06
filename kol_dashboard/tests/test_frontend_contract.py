@@ -249,10 +249,11 @@ class FrontendContractTests(unittest.TestCase):
         self.assertNotIn("DIRECT SOURCES", self.javascript)
         self.assertNotIn("NEXT CHECK", self.javascript)
 
-    def test_daily_assets_share_the_v35_cachebuster(self) -> None:
-        self.assertIn('static/app.js?v=35', self.html)
-        self.assertIn('static/style.css?v=35', self.html)
-        self.assertEqual(self.html.count("?v=35"), 2)
+    def test_daily_assets_share_the_v36_cachebuster(self) -> None:
+        self.assertIn('static/app.js?v=36', self.html)
+        self.assertIn('static/style.css?v=36', self.html)
+        self.assertEqual(self.html.count("?v=36"), 2)
+        self.assertNotIn("?v=35", self.html)
         self.assertNotIn("?v=26", self.html)
 
     def test_options_lab_is_an_accessible_login_only_research_view(self) -> None:
@@ -265,6 +266,10 @@ class FrontendContractTests(unittest.TestCase):
             'aria-labelledby="tab-options"',
             'id="options-subnav" role="tablist"',
             'aria-label="期权研究栏目"',
+            'id="options-tab-policy"',
+            'data-options-panel="policy"',
+            'aria-controls="options-panel-policy"',
+            "接货政策",
             'id="options-live-status" role="status"',
             "研究模式",
             "不会自动下单",
@@ -300,10 +305,15 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn("loadOptions()", ensure_contract)
 
     def test_options_private_state_is_cleared_on_logout_and_unauthorized(self) -> None:
+        locked_start = self.javascript.index("function renderOptionsLocked")
         clear_start = self.javascript.index("function clearOptionsView")
         clear_end = self.javascript.index("function optionNumberFrom", clear_start)
         clear_contract = self.javascript[clear_start:clear_end]
+        cleanup_contract = self.javascript[locked_start:clear_end]
         self.assertIn("state.optionsData = null", self.javascript)
+        self.assertIn("state.optionsPolicyDraft = null", cleanup_contract)
+        self.assertIn("state.optionsPolicySaving = false", cleanup_contract)
+        self.assertIn("state.optionsPolicySaveGeneration += 1", cleanup_contract)
         self.assertIn("state.optionsRequestGeneration += 1", clear_contract)
         self.assertIn("state.viewLastGoodAt.options = 0", clear_contract)
         self.assertIn("renderOptionsLocked(message)", clear_contract)
@@ -326,7 +336,10 @@ class FrontendContractTests(unittest.TestCase):
         load_start = self.javascript.index("async function loadOptions()")
         load_end = self.javascript.index("// ─── Macro view", load_start)
         options_contract = self.javascript[load_start:load_end]
-        self.assertIn("if (error?.status === 401)", options_contract)
+        self.assertIn(
+            "if (error?.status === 401 || error?.status === 403)",
+            options_contract,
+        )
         self.assertIn("handlePrivateSessionExpired();", options_contract)
         self.assertNotIn("localStorage", options_contract)
         self.assertNotIn("sessionStorage", options_contract)
@@ -357,8 +370,8 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn("data?.next_steps", contract)
         self.assertIn('class="options-empty-next"', contract)
         for boundary in (
-            "data.schema_version === 1",
-            'data.method_version === "options-research-readiness-v1"',
+            "data.schema_version === 2",
+            'data.method_version === "options-policy-readiness-v1"',
             "data.available === true",
             'data.mode === "research_only"',
             'data.decision_state === "abstain"',
@@ -367,6 +380,13 @@ class FrontendContractTests(unittest.TestCase):
             "data.human_review_required === true",
             "data.automatic_execution === false",
             "data.trade_execution_available === false",
+            "capabilities.policy_configuration === true",
+            "capabilities.live_option_chain === false",
+            "capabilities.broker_capacity === false",
+            "capabilities.event_calendar === false",
+            "capabilities.candidate_generation === false",
+            "capabilities.trade_execution === false",
+            "Number.isInteger(policy.revision)",
             "OPTIONS_READY_DATA_STATES.has(dataStatus)",
             "Number.isFinite(parsed)",
             "multiplier == null",
@@ -379,17 +399,23 @@ class FrontendContractTests(unittest.TestCase):
         self.assertNotIn("familiar_universe", self.javascript)
         self.assertNotIn("familiar_universe", self.html)
         for copy in (
-            "通用研究池 · 待用户确认",
+            "通用研究池 · 用户政策状态",
             "通用研究池",
             "不表示持有或适合交易",
             "系统不会使用示例代码补足候选",
-            "全部项目均待用户确认",
-            "不表示当前持有、熟悉、支持期权或适合卖 Put",
+            "状态来自接货政策",
+            "不表示当前持有、支持期权或适合卖 Put",
+            "未确认项不会进入后续候选",
+            "愿意研究",
+            "明确不做",
+            "未确认",
         ):
             self.assertIn(copy, self.javascript)
         self.assertIn("const grouped = new Map()", self.javascript)
         self.assertIn('optionTextFrom(item, ["tier"])', self.javascript)
         self.assertIn('class="options-universe-groups"', self.javascript)
+        self.assertIn("saved?.decision || item.status", self.javascript)
+        self.assertIn('class="options-universe-status"', self.javascript)
         self.assertIn(".options-universe-groups > section", self.css)
         self.assertIn('grid-template-areas: "ledger analysis" "universe analysis"', self.css)
         self.assertIn('grid-template-areas: "ledger" "analysis" "universe"', self.css)
@@ -432,6 +458,8 @@ class FrontendContractTests(unittest.TestCase):
             ".options-chart-path { fill: none; stroke: var(--accent)",
             ".options-subnav",
             ".options-stress-grid",
+            ".options-policy-form",
+            "grid-template-columns: minmax(0, 1.38fr) minmax(360px, 1fr)",
             "scroll-snap-type: x proximity",
         ):
             self.assertIn(contract, self.css)
@@ -448,9 +476,262 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn(".options-gate-rail { grid-template-columns: 1fr; }", mobile)
         self.assertIn(".options-stress-grid,", mobile)
         self.assertIn(".options-masthead { grid-template-columns: 1fr", mobile)
+        self.assertIn(".options-policy-form { grid-template-columns: 1fr; }", self.css)
+        self.assertIn(".options-policy-tier { grid-template-columns: 1fr; }", mobile)
+        self.assertIn(".options-policy-underlying {", mobile)
+        self.assertIn("min-height: 44px", mobile)
         self.assertIn(".tabs::-webkit-scrollbar { display: none; }", mobile)
         self.assertIn("flex: 0 0 auto; min-width: 74px; min-height: 44px", mobile)
         self.assertIn("font-size: 12px; scroll-snap-align: start", mobile)
+
+    def test_options_policy_is_an_explicit_revisioned_research_boundary(self) -> None:
+        start = self.javascript.index("function optionsPolicyPanelHTML")
+        end = self.javascript.index("function optionsReadinessItems", start)
+        policy_contract = self.javascript[start:end]
+        for copy in (
+            "人工确认的研究边界",
+            "研究预算不是券商可用现金",
+            "不读取购买力、保证金或实时账户余额",
+            "三态只表达研究意愿",
+            "未确认项不会提交",
+            "保存也不会生成候选或下单",
+            "实时期权链、券商资金、事件日历和执行能力仍未接入",
+            "最高接货价",
+            "总担保上限",
+            "单标的上限",
+            "最低现金缓冲",
+            "每周新增合约上限",
+            "指派后的复核计划",
+            "仅研究现金担保 Put",
+            "已理解指派风险",
+            "未勾选也可保存为未就绪政策",
+            "复核日期",
+        ):
+            self.assertIn(copy, policy_contract)
+        self.assertIn('id="options-panel-policy"', policy_contract)
+        self.assertIn('data-options-panel-view="policy"', policy_contract)
+        self.assertIn('id="options-policy-form"', policy_contract)
+        self.assertIn('["unconfirmed", "未确认"]', policy_contract)
+        self.assertIn('["willing", "愿意研究"]', policy_contract)
+        self.assertIn('["exclude", "明确不做"]', policy_contract)
+        self.assertLess(
+            policy_contract.index('class="options-policy-map"'),
+            policy_contract.index('class="options-policy-terms"'),
+        )
+        for status, label in (
+            ("ready", "已配置"),
+            ("review_due", "到期复核"),
+            ("acknowledgement_required", "待风险确认"),
+            ("no_willing_underlyings", "未选愿意研究"),
+        ):
+            self.assertIn(status, self.javascript)
+            self.assertIn(label, self.javascript)
+
+    def test_options_policy_put_is_exact_fail_safe_and_conflict_aware(self) -> None:
+        start = self.javascript.index("function optionsPolicyPayloadFromForm")
+        end = self.javascript.index("function optionsReadinessItems", start)
+        save_contract = self.javascript[start:end]
+        for contract in (
+            'api("api/private/options/policy")',
+            'method: "PUT"',
+            '"X-Finance-Radar-Action": OPTIONS_POLICY_ACTION',
+            "schema_version: 1",
+            "expected_revision: draft.expectedRevision",
+            'strategy: "cash_secured_put"',
+            "assignment_budget_ceiling_usd: budget",
+            "max_total_reserved_bps:",
+            "max_single_underlying_bps:",
+            "minimum_cash_buffer_bps:",
+            "max_new_contracts_per_week:",
+            "assignment_plan: draft.assignmentPlan",
+            "underlyings,",
+            "cash_secured_only: draft.acknowledgements.cashSecuredOnly",
+            "assignment_risk_reviewed: draft.acknowledgements.assignmentRiskReviewed",
+            'item.decision === "willing" || item.decision === "exclude"',
+            "OPTIONS_POLICY_MAX_SELECTIONS",
+            "state.optionsPanel = \"policy\"",
+            "state.optionsPolicyDraftDirty = false",
+            "state.optionsPolicyDraft = null",
+            "const reloaded = await loadOptions()",
+            "接货政策已保存并重新读取",
+            "另一页面已更新，已重新加载",
+            "error?.status === 422",
+            "请检查金额、比例、标的选择与风险确认",
+            "error?.status === 401 || error?.status === 403",
+            "handlePrivateSessionExpired()",
+        ):
+            self.assertIn(contract, save_contract)
+        self.assertIn(
+            'const OPTIONS_POLICY_ACTION = "update-options-policy"',
+            self.javascript,
+        )
+        self.assertNotIn("error.payload", save_contract)
+        self.assertNotIn("error.message", save_contract)
+        self.assertNotIn("localStorage", save_contract)
+        self.assertNotIn("sessionStorage", save_contract)
+        self.assertNotIn("URLSearchParams", save_contract)
+
+    def test_options_policy_dirty_draft_pauses_automatic_refresh(self) -> None:
+        options_start = self.javascript.index("// ─── Options research lab")
+        options_end = self.javascript.index("// ─── Macro view", options_start)
+        options_contract = self.javascript[options_start:options_end]
+        refresh_start = self.javascript.index("async function refreshCurrentView")
+        refresh_end = self.javascript.index("function scheduleRefresh", refresh_start)
+        refresh_contract = self.javascript[refresh_start:refresh_end]
+        self.assertIn("optionsPolicyDraftDirty: false", self.javascript)
+        self.assertIn("state.optionsPolicyDraftDirty = true", options_contract)
+        self.assertIn("const preserveUnsavedPolicy = Boolean(", options_contract)
+        self.assertIn(
+            "validBoundary && state.optionsPolicyDraftDirty && state.optionsPolicyDraft",
+            options_contract,
+        )
+        self.assertIn("if (!preserveUnsavedPolicy)", options_contract)
+        self.assertIn("未保存草稿已保留", options_contract)
+        self.assertIn('state.view === "options" && state.optionsPolicyDraftDirty', refresh_contract)
+        self.assertIn('state.view === "options" && state.optionsPolicySaving', refresh_contract)
+        self.assertIn("正在保存，请等待服务端响应后再刷新", refresh_contract)
+        self.assertIn("if (!showSpinner)", refresh_contract)
+        self.assertIn("已暂停自动刷新", refresh_contract)
+        self.assertIn("window.confirm(", refresh_contract)
+        self.assertIn("刷新会放弃当前页面内尚未保存的接货政策草稿", refresh_contract)
+        self.assertLess(
+            refresh_contract.index("state.optionsPolicyDraftDirty"),
+            refresh_contract.index("await ensureViewLoaded"),
+        )
+        self.assertIn("await refreshCurrentView();", self.javascript)
+        self.assertIn("void refreshCurrentView();", self.javascript)
+
+    def test_options_policy_dirty_draft_survives_transient_service_failure(self) -> None:
+        load_start = self.javascript.index("async function loadOptions()")
+        load_end = self.javascript.index("// ─── Macro view", load_start)
+        load_contract = self.javascript[load_start:load_end]
+        recovery_start = self.javascript.index("function optionsPolicyRecoveryHTML")
+        recovery_end = self.javascript.index("function optionsCapturePolicyDraft", recovery_start)
+        recovery_contract = self.javascript[recovery_start:recovery_end]
+        self.assertIn(
+            "stage && !state.optionsData && !state.optionsPolicyDraftDirty",
+            load_contract,
+        )
+        self.assertIn("const preserveDirtyPolicy = Boolean(", load_contract)
+        self.assertIn(
+            "state.optionsPolicyDraftDirty && state.optionsPolicyDraft",
+            load_contract,
+        )
+        self.assertIn("if (!preserveDirtyPolicy)", load_contract)
+        self.assertLess(
+            load_contract.index("error?.status === 401 || error?.status === 403"),
+            load_contract.index("const preserveDirtyPolicy"),
+        )
+        self.assertIn("state.optionsData = null", load_contract)
+        self.assertIn("optionsPolicyRecoveryHTML()", load_contract)
+        self.assertIn('optionsApplyPanel("policy")', load_contract)
+        self.assertIn("旧候选已隐藏；未保存草稿仍保留在本页内存", load_contract)
+        for copy in (
+            "期权研究服务暂不可用，未保存草稿仍在",
+            "候选、准备度与旧服务端视图已隐藏",
+            "草稿只保留在当前页面内存",
+            "请勿刷新或关闭页面",
+            "保留草稿并重试服务",
+        ):
+            self.assertIn(copy, recovery_contract)
+        self.assertIn('data-view-retry="options"', recovery_contract)
+        self.assertIn("safeDraftProjection", recovery_contract)
+        self.assertNotIn("state.optionsData", recovery_contract)
+        render_start = self.javascript.index("function renderOptions(data)")
+        render_end = self.javascript.index("async function loadOptions()", render_start)
+        invalid_boundary_contract = self.javascript[render_start:render_end]
+        self.assertIn("if (!optionsBoundaryIsValid(data))", invalid_boundary_contract)
+        self.assertIn("state.optionsPolicyDraft = null", invalid_boundary_contract)
+        self.assertIn("state.optionsPolicyDraftDirty = false", invalid_boundary_contract)
+
+    def test_options_policy_save_locks_all_form_editing_until_settled(self) -> None:
+        start = self.javascript.index("function optionsCapturePolicyDraft")
+        end = self.javascript.index("function optionsReadinessItems", start)
+        contract = self.javascript[start:end]
+        self.assertIn("state.optionsPolicySaving) return", contract)
+        self.assertIn('form.setAttribute("aria-busy", busy ? "true" : "false")', contract)
+        self.assertIn('form.toggleAttribute("inert", busy)', contract)
+        self.assertIn('form.classList.toggle("is-saving", busy)', contract)
+        self.assertIn("optionsPolicySetFormBusy(form, true)", contract)
+        self.assertIn('optionsPolicySetFormBusy($("#options-policy-form"), false)', contract)
+        self.assertLess(
+            contract.index("const result = optionsPolicyPayloadFromForm(form)"),
+            contract.index("optionsPolicySetFormBusy(form, true)"),
+        )
+        self.assertIn('aria-busy="${', self.javascript)
+        self.assertIn('state.optionsPolicySaving ? " inert" : ""', self.javascript)
+
+    def test_options_policy_draft_is_memory_only_and_cleared_across_sessions(self) -> None:
+        render_locked_start = self.javascript.index("function renderOptionsLocked")
+        clear_end = self.javascript.index("function optionNumberFrom", render_locked_start)
+        cleanup_contract = self.javascript[render_locked_start:clear_end]
+        for contract in (
+            "state.optionsPolicyDraft = null",
+            "state.optionsPolicyDraftDirty = false",
+            "state.optionsPolicySaving = false",
+            "state.optionsPolicySaveGeneration += 1",
+            "renderOptionsLocked(message)",
+        ):
+            self.assertIn(contract, cleanup_contract)
+        self.assertIn('new BroadcastChannel("finance-radar-private-session")', self.javascript)
+        self.assertIn('"private-session-locked"', self.javascript)
+        self.assertIn("broadcastPrivateSessionLocked(\"logout\")", self.javascript)
+        self.assertIn('window.addEventListener("pageshow"', self.javascript)
+        pageshow_start = self.javascript.index('window.addEventListener("pageshow"')
+        pageshow_contract = self.javascript[pageshow_start:]
+        self.assertIn("if (!event.persisted) return", pageshow_contract)
+        self.assertIn("state.authenticated = false", pageshow_contract)
+        self.assertIn("state.authStatusLoaded = false", pageshow_contract)
+        self.assertIn("旧接货政策已同步清除", pageshow_contract)
+        self.assertIn("clearOptionsView(", pageshow_contract)
+        self.assertLess(
+            pageshow_contract.index("clearOptionsView("),
+            pageshow_contract.index("await loadAuthStatus()"),
+        )
+        self.assertIn('ensureViewLoaded("options", { force: true })', self.javascript)
+        options_start = self.javascript.index("// ─── Options research lab")
+        options_end = self.javascript.index("// ─── Macro view", options_start)
+        options_contract = self.javascript[options_start:options_end]
+        self.assertNotIn("localStorage", options_contract)
+        self.assertNotIn("sessionStorage", options_contract)
+
+    def test_options_policy_first_configuration_has_no_financial_anchors(self) -> None:
+        draft_start = self.javascript.index("function optionsPolicyDraftFromData")
+        draft_end = self.javascript.index("function optionsPolicyStatusLabel", draft_start)
+        draft_contract = self.javascript[draft_start:draft_end]
+        panel_start = self.javascript.index("function optionsPolicyPanelHTML")
+        panel_end = self.javascript.index("function optionsCapturePolicyDraft", panel_start)
+        panel_contract = self.javascript[panel_start:panel_end]
+        for anchored_default in ('"50000.00"', '"30"', '"15"', '"20"', ': "2"'):
+            self.assertNotIn(anchored_default, draft_contract)
+        self.assertIn('fallback = ""', self.javascript)
+        self.assertGreaterEqual(panel_contract.count('placeholder="请自行设定"'), 4)
+        self.assertIn("页面不会预填示例数值", panel_contract)
+        for label in ("总担保上限", "单标的上限", "最低现金缓冲"):
+            self.assertIn('${label}（百分比）', panel_contract)
+            self.assertIn('aria-label="${label}，百分比"', panel_contract)
+        self.assertIn('aria-label="${label}，百分比"', panel_contract)
+
+    def test_options_policy_layout_has_touch_targets_and_mobile_reading_order(self) -> None:
+        for contract in (
+            ".options-policy-form {",
+            "grid-template-columns: minmax(0, 1.38fr) minmax(360px, 1fr)",
+            ".options-policy-tiers::before",
+            ".options-policy-underlying {",
+            ".options-policy-decisions span {",
+            "min-height: 44px",
+            ".options-policy-save {",
+            "min-height: 48px",
+            ".options-policy-terms { position: sticky",
+        ):
+            self.assertIn(contract, self.css)
+        mobile = self.css[self.css.index("@media (max-width: 700px)") :]
+        self.assertIn(".options-policy-meta { grid-template-columns: repeat(2", mobile)
+        self.assertIn(".options-policy-tier { grid-template-columns: 1fr; }", mobile)
+        self.assertIn("grid-template-columns: 1fr; min-inline-size: 0", mobile)
+        self.assertIn(".options-policy-fields { grid-template-columns: 1fr", mobile)
+        self.assertIn(".options-policy-feedback { padding-inline: 13px; font-size: 16px", mobile)
+        self.assertIn(".options-policy-decisions span { min-height: 44px; font-size: 14px; }", mobile)
 
     def test_other_views_share_the_daily_editorial_reading_system(self) -> None:
         self.assertIn(".wrap { max-width: 1240px", self.css)
@@ -670,8 +951,8 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn('stale ? "数据延迟" : ""', self.javascript)
         self.assertIn('"高收益债利差"', self.javascript)
         self.assertIn("cs.hy_oas", self.javascript)
-        self.assertIn('static/app.js?v=35', self.html)
-        self.assertIn('static/style.css?v=35', self.html)
+        self.assertIn('static/app.js?v=36', self.html)
+        self.assertIn('static/style.css?v=36', self.html)
         self.assertNotIn('?v=26', self.html)
         self.assertIn(".metric.is-stale", self.css)
 

@@ -132,6 +132,36 @@ class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
             json={"passcode": "open-sesame"},
         )
 
+    @staticmethod
+    def _options_policy_body(**overrides) -> dict:
+        body = {
+            "schema_version": 1,
+            "expected_revision": 0,
+            "strategy": "cash_secured_put",
+            "limits": {
+                "assignment_budget_ceiling_usd": "50000.00",
+                "max_total_reserved_bps": 3000,
+                "max_single_underlying_bps": 1500,
+                "minimum_cash_buffer_bps": 2000,
+                "max_new_contracts_per_week": 2,
+            },
+            "assignment_plan": "hold_for_review",
+            "underlyings": [
+                {
+                    "asset_key": "US:NVDA",
+                    "decision": "willing",
+                    "max_assignment_price_usd": "150.00",
+                },
+                {"asset_key": "US:TSLA", "decision": "exclude"},
+            ],
+            "acknowledgements": {
+                "cash_secured_only": True,
+                "assignment_risk_reviewed": True,
+            },
+        }
+        body.update(overrides)
+        return body
+
     def _seed_ai_event(
         self, *, title: str = "Jensen Huang says NVIDIA AI demand remains strong"
     ) -> int:
@@ -260,6 +290,7 @@ class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
             "/api/private/decisions",
             "/api/private/portfolio-impact",
             "/api/private/options/overview",
+            "/api/private/options/policy",
         ):
             denied = await self.client.get(path)
             self.assertEqual(denied.status_code, 401)
@@ -333,6 +364,8 @@ class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.headers["cache-control"], "no-store")
         self.assertEqual(response.headers["pragma"], "no-cache")
         body = response.json()
+        self.assertEqual(body["schema_version"], 2)
+        self.assertEqual(body["method_version"], "options-policy-readiness-v1")
         self.assertTrue(body["available"])
         self.assertEqual(body["mode"], "research_only")
         self.assertEqual(body["data_status"], "insufficient")
@@ -351,6 +384,9 @@ class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(body["human_review_required"])
         self.assertFalse(body["automatic_execution"])
         self.assertFalse(body["trade_execution_available"])
+        self.assertEqual(body["policy"]["status"], "not_configured")
+        self.assertTrue(body["capabilities"]["policy_configuration"])
+        self.assertFalse(body["capabilities"]["live_option_chain"])
         latest_portfolio.assert_called_once_with()
         latest_macro.assert_called_once_with()
 
@@ -375,6 +411,263 @@ class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
 
         public_route = await self.client.get("/api/options/overview")
         self.assertEqual(public_route.status_code, 404)
+
+    async def test_options_policy_get_put_is_private_versioned_and_no_store(
+        self,
+    ) -> None:
+        path = "/api/private/options/policy"
+        action = {"X-Finance-Radar-Action": "update-options-policy"}
+        denied = await self.client.put(
+            path,
+            json=self._options_policy_body(),
+            headers=action,
+        )
+        self.assertEqual(denied.status_code, 401)
+        self.assertEqual(denied.headers["cache-control"], "no-store")
+
+        await self._login()
+        initial = await self.client.get(path)
+        self.assertEqual(initial.status_code, 200)
+        self.assertEqual(initial.headers["cache-control"], "no-store")
+        self.assertEqual(initial.json()["status"], "not_configured")
+        self.assertEqual(initial.json()["revision"], 0)
+
+        saved = await self.client.put(
+            path,
+            json=self._options_policy_body(),
+            headers={**action, "Origin": "http://testserver"},
+        )
+        self.assertEqual(saved.status_code, 200)
+        self.assertEqual(saved.headers["cache-control"], "no-store")
+        policy = saved.json()
+        self.assertEqual(policy["status"], "ready")
+        self.assertEqual(policy["revision"], 1)
+        self.assertEqual(
+            policy["limits"]["assignment_budget_ceiling_usd"],
+            "50000.00",
+        )
+        self.assertEqual(policy["confirmed_count"], 1)
+        self.assertEqual(policy["excluded_count"], 1)
+        self.assertEqual(policy["evidence_basis"], "user_confirmed")
+        self.assertNotIn("payload_sha256", saved.text)
+
+        # A response-lost retry may still carry revision 0; identical current
+        # content is idempotent and must not create revision 2.
+        retry = await self.client.put(
+            path,
+            json=self._options_policy_body(expected_revision=0),
+            headers=action,
+        )
+        current = await self.client.get(path)
+        self.assertEqual(retry.status_code, 200)
+        self.assertEqual(retry.json()["revision"], 1)
+        self.assertEqual(current.json()["revision"], 1)
+        self.assertEqual(current.headers["cache-control"], "no-store")
+
+        changed_limits = {
+            **self._options_policy_body()["limits"],
+            "assignment_budget_ceiling_usd": "60000.00",
+        }
+        conflict = await self.client.put(
+            path,
+            json=self._options_policy_body(
+                expected_revision=0,
+                limits=changed_limits,
+            ),
+            headers=action,
+        )
+        self.assertEqual(conflict.status_code, 409)
+        self.assertEqual(
+            conflict.json()["detail"], "options_policy_revision_conflict"
+        )
+        self.assertEqual(conflict.headers["cache-control"], "no-store")
+
+        public_get = await self.client.get("/api/options/policy")
+        public_put = await self.client.put(
+            "/api/options/policy",
+            json=self._options_policy_body(),
+            headers=action,
+        )
+        self.assertEqual(public_get.status_code, 404)
+        self.assertEqual(public_put.status_code, 404)
+
+    async def test_options_policy_put_enforces_csrf_media_size_and_exact_json(
+        self,
+    ) -> None:
+        await self._login()
+        path = "/api/private/options/policy"
+        action = {"X-Finance-Radar-Action": "update-options-policy"}
+
+        cases = [
+            (
+                await self.client.put(path, json=self._options_policy_body()),
+                403,
+                "options_policy_action_header_required",
+            ),
+            (
+                await self.client.put(
+                    path,
+                    json=self._options_policy_body(),
+                    headers={**action, "Origin": "https://attacker.example"},
+                ),
+                403,
+                "options_policy_same_origin_required",
+            ),
+            (
+                await self.client.put(
+                    path,
+                    content=b"{}",
+                    headers={**action, "Content-Type": "text/plain"},
+                ),
+                415,
+                "options_policy_json_body_required",
+            ),
+            (
+                await self.client.put(
+                    path,
+                    content=b"{" + b" " * (16 * 1024) + b"}",
+                    headers={**action, "Content-Type": "application/json"},
+                ),
+                413,
+                "options_policy_request_too_large",
+            ),
+        ]
+        for response, status, detail in cases:
+            self.assertEqual(response.status_code, status)
+            self.assertEqual(response.json()["detail"], detail)
+            self.assertEqual(response.headers["cache-control"], "no-store")
+
+        invalid_length = await self.client.put(
+            path,
+            content=b"{}",
+            headers={
+                **action,
+                "Content-Type": "application/json",
+                "Content-Length": "not-a-number",
+            },
+        )
+        self.assertEqual(invalid_length.status_code, 400)
+        self.assertEqual(
+            invalid_length.json()["detail"], "invalid_content_length"
+        )
+        self.assertEqual(invalid_length.headers["cache-control"], "no-store")
+
+        hostile = {
+            **self._options_policy_body(),
+            "unknown": "PRIVATE-MALICIOUS-VALUE",
+        }
+        extra = await self.client.put(path, json=hostile, headers=action)
+        self.assertEqual(extra.status_code, 422)
+        self.assertEqual(
+            extra.json()["detail"], "options_policy_invalid_policy_fields"
+        )
+        self.assertNotIn("PRIVATE-MALICIOUS-VALUE", extra.text)
+        self.assertEqual(extra.headers["cache-control"], "no-store")
+
+        duplicate_json = json.dumps(self._options_policy_body()).replace(
+            '"schema_version": 1',
+            '"schema_version": 1, "schema_version": 1',
+            1,
+        )
+        duplicate = await self.client.put(
+            path,
+            content=duplicate_json,
+            headers={**action, "Content-Type": "application/json"},
+        )
+        self.assertEqual(duplicate.status_code, 422)
+        self.assertEqual(
+            duplicate.json()["detail"], "invalid_options_policy_json"
+        )
+        self.assertEqual(duplicate.headers["cache-control"], "no-store")
+
+        leveraged = await self.client.put(
+            path,
+            json=self._options_policy_body(
+                underlyings=[
+                    {"asset_key": "US:NVDL", "decision": "exclude"}
+                ]
+            ),
+            headers=action,
+        )
+        self.assertEqual(leveraged.status_code, 422)
+        self.assertEqual(
+            leveraged.json()["detail"],
+            "options_policy_leveraged_underlying_not_allowed",
+        )
+        decimal = await self.client.put(
+            path,
+            json=self._options_policy_body(
+                limits={
+                    **self._options_policy_body()["limits"],
+                    "assignment_budget_ceiling_usd": "5e4",
+                }
+            ),
+            headers=action,
+        )
+        self.assertEqual(decimal.status_code, 422)
+        self.assertEqual(
+            decimal.json()["detail"],
+            "options_policy_invalid_assignment_budget_ceiling_usd",
+        )
+        for response in (leveraged, decimal):
+            self.assertEqual(response.headers["cache-control"], "no-store")
+
+    async def test_configured_policy_never_unblocks_live_or_broker_gates(self) -> None:
+        await self._login()
+        action = {"X-Finance-Radar-Action": "update-options-policy"}
+        saved = await self.client.put(
+            "/api/private/options/policy",
+            json=self._options_policy_body(),
+            headers=action,
+        )
+        self.assertEqual(saved.status_code, 200)
+
+        overview = await self.client.get("/api/private/options/overview")
+        self.assertEqual(overview.status_code, 200)
+        self.assertEqual(overview.headers["cache-control"], "no-store")
+        body = overview.json()
+        readiness = {
+            item["key"]: item for item in body["readiness"]["items"]
+        }
+        self.assertEqual(readiness["underwriting_policy"]["status"], "ready")
+        self.assertEqual(readiness["familiar_universe"]["status"], "ready")
+        for blocked in (
+            "option_market_data",
+            "funding_capacity",
+            "options_permission",
+            "event_calendar",
+        ):
+            self.assertTrue(readiness[blocked]["blocking"])
+        self.assertEqual(body["data_status"], "insufficient")
+        self.assertEqual(body["decision_state"], "abstain")
+        self.assertEqual(body["candidate_count"], 0)
+        self.assertEqual(body["candidates"], [])
+        self.assertFalse(body["trade_execution_available"])
+
+    async def test_corrupt_policy_storage_returns_private_503_without_cache(self) -> None:
+        await self._login()
+        await self.client.put(
+            "/api/private/options/policy",
+            json=self._options_policy_body(),
+            headers={"X-Finance-Radar-Action": "update-options-policy"},
+        )
+        with db.conn(immediate=True) as connection:
+            connection.execute("DROP TRIGGER option_policy_versions_no_update")
+            connection.execute(
+                "UPDATE option_policy_versions SET payload_sha256=?",
+                ("0" * 64,),
+            )
+
+        for path in (
+            "/api/private/options/policy",
+            "/api/private/options/overview",
+        ):
+            response = await self.client.get(path)
+            self.assertEqual(response.status_code, 503)
+            self.assertEqual(
+                response.json()["detail"], "options_policy_storage_unavailable"
+            )
+            self.assertEqual(response.headers["cache-control"], "no-store")
 
     async def test_manual_ai_request_requires_session_header_and_exact_body(
         self,

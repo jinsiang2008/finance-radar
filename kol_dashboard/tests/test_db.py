@@ -11,7 +11,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
-from kol_dashboard import db, llm_enrichment, relation_engine
+from kol_dashboard import db, llm_enrichment, options_policy, relation_engine
 
 
 def ready_enrichment(**overrides):
@@ -3951,8 +3951,185 @@ class DailyBriefingDatabaseTests(unittest.TestCase):
         self.assertEqual([row["id"] for row in outside_window], [current_id])
 
 
+class OptionPolicyPersistenceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = str(Path(self.tmp.name) / "options-policy.sqlite3")
+        self.path_patch = mock.patch.object(db, "DB_PATH", self.path)
+        self.path_patch.start()
+        db.init()
+
+    def tearDown(self) -> None:
+        self.path_patch.stop()
+        self.tmp.cleanup()
+
+    @staticmethod
+    def policy(*, budget: str = "50000.00") -> dict:
+        request = {
+            "schema_version": 1,
+            "expected_revision": 0,
+            "strategy": "cash_secured_put",
+            "limits": {
+                "assignment_budget_ceiling_usd": budget,
+                "max_total_reserved_bps": 3000,
+                "max_single_underlying_bps": 1500,
+                "minimum_cash_buffer_bps": 2000,
+                "max_new_contracts_per_week": 2,
+            },
+            "assignment_plan": "hold_for_review",
+            "underlyings": [
+                {
+                    "asset_key": "US:NVDA",
+                    "decision": "willing",
+                    "max_assignment_price_usd": "150.00",
+                }
+            ],
+            "acknowledgements": {
+                "cash_secured_only": True,
+                "assignment_risk_reviewed": True,
+            },
+        }
+        return options_policy.normalize_policy_request(request)[1]
+
+    def row_count(self) -> int:
+        with db.conn() as connection:
+            return int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM option_policy_versions"
+                ).fetchone()[0]
+            )
+
+    def test_policy_versions_are_idempotent_and_revision_guarded(self) -> None:
+        observed = datetime(2026, 9, 6, 3, 4, 5, tzinfo=timezone.utc)
+        first = db.save_option_policy(
+            self.policy(), expected_revision=0, now=observed
+        )
+        lost_response_retry = db.save_option_policy(
+            self.policy(),
+            expected_revision=0,
+            now=observed + timedelta(minutes=1),
+        )
+
+        self.assertEqual(first["revision"], 1)
+        self.assertFalse(first["idempotent"])
+        self.assertEqual(
+            first["review_due_at"], "2026-10-06T03:04:05+00:00"
+        )
+        self.assertEqual(lost_response_retry["revision"], 1)
+        self.assertTrue(lost_response_retry["idempotent"])
+        self.assertEqual(self.row_count(), 1)
+
+        with self.assertRaises(db.OptionPolicyRevisionConflict):
+            db.save_option_policy(
+                self.policy(budget="60000.00"),
+                expected_revision=0,
+                now=observed + timedelta(minutes=2),
+            )
+        second = db.save_option_policy(
+            self.policy(budget="60000.00"),
+            expected_revision=1,
+            now=observed + timedelta(minutes=2),
+        )
+        self.assertEqual(second["revision"], 2)
+        self.assertEqual(self.row_count(), 2)
+
+        latest = db.latest_option_policy()
+        assert latest is not None
+        self.assertEqual(latest["revision"], 2)
+        self.assertEqual(
+            latest["payload"]["limits"]["assignment_budget_ceiling_usd"],
+            "60000.00",
+        )
+
+    def test_expired_identical_policy_creates_a_review_version(self) -> None:
+        observed = datetime(2026, 9, 1, tzinfo=timezone.utc)
+        first = db.save_option_policy(
+            self.policy(), expected_revision=0, now=observed
+        )
+        renewed = db.save_option_policy(
+            self.policy(),
+            expected_revision=first["revision"],
+            now=observed + timedelta(days=31),
+        )
+
+        self.assertEqual(renewed["revision"], 2)
+        self.assertFalse(renewed["idempotent"])
+        self.assertEqual(renewed["updated_at"], "2026-10-02T00:00:00+00:00")
+        self.assertEqual(renewed["review_due_at"], "2026-11-01T00:00:00+00:00")
+
+    def test_history_is_bounded_and_versions_cannot_be_updated(self) -> None:
+        revision = 0
+        observed = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        for index in range(options_policy.MAX_POLICY_VERSIONS + 5):
+            saved = db.save_option_policy(
+                self.policy(budget=f"{50000 + index}.00"),
+                expected_revision=revision,
+                now=observed + timedelta(days=index),
+            )
+            revision = saved["revision"]
+
+        with db.conn() as connection:
+            rows = connection.execute(
+                "SELECT revision FROM option_policy_versions "
+                "ORDER BY revision"
+            ).fetchall()
+        self.assertEqual(len(rows), options_policy.MAX_POLICY_VERSIONS)
+        self.assertEqual(rows[-1]["revision"], revision)
+        self.assertGreater(rows[0]["revision"], 1)
+
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "immutable"):
+            with db.conn(immediate=True) as connection:
+                connection.execute(
+                    "UPDATE option_policy_versions SET updated_at='changed' "
+                    "WHERE revision=?",
+                    (revision,),
+                )
+
+    def test_corrupt_current_policy_fails_closed(self) -> None:
+        db.save_option_policy(self.policy(), expected_revision=0)
+        with db.conn(immediate=True) as connection:
+            connection.execute("DROP TRIGGER option_policy_versions_no_update")
+            connection.execute(
+                "UPDATE option_policy_versions SET payload_sha256=?",
+                ("0" * 64,),
+            )
+
+        with self.assertRaisesRegex(RuntimeError, "invalid persisted"):
+            db.latest_option_policy()
+
+    def test_concurrent_identical_first_save_creates_one_revision(self) -> None:
+        barrier = threading.Barrier(2)
+        results: list[dict] = []
+        errors: list[BaseException] = []
+
+        def save() -> None:
+            try:
+                barrier.wait(timeout=2)
+                results.append(
+                    db.save_option_policy(self.policy(), expected_revision=0)
+                )
+            except BaseException as exc:  # Thread failures must reach the test.
+                errors.append(exc)
+
+        first = threading.Thread(target=save)
+        second = threading.Thread(target=save)
+        first.start()
+        second.start()
+        first.join(timeout=3)
+        second.join(timeout=3)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted(row["revision"] for row in results), [1, 1])
+        self.assertEqual(
+            sorted(row["idempotent"] for row in results), [False, True]
+        )
+        self.assertEqual(self.row_count(), 1)
+
+
 class LegacyMigrationTests(unittest.TestCase):
-    def test_direct_v3_to_v4_migration_adds_daily_briefing_storage(self) -> None:
+    def test_direct_v3_to_current_migration_adds_daily_and_policy_storage(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = str(Path(tmp) / "v3-to-v4.sqlite3")
             with mock.patch.object(db, "DB_PATH", path):
@@ -3972,13 +4149,135 @@ class LegacyMigrationTests(unittest.TestCase):
                         "SELECT 1 FROM sqlite_master "
                         "WHERE type='table' AND name='daily_briefing_snapshots'"
                     ).fetchone()
+                    policy_table = migrated.execute(
+                        "SELECT 1 FROM sqlite_master "
+                        "WHERE type='table' AND name='option_policy_versions'"
+                    ).fetchone()
                     marker = migrated.execute(
                         "SELECT value FROM meta WHERE key='v3-marker'"
                     ).fetchone()["value"]
 
-            self.assertEqual(version, 4)
+            self.assertEqual(version, db._DB_SCHEMA_VERSION)
+            self.assertIsNotNone(table)
+            self.assertIsNotNone(policy_table)
+            self.assertEqual(marker, "preserved")
+
+    def test_direct_v4_to_v5_policy_migration_is_atomic_and_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "v4-to-v5.sqlite3")
+            with mock.patch.object(db, "DB_PATH", path):
+                db.init()
+                with db.conn(immediate=True) as connection:
+                    connection.execute(
+                        "INSERT INTO meta(key, value) VALUES('v4-marker', 'preserved')"
+                    )
+                    connection.execute("DROP TABLE option_policy_versions")
+                    connection.execute("PRAGMA user_version=4")
+
+                db.init()
+                db.init()
+                with db.conn() as migrated:
+                    version = migrated.execute(
+                        "PRAGMA user_version"
+                    ).fetchone()[0]
+                    table = migrated.execute(
+                        "SELECT 1 FROM sqlite_master "
+                        "WHERE type='table' AND name='option_policy_versions'"
+                    ).fetchone()
+                    marker = migrated.execute(
+                        "SELECT value FROM meta WHERE key='v4-marker'"
+                    ).fetchone()["value"]
+
+            self.assertEqual(version, 5)
             self.assertIsNotNone(table)
             self.assertEqual(marker, "preserved")
+
+    def test_v4_to_v5_policy_migration_rolls_back_as_one_transaction(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "v4-atomic.sqlite3")
+            with mock.patch.object(db, "DB_PATH", path):
+                db.init()
+                with db.conn(immediate=True) as connection:
+                    connection.execute("DROP TABLE option_policy_versions")
+                    connection.execute("PRAGMA user_version=4")
+
+                with mock.patch.object(
+                    db, "backfill_dedup", side_effect=RuntimeError("injected")
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "injected"):
+                        db.init()
+
+                with db.conn() as connection:
+                    version = connection.execute(
+                        "PRAGMA user_version"
+                    ).fetchone()[0]
+                    table = connection.execute(
+                        "SELECT 1 FROM sqlite_master "
+                        "WHERE type='table' AND name='option_policy_versions'"
+                    ).fetchone()
+
+                self.assertEqual(version, 4)
+                self.assertIsNone(table)
+                db.init()
+
+    def test_concurrent_v4_to_v5_initializers_migrate_policy_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "v4-concurrent.sqlite3")
+            with mock.patch.object(db, "DB_PATH", path):
+                db.init()
+                with db.conn(immediate=True) as connection:
+                    connection.execute("DROP TABLE option_policy_versions")
+                    connection.execute("PRAGMA user_version=4")
+
+                entered = threading.Event()
+                release = threading.Event()
+                errors: list[BaseException] = []
+                calls = 0
+                real_backfill = db.backfill_dedup
+
+                def gated_backfill(*args, **kwargs):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 1:
+                        entered.set()
+                        if not release.wait(timeout=2):
+                            raise AssertionError("second initializer did not wait")
+                    return real_backfill(*args, **kwargs)
+
+                def initialize() -> None:
+                    try:
+                        db.init()
+                    except BaseException as exc:
+                        errors.append(exc)
+
+                with mock.patch.dict(
+                    db.os.environ, {db._BEGIN_RETRY_ENV: "2"}
+                ), mock.patch.object(
+                    db, "backfill_dedup", side_effect=gated_backfill
+                ):
+                    first = threading.Thread(target=initialize)
+                    second = threading.Thread(target=initialize)
+                    first.start()
+                    self.assertTrue(entered.wait(timeout=1))
+                    second.start()
+                    threading.Event().wait(0.05)
+                    self.assertTrue(second.is_alive())
+                    release.set()
+                    first.join(timeout=3)
+                    second.join(timeout=3)
+
+                self.assertEqual(errors, [])
+                self.assertEqual(calls, 1)
+                with db.conn() as connection:
+                    version = connection.execute(
+                        "PRAGMA user_version"
+                    ).fetchone()[0]
+                    table = connection.execute(
+                        "SELECT 1 FROM sqlite_master "
+                        "WHERE type='table' AND name='option_policy_versions'"
+                    ).fetchone()
+                self.assertEqual(version, 5)
+                self.assertIsNotNone(table)
 
     def test_v2_sighting_provenance_migration_is_conservative(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -77,6 +77,11 @@ except ModuleNotFoundError:  # Flat production bundle in /opt/kol-dashboard.
         is_owned_direct_source,
     )
 
+try:
+    from kol_dashboard import options_policy
+except ModuleNotFoundError:  # Flat production bundle in /opt/kol-dashboard.
+    import options_policy  # type: ignore
+
 _DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "data"
 DB_PATH = os.environ.get(
     "KOL_DASHBOARD_DB", str(_DEFAULT_DATA_DIR / "kol_dashboard.db")
@@ -86,7 +91,7 @@ DB_PATH = os.environ.get(
 # Bump this whenever ``init`` gains a new migration that existing databases must
 # execute.  A current database takes the read-only fast path instead of scanning
 # and rewriting the event tables on every process start.
-_DB_SCHEMA_VERSION = 4
+_DB_SCHEMA_VERSION = 5
 _BEGIN_RETRY_ENV = "KOL_DB_BEGIN_RETRY_SECONDS"
 _DEFAULT_BEGIN_RETRY_SECONDS = 30.0
 _MAX_BEGIN_RETRY_SECONDS = 120.0
@@ -103,6 +108,10 @@ RETENTION_DAYS = 14
 MACRO_RETENTION_DAYS = 90
 MAX_EVENT_KOL_FILTERS = 20
 _EVENT_RELEVANCE_CACHE_SIZE = 32_768
+
+
+class OptionPolicyRevisionConflict(RuntimeError):
+    """The supplied optimistic-concurrency revision is no longer current."""
 
 
 @lru_cache(maxsize=_EVENT_RELEVANCE_CACHE_SIZE)
@@ -2052,6 +2061,36 @@ def init() -> None:
             "ON daily_briefing_snapshots(generated_at DESC, imported_at DESC, id DESC)"
         )
 
+        # Each saved Options Lab underwriting policy is an append-only,
+        # canonical version.  Optimistic concurrency and review renewal happen
+        # in one BEGIN IMMEDIATE transaction in ``save_option_policy``.
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS option_policy_versions (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              revision INTEGER NOT NULL UNIQUE CHECK(revision > 0),
+              schema_version INTEGER NOT NULL CHECK(schema_version = 1),
+              payload_json TEXT NOT NULL,
+              payload_sha256 TEXT NOT NULL CHECK(length(payload_sha256) = 64),
+              updated_at TEXT NOT NULL,
+              review_due_at TEXT NOT NULL
+            )
+            """
+        )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_option_policy_current "
+            "ON option_policy_versions(revision DESC)"
+        )
+        c.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS option_policy_versions_no_update
+            BEFORE UPDATE ON option_policy_versions
+            BEGIN
+              SELECT RAISE(ABORT, 'option policy versions are immutable');
+            END
+            """
+        )
+
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS meta (
@@ -2107,6 +2146,156 @@ def set_meta_in(c, key: str, value: str) -> None:
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         (key, value),
     )
+
+
+def _decode_option_policy_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    """Decode and integrity-check one immutable policy version."""
+
+    if row is None:
+        return None
+    try:
+        payload = json.loads(row["payload_json"])
+        _, canonical = options_policy.normalize_policy_request(
+            {**payload, "expected_revision": 0}
+        )
+        canonical_json = options_policy.canonical_policy_json(canonical)
+    except (TypeError, json.JSONDecodeError, options_policy.PolicyValidationError):
+        return None
+    expected_hash = options_policy.policy_hash(canonical_json)
+    if canonical_json != row["payload_json"] or expected_hash != row["payload_sha256"]:
+        return None
+    try:
+        row_id = int(row["id"])
+        revision = int(row["revision"])
+        schema_version = int(row["schema_version"])
+        updated_at = _option_policy_time(str(row["updated_at"]))
+        review_due_at = _option_policy_time(str(row["review_due_at"]))
+    except (TypeError, ValueError, RuntimeError):
+        return None
+    if (
+        row_id <= 0
+        or revision <= 0
+        or schema_version != options_policy.POLICY_SCHEMA_VERSION
+        or review_due_at
+        != updated_at + timedelta(days=options_policy.POLICY_REVIEW_DAYS)
+    ):
+        return None
+    return {
+        "id": row_id,
+        "revision": revision,
+        "schema_version": schema_version,
+        "payload": canonical,
+        "payload_sha256": expected_hash,
+        "updated_at": updated_at.isoformat(),
+        "review_due_at": review_due_at.isoformat(),
+    }
+
+
+def _option_policy_time(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise RuntimeError("invalid persisted option policy timestamp") from exc
+    if parsed.tzinfo is None:
+        raise RuntimeError("invalid persisted option policy timestamp")
+    return parsed.astimezone(timezone.utc)
+
+
+def latest_option_policy() -> dict[str, Any] | None:
+    """Return the latest integrity-checked private underwriting policy."""
+
+    with conn() as c:
+        row = c.execute(
+            "SELECT id, revision, schema_version, payload_json, payload_sha256, "
+            "updated_at, review_due_at FROM option_policy_versions "
+            "ORDER BY revision DESC LIMIT 1"
+        ).fetchone()
+    decoded = _decode_option_policy_row(row)
+    if row is not None and decoded is None:
+        raise RuntimeError("invalid persisted option policy")
+    return decoded
+
+
+def save_option_policy(
+    policy: Mapping[str, Any],
+    *,
+    expected_revision: int,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Append an immutable policy version with optimistic concurrency.
+
+    A current identical payload is idempotent even if its original response was
+    lost.  Once review is due, resaving the same payload with the current
+    revision records a new explicit confirmation and extends review by 30 days.
+    """
+
+    normalized_expected, canonical = options_policy.normalize_policy_request(
+        {**dict(policy), "expected_revision": expected_revision}
+    )
+    canonical_json = options_policy.canonical_policy_json(canonical)
+    canonical_hash = options_policy.policy_hash(canonical_json)
+    current_time = now or datetime.now(timezone.utc)
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=timezone.utc)
+    current_time = current_time.astimezone(timezone.utc).replace(microsecond=0)
+
+    with conn(immediate=True) as c:
+        row = c.execute(
+            "SELECT id, revision, schema_version, payload_json, payload_sha256, "
+            "updated_at, review_due_at FROM option_policy_versions "
+            "ORDER BY revision DESC LIMIT 1"
+        ).fetchone()
+        current = _decode_option_policy_row(row)
+        if row is not None and current is None:
+            raise RuntimeError("invalid persisted option policy")
+
+        if current is None:
+            if normalized_expected != 0:
+                raise OptionPolicyRevisionConflict
+            next_revision = 1
+        else:
+            current_revision = int(current["revision"])
+            same_payload = current["payload_sha256"] == canonical_hash
+            review_due = _option_policy_time(str(current["review_due_at"]))
+            if same_payload and current_time < review_due:
+                return {**current, "idempotent": True}
+            if normalized_expected != current_revision:
+                raise OptionPolicyRevisionConflict
+            next_revision = current_revision + 1
+
+        updated_at = current_time.isoformat()
+        review_due_at = (
+            current_time + timedelta(days=options_policy.POLICY_REVIEW_DAYS)
+        ).isoformat()
+        cursor = c.execute(
+            """
+            INSERT INTO option_policy_versions (
+              revision, schema_version, payload_json, payload_sha256,
+              updated_at, review_due_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                next_revision,
+                options_policy.POLICY_SCHEMA_VERSION,
+                canonical_json,
+                canonical_hash,
+                updated_at,
+                review_due_at,
+            ),
+        )
+        c.execute(
+            "DELETE FROM option_policy_versions WHERE revision <= ?",
+            (next_revision - options_policy.MAX_POLICY_VERSIONS,),
+        )
+        saved_row = c.execute(
+            "SELECT id, revision, schema_version, payload_json, payload_sha256, "
+            "updated_at, review_due_at FROM option_policy_versions WHERE id=?",
+            (cursor.lastrowid,),
+        ).fetchone()
+        saved = _decode_option_policy_row(saved_row)
+        if saved is None:
+            raise RuntimeError("failed to persist option policy")
+        return {**saved, "idempotent": False}
 
 
 # Bump when normalize_title / clean_display_title change, to force a re-key.

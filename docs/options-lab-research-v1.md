@@ -114,7 +114,7 @@ Finance Radar 不复制高密度券商终端，而采用：
 的编辑式宋体和细分隔线，正文不低于 16px；数值用等宽数字，收益不使用绿色大字，
 琥珀色只表示谨慎，暗红色只表示尾部风险。
 
-### 4.2 当前安全切片：研究准备度
+### 4.2 当前安全切片：研究准备度与私人承保政策
 
 登录后的一级标签为“期权研究”，公开页面只出现锁定态；解锁后首先回答“为什么
 现在不能出候选，还缺什么”，而不是展示伪造合约：
@@ -130,8 +130,16 @@ Finance Radar 不复制高密度券商终端，而采用：
 ```
 
 服务端固定返回 `research_only + abstain + candidate_count=0`，直至实时链、现金、
-权限、事件日历和显式接货政策全部可用。缺数据是有效风控结论，返回 HTTP 200；未
-登录返回 401 且 `Cache-Control: no-store`，登出或会话失效必须立即清除私人 DOM。
+权限、事件日历和显式接货政策全部可用。登录用户可以先建立版本化的私人承保政策：
+确认愿意接货或排除的通用研究标的、每只标的最高接货价、研究预算上限、现金缓冲、
+单一标的与总担保上限、每周新增上限和指派后的人工复核路径。这里填写的预算只是
+研究约束，绝不能替代券商现金、购买力或期权权限。
+
+政策采用乐观并发与 30 天复核周期：重复保存相同有效内容不制造新版本，过期后必须
+再次确认；两个页面同时修改时，后提交者会看到冲突并重新加载。政策不写入静态页面、
+URL 或浏览器持久存储，退出登录、会话失效或跨标签页注销时立即清空表单和私人 DOM。
+缺数据是有效风控结论，返回 HTTP 200；未登录返回 401 且
+`Cache-Control: no-store`。
 
 ### 4.3 完整候选阶段的信息架构
 
@@ -177,7 +185,10 @@ max_profit = premium_received
 stock_zero_loss = (strike - option_credit) × contract_multiplier × contracts
 breakeven_cushion = 1 - breakeven / spot
 simple_annualized_premium_yield = option_credit / strike × 365 / DTE
-spread_ratio = (ask - bid) / midpoint
+spread_ratio = (ask - bid) / bid
+post_assignment_underlying_exposure = current_underlying_market_value
+                                      + existing_same_underlying_put_reserve
+                                      + new_contract_gross_cash_reserved
 ```
 
 “简单年化”不是可实现 CAGR，不能用于跨越不同尾部风险的合约做单一排名。
@@ -188,16 +199,20 @@ spread_ratio = (ask - bid) / midpoint
 
 以下任一条件不满足，候选直接被拒绝，不能靠评分补回来：
 
-1. **数据**：报价新鲜、Bid 大于零、Bid 不高于 Ask、时间语义明确；
+1. **数据**：报价新鲜、Bid 大于零、Bid 不高于 Ask、Put 权利金不突破行权价，
+   时间语义明确；来源快照、合约键、期权报价、标的报价、Delta 与事件日历必须
+   精确绑定；
 2. **账户**：实时现金、购买力、权限和已有期权仓位可用；
 3. **全额担保**：按最保守口径预留 `K × multiplier`；
 4. **接货意愿**：行权价不高于用户显式设定的愿意买入价；
-5. **组合容量**：接货后单一标的不超过 20%，行业和高相关因子不过度集中；
-6. **事件**：v1 到期前不能覆盖财报、重大监管裁决、明确并购表决等二元事件；
+5. **组合容量**：接货后单一标的不超过 20%，并计入同标的已有短 Put 的潜在指派；
+   行业和高相关因子不过度集中；
+6. **事件**：点时事件日历必须足够新且覆盖到合约到期日；v1 到期前不能覆盖财报、
+   重大监管裁决、明确并购表决等二元事件；
 7. **流动性**：OI、成交量、价差、报价尺寸均达到按标的分层的阈值；
 8. **宏观**：宏观页出现 `reduce_candidate` 或 `exit_candidate` 时停止新增短 Put；
 9. **产品**：非杠杆 / 反向 / 波动率 ETP，且为标准交割合约；
-10. **执行**：只允许人工 Limit Order，不显示 Market Order 建议。
+10. **执行**：候选阶段仍只供人工复核；不生成订单或 Market Order 建议。
 
 [OIC 的指派说明](https://www.optionseducation.org/referencelibrary/faq/options-assignment)
 提醒美式期权在到期前任何交易日都可能被指派；深度实值、临近到期和分红附近
@@ -207,10 +222,10 @@ spread_ratio = (ask - bid) / midpoint
 
 | 宏观状态 | 期权实验室行为 |
 | --- | --- |
-| `observe` | 正常扫描，但仍受账户、事件和流动性门槛约束 |
-| `prepare_reduce` | 风险预算减半；首期只保留 SPY / QQQ 候选，并提高现金缓冲 |
-| `reduce_candidate` | 停止新增短 Put；只提示已有仓位的平仓 / 展期人工复核 |
-| `exit_candidate` | 全部新增候选关闭；展示尾部情景、指派和流动性风险 |
+| `observe / ready` | 正常扫描，但仍受账户、事件和流动性门槛约束 |
+| `prepare_reduce / constrained` | 风险预算减半；首期只保留 SPY / QQQ 候选，并提高现金缓冲 |
+| `reduce_candidate / blocked` | 停止新增短 Put；只提示已有仓位的平仓 / 展期人工复核 |
+| `exit_candidate / blocked` | 全部新增候选关闭；展示尾部情景、指派和流动性风险 |
 | `abstain` | 数据不足，停止个性化候选；不能把未知解释成低风险 |
 
 ### 5.3 排序不是下单指令
@@ -237,14 +252,24 @@ spread_ratio = (ask - bid) / midpoint
   实时权限、延迟语义与使用限制。
 - Cboe 的公开延迟 JSON 可用于开发烟雾测试，但在明确生产许可、稳定性和再展示
   权利之前，不能作为生产 SLA 或数据授权依据。
-- 所有快照必须保存 `provider_timestamp`、`fetched_at`、延迟类型、NBBO / 单市场
-  语义和原始输入哈希。前端不能用页面刷新时间冒充报价时间。
+- OPRA 是美国上市期权综合行情的计划主体。生产接入必须确认供应商的 OPRA
+  授权、用户分类、再展示权和实时 / 延迟口径；有 API 并不自动等于可以在产品中
+  公开展示或保存行情。参见 [OPRA 官方说明](https://www.opraplan.com/) 与
+  [OPRA FAQ](https://www.opraplan.com/faqs)。首期不直接建设 OPRA 接入，而应先用
+  已处理许可与报送义务的数据供应商完成只读验证。
+- 原型期可比较 [Massive Options WebSocket](https://massive.com/docs/websocket/options/overview)
+  与 [Databento venues and datasets](https://databento.com/docs/venues-and-datasets) 的
+  覆盖、点时字段、许可和成本；采购决策前必须用书面条款确认生产与再展示权限。
+- 所有快照必须保存 `snapshot_id`、`contract_key`、`provider_timestamp`、
+  `fetched_at`、延迟类型、NBBO / 单市场语义和原始输入哈希。期权报价、标的报价与
+  事件日历必须绑定同一标的和可审计快照；前端不能用页面刷新时间冒充报价时间。
 
 ### 6.2 历史回测
 
-[Cboe DataShop Option EOD Summary](https://datashop.cboe.com/option-eod-summary)
-提供自 2012 年起的历史期权 EOD 数据，并列出 15:45 和收盘 NBBO、OHLC、成交量、
-OI，以及可选的 IV / Greeks。正式逐合约回测需要授权数据，还必须补充：
+[Cboe DataShop Option Quote Intervals](https://datashop.cboe.com/option-quote-intervals)
+提供历史期权报价区间产品，可作为首轮小样本逐合约回测的采购候选；具体起始日期、
+字段、覆盖市场与使用权限应以购买时的数据字典和协议为准。正式逐合约回测需要授权
+数据，还必须补充：
 
 - 复权标的 OHLCV；
 - 点时财报日、分红除息日与公司行动；
@@ -270,7 +295,7 @@ OI，以及可选的 IV / Greeks。正式逐合约回测需要授权数据，还
 
 | 维度 | 待测范围 |
 | --- | --- |
-| Delta | 0.10、0.15、0.20、0.25、0.30、接近平值 |
+| Put Delta | `-0.10`、`-0.15`、`-0.20`、`-0.25`、`-0.30`、接近平值 |
 | 初始 DTE | 14–21、22–35、36–50、51–65 |
 | 退出 | 持有到期；25% / 50% / 75% 权利金止盈 |
 | 展期复核 | 剩余 21 / 14 / 7 DTE，按净 Debit / Credit 分开报告 |
@@ -314,7 +339,8 @@ OI，以及可选的 IV / Greeks。正式逐合约回测需要授权数据，还
 | --- | --- |
 | `options_domain.py` | 合约、报价、Greeks、账户策略与拒绝原因的严格模型 |
 | `options_market_data.py` | 数据提供方适配、时间语义、重试、限流与快照哈希 |
-| `options_strategy.py` | CSP 硬门槛、情景损益、评分与 parity 偏差检测 |
+| `options_policy.py` | 私人承保政策的严格校验、规范化、版本哈希与安全投影 |
+| `options_strategy.py` | CSP 的纯函数硬门槛与 Bid 口径研究指标；校验快照 / 合约身份、纽约交易日、事件覆盖和账户容量；当前不接 API、不生成订单 |
 | `options_collect.py` | 熟悉池定时扫描；失败时保留 last-good，但不刷新证据时间 |
 | `options_backtest.py` | 点时链、Bid/Ask 成交、指派、费用与 walk-forward 引擎 |
 | `options_service.py` | 私有 API、安全投影、缓存和前端 view model |
@@ -335,6 +361,8 @@ OI，以及可选的 IV / Greeks。正式逐合约回测需要授权数据，还
 
 ```text
 GET /api/private/options/overview
+GET /api/private/options/policy
+PUT /api/private/options/policy          # 只保存研究约束，需同源与显式动作头
 GET /api/private/options/candidates?strategy=cash_secured_put
 GET /api/private/options/contracts/{opaque_id}
 GET /api/private/options/backtests
@@ -376,10 +404,30 @@ POST /api/private/options/scans       # 可选、限流、只生成研究快照
 验收：未登录绝不请求私有 API；认证响应 `no-store`；缺失或陈旧信息仍返回可解释
 的有效风控状态；桌面与移动端都能在 10 秒内看懂“为何不能出候选、还缺什么”。
 
-### Phase 1B：只读候选 MVP
+### Phase 1B-a：私人承保政策（当前实现切片）
+
+- 增加版本化、登录后可见的接货政策台；只接受固定白名单中的标准、非杠杆研究标的；
+- 区分“愿意接货”与“排除”，愿意接货必须填写最高接货价，排除时禁止夹带价格；
+- 保存研究预算上限、总担保比例、单一标的比例、最低现金缓冲、每周新增上限和
+  指派后的人工复核路径；
+- 使用严格字段校验、固定精度金额、内容哈希、乐观并发、30 天复核与有界历史；
+- 服务端准备度可以将“熟悉池”和“接货政策”标记为已完成，但实时链、券商现金 /
+  权限 / 已有期权和事件日历仍保持阻断，因此仍为 `abstain`、0 个候选；
+- 同时加入尚未对 API 开放的确定性 CSP 硬门槛引擎，先用合成测试证明陈旧报价、
+  错配快照 / 合约 / Delta、非标准合约、不可能的 Put 报价、流动性、事件覆盖、
+  纽约交易日、宏观、政策与账户约束不能被评分绕过；接货后集中度同时计入同标的
+  既有短 Put 潜在指派；Put Delta 必须按负数约定落在 -0.30 至 -0.10。
+
+验收：私人政策不进入公开 API、静态 HTML、URL、日志或浏览器持久存储；相同内容
+幂等保存，并发冲突可恢复，过期政策需复核；刷新后可从私有 API 恢复，注销后页面
+不残留标的、价格或预算；政策就绪不能让候选数从 0 变为正数。
+
+### Phase 1B-b：只读候选 MVP
 
 - 接入合法的实时 / 延迟链与报价时效门禁；
-- 同步真实持仓、现金、购买力、权限、已有期权和愿意买入价；
+- 同步真实持仓、现金、购买力、权限和已有期权；私人愿意买入价沿用 1B-a 政策；
+- 增加政策百分比 / 金额到策略引擎有效美元限额的显式、版本化适配层；在该适配层
+  完成并通过验收前，策略内核保持休眠，不能直接消费页面政策；
 - 实现熟悉池、CSP 硬门槛、宏观联动和最多 3 个候选；
 - 保存决策快照和拒绝原因；不连接下单。
 
@@ -410,7 +458,8 @@ POST /api/private/options/scans       # 可选、限流、只生成研究快照
 3. 每只由用户显式确认的熟悉标的的“愿意接货价”和不愿持有清单；
 4. 组合级最大现金占用、每周新增上限、单一标的 / 行业上限；
 5. 指派后的默认策略：持有、卖股，还是在明确条件下进入 Wheel；
-6. 实时与历史期权数据授权。
+6. 实时与历史期权数据授权，包括 OPRA / 供应商许可、用户分类、保存与再展示边界。
+7. 点时事件日历（至少覆盖到合约到期日）及政策到策略有效美元限额的受测适配层。
 
 在这些输入补齐前，系统可以做研究和市场扫描，但不能诚实地回答“今天应该卖
 哪只、哪个行权价、几张”。

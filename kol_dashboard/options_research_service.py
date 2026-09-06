@@ -16,9 +16,14 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any
 
+try:
+    from kol_dashboard import options_policy
+except ModuleNotFoundError:  # Flat production bundle in /opt/kol-dashboard.
+    import options_policy  # type: ignore
 
-SCHEMA_VERSION = 1
-METHOD_VERSION = "options-research-readiness-v1"
+
+SCHEMA_VERSION = 2
+METHOD_VERSION = "options-policy-readiness-v1"
 
 _MACRO_ACTION_LABELS = {
     "observe": "观察",
@@ -27,23 +32,14 @@ _MACRO_ACTION_LABELS = {
     "exit_candidate": "停止新增短 Put",
 }
 
-_GENERAL_RESEARCH_UNIVERSE = (
-    ("US:SPY", "SPY", "标普 500 ETF", "核心 ETF"),
-    ("US:QQQ", "QQQ", "纳斯达克 100 ETF", "核心 ETF"),
-    ("US:MSFT", "MSFT", "微软", "核心大盘股"),
-    ("US:GOOGL", "GOOGL", "谷歌", "核心大盘股"),
-    ("US:META", "META", "Meta", "核心大盘股"),
-    ("US:NVDA", "NVDA", "英伟达", "核心大盘股"),
-    ("US:JPM", "JPM", "摩根大通", "核心大盘股"),
-    ("US:AMD", "AMD", "AMD", "半导体扩展"),
-    ("US:AVGO", "AVGO", "博通", "半导体扩展"),
-    ("US:QCOM", "QCOM", "高通", "半导体扩展"),
-    ("US:TSM", "TSM", "台积电", "半导体扩展"),
-    ("US:TSLA", "TSLA", "特斯拉", "高波动观察"),
-    ("US:HOOD", "HOOD", "Robinhood", "高波动观察"),
-    ("US:PLTR", "PLTR", "Palantir", "高波动观察"),
-    ("US:MU", "MU", "美光", "高波动观察"),
-    ("US:BABA", "BABA", "阿里巴巴", "高波动观察"),
+_GENERAL_RESEARCH_UNIVERSE = tuple(
+    (
+        asset_key,
+        metadata["symbol"],
+        metadata["name_zh"],
+        metadata["tier"],
+    )
+    for asset_key, metadata in options_policy.UNDERLYING_DIRECTORY.items()
 )
 
 _PUTWRITE_BASELINE = {
@@ -292,8 +288,49 @@ def _market_gate(public_macro: Any) -> dict[str, Any]:
 def _readiness_items(
     portfolio_snapshot: Any,
     market_gate: Mapping[str, Any],
+    policy: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
+    policy_revision = policy.get("revision")
+    configured = type(policy_revision) is int and policy_revision > 0
+    acknowledgements = policy.get("acknowledgements")
+    acknowledgements = (
+        acknowledgements if isinstance(acknowledgements, Mapping) else {}
+    )
+    policy_reviewed = (
+        acknowledgements.get("cash_secured_only") is True
+        and acknowledgements.get("assignment_risk_reviewed") is True
+        and policy.get("status") != "review_due"
+    )
+    underwriting_ready = configured and policy_reviewed
+    familiar_ready = (
+        configured
+        and type(policy.get("confirmed_count")) is int
+        and policy.get("confirmed_count", 0) > 0
+        and policy.get("status") != "review_due"
+    )
     items = [
+        {
+            "key": "underwriting_policy",
+            "label": "承保政策",
+            "status": "ready" if underwriting_ready else "unavailable",
+            "blocking": not underwriting_ready,
+            "detail": (
+                "现金担保、接货风险与组合上限已由用户确认；仍需其他独立闸门。"
+                if underwriting_ready
+                else "尚未完成或已到期的现金担保承保政策确认。"
+            ),
+        },
+        {
+            "key": "familiar_universe",
+            "label": "熟悉标的",
+            "status": "ready" if familiar_ready else "unavailable",
+            "blocking": not familiar_ready,
+            "detail": (
+                "已记录愿意接货的白名单与最高接货价；这不是合约候选。"
+                if familiar_ready
+                else "尚未确认至少一个愿意接货的非杠杆白名单标的。"
+            ),
+        },
         {
             "key": "option_market_data",
             "label": "期权链与报价",
@@ -354,16 +391,73 @@ def _research_universe() -> list[dict[str, Any]]:
     ]
 
 
+def _safe_policy_projection(
+    policy: Mapping[str, Any] | None,
+    *,
+    now: datetime | None,
+) -> dict[str, Any]:
+    """Revalidate the bounded fields before embedding private policy output."""
+
+    if not isinstance(policy, Mapping):
+        return options_policy.empty_policy_projection()
+    revision = policy.get("revision")
+    if type(revision) is not int or revision <= 0:
+        return options_policy.empty_policy_projection()
+    raw_underlyings = policy.get("underlyings")
+    underlyings = []
+    if isinstance(raw_underlyings, list):
+        for item in raw_underlyings:
+            if not isinstance(item, Mapping):
+                continue
+            projected = {
+                key: item[key]
+                for key in ("asset_key", "decision", "max_assignment_price_usd")
+                if key in item
+            }
+            underlyings.append(projected)
+    try:
+        _, canonical = options_policy.normalize_policy_request(
+            {
+                "schema_version": policy.get("schema_version"),
+                "expected_revision": 0,
+                "strategy": policy.get("strategy"),
+                "limits": policy.get("limits"),
+                "assignment_plan": policy.get("assignment_plan"),
+                "underlyings": underlyings,
+                "acknowledgements": policy.get("acknowledgements"),
+            }
+        )
+    except options_policy.PolicyValidationError:
+        return options_policy.empty_policy_projection()
+    return options_policy.project_policy_record(
+        {
+            "revision": revision,
+            "updated_at": _safe_text(policy.get("updated_at"), maximum=64),
+            "review_due_at": _safe_text(
+                policy.get("review_due_at"), maximum=64
+            ),
+            "payload": canonical,
+        },
+        now=now,
+    )
+
+
 def build_options_overview(
     *,
     portfolio_snapshot: Any = None,
     public_macro: Any = None,
+    policy: Mapping[str, Any] | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Return a bounded, private-safe Options Lab research view model."""
 
+    policy_projection = _safe_policy_projection(policy, now=now)
     market_gate = _market_gate(public_macro)
-    readiness_items = _readiness_items(portfolio_snapshot, market_gate)
+    readiness_items = _readiness_items(
+        portfolio_snapshot,
+        market_gate,
+        policy_projection,
+    )
     rejections = [
         {
             "code": item["key"],
@@ -386,6 +480,15 @@ def build_options_overview(
             "卖哪只、哪个行权价或多少张。"
         ),
         "served_at": _served_at(now),
+        "capabilities": {
+            "policy_configuration": True,
+            "live_option_chain": False,
+            "broker_capacity": False,
+            "event_calendar": False,
+            "candidate_generation": False,
+            "trade_execution": False,
+        },
+        "policy": policy_projection,
         "market_gate": market_gate,
         "readiness": {
             "met": sum(item["status"] == "ready" for item in readiness_items),
