@@ -27,7 +27,7 @@
     optionsPolicySaveGeneration: 0,
     optionsPolicySaving: false,
     selectedOptionIndex: 0,
-    optionsPanel: "candidates",
+    optionsPanel: "today",
     decisionData: null,
     selectedDecisionKey: "",
     decisionLens: "all",
@@ -4785,7 +4785,7 @@
 
   // ─── Options research lab ─────────────────
 
-  const OPTIONS_PANELS = new Set(["candidates", "readiness", "benchmark", "policy"]);
+  const OPTIONS_PANELS = new Set(["today", "policy"]);
   const OPTIONS_POLICY_ACTION = "update-options-policy";
   const OPTIONS_POLICY_MAX_SELECTIONS = 8;
   const OPTIONS_POLICY_DECISIONS = new Set(["unconfirmed", "willing", "exclude"]);
@@ -4841,13 +4841,20 @@
   }
 
   function optionsSetNavEnabled(enabled) {
+    const nav = $("#options-subnav");
+    if (nav) nav.hidden = !enabled;
     $$("#options-subnav [data-options-panel]").forEach((button) => {
       button.disabled = !enabled;
+      if (enabled) {
+        button.setAttribute("aria-controls", `options-panel-${button.dataset.optionsPanel}`);
+      } else {
+        button.removeAttribute("aria-controls");
+      }
     });
   }
 
   function optionsApplyPanel(panel, { focus = false } = {}) {
-    const next = OPTIONS_PANELS.has(panel) ? panel : "candidates";
+    const next = OPTIONS_PANELS.has(panel) ? panel : "today";
     state.optionsPanel = next;
     $$("#options-subnav [data-options-panel]").forEach((button) => {
       const active = button.dataset.optionsPanel === next;
@@ -4861,6 +4868,13 @@
     });
   }
 
+  function optionsFocusActiveTab() {
+    requestAnimationFrame(() => {
+      const tab = $(`#options-tab-${state.optionsPanel}`);
+      if (tab && !tab.disabled) tab.focus();
+    });
+  }
+
   function renderOptionsLocked(
     message = "登录后才读取研究准备度与账户风控状态"
   ) {
@@ -4871,7 +4885,7 @@
     optionsPolicySyncBeforeUnloadProtection();
     state.optionsPolicySaveGeneration += 1;
     state.selectedOptionIndex = 0;
-    state.optionsPanel = "candidates";
+    state.optionsPanel = "today";
     optionsSetNavEnabled(false);
     const session = $("#options-session");
     if (session) {
@@ -5102,11 +5116,27 @@
 
   function optionsPolicyStatusLabel(status) {
     const key = String(status || "").trim().toLowerCase();
-    if (key === "ready" || key === "configured" || key === "active") return "已配置";
+    if (key === "ready") return "已配置";
     if (key === "review_due" || key === "stale") return "到期复核";
     if (key === "acknowledgement_required") return "待风险确认";
     if (key === "no_willing_underlyings") return "未选愿意研究";
     return "尚未保存";
+  }
+
+  function optionsPolicyIsSaved(data) {
+    const revision = data?.policy?.revision;
+    return Number.isInteger(revision) && revision > 0;
+  }
+
+  function optionsPolicyIsReady(data) {
+    if (!optionsPolicyIsSaved(data)) return false;
+    const policy = data?.policy;
+    return (
+      policy?.schema_version === 1 &&
+      policy?.strategy === "cash_secured_put" &&
+      policy?.ready === true &&
+      policy?.status === "ready"
+    );
   }
 
   function optionsPolicyPanelHTML(
@@ -5183,7 +5213,7 @@
                active ? "" : " hidden"
              }>
       <header class="options-page-head options-policy-head">
-        <div><p>人工确认的研究边界</p><h2>接货政策</h2></div>
+        <div><p>只需完成一次，之后按需复核</p><h2>我的接货边界</h2></div>
         <span>${esc(policyStatus)} · 修订 ${esc(revision)}</span>
       </header>
       <dl class="options-policy-meta">
@@ -5206,22 +5236,25 @@
             }"${state.optionsPolicySaving ? " inert" : ""}>
         <section class="options-policy-map" aria-labelledby="options-policy-map-title">
           <header class="options-policy-section-head">
-            <div><p>标的决策</p><h3 id="options-policy-map-title">通用研究池</h3></div>
+            <span class="options-policy-step-number" aria-hidden="true">01</span>
+            <div><p>选择与定价</p><h3 id="options-policy-map-title">愿意接哪些股票</h3></div>
             <span class="options-policy-selection-count" data-policy-selection-count>${esc(
-              `${selectedCount} / ${OPTIONS_POLICY_MAX_SELECTIONS} 已确认`
+              `${selectedCount} / ${OPTIONS_POLICY_MAX_SELECTIONS} 已处理`
             )}</span>
           </header>
-          <p class="options-policy-boundary">三态只表达研究意愿，不表示当前持有、期权可交易或适合卖 Put；未确认项不会提交。</p>
+          <p class="options-policy-boundary">只把你确实愿意按某个价格买入并长期复核的股票设为“愿意研究”。三态不表示当前持有、期权可交易或适合卖 Put；未确认项不会提交。</p>
           <div class="options-policy-tiers">${policyRows}</div>
         </section>
-        <aside class="options-policy-terms" aria-labelledby="options-policy-terms-title">
-          <header class="options-policy-section-head">
-            <div><p>保单条款</p><h3 id="options-policy-terms-title">资金与指派护栏</h3></div>
-            <span>服务端最终校验</span>
-          </header>
-          <p class="options-policy-budget-warning"><strong>研究预算不是券商可用现金。</strong>这里只记录研究上限，不读取购买力、保证金或实时账户余额。</p>
+        <aside class="options-policy-terms" aria-label="资金与指派边界">
           <input type="hidden" name="strategy" value="cash_secured_put" />
-          <div class="options-policy-fields">
+          <section class="options-policy-step" aria-labelledby="options-policy-budget-title">
+            <header class="options-policy-section-head">
+              <span class="options-policy-step-number" aria-hidden="true">02</span>
+              <div><p>现金与集中度</p><h3 id="options-policy-budget-title">最多承担多少</h3></div>
+              <span>服务端最终校验</span>
+            </header>
+            <p class="options-policy-budget-warning"><strong>研究预算不是券商可用现金。</strong>这里只记录你自行设定的研究上限，不读取购买力、保证金或实时账户余额。</p>
+            <div class="options-policy-fields">
             <label class="options-policy-field">
               <span>研究预算上限</span>
               <span class="options-policy-money"><b aria-hidden="true">$</b><input
@@ -5249,6 +5282,15 @@
                 )}" required />
               <small>这是研究护栏，不是下单张数</small>
             </label>
+            </div>
+          </section>
+          <section class="options-policy-step options-policy-assignment-step" aria-labelledby="options-policy-assignment-title">
+            <header class="options-policy-section-head">
+              <span class="options-policy-step-number" aria-hidden="true">03</span>
+              <div><p>指派预案</p><h3 id="options-policy-assignment-title">被指派后怎么办</h3></div>
+              <span>不会自动下单</span>
+            </header>
+            <div class="options-policy-fields options-policy-assignment-fields">
             <label class="options-policy-field">
               <span>指派后的复核计划</span>
               <select name="assignment_plan" required>
@@ -5263,30 +5305,31 @@
                 }>复核后再研究 Wheel</option>
               </select>
             </label>
-          </div>
-          <fieldset class="options-policy-acknowledgements">
-            <legend>风险确认</legend>
-            <p>未勾选也可保存为未就绪政策，但不会进入后续候选。</p>
-            <label><input type="checkbox" name="cash_secured_only"${
-              draft.acknowledgements.cashSecuredOnly ? " checked" : ""
-            } /><span><strong>仅研究现金担保 Put</strong>不把融资额度当作现金。</span></label>
-            <label><input type="checkbox" name="assignment_risk_reviewed"${
-              draft.acknowledgements.assignmentRiskReviewed ? " checked" : ""
-            } /><span><strong>已理解指派风险</strong>可能需要按行权价买入 100 股。</span></label>
-          </fieldset>
-          <p class="options-policy-save-boundary">保存也不会生成候选或下单；实时期权链、券商资金、事件日历和执行能力仍未接入。</p>
-          <p class="options-policy-feedback${
-            state.optionsPolicyDraftDirty ? " is-pending" : ""
-          }" data-policy-feedback role="status" aria-live="polite">${
-            serviceUnavailable
-              ? "服务状态不可用；草稿仅保留在本页内存。请勿刷新或关闭页面，可继续修改并尝试保存，或使用上方重试。"
-              : state.optionsPolicyDraftDirty
-              ? "有未保存更改；自动刷新已暂停。请先保存，或点击顶部刷新并确认放弃草稿。"
-              : revision > 0
-                ? "可调整后保存为下一修订。"
-                : "尚未保存；请自行设定全部财务护栏，页面不会预填示例数值。"
-          }</p>
-          <button class="options-policy-save" type="submit" data-options-policy-save>保存接货政策</button>
+            </div>
+            <fieldset class="options-policy-acknowledgements">
+              <legend>风险确认</legend>
+              <p>未勾选也可保存为未就绪边界，但不会进入后续候选。</p>
+              <label><input type="checkbox" name="cash_secured_only"${
+                draft.acknowledgements.cashSecuredOnly ? " checked" : ""
+              } /><span><strong>仅研究现金担保 Put</strong>不把融资额度当作现金。</span></label>
+              <label><input type="checkbox" name="assignment_risk_reviewed"${
+                draft.acknowledgements.assignmentRiskReviewed ? " checked" : ""
+              } /><span><strong>已理解指派风险</strong>可能需要按行权价买入 100 股。</span></label>
+            </fieldset>
+            <p class="options-policy-save-boundary">保存只会记录研究边界，不会生成候选或下单；实时期权链、券商资金、事件日历和执行能力仍未接入。</p>
+            <p class="options-policy-feedback${
+              state.optionsPolicyDraftDirty ? " is-pending" : ""
+            }" data-policy-feedback role="status" aria-live="polite">${
+              serviceUnavailable
+                ? "服务状态不可用；草稿仅保留在本页内存。请勿刷新或关闭页面，可继续修改并尝试保存，或使用上方重试。"
+                : state.optionsPolicyDraftDirty
+                ? "有未保存更改；自动刷新已暂停。请先保存，或点击顶部刷新并确认放弃草稿。"
+                : revision > 0
+                  ? "可调整后保存为下一修订。"
+                  : "尚未保存；请自行设定全部财务护栏，页面不会预填示例数值。"
+            }</p>
+            <button class="options-policy-save" type="submit" data-options-policy-save>保存我的接货边界</button>
+          </section>
         </aside>
       </form>
     </section>`;
@@ -5360,7 +5403,7 @@
     ).length;
     const count = form.querySelector("[data-policy-selection-count]");
     if (count) {
-      count.textContent = `${selectedCount} / ${OPTIONS_POLICY_MAX_SELECTIONS} 已确认`;
+      count.textContent = `${selectedCount} / ${OPTIONS_POLICY_MAX_SELECTIONS} 已处理`;
       count.classList.toggle("is-over", selectedCount > OPTIONS_POLICY_MAX_SELECTIONS);
     }
     if (markChanged) {
@@ -5368,7 +5411,7 @@
       optionsPolicySyncBeforeUnloadProtection();
       optionsPolicySetFeedback(
         selectedCount > OPTIONS_POLICY_MAX_SELECTIONS
-          ? `最多确认 ${OPTIONS_POLICY_MAX_SELECTIONS} 项，请把其余标的改回未确认。`
+          ? `最多处理 ${OPTIONS_POLICY_MAX_SELECTIONS} 项，请把其余标的改回未确认。`
           : "有未保存更改；自动刷新已暂停。请先保存，或点击顶部刷新并确认放弃草稿。",
         selectedCount > OPTIONS_POLICY_MAX_SELECTIONS ? "error" : "pending"
       );
@@ -5538,7 +5581,7 @@
     const button = form.querySelector("[data-options-policy-save]");
     if (button) {
       button.disabled = busy;
-      button.textContent = busy ? "正在保存政策…" : "保存接货政策";
+      button.textContent = busy ? "正在保存接货边界…" : "保存我的接货边界";
     }
   }
 
@@ -5569,15 +5612,19 @@
       ) {
         return;
       }
-      state.optionsPanel = "policy";
+      // A ready policy should complete the setup flow and return to Today's
+      // conclusion. renderOptions will route back to policy when it still needs
+      // acknowledgement, a willing underlying, or a scheduled review.
+      state.optionsPanel = "today";
       state.optionsPolicyDraftDirty = false;
       state.optionsPolicyDraft = null;
       optionsPolicySyncBeforeUnloadProtection();
       const reloaded = await loadOptions();
       if (saveGeneration !== state.optionsPolicySaveGeneration || !state.authenticated) return;
       if (reloaded) {
-        optionsPolicySetFeedback("接货政策已保存并重新读取；候选仍保持为零。", "success");
-        optionsAnnounce("接货政策已保存。保存不会生成候选或提交订单。");
+        optionsPolicySetFeedback("接货边界已保存并重新读取；不会自动生成候选或下单。", "success");
+        optionsAnnounce("接货边界已保存。保存不会生成候选或提交订单。");
+        optionsFocusActiveTab();
       }
     } catch (error) {
       if (saveGeneration !== state.optionsPolicySaveGeneration) return;
@@ -5593,7 +5640,8 @@
         await loadOptions();
         if (saveGeneration !== state.optionsPolicySaveGeneration || !state.authenticated) return;
         optionsPolicySetFeedback("另一页面已更新，已重新加载。请核对后再保存。", "error");
-        optionsAnnounce("另一页面已更新，接货政策已重新加载。");
+        optionsAnnounce("另一页面已更新，接货边界已重新加载。");
+        optionsFocusActiveTab();
         return;
       }
       const message =
@@ -5601,7 +5649,7 @@
           ? "保存未通过服务端校验，请检查金额、比例、标的选择与风险确认。"
           : error?.name === "AbortError"
             ? "保存超时，未确认是否写入；请刷新后核对修订号。"
-            : "接货政策暂时无法保存，请稍后重试。";
+            : "接货边界暂时无法保存，请稍后重试。";
       optionsPolicySetFeedback(message, "error");
       optionsAnnounce(message);
     } finally {
@@ -5681,21 +5729,54 @@
     const dataStatus = String(data?.data_status || "insufficient").toLowerCase();
     const marketBlocked = data?.market_gate?.blocks_new_short_puts === true;
     const stale = ["stale", "delayed", "expired"].includes(dataStatus);
+    const candidateGenerationConnected = data?.capabilities?.candidate_generation === true;
+    const candidateCount = Math.max(0, optionNumberFrom(data?.candidate_count) ?? 0);
+    const policySaved = optionsPolicyIsSaved(data);
+    const policyReady = optionsPolicyIsReady(data);
     let tone = "caution";
+    let stateKey = "inputs_missing";
     let title = "研究输入尚未补齐";
-    let detail = "候选保持为零，不会使用旧报价或推测值补位。";
+    let detail = "仍有研究条件待补齐，不会使用旧报价或推测值补位。";
     if (marketBlocked) {
       tone = "block";
+      stateKey = "market_blocked";
       title = "已停止新增卖 Put";
       detail = optionTextFrom(data.market_gate, ["detail"]) ||
         "宏观风控正在阻断新增下行暴露；只保留研究与复核。";
+    } else if (!policySaved) {
+      stateKey = "policy_unconfigured";
+      title = "先完成我的接货边界";
+      detail = "告诉系统你愿意接哪些股票、最高接货价和最多承担多少；保存也不会自动下单。";
+    } else if (!policyReady) {
+      const policyStatus = String(data?.policy?.status || "").trim().toLowerCase();
+      stateKey = "policy_attention";
+      title = policyStatus === "review_due"
+        ? "接货边界需要重新复核"
+        : policyStatus === "acknowledgement_required"
+          ? "请完成现金担保与指派风险确认"
+          : policyStatus === "no_willing_underlyings"
+            ? "请确认至少一只愿意接货的股票"
+            : "我的接货边界尚未就绪";
+      detail = "先补齐用户可确认的接货范围、资金护栏与风险确认；系统数据缺口会单独列出，不需要你代为处理。";
+    } else if (!candidateGenerationConnected) {
+      stateKey = "generation_unavailable";
+      title = "候选生成能力尚未接通";
+      detail = "实时期权链、账户可用现金与事件日历尚未形成完整扫描输入；当前没有执行过真实市场候选扫描。";
     } else if (stale) {
+      stateKey = "quotes_stale";
       title = "报价过期，候选已暂停";
       detail = "行情超过允许时限；历史快照不会被包装成当前可执行候选。";
     } else if (OPTIONS_READY_DATA_STATES.has(dataStatus)) {
       tone = "pass";
-      title = "研究输入已通过基础检查";
-      detail = "候选仍需逐项核验接货意愿、现金占用、事件与流动性。";
+      if (candidateCount === 0) {
+        stateKey = "scan_empty";
+        title = "今日扫描完成：没有合约通过全部门槛";
+        detail = "这是完整输入上的风控结果；不会为了填满列表而放宽接货、现金、事件或流动性标准。";
+      } else {
+        stateKey = "candidates_ready";
+        title = `今天有 ${candidateCount} 个合约可继续复核`;
+        detail = "只代表进入人工复核，不构成交易建议，也不会自动提交订单。";
+      }
     }
     const dataAsOf = optionTextFrom(data?.market_gate || {}, ["data_as_of"]);
     const servedAt = optionTextFrom(data || {}, ["served_at"]);
@@ -5704,7 +5785,18 @@
       : servedAt
         ? `响应生成 ${fmtAbsoluteTime(servedAt)}`
         : "证据时间待确认";
-    return { tone, title, detail, timeCopy, stale, marketBlocked };
+    return {
+      tone,
+      stateKey,
+      title,
+      detail,
+      timeCopy,
+      stale,
+      marketBlocked,
+      candidateGenerationConnected,
+      policySaved,
+      policyReady,
+    };
   }
 
   function optionCandidateTitle(candidate, index) {
@@ -5827,7 +5919,7 @@
           ${
             nextSteps.length
               ? `<ol>${nextSteps.map((step) => `<li>${esc(step)}</li>`).join("")}</ol>`
-              : `<p>先在承保闸门中补齐行情、账户、事件日历和接货政策。</p>`
+              : `<p>先补齐行情、账户、事件日历和我的接货边界。</p>`
           }
           <p>完成输入也不代表一定入选；宏观、财报、流动性与集中度仍可否决交易。</p>
         </section>
@@ -5883,44 +5975,95 @@
     </article>`;
   }
 
-  function optionsUniverseHTML(data) {
-    const universe = Array.isArray(data?.research_universe)
-      ? data.research_universe.filter((item) => item && typeof item === "object")
-      : [];
-    if (!universe.length) {
-      return `<div class="options-universe-empty">通用研究池尚未返回；系统不会使用示例代码补足候选。</div>`;
-    }
-    const configured = Array.isArray(data?.policy?.underlyings)
-      ? new Map(
-          data.policy.underlyings.flatMap((item) => {
-            const assetKey = optionTextFrom(item, ["asset_key"]);
-            return assetKey ? [[assetKey, item]] : [];
-          })
-        )
-      : new Map();
-    const grouped = new Map();
-    universe.forEach((item) => {
-      const tier = optionTextFrom(item, ["tier"]) || "其他研究";
-      if (!grouped.has(tier)) grouped.set(tier, []);
-      grouped.get(tier).push(item);
+  function optionsGateSummaryHTML(data) {
+    const readiness = optionsReadinessItems(data);
+    const byKey = new Map(readiness.map((item) => [String(item.key || ""), item]));
+    const marketGate = data?.market_gate && typeof data.market_gate === "object"
+      ? {
+          ...data.market_gate,
+          status: data.market_gate.status || data.market_gate.data_status,
+          blocking: data.market_gate.blocks_new_short_puts === true,
+        }
+      : byKey.get("macro_gate");
+    const groups = [
+      {
+        label: "我的边界",
+        items: [byKey.get("underwriting_policy"), byKey.get("familiar_universe")],
+      },
+      {
+        label: "系统数据",
+        items: [
+          byKey.get("option_market_data"),
+          byKey.get("funding_capacity"),
+          byKey.get("portfolio_freshness"),
+          byKey.get("options_permission"),
+          byKey.get("event_calendar"),
+        ],
+      },
+      { label: "市场风险", items: [marketGate] },
+    ].map((group) => {
+      const items = group.items.filter(Boolean);
+      const tones = items.map((item) =>
+        optionStatusTone(item.status || item.data_status, item.blocking === true)
+      );
+      const tone = !items.length
+        ? "caution"
+        : tones.includes("block")
+          ? "block"
+          : tones.every((item) => item === "pass")
+            ? "pass"
+            : "caution";
+      return { ...group, tone };
     });
-    return `<p class="options-universe-boundary">状态来自接货政策；通用研究池不表示当前持有、支持期权或适合卖 Put，未确认项不会进入后续候选。</p>
-      <div class="options-universe-groups">${Array.from(grouped, ([tier, items]) =>
-        `<section><h4>${esc(tier)}</h4><ul>${items
-          .map((item) => {
-            const name = optionTextFrom(item, ["name_zh", "name"]);
-            const symbol = optionTextFrom(item, ["symbol"]);
-            const assetKey = optionTextFrom(item, ["asset_key", "key", "symbol"]);
-            const saved = configured.get(assetKey);
-            const meta = optionsPolicyDecisionMeta(saved?.decision || item.status);
-            return `<li class="is-${meta.tone}"><span class="options-universe-identity"><strong>${
-              esc(symbol || name || "未命名")
-            }</strong>${
-              name && name !== symbol ? `<span class="options-universe-name">${esc(name)}</span>` : ""
-            }</span><span class="options-universe-status">${esc(meta.label)}</span></li>`;
-          })
-          .join("")}</ul></section>`
-      ).join("")}</div>`;
+    return `<ul class="options-gate-summary" aria-label="今日研究条件：我的边界、系统数据、市场风险">
+      ${groups
+        .map(
+          (group) => `<li class="is-${group.tone}"><span aria-hidden="true"></span><strong>${esc(
+            group.label
+          )}</strong><small>${esc(
+            group.tone === "pass" ? "已满足" : group.tone === "block" ? "阻断" : "待补齐"
+          )}</small></li>`
+        )
+        .join("")}
+    </ul>`;
+  }
+
+  function optionsPolicySnapshotHTML(data, notice) {
+    if (!notice.policySaved) return "";
+    const policy = data?.policy && typeof data.policy === "object" ? data.policy : {};
+    const limits = policy?.limits && typeof policy.limits === "object" ? policy.limits : {};
+    const willingCount = Math.max(0, optionNumberFrom(policy.confirmed_count) ?? 0);
+    const budget = optionMoney(limits.assignment_budget_ceiling_usd, "USD") || "待核验";
+    const reviewDue = fmtBeijingDateTime(policy.review_due_at) || "待复核";
+    return `<section class="options-policy-snapshot" aria-label="我的接货边界摘要">
+      <div><small>我的接货边界</small><strong>${esc(String(willingCount))} 个愿意接货标的</strong></div>
+      <dl><div><dt>研究预算</dt><dd>${esc(budget)}</dd></div><div><dt>复核日期</dt><dd>${esc(
+        reviewDue
+      )}</dd></div></dl>
+      <button type="button" data-options-panel="policy">编辑边界</button>
+    </section>`;
+  }
+
+  function optionsTodayActionHTML(notice) {
+    if (notice.stateKey === "policy_unconfigured") {
+      return `<button type="button" class="options-primary-action" data-options-panel="policy">设置我的接货边界</button>`;
+    }
+    if (notice.stateKey === "policy_attention") {
+      return `<button type="button" class="options-primary-action" data-options-panel="policy">完善我的接货边界</button>`;
+    }
+    if (notice.stateKey === "quotes_stale") {
+      return `<button type="button" class="options-primary-action" data-view-retry="options">刷新研究数据</button>`;
+    }
+    if (notice.stateKey === "market_blocked") {
+      return `<button type="button" class="options-secondary-action" data-options-reveal="options-readiness-details">查看阻断原因</button>`;
+    }
+    if (notice.stateKey === "generation_unavailable") {
+      return `<button type="button" class="options-secondary-action" data-options-reveal="options-readiness-details">查看缺失数据</button>`;
+    }
+    if (notice.stateKey === "candidates_ready") {
+      return `<button type="button" class="options-secondary-action" data-options-reveal="options-readiness-details">查看筛选依据</button>`;
+    }
+    return `<button type="button" class="options-secondary-action" data-options-reveal="options-readiness-details">查看还缺什么</button>`;
   }
 
   function optionsCandidatesPanelHTML(data, notice) {
@@ -5929,35 +6072,49 @@
       : [];
     const dataStatus = String(data?.data_status || "").toLowerCase();
     const canUseCandidates =
-      OPTIONS_READY_DATA_STATES.has(dataStatus) && !notice.marketBlocked && !notice.stale;
+      notice.policyReady &&
+      notice.candidateGenerationConnected &&
+      OPTIONS_READY_DATA_STATES.has(dataStatus) &&
+      !notice.marketBlocked &&
+      !notice.stale;
     const candidates = canUseCandidates ? sourceCandidates : [];
     const reportedCount = optionNumberFrom(data?.candidate_count);
     const count = reportedCount == null ? sourceCandidates.length : Math.max(0, reportedCount);
     if (state.selectedOptionIndex >= candidates.length) state.selectedOptionIndex = 0;
     const selected = candidates[state.selectedOptionIndex] || null;
-    let emptyTitle = "今天没有通过全部门槛的卖 Put";
-    let emptyCopy = "这是风控结论，不是页面故障；不会为了填满列表而放宽标准。";
-    if (notice.marketBlocked) {
-      emptyTitle = "新增候选已被宏观风控停止";
-      emptyCopy = "只保留研究与复核，不展示可行动合约。";
-    } else if (notice.stale) {
-      emptyTitle = "报价过期，候选已暂停";
-      emptyCopy = "刷新并通过数据闸门后才会重新显示合约。";
-    } else if (count > 0 && !candidates.length) {
-      emptyTitle = "候选明细暂不可用";
-      emptyCopy = "摘要计数与可核验明细不一致，系统已失败关闭。";
-    }
-    return `<section id="options-panel-candidates" role="tabpanel"
-             aria-labelledby="options-tab-candidates" data-options-panel-view="candidates">
-      <div class="options-workbench">
+    const countMismatch = count > 0 && !candidates.length;
+    const statusTitle = countMismatch ? "候选明细未通过完整性校验" : notice.title;
+    const statusDetail = countMismatch
+      ? "摘要计数与可核验明细不一致，系统已失败关闭；不会展示无法逐项复核的合约。"
+      : notice.detail;
+    return `<section id="options-panel-today" role="tabpanel"
+             aria-labelledby="options-tab-today" data-options-panel-view="today">
+      <section class="options-today-hero is-${notice.tone}" aria-labelledby="options-today-title">
+        <span class="options-today-mark" aria-hidden="true"></span>
+        <div class="options-today-copy">
+          <p>今日结论 · ${esc(notice.timeCopy)}</p>
+          <h2 id="options-today-title">${esc(statusTitle)}</h2>
+          <p>${esc(statusDetail)}</p>
+          ${optionsGateSummaryHTML(data)}
+        </div>
+        <div class="options-today-actions">
+          ${optionsTodayActionHTML(notice)}
+          ${notice.policyReady
+            ? `<button type="button" class="options-text-action" data-options-panel="policy">检查我的接货边界</button>`
+            : ""}
+        </div>
+      </section>
+      ${optionsPolicySnapshotHTML(data, notice)}
+      ${
+        candidates.length
+          ? `<section class="options-candidate-section" aria-labelledby="options-candidates-title">
+              <header class="options-page-head">
+                <div><p>最多只显示可逐项复核的合约</p><h2 id="options-candidates-title">今日候选</h2></div>
+                <span>${esc(String(candidates.length))} 个 · 必须人工确认</span>
+              </header>
+              <div class="options-workbench">
         <section class="options-ledger" aria-labelledby="options-candidates-title">
-          <header class="options-section-head">
-            <div><p>通用研究池 · 用户政策状态</p><h2 id="options-candidates-title">今日候选</h2></div>
-            <strong>${esc(String(candidates.length))}</strong>
-          </header>
-          ${
-            candidates.length
-              ? `<div class="options-candidate-list">${candidates
+          <div class="options-candidate-list">${candidates
                   .map((candidate, index) => {
                     const facts = optionCandidateFacts(candidate).slice(0, 3);
                     const selectedRow = index === state.selectedOptionIndex;
@@ -5985,24 +6142,21 @@
                         .join("")}</span>
                     </button>`;
                   })
-                  .join("")}</div>`
-              : `<div class="options-zero-state"><span aria-hidden="true">0</span><div><strong>${esc(
-                  emptyTitle
-                )}</strong><p>${esc(emptyCopy)}</p></div></div>`
-          }
+                  .join("")}</div>
         </section>
         <aside class="options-analysis" aria-label="当前候选风险测算">
           ${optionsCandidateDetailHTML(selected, state.selectedOptionIndex, data)}
         </aside>
-        <section class="options-universe" aria-labelledby="options-universe-title">
-          <header><h3 id="options-universe-title">通用研究池</h3><span>不表示持有或适合交易</span></header>
-          ${optionsUniverseHTML(data)}
-        </section>
-      </div>
+              </div>
+            </section>`
+          : ""
+      }
+      ${optionsReadinessPanelHTML(data, notice)}
+      ${optionsBenchmarkPanelHTML(data)}
     </section>`;
   }
 
-  function optionsReadinessPanelHTML(data) {
+  function optionsReadinessPanelHTML(data, notice = {}) {
     const readiness = data?.readiness && typeof data.readiness === "object"
       ? data.readiness
       : {};
@@ -6013,12 +6167,18 @@
     const nextSteps = Array.isArray(data?.next_steps) ? data.next_steps : [];
     const met = optionNumberFrom(readiness.met);
     const total = optionNumberFrom(readiness.total);
-    return `<section id="options-panel-readiness" role="tabpanel"
-             aria-labelledby="options-tab-readiness" data-options-panel-view="readiness" hidden>
-      <header class="options-page-head">
-        <div><p>逐项失败关闭</p><h2>承保闸门明细</h2></div>
-        <span>${met != null && total != null ? `${esc(met)} / ${esc(total)} 已满足` : "完成度待确认"}</span>
-      </header>
+    const summaryLabel = notice.stateKey === "candidates_ready"
+      ? "查看筛选依据与排除原因"
+      : "为什么现在不能生成候选";
+    return `<details class="options-disclosure options-readiness-disclosure" id="options-readiness-details">
+      <summary><span><small>研究条件</small><strong>${esc(summaryLabel)}</strong></span>
+        <b>${met != null && total != null ? `${esc(met)} / ${esc(total)} 已满足` : "完成度待确认"}</b></summary>
+      <div class="options-disclosure-body">
+        <section class="options-gate-section" aria-labelledby="options-gate-title">
+          <header><div><p>逐项失败关闭</p><h2 id="options-gate-title">数据 → 市场 → 标的 → 资金</h2></div>
+          <span>任一关键项不完整，就不生成候选</span></header>
+          ${optionsGateRailHTML(data)}
+        </section>
       <div class="options-readiness-layout">
         <div class="options-readiness-list">
           ${
@@ -6044,7 +6204,7 @@
                     </article>`;
                   })
                   .join("")
-              : `<div class="options-no-records">尚未返回闸门明细；保持零候选。</div>`
+              : `<div class="options-no-records">尚未返回闸门明细；不会推断或生成候选。</div>`
           }
         </div>
         <aside class="options-exclusions">
@@ -6059,7 +6219,7 @@
                     )}</span></li>`
                   )
                   .join("")}</ul>`
-              : `<p>当前没有独立排除记录；零候选仍以闸门状态为准。</p>`
+              : `<p>当前没有独立排除记录；是否生成候选仍以闸门状态为准。</p>`
           }</section>
           <section><h3>下一步补齐</h3>${
             nextSteps.length
@@ -6075,7 +6235,8 @@
           }</section>
         </aside>
       </div>
-    </section>`;
+      </div>
+    </details>`;
   }
 
   const OPTION_BENCHMARK_METRICS = [
@@ -6160,11 +6321,13 @@
           ([key, value]) => key && typeof value === "string" && /^[a-f0-9]{64}$/i.test(value)
         )
       : [];
-    return `<section id="options-panel-benchmark" role="tabpanel"
-             aria-labelledby="options-tab-benchmark" data-options-panel-view="benchmark" hidden>
+    return `<details class="options-disclosure options-method-disclosure" id="options-method-details">
+      <summary><span><small>可选阅读</small><strong>方法与历史风险参考</strong></span>
+        <b>${esc(range || reportDate || "区间待确认")}</b></summary>
+      <div class="options-disclosure-body options-method-body">
       <header class="options-page-head">
         <div><p>只作风险基线</p><h2>Put-write 官方指数复算</h2></div>
-        <span>${esc(range || reportDate || "区间待确认")}</span>
+        <span>不能推出今天该交易什么</span>
       </header>
       <p class="options-benchmark-boundary">指数历史只能验证风险口径，不能推出今天该卖哪只股票、哪个行权价或多少张。</p>
       <dl class="options-benchmark-meta">
@@ -6240,7 +6403,8 @@
               .join("")}</dl></details>`
           : ""
       }
-    </section>`;
+      </div>
+    </details>`;
   }
 
   function renderOptions(data) {
@@ -6283,20 +6447,14 @@
         notice.timeCopy
       )}</span>`;
     }
+    if (notice.marketBlocked) {
+      state.optionsPanel = "today";
+    } else if (!notice.policyReady && !state.optionsPolicyDraftDirty) {
+      state.optionsPanel = "policy";
+    }
     optionsSetNavEnabled(true);
     stage.setAttribute("aria-busy", "false");
-    stage.innerHTML = `<section class="options-notice is-${notice.tone}" role="status">
-        <div><strong>${esc(notice.title)}</strong><p>${esc(notice.detail)}</p></div>
-        <span>${esc(notice.timeCopy)}</span>
-      </section>
-      <section class="options-gate-section" aria-labelledby="options-gate-title">
-        <header><div><p>承保闸门轨迹</p><h2 id="options-gate-title">先判断能不能研究，再比较收益</h2></div>
-        <span>数据 → 市场 → 标的 → 资金</span></header>
-        ${optionsGateRailHTML(data)}
-      </section>
-      ${optionsCandidatesPanelHTML(data, notice)}
-      ${optionsReadinessPanelHTML(data)}
-      ${optionsBenchmarkPanelHTML(data)}
+    stage.innerHTML = `${optionsCandidatesPanelHTML(data, notice)}
       ${optionsPolicyPanelHTML(data)}
       <p class="options-risk-notice">${esc(
         optionTextFrom(data, ["risk_notice"]) ||
@@ -6352,7 +6510,7 @@
           "服务端研究状态已刷新；未保存草稿已保留。保存时如修订冲突，会要求重新核对。",
           "pending"
         );
-        optionsAnnounce("服务端研究状态已刷新，未保存的接货政策草稿仍保留在页面内。");
+        optionsAnnounce("服务端研究状态已刷新，未保存的接货边界草稿仍保留在页面内。");
       }
       return validBoundary;
     } catch (error) {
@@ -6386,15 +6544,15 @@
         session.className = "options-session is-block";
         session.innerHTML = preserveDirtyPolicy
           ? "<strong>服务暂不可用</strong><span>旧私人结果已隐藏 · 内存草稿已保留</span>"
-          : "<strong>期权研究暂不可用</strong><span>旧私人结果已隐藏</span>";
+          : "<strong>期权研究服务错误</strong><span>旧私人结果已隐藏</span>";
       }
       if (stage) {
         stage.setAttribute("aria-busy", "false");
         stage.innerHTML = preserveDirtyPolicy
           ? optionsPolicyRecoveryHTML()
           : `<section class="options-integrity-block" role="alert">
-              <strong>期权研究暂不可用</strong>
-              <p>当前响应未通过，旧候选已隐藏；请使用上方“重试当前视图”。</p>
+              <strong>期权研究服务错误</strong>
+              <p>本次请求失败或响应不可用，旧候选已隐藏；请使用上方“重试当前视图”。</p>
             </section>`;
       }
       setViewLoadError("options", error, url);
@@ -9333,8 +9491,8 @@
   async function refreshCurrentView({ showSpinner = false } = {}) {
     const button = $("#refresh-btn");
     if (state.view === "options" && state.optionsPolicySaving) {
-      optionsPolicySetFeedback("接货政策正在保存，请等待服务端响应后再刷新。", "pending");
-      optionsAnnounce("接货政策正在保存，暂不刷新期权实验室。");
+      optionsPolicySetFeedback("接货边界正在保存，请等待服务端响应后再刷新。", "pending");
+      optionsAnnounce("接货边界正在保存，暂不刷新期权实验室。");
       return false;
     }
     if (state.view === "options" && state.optionsPolicyDraftDirty) {
@@ -9343,21 +9501,21 @@
           "有未保存更改；已暂停自动刷新。保存，或点击顶部刷新并确认放弃草稿。",
           "pending"
         );
-        optionsAnnounce("接货政策有未保存更改，已暂停期权实验室自动刷新。");
+        optionsAnnounce("接货边界有未保存更改，已暂停期权实验室自动刷新。");
         return false;
       }
       const discard = window.confirm(
-        "刷新会放弃当前页面内尚未保存的接货政策草稿。确定重新加载服务端版本吗？"
+        "刷新会放弃当前页面内尚未保存的接货边界草稿。确定重新加载服务端版本吗？"
       );
       if (!discard) {
         optionsPolicySetFeedback("已保留未保存草稿，未执行刷新。", "pending");
-        optionsAnnounce("已取消刷新，接货政策草稿仍保留在页面内。");
+        optionsAnnounce("已取消刷新，接货边界草稿仍保留在页面内。");
         return false;
       }
       state.optionsPolicyDraftDirty = false;
       state.optionsPolicyDraft = null;
       optionsPolicySyncBeforeUnloadProtection();
-      optionsAnnounce("已放弃页面内草稿，正在重新加载服务端接货政策。");
+      optionsAnnounce("已放弃页面内草稿，正在重新加载服务端接货边界。");
     }
     if (showSpinner) button.classList.add("spinning");
     try {
@@ -9410,7 +9568,19 @@
       }
       const panelButton = event.target.closest("[data-options-panel]");
       if (panelButton && !panelButton.disabled) {
-        optionsApplyPanel(panelButton.dataset.optionsPanel);
+        const cameFromTablist = Boolean(panelButton.closest("#options-subnav"));
+        optionsApplyPanel(panelButton.dataset.optionsPanel, { focus: !cameFromTablist });
+        return;
+      }
+      const revealButton = event.target.closest("[data-options-reveal]");
+      if (revealButton) {
+        const details = document.getElementById(revealButton.dataset.optionsReveal || "");
+        if (details?.tagName === "DETAILS") {
+          details.open = true;
+          details.querySelector("summary")?.focus();
+          const reduceMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches;
+          details.scrollIntoView({ behavior: reduceMotion ? "auto" : "smooth", block: "start" });
+        }
         return;
       }
       const candidateButton = event.target.closest("[data-options-candidate-index]");
@@ -9691,7 +9861,7 @@
       const restoredPrivateSession = state.authenticated;
       state.authenticated = false;
       state.authStatusLoaded = false;
-      clearOptionsView("正在重新核验私人会话；旧接货政策已同步清除");
+      clearOptionsView("正在重新核验私人会话；旧接货边界已同步清除");
       if (restoredPrivateSession) {
         clearDecisionView("正在重新核验私人会话；旧私人决策已同步清除");
       }

@@ -18,7 +18,7 @@
     } catch (e) {}
   })();
 </script>
-  <link rel="stylesheet" href="static/style.css?v=37" />
+  <link rel="stylesheet" href="static/style.css?v=38" />
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ccircle cx='50' cy='50' r='42' fill='%230b1720' stroke='%2331d69b' stroke-width='6'/%3E%3Ccircle cx='50' cy='50' r='20' fill='none' stroke='%234ab8d8' stroke-width='5'/%3E%3Cpath d='M50 50L82 24' stroke='%23f4b942' stroke-width='6' stroke-linecap='round'/%3E%3Ccircle cx='50' cy='50' r='7' fill='%23eef4f2'/%3E%3C/svg%3E" />
 </head>
 <body>
@@ -301,7 +301,7 @@
       <div class="options-masthead-copy">
         <span class="options-mode">研究模式</span>
         <h1>期权实验室</h1>
-        <p>把愿意接货的价格变成可复核的现金担保 Put 研究；这里只展示证据，不会自动下单。</p>
+        <p>先说清愿意接什么、最多承担多少，再判断今天是否值得研究；这里只展示证据，不会自动下单。</p>
       </div>
       <div class="options-session" id="options-session" aria-live="polite">
         <strong>私人研究</strong>
@@ -310,26 +310,16 @@
     </header>
 
     <nav class="options-subnav" id="options-subnav" role="tablist"
-         aria-label="期权研究栏目">
-      <button type="button" id="options-tab-candidates" role="tab"
-              data-options-panel="candidates" aria-selected="true"
-              aria-controls="options-panel-candidates" tabindex="0" disabled>
-        今日候选
-      </button>
-      <button type="button" id="options-tab-readiness" role="tab"
-              data-options-panel="readiness" aria-selected="false"
-              aria-controls="options-panel-readiness" tabindex="-1" disabled>
-        承保闸门
-      </button>
-      <button type="button" id="options-tab-benchmark" role="tab"
-              data-options-panel="benchmark" aria-selected="false"
-              aria-controls="options-panel-benchmark" tabindex="-1" disabled>
-        研究基线
+         aria-label="期权研究栏目" hidden>
+      <button type="button" id="options-tab-today" role="tab"
+              data-options-panel="today" aria-selected="true"
+              tabindex="0" disabled>
+        今日
       </button>
       <button type="button" id="options-tab-policy" role="tab"
               data-options-panel="policy" aria-selected="false"
-              aria-controls="options-panel-policy" tabindex="-1" disabled>
-        接货政策
+              tabindex="-1" disabled>
+        我的接货边界
       </button>
     </nav>
 
@@ -502,6 +492,6 @@
   </div>
 </div>
 
-  <script src="static/app.js?v=37"></script>
+  <script src="static/app.js?v=38"></script>
 </body>
 </html>

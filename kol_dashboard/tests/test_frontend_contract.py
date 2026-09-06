@@ -249,13 +249,13 @@ class FrontendContractTests(unittest.TestCase):
         self.assertNotIn("DIRECT SOURCES", self.javascript)
         self.assertNotIn("NEXT CHECK", self.javascript)
 
-    def test_daily_assets_share_the_v37_cachebuster(self) -> None:
-        self.assertIn('static/app.js?v=37', self.html)
-        self.assertIn('static/style.css?v=37', self.html)
-        self.assertEqual(self.html.count("?v=37"), 2)
+    def test_daily_assets_share_the_v38_cachebuster(self) -> None:
+        self.assertIn('static/app.js?v=38', self.html)
+        self.assertIn('static/style.css?v=38', self.html)
+        self.assertEqual(self.html.count("?v=38"), 2)
+        self.assertNotIn("?v=37", self.html)
         self.assertNotIn("?v=36", self.html)
         self.assertNotIn("?v=35", self.html)
-        self.assertNotIn("?v=26", self.html)
 
     def test_options_lab_is_an_accessible_login_only_research_view(self) -> None:
         for contract in (
@@ -267,10 +267,12 @@ class FrontendContractTests(unittest.TestCase):
             'aria-labelledby="tab-options"',
             'id="options-subnav" role="tablist"',
             'aria-label="期权研究栏目"',
+            'id="options-tab-today"',
+            'data-options-panel="today"',
+            "今日",
             'id="options-tab-policy"',
             'data-options-panel="policy"',
-            'aria-controls="options-panel-policy"',
-            "接货政策",
+            "我的接货边界",
             'id="options-live-status" role="status"',
             "研究模式",
             "不会自动下单",
@@ -282,9 +284,24 @@ class FrontendContractTests(unittest.TestCase):
         options_html_start = self.html.index('id="view-options"')
         options_html_end = self.html.index("<!-- ══════════════ KOL", options_html_start)
         static_options = self.html[options_html_start:options_html_end]
+        self.assertIn('aria-label="期权研究栏目" hidden', static_options)
+        self.assertNotIn('aria-controls="options-panel-today"', static_options)
+        self.assertNotIn('aria-controls="options-panel-policy"', static_options)
+        self.assertIn('nav.hidden = !enabled', self.javascript)
+        self.assertIn(
+            'button.setAttribute("aria-controls", `options-panel-${button.dataset.optionsPanel}`)',
+            self.javascript,
+        )
+        self.assertIn('button.removeAttribute("aria-controls")', self.javascript)
         self.assertNotIn("US:", static_options)
         self.assertNotIn("SPY", static_options)
         self.assertNotIn("熟悉标的", static_options)
+        self.assertEqual(static_options.count('data-options-panel="'), 2)
+        for removed_panel in ("candidates", "readiness", "benchmark"):
+            self.assertNotIn(f'id="options-tab-{removed_panel}"', static_options)
+            self.assertNotIn(
+                f'data-options-panel="{removed_panel}"', static_options
+            )
 
         load_start = self.javascript.index("async function loadOptions()")
         load_end = self.javascript.index("// ─── Macro view", load_start)
@@ -350,17 +367,19 @@ class FrontendContractTests(unittest.TestCase):
             self.javascript,
         )
 
-    def test_options_zero_candidates_and_contract_values_fail_closed(self) -> None:
+    def test_options_unconnected_candidate_generation_and_contract_values_fail_closed(
+        self,
+    ) -> None:
         start = self.javascript.index("// ─── Options research lab")
         end = self.javascript.index("// ─── Macro view", start)
         contract = self.javascript[start:end]
         for copy in (
-            "今天没有通过全部门槛的卖 Put",
-            "这是风控结论，不是页面故障",
-            "不会为了填满列表而放宽标准",
-            "把研究推进到候选，需要",
-            "完成输入也不代表一定入选",
-            "宏观、财报、流动性与集中度仍可否决交易",
+            "候选生成能力尚未接通",
+            "实时期权链、账户可用现金与事件日历尚未形成完整扫描输入",
+            "当前没有执行过真实市场候选扫描",
+            "今日扫描完成：没有合约通过全部门槛",
+            "不会为了填满列表而放宽接货、现金、事件或流动性标准",
+            "摘要计数与可核验明细不一致，系统已失败关闭",
             "合约明细尚未随响应提供",
             "不会显示推测的行权价、Delta 或权利金",
             "响应未同时提供现价、行权价、权利金和合约乘数",
@@ -368,8 +387,28 @@ class FrontendContractTests(unittest.TestCase):
             "研究结果必须人工确认；本页面不会提交订单",
         ):
             self.assertIn(copy, contract)
-        self.assertIn("data?.next_steps", contract)
-        self.assertIn('class="options-empty-next"', contract)
+        notice_start = contract.index("function optionsDataNotice")
+        notice_end = contract.index("function optionCandidateTitle", notice_start)
+        notice_contract = contract[notice_start:notice_end]
+        self.assertLess(
+            notice_contract.index("if (marketBlocked)"),
+            notice_contract.index("else if (!policySaved)"),
+        )
+        self.assertLess(
+            notice_contract.index("else if (!policySaved)"),
+            notice_contract.index("else if (!policyReady)"),
+        )
+        self.assertLess(
+            notice_contract.index("else if (!policyReady)"),
+            notice_contract.index("else if (!candidateGenerationConnected)"),
+        )
+        candidates_start = contract.index("function optionsCandidatesPanelHTML")
+        candidates_end = contract.index("function optionsReadinessPanelHTML", candidates_start)
+        candidates_contract = contract[candidates_start:candidates_end]
+        self.assertIn("notice.policyReady", candidates_contract)
+        self.assertIn("notice.candidateGenerationConnected", candidates_contract)
+        self.assertIn("const countMismatch = count > 0 && !candidates.length", candidates_contract)
+        self.assertIn("candidates.length", candidates_contract)
         for boundary in (
             "data.schema_version === 2",
             'data.method_version === "options-policy-readiness-v1"',
@@ -395,31 +434,38 @@ class FrontendContractTests(unittest.TestCase):
             self.assertIn(boundary, contract)
         self.assertNotIn("|| 100", contract)
 
-    def test_options_uses_research_universe_without_implying_holdings(self) -> None:
+    def test_options_uses_research_universe_only_for_policy_not_as_fake_candidates(
+        self,
+    ) -> None:
         self.assertIn("data?.research_universe", self.javascript)
-        self.assertNotIn("familiar_universe", self.javascript)
         self.assertNotIn("familiar_universe", self.html)
         for copy in (
-            "通用研究池 · 用户政策状态",
-            "通用研究池",
-            "不表示持有或适合交易",
-            "系统不会使用示例代码补足候选",
-            "状态来自接货政策",
-            "不表示当前持有、支持期权或适合卖 Put",
-            "未确认项不会进入后续候选",
+            "通用研究池尚未返回，无法配置标的态度",
+            "不会使用示例代码代替",
+            "三态不表示当前持有、期权可交易或适合卖 Put",
+            "未确认项不会提交",
             "愿意研究",
             "明确不做",
             "未确认",
         ):
             self.assertIn(copy, self.javascript)
-        self.assertIn("const grouped = new Map()", self.javascript)
-        self.assertIn('optionTextFrom(item, ["tier"])', self.javascript)
-        self.assertIn('class="options-universe-groups"', self.javascript)
-        self.assertIn("saved?.decision || item.status", self.javascript)
-        self.assertIn('class="options-universe-status"', self.javascript)
-        self.assertIn(".options-universe-groups > section", self.css)
-        self.assertIn('grid-template-areas: "ledger analysis" "universe analysis"', self.css)
-        self.assertIn('grid-template-areas: "ledger" "analysis" "universe"', self.css)
+        policy_rows_start = self.javascript.index("function optionsPolicyUniverseRows")
+        policy_rows_end = self.javascript.index("function optionsPolicyDraftFromData", policy_rows_start)
+        policy_rows_contract = self.javascript[policy_rows_start:policy_rows_end]
+        self.assertIn("data?.research_universe", policy_rows_contract)
+        self.assertNotIn("data?.familiar_universe", policy_rows_contract)
+        self.assertIn('optionTextFrom(item, ["tier"])', policy_rows_contract)
+        self.assertIn("saved?.decision || item.status || item.decision", policy_rows_contract)
+
+        today_start = self.javascript.index("function optionsCandidatesPanelHTML")
+        today_end = self.javascript.index("function optionsReadinessPanelHTML", today_start)
+        today_contract = self.javascript[today_start:today_end]
+        self.assertNotIn("optionsUniverseHTML(data)", today_contract)
+        self.assertNotIn('class="options-zero-state"', today_contract)
+        self.assertNotIn("通用研究池", today_contract)
+        self.assertIn('grid-template-areas: "ledger analysis"', self.css)
+        self.assertNotIn('grid-template-areas: "ledger analysis" "universe analysis"', self.css)
+        self.assertNotIn('grid-template-areas: "ledger" "analysis" "universe"', self.css)
 
     def test_options_benchmark_formats_ratios_and_provenance_exactly(self) -> None:
         start = self.javascript.index("function optionRatioPercent")
@@ -448,16 +494,37 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn("本窗口没有通过有限数校验的收益", contract)
         benchmark_start = self.javascript.index("function optionsBenchmarkPanelHTML")
         benchmark_end = self.javascript.index("function renderOptions(data)", benchmark_start)
-        self.assertNotIn("served_at", self.javascript[benchmark_start:benchmark_end])
+        benchmark_contract = self.javascript[benchmark_start:benchmark_end]
+        self.assertNotIn("served_at", benchmark_contract)
+        self.assertIn(
+            '<details class="options-disclosure options-method-disclosure"',
+            benchmark_contract,
+        )
+        self.assertIn('id="options-method-details"', benchmark_contract)
+        self.assertIn("方法与历史风险参考", benchmark_contract)
+        self.assertIn("不能推出今天该交易什么", benchmark_contract)
+        self.assertNotIn('role="tabpanel"', benchmark_contract)
+        self.assertNotIn('data-options-panel-view="benchmark"', benchmark_contract)
 
     def test_options_layout_is_editorial_responsive_and_readable(self) -> None:
         for contract in (
             "#view-options { font-size: 16px; }",
+            ".options-today-hero",
+            "grid-template-columns: 10px minmax(0, 1fr) auto",
+            ".options-today-copy h2",
+            "font-size: clamp(24px, 2.6vw, 32px)",
+            ".options-gate-summary",
+            "grid-template-columns: repeat(3, minmax(120px, 1fr))",
+            ".options-policy-snapshot",
+            "grid-template-columns: minmax(170px, .8fr) minmax(0, 1.5fr) auto",
             ".options-gate-rail",
             "grid-template-columns: repeat(4, minmax(0, 1fr))",
             "grid-template-columns: minmax(0, 1.38fr) minmax(340px, 1fr)",
             ".options-chart-path { fill: none; stroke: var(--accent)",
             ".options-subnav",
+            ".options-subnav[hidden] { display: none; }",
+            ".options-disclosure",
+            ".options-disclosure > summary",
             ".options-stress-grid",
             ".options-policy-form",
             "grid-template-columns: minmax(0, 1.38fr) minmax(360px, 1fr)",
@@ -475,6 +542,10 @@ class FrontendContractTests(unittest.TestCase):
         mobile_start = self.css.index("@media (max-width: 700px)")
         mobile = self.css[mobile_start:]
         self.assertIn(".options-gate-rail { grid-template-columns: 1fr; }", mobile)
+        self.assertIn(".options-gate-summary { grid-template-columns: 1fr; }", mobile)
+        self.assertIn(".options-today-hero { grid-template-columns: 1fr", mobile)
+        self.assertIn(".options-today-actions button { width: 100%; }", mobile)
+        self.assertIn(".options-disclosure > summary { grid-template-columns:", mobile)
         self.assertIn(".options-stress-grid,", mobile)
         self.assertIn(".options-masthead { grid-template-columns: 1fr", mobile)
         self.assertIn(".options-policy-form { grid-template-columns: 1fr; }", self.css)
@@ -490,12 +561,19 @@ class FrontendContractTests(unittest.TestCase):
         end = self.javascript.index("function optionsReadinessItems", start)
         policy_contract = self.javascript[start:end]
         for copy in (
-            "人工确认的研究边界",
+            "只需完成一次，之后按需复核",
+            "我的接货边界",
+            "选择与定价",
+            "愿意接哪些股票",
+            "现金与集中度",
+            "最多承担多少",
+            "指派预案",
+            "被指派后怎么办",
             "研究预算不是券商可用现金",
             "不读取购买力、保证金或实时账户余额",
-            "三态只表达研究意愿",
+            "三态不表示当前持有、期权可交易或适合卖 Put",
             "未确认项不会提交",
-            "保存也不会生成候选或下单",
+            "保存只会记录研究边界，不会生成候选或下单",
             "实时期权链、券商资金、事件日历和执行能力仍未接入",
             "最高接货价",
             "总担保上限",
@@ -505,7 +583,8 @@ class FrontendContractTests(unittest.TestCase):
             "指派后的复核计划",
             "仅研究现金担保 Put",
             "已理解指派风险",
-            "未勾选也可保存为未就绪政策",
+            "未勾选也可保存为未就绪边界",
+            "保存我的接货边界",
             "复核日期",
         ):
             self.assertIn(copy, policy_contract)
@@ -515,10 +594,24 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn('["unconfirmed", "未确认"]', policy_contract)
         self.assertIn('["willing", "愿意研究"]', policy_contract)
         self.assertIn('["exclude", "明确不做"]', policy_contract)
+        for step in ("01", "02", "03"):
+            self.assertIn(
+                f'<span class="options-policy-step-number" aria-hidden="true">{step}</span>',
+                policy_contract,
+            )
         self.assertLess(
             policy_contract.index('class="options-policy-map"'),
             policy_contract.index('class="options-policy-terms"'),
         )
+        self.assertLess(
+            policy_contract.index('id="options-policy-map-title"'),
+            policy_contract.index('id="options-policy-budget-title"'),
+        )
+        self.assertLess(
+            policy_contract.index('id="options-policy-budget-title"'),
+            policy_contract.index('id="options-policy-assignment-title"'),
+        )
+        self.assertNotIn("保单条款", policy_contract)
         for status, label in (
             ("ready", "已配置"),
             ("review_due", "到期复核"),
@@ -550,12 +643,14 @@ class FrontendContractTests(unittest.TestCase):
             "assignment_risk_reviewed: draft.acknowledgements.assignmentRiskReviewed",
             'item.decision === "willing" || item.decision === "exclude"',
             "OPTIONS_POLICY_MAX_SELECTIONS",
-            "state.optionsPanel = \"policy\"",
+            "state.optionsPanel = \"today\"",
             "state.optionsPolicyDraftDirty = false",
             "state.optionsPolicyDraft = null",
             "const reloaded = await loadOptions()",
-            "接货政策已保存并重新读取",
+            "接货边界已保存并重新读取",
+            "保存不会生成候选或提交订单",
             "另一页面已更新，已重新加载",
+            "error?.status === 409",
             "error?.status === 422",
             "请检查金额、比例、标的选择与风险确认",
             "error?.status === 401 || error?.status === 403",
@@ -571,6 +666,15 @@ class FrontendContractTests(unittest.TestCase):
         self.assertNotIn("localStorage", save_contract)
         self.assertNotIn("sessionStorage", save_contract)
         self.assertNotIn("URLSearchParams", save_contract)
+        conflict_start = save_contract.index("if (error?.status === 409)")
+        conflict_end = save_contract.index("error?.status === 422", conflict_start)
+        conflict_contract = save_contract[conflict_start:conflict_end]
+        self.assertIn('state.optionsPanel = "policy"', conflict_contract)
+        self.assertIn("await loadOptions()", conflict_contract)
+        self.assertLess(
+            save_contract.index('state.optionsPanel = "today"'),
+            save_contract.index("const reloaded = await loadOptions()"),
+        )
 
     def test_options_policy_dirty_draft_pauses_automatic_refresh(self) -> None:
         options_start = self.javascript.index("// ─── Options research lab")
@@ -590,11 +694,11 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn("未保存草稿已保留", options_contract)
         self.assertIn('state.view === "options" && state.optionsPolicyDraftDirty', refresh_contract)
         self.assertIn('state.view === "options" && state.optionsPolicySaving', refresh_contract)
-        self.assertIn("正在保存，请等待服务端响应后再刷新", refresh_contract)
+        self.assertIn("接货边界正在保存，请等待服务端响应后再刷新", refresh_contract)
         self.assertIn("if (!showSpinner)", refresh_contract)
         self.assertIn("已暂停自动刷新", refresh_contract)
         self.assertIn("window.confirm(", refresh_contract)
-        self.assertIn("刷新会放弃当前页面内尚未保存的接货政策草稿", refresh_contract)
+        self.assertIn("刷新会放弃当前页面内尚未保存的接货边界草稿", refresh_contract)
         self.assertLess(
             refresh_contract.index("state.optionsPolicyDraftDirty"),
             refresh_contract.index("await ensureViewLoaded"),
@@ -708,7 +812,7 @@ class FrontendContractTests(unittest.TestCase):
             load_contract,
         )
         self.assertIn(
-            "clearOptionsView(\"正在重新核验私人会话；旧接货政策已同步清除\")",
+            "clearOptionsView(\"正在重新核验私人会话；旧接货边界已同步清除\")",
             self.javascript,
         )
 
@@ -793,7 +897,7 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn("if (!event.persisted) return", pageshow_contract)
         self.assertIn("state.authenticated = false", pageshow_contract)
         self.assertIn("state.authStatusLoaded = false", pageshow_contract)
-        self.assertIn("旧接货政策已同步清除", pageshow_contract)
+        self.assertIn("旧接货边界已同步清除", pageshow_contract)
         self.assertIn("clearOptionsView(", pageshow_contract)
         self.assertLess(
             pageshow_contract.index("clearOptionsView("),
@@ -823,6 +927,145 @@ class FrontendContractTests(unittest.TestCase):
             self.assertIn('aria-label="${label}，百分比"', panel_contract)
         self.assertIn('aria-label="${label}，百分比"', panel_contract)
 
+    def test_options_first_unconfigured_visit_opens_policy_without_hiding_market_block(
+        self,
+    ) -> None:
+        saved_start = self.javascript.index("function optionsPolicyIsSaved")
+        saved_end = self.javascript.index("function optionsPolicyPanelHTML", saved_start)
+        saved_contract = self.javascript[saved_start:saved_end]
+        self.assertIn("Number.isInteger(revision) && revision > 0", saved_contract)
+        self.assertIn("if (!optionsPolicyIsSaved(data)) return false", saved_contract)
+        self.assertIn("policy?.schema_version === 1", saved_contract)
+        self.assertIn('policy?.strategy === "cash_secured_put"', saved_contract)
+        self.assertIn("policy?.ready === true", saved_contract)
+        self.assertIn('policy?.status === "ready"', saved_contract)
+        self.assertNotIn('"configured"', saved_contract)
+        self.assertNotIn('"active"', saved_contract)
+
+        render_start = self.javascript.index("function renderOptions(data)")
+        render_end = self.javascript.index("async function loadOptions()", render_start)
+        render_contract = self.javascript[render_start:render_end]
+        first_visit = "else if (!notice.policyReady && !state.optionsPolicyDraftDirty)"
+        self.assertIn(first_visit, render_contract)
+        self.assertIn('if (notice.marketBlocked)', render_contract)
+        self.assertIn('state.optionsPanel = "today"', render_contract)
+        self.assertIn('state.optionsPanel = "policy"', render_contract)
+        self.assertLess(
+            render_contract.index('if (notice.marketBlocked)'),
+            render_contract.index(first_visit),
+        )
+        self.assertLess(
+            render_contract.index(first_visit),
+            render_contract.index("optionsApplyPanel(state.optionsPanel)"),
+        )
+
+        notice_start = self.javascript.index("function optionsDataNotice")
+        notice_end = self.javascript.index("function optionCandidateTitle", notice_start)
+        notice_contract = self.javascript[notice_start:notice_end]
+        for copy in (
+            "policy_unconfigured",
+            "先完成我的接货边界",
+            "愿意接哪些股票、最高接货价和最多承担多少",
+            "policy_attention",
+            "系统数据缺口会单独列出，不需要你代为处理",
+        ):
+            self.assertIn(copy, notice_contract)
+        self.assertIn("设置我的接货边界", self.javascript)
+
+    def test_options_readiness_and_methodology_are_disclosures_not_primary_tabs(
+        self,
+    ) -> None:
+        readiness_start = self.javascript.index("function optionsReadinessPanelHTML")
+        readiness_end = self.javascript.index("const OPTION_BENCHMARK_METRICS", readiness_start)
+        readiness_contract = self.javascript[readiness_start:readiness_end]
+        self.assertIn(
+            '<details class="options-disclosure options-readiness-disclosure"',
+            readiness_contract,
+        )
+        self.assertIn('id="options-readiness-details"', readiness_contract)
+        self.assertIn("为什么现在不能生成候选", readiness_contract)
+        self.assertIn("任一关键项不完整，就不生成候选", readiness_contract)
+        self.assertNotIn('role="tabpanel"', readiness_contract)
+        self.assertNotIn('data-options-panel-view="readiness"', readiness_contract)
+
+        reveal_start = self.javascript.index(
+            'const revealButton = event.target.closest("[data-options-reveal]")'
+        )
+        reveal_contract = self.javascript[reveal_start : reveal_start + 850]
+        for interaction in (
+            "details.open = true",
+            'details.querySelector("summary")?.focus()',
+            'window.matchMedia?.("(prefers-reduced-motion: reduce)")',
+            "details.scrollIntoView",
+        ):
+            self.assertIn(interaction, reveal_contract)
+
+    def test_options_cross_panel_actions_and_save_restore_keyboard_focus(self) -> None:
+        click_start = self.javascript.index(
+            '$("#view-options")?.addEventListener("click"'
+        )
+        click_end = self.javascript.index(
+            '$("#view-options")?.addEventListener("input"', click_start
+        )
+        click_contract = self.javascript[click_start:click_end]
+        self.assertIn(
+            'const cameFromTablist = Boolean(panelButton.closest("#options-subnav"))',
+            click_contract,
+        )
+        self.assertIn(
+            "optionsApplyPanel(panelButton.dataset.optionsPanel, { focus: !cameFromTablist })",
+            click_contract,
+        )
+
+        focus_start = self.javascript.index("function optionsFocusActiveTab")
+        focus_end = self.javascript.index("function renderOptionsLocked", focus_start)
+        focus_contract = self.javascript[focus_start:focus_end]
+        self.assertIn("requestAnimationFrame", focus_contract)
+        self.assertIn('const tab = $(`#options-tab-${state.optionsPanel}`)', focus_contract)
+        self.assertIn("if (tab && !tab.disabled) tab.focus()", focus_contract)
+
+        save_start = self.javascript.index("async function saveOptionsPolicy")
+        save_end = self.javascript.index("function optionsReadinessItems", save_start)
+        save_contract = self.javascript[save_start:save_end]
+        self.assertGreaterEqual(save_contract.count("optionsFocusActiveTab()"), 2)
+        self.assertLess(
+            save_contract.index("optionsPolicySetFeedback(\"接货边界已保存"),
+            save_contract.index("optionsFocusActiveTab()"),
+        )
+
+    def test_options_today_separates_user_boundary_system_data_and_market_risk(
+        self,
+    ) -> None:
+        summary_start = self.javascript.index("function optionsGateSummaryHTML")
+        summary_end = self.javascript.index("function optionsPolicySnapshotHTML", summary_start)
+        summary_contract = self.javascript[summary_start:summary_end]
+        self.assertIn(
+            'aria-label="今日研究条件：我的边界、系统数据、市场风险"',
+            summary_contract,
+        )
+        for label in ("我的边界", "系统数据", "市场风险"):
+            self.assertIn(f'label: "{label}"', summary_contract)
+        for readiness_key in (
+            "underwriting_policy",
+            "familiar_universe",
+            "option_market_data",
+            "funding_capacity",
+            "portfolio_freshness",
+            "options_permission",
+            "event_calendar",
+        ):
+            self.assertIn(f'byKey.get("{readiness_key}")', summary_contract)
+        self.assertIn("blocks_new_short_puts === true", summary_contract)
+
+        snapshot_start = summary_end
+        snapshot_end = self.javascript.index("function optionsTodayActionHTML", snapshot_start)
+        snapshot_contract = self.javascript[snapshot_start:snapshot_end]
+        self.assertIn('if (!notice.policySaved) return ""', snapshot_contract)
+        self.assertIn('aria-label="我的接货边界摘要"', snapshot_contract)
+        self.assertIn("研究预算", snapshot_contract)
+        self.assertIn("复核日期", snapshot_contract)
+        self.assertIn("编辑边界", snapshot_contract)
+
     def test_options_policy_layout_has_touch_targets_and_mobile_reading_order(self) -> None:
         for contract in (
             ".options-policy-form {",
@@ -831,6 +1074,7 @@ class FrontendContractTests(unittest.TestCase):
             ".options-policy-underlying {",
             ".options-policy-decisions span {",
             "min-height: 44px",
+            ".options-policy-section-head > .options-policy-step-number",
             ".options-policy-save {",
             "min-height: 48px",
             ".options-policy-terms { position: sticky",
@@ -841,6 +1085,8 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn(".options-policy-tier { grid-template-columns: 1fr; }", mobile)
         self.assertIn("grid-template-columns: 1fr; min-inline-size: 0", mobile)
         self.assertIn(".options-policy-fields { grid-template-columns: 1fr", mobile)
+        self.assertIn(".options-policy-snapshot { grid-template-columns: 1fr", mobile)
+        self.assertIn(".options-policy-snapshot button { width: 100%; }", mobile)
         self.assertIn(".options-policy-feedback { padding-inline: 13px; font-size: 16px", mobile)
         self.assertIn(".options-policy-decisions span { min-height: 44px; font-size: 14px; }", mobile)
 
@@ -1062,9 +1308,9 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn('stale ? "数据延迟" : ""', self.javascript)
         self.assertIn('"高收益债利差"', self.javascript)
         self.assertIn("cs.hy_oas", self.javascript)
-        self.assertIn('static/app.js?v=37', self.html)
-        self.assertIn('static/style.css?v=37', self.html)
-        self.assertNotIn('?v=26', self.html)
+        self.assertIn('static/app.js?v=38', self.html)
+        self.assertIn('static/style.css?v=38', self.html)
+        self.assertNotIn('?v=37', self.html)
         self.assertIn(".metric.is-stale", self.css)
 
     def test_macro_events_render_compact_ai_digest_and_bounded_highlights(self) -> None:
