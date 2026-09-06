@@ -213,17 +213,21 @@ python3 kol_dashboard/briefing_import.py /path/to/daily-briefing.json \
 CLI 默认在采集后尝试生成中文阅读增强；模型未配置或暂时失败时会保留原始资讯，
 以 `translation_status=unavailable` 明确降级，使用 `--no-ai-enrichment` 可关闭模型
 调用但仍执行确定性内容分类。HN 两个榜单根接口都必须成功且至少产生一条当前
-有效 story；两个 AI feed 也必须各自产生至少一条当前有效条目。任一采集完整性
-门槛失败都会在写文件和导入前退出，保留 last-good 快照。网络读取同时受单请求
-和整批墙钟上限约束。中文增强只能使用采集墙钟的剩余预算，且自身默认最多占用
-24 秒（环境变量 `KOL_DAILY_ENRICHMENT_DEADLINE_SECONDS` 可调但硬上限 40 秒）；
-超时条目按 `unavailable` 降级，不得阻塞新快照。
+有效 story；两个 AI feed 的根地址也都必须抓取成功并解析为有效 RSS。若某个 AI
+feed 成功完成扫描、但最近 24 小时没有新条目，这是有效空扫描，不应伪造条目或
+阻断其他新资讯发布。根抓取或 RSS 解析失败仍会在写文件和导入前退出，保留
+last-good 快照。网络读取同时受单请求和整批墙钟上限约束。中文增强只能使用采集
+墙钟的剩余预算，且自身默认最多占用 24 秒（环境变量
+`KOL_DAILY_ENRICHMENT_DEADLINE_SECONDS` 可调但硬上限 40 秒）；超时条目按
+`unavailable` 降级，不得阻塞新快照。
 
 producer 按一次采集、一次退出的 CLI 运行模型设计；`collect.sh daily` 每次都会启动
 独立进程。生产 `deploy.sh` 会安装应用自管的 `kol-collect-daily.service/.timer`，
 在每小时第 5 分钟加不超过 90 秒随机延迟后运行，并通过 `Persistent=true` 补跑
-错过的周期。不要在常驻 Web 进程内无限循环调用采集 library API，底层 DNS 或
-系统网络调用若无法取消，应交给下一次独立任务重试。
+错过的周期。部署候选必须先成功执行一次 collector；快照验收继续要求部署期内的
+当前数据、完整六栏目和至少一条 HN story，但不要求每个已成功空扫描的 AI feed
+当天必须产出文章。不要在常驻 Web 进程内无限循环调用采集 library API，底层 DNS
+或系统网络调用若无法取消，应交给下一次独立任务重试。
 
 输出先写入同目录临时文件，完成 JSON 校验后再原子改名，然后执行导入。自定义
 OpenClaw/Hermes producer、跨主机传输和 Slack 通知仍属于独立运维变更；若启用

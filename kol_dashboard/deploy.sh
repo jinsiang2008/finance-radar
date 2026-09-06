@@ -338,11 +338,7 @@ observed = {
     for item in values
     if isinstance(item, dict)
 }
-required = {
-    ("Hacker News", "hn_story"),
-    ("AI Digest", "ai_digest"),
-    ("AI Brief", "paper_digest"),
-}
+required = {("Hacker News", "hn_story")}
 missing = sorted(required - observed)
 if missing:
     raise SystemExit(f"Daily candidate is missing required discovery sources: {missing}")

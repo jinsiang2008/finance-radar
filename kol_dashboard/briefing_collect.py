@@ -151,7 +151,7 @@ _LOCALE_SEGMENT_RE = re.compile(r"^[a-z]{2}(?:-[a-z]{2})?$", re.IGNORECASE)
 
 
 class CollectionError(RuntimeError):
-    """A collection run could not produce any valid, safe story."""
+    """A collection run could not complete its required source scans safely."""
 
 
 class FetchError(CollectionError):
@@ -1317,9 +1317,9 @@ class BriefingCollector:
         all_stories = list(hn_stories)
         for spec in _FEEDS:
             feed_stories, succeeded = feed_results[spec]
-            if not succeeded or not feed_stories:
+            if not succeeded:
                 raise CollectionError(
-                    f"{spec.source} must provide at least one current valid story"
+                    f"{spec.source} feed root must fetch and parse successfully"
                 )
             all_stories.extend(feed_stories)
 

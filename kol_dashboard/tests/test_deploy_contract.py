@@ -148,15 +148,30 @@ class DeploymentContractTests(unittest.TestCase):
         self.assertLess(api_acceptance, timer_start)
         self.assertLess(timer_start, committed)
         for required in (
-            '("Hacker News", "hn_story")',
-            '("AI Digest", "ai_digest")',
-            '("AI Brief", "paper_digest")',
             'payload.get("refresh_schedule_status") not in {"configured", "active"}',
             'payload.get("next_refresh_at")',
             "database_integrity \"$DB_PATH\"",
             "https://zlstreet.xyz/kol/api/briefings/latest",
         ):
             self.assertIn(required, self.deploy)
+
+    def test_daily_snapshot_accepts_empty_curated_feeds_but_keeps_core_gates(
+        self,
+    ) -> None:
+        contract_start = self.deploy.index("validate_daily_snapshot()")
+        contract_end = self.deploy.index("validate_daily_api()", contract_start)
+        contract = self.deploy[contract_start:contract_end]
+
+        self.assertIn('required = {("Hacker News", "hn_story")}', contract)
+        self.assertNotIn('("AI Digest", "ai_digest")', contract)
+        self.assertNotIn('("AI Brief", "paper_digest")', contract)
+        self.assertIn(
+            'expected_sections = {"macro", "world", "finance", '
+            '"technology", "ai", "investors"}',
+            contract,
+        )
+        self.assertIn("coverage_time < not_before - timedelta(minutes=5)", contract)
+        self.assertIn("coverage_time > now + timedelta(minutes=5)", contract)
 
     def test_daily_units_are_quiesced_enabled_and_rollback_safe(self) -> None:
         self.assertGreaterEqual(

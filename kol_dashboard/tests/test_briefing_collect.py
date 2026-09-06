@@ -1139,33 +1139,66 @@ class FullProducerTests(unittest.TestCase):
                     "previous\n",
                 )
 
-    def test_each_ai_feed_must_produce_at_least_one_current_story(self) -> None:
-        for feed_url in (
+    def test_ai_digest_with_no_new_story_is_a_valid_empty_scan(self) -> None:
+        routes = self.routes()
+        routes[briefing_collect.AI_DIGEST_FEED_URL] = rss_document(
+            rss_item(
+                title="Older digest issue",
+                link="https://ai-digest.liziran.com/zh/digest/older.html",
+                pub_date="Thu, 03 Sep 2026 00:00:00 +0000",
+                content="<h2>1. An older AI story</h2>",
+            )
+        )
+        opener = FakeOpener(routes)
+
+        result = briefing_collect.collect_briefing(
+            opener=opener,
+            now=self.now,
+        )
+
+        items = [
+            item
+            for section in result.payload["sections"].values()
+            for item in section
+        ]
+        self.assertTrue(any(item["kind"] == "hn_story" for item in items))
+        self.assertTrue(any(item["kind"] == "paper_digest" for item in items))
+        self.assertFalse(any(item["kind"] == "ai_digest" for item in items))
+        self.assertIn(
             briefing_collect.AI_DIGEST_FEED_URL,
-            briefing_collect.AI_BRIEF_FEED_URL,
-        ):
-            with self.subTest(feed_url=feed_url), tempfile.TemporaryDirectory() as directory:
-                routes = self.routes()
-                routes[feed_url] = rss_document()
-                destination = Path(directory, "daily.json")
-                destination.write_text("previous\n", encoding="utf-8")
+            [url for url, _ in opener.calls],
+        )
+        self.assertEqual(result.errors, ())
+        briefing_import.validate_payload(result.payload, now=self.now)
 
-                with mock.patch.object(
-                    briefing_collect.briefing_import,
-                    "import_payload",
-                ) as importer, self.assertRaises(briefing_collect.CollectionError):
-                    briefing_collect.produce_briefing(
-                        output_path=destination,
-                        import_snapshot=True,
-                        opener=FakeOpener(routes),
-                        now=self.now,
-                    )
+    def test_ai_digest_root_fetch_failure_is_fail_closed_before_output(self) -> None:
+        routes = self.routes()
+        routes[briefing_collect.AI_DIGEST_FEED_URL] = OSError(
+            "required source unavailable"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory, "daily.json")
+            destination.write_text("previous\n", encoding="utf-8")
 
-                self.assertEqual(
-                    destination.read_text(encoding="utf-8"),
-                    "previous\n",
+            with mock.patch.object(
+                briefing_collect.briefing_import,
+                "import_payload",
+            ) as importer, self.assertRaisesRegex(
+                briefing_collect.CollectionError,
+                "AI Digest feed root must fetch and parse successfully",
+            ):
+                briefing_collect.produce_briefing(
+                    output_path=destination,
+                    import_snapshot=True,
+                    opener=FakeOpener(routes),
+                    now=self.now,
                 )
-                importer.assert_not_called()
+
+            self.assertEqual(
+                destination.read_text(encoding="utf-8"),
+                "previous\n",
+            )
+            importer.assert_not_called()
 
     def test_empty_hn_roots_preserve_last_good_and_do_not_import(self) -> None:
         routes = self.routes()
