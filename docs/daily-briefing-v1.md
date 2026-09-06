@@ -213,11 +213,12 @@ python3 kol_dashboard/briefing_import.py /path/to/daily-briefing.json \
 CLI 默认在采集后尝试生成中文阅读增强；模型未配置或暂时失败时会保留原始资讯，
 以 `translation_status=unavailable` 明确降级，使用 `--no-ai-enrichment` 可关闭模型
 调用但仍执行确定性内容分类。HN 两个榜单根接口都必须成功且至少产生一条当前
-有效 story；两个 AI feed 的根地址也都必须抓取成功并解析为有效 RSS。若某个 AI
-feed 成功完成扫描、但最近 24 小时没有新条目，这是有效空扫描，不应伪造条目或
-阻断其他新资讯发布。根抓取或 RSS 解析失败仍会在写文件和导入前退出，保留
-last-good 快照。网络读取同时受单请求和整批墙钟上限约束。中文增强只能使用采集
-墙钟的剩余预算，且自身默认最多占用 24 秒（环境变量
+有效 story；两个 AI feed 的根地址也都必须抓取成功并解析为有效 RSS/Atom 根结构。
+可解析的 HTML/维护页 XML、缺少 channel 的 RSS 或未声明 Atom 命名空间的 feed
+仍按源失败处理。若某个 AI feed 成功完成扫描、但最近 24 小时没有新条目，这是
+有效空扫描，不应伪造条目或阻断其他新资讯发布。根抓取或 feed 解析失败仍会在
+写文件和导入前退出，保留 last-good 快照。网络读取同时受单请求和整批墙钟上限
+约束。中文增强只能使用采集墙钟的剩余预算，且自身默认最多占用 24 秒（环境变量
 `KOL_DAILY_ENRICHMENT_DEADLINE_SECONDS` 可调但硬上限 40 秒）；超时条目按
 `unavailable` 降级，不得阻塞新快照。
 

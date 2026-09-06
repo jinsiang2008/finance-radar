@@ -180,8 +180,23 @@ def rss_document(*items: str) -> bytes:
         "<rss version='2.0' "
         "xmlns:content='http://purl.org/rss/1.0/modules/content/'>"
         "<channel>"
+        "<title>AI feed</title>"
+        "<link>https://ai-digest.liziran.com/zh/</link>"
+        "<description>AI updates</description>"
         + "".join(items)
         + "</channel></rss>"
+    ).encode()
+
+
+def atom_document(*entries: str) -> bytes:
+    return (
+        "<?xml version='1.0' encoding='UTF-8'?>"
+        "<feed xmlns='http://www.w3.org/2005/Atom'>"
+        "<title>AI feed</title>"
+        "<id>https://ai-digest.liziran.com/zh/feed.xml</id>"
+        "<updated>2026-09-05T03:00:00Z</updated>"
+        + "".join(entries)
+        + "</feed>"
     ).encode()
 
 
@@ -718,6 +733,119 @@ class RssCollectorTests(unittest.TestCase):
             self.assertEqual(stories, [])
             self.assertTrue(collector.errors)
 
+    def test_parseable_non_feed_xml_and_invalid_feed_roots_fail_closed(self) -> None:
+        bodies = {
+            "maintenance html": (
+                b"<?xml version='1.0'?><html><body>maintenance</body></html>"
+            ),
+            "rss without version": b"<rss><channel/></rss>",
+            "rss without channel": b"<rss version='2.0'><message>down</message></rss>",
+            "rss without channel metadata": (
+                b"<rss version='2.0'><channel><message>down</message></channel></rss>"
+            ),
+            "atom without namespace": b"<feed><title>maintenance</title></feed>",
+            "atom without required metadata": (
+                b"<feed xmlns='http://www.w3.org/2005/Atom'>"
+                b"<title>maintenance</title></feed>"
+            ),
+        }
+        for label, body in bodies.items():
+            with self.subTest(label=label):
+                collector = self.collector(
+                    {briefing_collect.AI_DIGEST_FEED_URL: body}
+                )
+
+                stories, succeeded = collector.collect_feed(
+                    briefing_collect._FEEDS[0],
+                    current=self.now,
+                )
+
+                self.assertFalse(succeeded)
+                self.assertEqual(stories, [])
+                self.assertTrue(collector.errors)
+
+    def test_valid_rss_and_atom_zero_entry_scans_succeed_empty(self) -> None:
+        for label, body in (
+            ("rss", rss_document()),
+            ("atom", atom_document()),
+        ):
+            with self.subTest(label=label):
+                collector = self.collector(
+                    {briefing_collect.AI_DIGEST_FEED_URL: body}
+                )
+
+                stories, succeeded = collector.collect_feed(
+                    briefing_collect._FEEDS[0],
+                    current=self.now,
+                )
+
+                self.assertTrue(succeeded)
+                self.assertEqual(stories, [])
+                self.assertEqual(collector.errors, [])
+
+    def test_valid_atom_with_only_stale_entries_succeeds_empty(self) -> None:
+        body = atom_document(
+            "<entry>"
+            "<title>Older digest issue</title>"
+            "<id>https://ai-digest.liziran.com/zh/digest/older.html</id>"
+            "<link rel='alternate' "
+            "href='https://ai-digest.liziran.com/zh/digest/older.html'/>"
+            "<published>2026-09-03T00:00:00Z</published>"
+            "<content type='html'>&lt;h2&gt;1. Old item&lt;/h2&gt;</content>"
+            "</entry>"
+        )
+        collector = self.collector(
+            {briefing_collect.AI_DIGEST_FEED_URL: body}
+        )
+
+        stories, succeeded = collector.collect_feed(
+            briefing_collect._FEEDS[0],
+            current=self.now,
+        )
+
+        self.assertTrue(succeeded)
+        self.assertEqual(stories, [])
+        self.assertEqual(collector.errors, [])
+
+    def test_valid_atom_entry_is_parsed_without_weakening_freshness_checks(
+        self,
+    ) -> None:
+        issue_url = "https://ai-digest.liziran.com/zh/digest/atom.html"
+        body = atom_document(
+            "<entry>"
+            "<title>Current Atom digest issue</title>"
+            f"<id>{issue_url}</id>"
+            f"<link rel='alternate' href='{issue_url}'/>"
+            "<published>2026-09-05T01:00:00Z</published>"
+            "<content type='html'>"
+            "&lt;h2&gt;1. Current AI item&lt;/h2&gt;"
+            "&lt;p&gt;Source-backed summary.&lt;/p&gt;"
+            "&lt;a href='https://example.com/articles/atom-source'&gt;"
+            "Source&lt;/a&gt;"
+            "</content>"
+            "</entry>"
+        )
+        collector = self.collector(
+            {
+                briefing_collect.AI_DIGEST_FEED_URL: body,
+                issue_url: page_metadata(modified="2026-09-05T02:00:00Z"),
+            }
+        )
+
+        stories, succeeded = collector.collect_feed(
+            briefing_collect._FEEDS[0],
+            current=self.now,
+        )
+
+        self.assertTrue(succeeded)
+        self.assertEqual(len(stories), 1)
+        self.assertEqual(stories[0].title, "Current AI item")
+        self.assertEqual(stories[0].source_url, issue_url)
+        self.assertEqual(
+            stories[0].original_url,
+            "https://example.com/articles/atom-source",
+        )
+
     def test_rss_scan_limit_bounds_detail_page_requests(self) -> None:
         items = []
         routes: dict[str, object] = {}
@@ -1175,6 +1303,36 @@ class FullProducerTests(unittest.TestCase):
         routes = self.routes()
         routes[briefing_collect.AI_DIGEST_FEED_URL] = OSError(
             "required source unavailable"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory, "daily.json")
+            destination.write_text("previous\n", encoding="utf-8")
+
+            with mock.patch.object(
+                briefing_collect.briefing_import,
+                "import_payload",
+            ) as importer, self.assertRaisesRegex(
+                briefing_collect.CollectionError,
+                "AI Digest feed root must fetch and parse successfully",
+            ):
+                briefing_collect.produce_briefing(
+                    output_path=destination,
+                    import_snapshot=True,
+                    opener=FakeOpener(routes),
+                    now=self.now,
+                )
+
+            self.assertEqual(
+                destination.read_text(encoding="utf-8"),
+                "previous\n",
+            )
+            importer.assert_not_called()
+
+    def test_parseable_maintenance_xml_is_fail_closed_before_output(self) -> None:
+        routes = self.routes()
+        routes[briefing_collect.AI_DIGEST_FEED_URL] = (
+            b"<?xml version='1.0'?>"
+            b"<html><body><h1>Maintenance</h1></body></html>"
         )
         with tempfile.TemporaryDirectory() as directory:
             destination = Path(directory, "daily.json")

@@ -148,6 +148,7 @@ _GENERIC_URL_SUFFIX_TOKENS = {
 }
 _IDENTITY_QUERY_KEYS = {"article", "document", "id", "paper", "post", "story"}
 _LOCALE_SEGMENT_RE = re.compile(r"^[a-z]{2}(?:-[a-z]{2})?$", re.IGNORECASE)
+_ATOM_NAMESPACE = "http://www.w3.org/2005/Atom"
 
 
 class CollectionError(RuntimeError):
@@ -783,7 +784,7 @@ class BriefingCollector:
             url,
             headers={
                 "Accept": "application/json, application/rss+xml, "
-                "application/xml, text/html;q=0.8",
+                "application/atom+xml, application/xml, text/html;q=0.8",
                 "User-Agent": "zlstreet-daily-briefing/1.0",
             },
             method="GET",
@@ -1486,30 +1487,123 @@ def _rss_items(body: bytes) -> list[dict[str, str]]:
     if re.search(br"<!\s*(?:DOCTYPE|ENTITY)\b", body, re.IGNORECASE):
         raise ValueError("DTD and entity declarations are not supported")
     root = ET.fromstring(body)
-    output: list[dict[str, str]] = []
-    for node in root.iter():
-        if _local_name(node.tag) != "item":
+
+    root_namespace, root_name = _xml_name(root.tag)
+    if (root_namespace, root_name) == ("", "rss"):
+        if root.attrib.get("version", "").strip() != "2.0":
+            raise ValueError("RSS root must declare version 2.0")
+        channels = [
+            child
+            for child in list(root)
+            if _xml_name(child.tag) == ("", "channel")
+        ]
+        if len(channels) != 1:
+            raise ValueError("RSS root must contain exactly one channel")
+        channel = channels[0]
+        for required_name in ("title", "link", "description"):
+            if not _direct_xml_text(channel, "", required_name):
+                raise ValueError(
+                    f"RSS channel is missing required {required_name} metadata"
+                )
+        nodes = [
+            child
+            for child in list(channel)
+            if _xml_name(child.tag) == ("", "item")
+        ]
+        return [_rss_item_fields(node) for node in nodes]
+
+    if root_name == "feed":
+        if root_namespace != _ATOM_NAMESPACE:
+            raise ValueError("Atom feed root must use the Atom namespace")
+        for required_name in ("title", "id", "updated"):
+            value = _direct_xml_text(root, _ATOM_NAMESPACE, required_name)
+            if not value:
+                raise ValueError(
+                    f"Atom feed is missing required {required_name} metadata"
+                )
+            if required_name == "updated" and _parse_datetime(value) is None:
+                raise ValueError("Atom feed updated metadata is invalid")
+        nodes = [
+            child
+            for child in list(root)
+            if _xml_name(child.tag) == (_ATOM_NAMESPACE, "entry")
+        ]
+        return [_atom_entry_fields(node) for node in nodes]
+
+    raise ValueError("document root is not a supported RSS or Atom feed")
+
+
+def _rss_item_fields(node: ET.Element) -> dict[str, str]:
+    item: dict[str, str] = {}
+    for child in list(node):
+        name = _local_name(child.tag)
+        output_name = "content" if name == "encoded" else name
+        if output_name == "date":
+            output_name = "pubDate"
+        if output_name not in {
+            "title",
+            "link",
+            "guid",
+            "pubDate",
+            "description",
+            "content",
+        }:
             continue
-        item: dict[str, str] = {}
-        for child in list(node):
-            name = _local_name(child.tag)
-            output_name = "content" if name == "encoded" else name
-            if output_name not in {
-                "title",
-                "link",
-                "guid",
-                "pubDate",
-                "description",
-                "content",
-            }:
-                continue
-            value = "".join(child.itertext()).strip()
-            if output_name == "link" and not value:
-                value = child.attrib.get("href", "").strip()
-            if value and output_name not in item:
-                item[output_name] = value
-        output.append(item)
-    return output
+        value = "".join(child.itertext()).strip()
+        if output_name == "link" and not value:
+            value = child.attrib.get("href", "").strip()
+        if value and output_name not in item:
+            item[output_name] = value
+    return item
+
+
+def _atom_entry_fields(node: ET.Element) -> dict[str, str]:
+    item: dict[str, str] = {}
+    fallback_link = ""
+    updated = ""
+    for child in list(node):
+        namespace, name = _xml_name(child.tag)
+        if namespace != _ATOM_NAMESPACE:
+            continue
+        value = "".join(child.itertext()).strip()
+        if name == "title" and value:
+            item.setdefault("title", value)
+        elif name == "id" and value:
+            item.setdefault("guid", value)
+        elif name == "link":
+            href = child.attrib.get("href", "").strip()
+            if href and child.attrib.get("rel", "alternate") == "alternate":
+                item.setdefault("link", href)
+            elif href and not fallback_link:
+                fallback_link = href
+        elif name == "published" and value:
+            item.setdefault("pubDate", value)
+        elif name == "updated" and value and not updated:
+            updated = value
+        elif name == "summary" and value:
+            item.setdefault("description", value)
+        elif name == "content" and value:
+            item.setdefault("content", value)
+    if "link" not in item and fallback_link:
+        item["link"] = fallback_link
+    if "pubDate" not in item and updated:
+        item["pubDate"] = updated
+    return item
+
+
+def _xml_name(value: Any) -> tuple[str, str]:
+    text = str(value)
+    if text.startswith("{") and "}" in text:
+        namespace, local = text[1:].split("}", 1)
+        return namespace, local
+    return "", text
+
+
+def _direct_xml_text(node: ET.Element, namespace: str, name: str) -> str:
+    for child in list(node):
+        if _xml_name(child.tag) == (namespace, name):
+            return "".join(child.itertext()).strip()
+    return ""
 
 
 def _local_name(value: Any) -> str:
