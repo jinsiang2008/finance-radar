@@ -4703,11 +4703,13 @@ def _event_ai_select(sighting_alias: str) -> str:
     )
 
 
-# The public score combines deterministic rules with the model assessment.
-# Rules retain veto power over high-risk events, while the model may promote a
-# signal or demote a medium rule hit only when it has enough evidence.  Stored
-# historical impact is deliberately ignored: the contextual classifier repairs
-# old ambiguous-word false positives without rewriting rows or invalidating AI
+# The public level combines deterministic rules with an AI review.  Model
+# confidence describes evidence sufficiency, not market-impact probability:
+# AI may refine a deterministic medium event, but a deterministic low event is
+# capped at medium and therefore cannot become a public high-impact alert on
+# model output alone.  Deterministic high retains veto power.  Stored historical
+# impact is deliberately ignored: the contextual classifier repairs old
+# ambiguous-word false positives without rewriting rows or invalidating AI
 # caches. A title-only enrichment is capped below this threshold upstream.
 def _public_impact_sql(sighting_alias: str) -> str:
     rule = _event_rule_impact_sql(sighting_alias)
@@ -4715,15 +4717,39 @@ def _public_impact_sql(sighting_alias: str) -> str:
     return (
         "CASE "
         f"WHEN {rule}='high' THEN 'high' "
-        f"WHEN {current_ai} AND ai.impact_level='high' "
+        f"WHEN {rule}='medium' AND {current_ai} "
+        "AND ai.impact_level='high' "
         "AND ai.confidence>=0.65 THEN 'high' "
         f"WHEN {rule}='medium' AND {current_ai} "
         "AND ai.impact_level='none' AND ai.confidence>=0.65 THEN 'low' "
         f"WHEN {rule}='medium' THEN 'medium' "
-        f"WHEN {current_ai} AND ai.impact_level='medium' "
+        f"WHEN {current_ai} AND ai.impact_level IN ('high', 'medium') "
         "AND ai.confidence>=0.65 THEN 'medium' "
         "ELSE 'low' END"
     )
+
+
+def _set_event_impact_basis(item: dict[str, Any]) -> None:
+    """Expose the rule/model boundary without presenting confidence as odds."""
+    impact = str(item.get("impact") or "low").strip().lower()
+    rule = str(item.get("rule_impact") or "low").strip().lower()
+    enrichment = item.get("ai_enrichment")
+    ai_level = (
+        str(enrichment.get("impact_level") or "unknown").strip().lower()
+        if isinstance(enrichment, Mapping)
+        else "unknown"
+    )
+    if impact == rule:
+        basis = "deterministic_rule"
+    elif rule == "medium" and impact == "high" and ai_level == "high":
+        basis = "ai_reviewed_rule_medium"
+    elif rule == "low" and impact == "medium" and ai_level in {"high", "medium"}:
+        basis = "ai_review_only"
+    elif rule == "medium" and impact == "low" and ai_level == "none":
+        basis = "ai_reviewed_demotion"
+    else:
+        basis = "deterministic_rule"
+    item["impact_basis"] = basis
 
 
 def _event_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -4746,6 +4772,7 @@ def _event_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
                 "ai_request_eligible",
             }:
                 item.pop(key, None)
+        _set_event_impact_basis(item)
         return item
 
     def decode_list(key: str) -> list[Any]:
@@ -4776,6 +4803,7 @@ def _event_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
     item.pop("ai_prompt_version", None)
     item["ai_status"] = "ready"
     item["ai_enrichment"] = enrichment
+    _set_event_impact_basis(item)
     return item
 
 def query_events(

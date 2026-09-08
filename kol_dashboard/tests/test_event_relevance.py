@@ -80,6 +80,18 @@ class EventRelevanceTests(unittest.TestCase):
         self.assertEqual(result["attribution_basis"], "person_mention")
         self.assertEqual(result["rule_impact"], "medium")
 
+    def test_prominent_person_baseline_does_not_invent_market_impact(self) -> None:
+        result = assess_event_relevance(event(
+            "Elon Musk comments on stock market valuations",
+            kol_key="musk",
+            kol_name="Elon Musk",
+            kol_name_cn="马斯克",
+        ))
+
+        self.assertTrue(result["intelligence_eligible"])
+        self.assertEqual(result["classifier_version"], "kol-event-relevance-v2")
+        self.assertEqual(result["rule_impact"], "low")
+
     def test_ai_bubble_requires_and_has_a_market_theme_context(self) -> None:
         result = assess_event_relevance(event(
             "Zuckerberg warns the AI bubble may collapse",

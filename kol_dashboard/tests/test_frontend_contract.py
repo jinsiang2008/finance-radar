@@ -249,10 +249,62 @@ class FrontendContractTests(unittest.TestCase):
         self.assertNotIn("DIRECT SOURCES", self.javascript)
         self.assertNotIn("NEXT CHECK", self.javascript)
 
-    def test_daily_assets_share_the_v38_cachebuster(self) -> None:
-        self.assertIn('static/app.js?v=38', self.html)
-        self.assertIn('static/style.css?v=38', self.html)
-        self.assertEqual(self.html.count("?v=38"), 2)
+    def test_public_news_updates_are_staged_and_major_unread_is_retained(self) -> None:
+        for identifier in (
+            'id="daily-attention-desk"',
+            'id="kol-attention-desk"',
+            'id="daily-update-banner"',
+            'id="kol-update-banner"',
+        ):
+            self.assertIn(identifier, self.html)
+        for contract in (
+            'const PUBLIC_ATTENTION_STORAGE_KEY = "finance-radar-public-attention-v1"',
+            "PUBLIC_ATTENTION_MAX_ITEMS = 200",
+            "PUBLIC_ATTENTION_HIGH_TTL_MS = 7 * 86400_000",
+            "PUBLIC_ATTENTION_MEDIUM_TTL_MS = 72 * 3600_000",
+            "function publicAttentionObserve(",
+            "if (!baseline.initialized)",
+            "data-apply-public-update",
+            "当前版面保持不动",
+            "loadDaily({ background })",
+            "loadEvents({ background })",
+            "refreshCurrentView({ background: true })",
+            "data-attention-read",
+            "全部可见已读",
+            "data?.all_major",
+            "data?.highlights_overflow",
+            "另有 ${rows.length} 条重大消息未被 Top 5 隐藏",
+            "Hacker News 热度仅代表社区关注，不是事实确认",
+        ):
+            self.assertIn(contract, self.javascript)
+        for selector in (
+            ".attention-desk",
+            ".attention-overflow > summary",
+            ".freshness-banner",
+            ".story-dimensions",
+            ".daily-major-overflow > summary",
+        ):
+            self.assertIn(selector, self.css)
+        self.assertIn("min-height: 44px", self.css)
+        self.assertNotIn("importance-score", self.javascript)
+        assessment_start = self.javascript.index(
+            "function attentionAssessment(item, surface)"
+        )
+        assessment_end = self.javascript.index(
+            "function attentionObservedTimestamp", assessment_start
+        )
+        assessment_contract = self.javascript[assessment_start:assessment_end]
+        self.assertIn("item?.market_impact || item?.impact", assessment_contract)
+        self.assertIn(
+            'const majorImpact = ["critical", "severe", "high"].includes(impact)',
+            assessment_contract,
+        )
+
+    def test_daily_assets_share_the_v39_cachebuster(self) -> None:
+        self.assertIn('static/app.js?v=39', self.html)
+        self.assertIn('static/style.css?v=39', self.html)
+        self.assertEqual(self.html.count("?v=39"), 2)
+        self.assertNotIn("?v=38", self.html)
         self.assertNotIn("?v=37", self.html)
         self.assertNotIn("?v=36", self.html)
         self.assertNotIn("?v=35", self.html)
@@ -703,8 +755,14 @@ class FrontendContractTests(unittest.TestCase):
             refresh_contract.index("state.optionsPolicyDraftDirty"),
             refresh_contract.index("await ensureViewLoaded"),
         )
-        self.assertIn("await refreshCurrentView();", self.javascript)
-        self.assertIn("void refreshCurrentView();", self.javascript)
+        self.assertIn(
+            "await refreshCurrentView({ background: true });",
+            self.javascript,
+        )
+        self.assertIn(
+            "void refreshCurrentView({ background: true });",
+            self.javascript,
+        )
 
     def test_auth_status_failure_is_not_cached_and_next_view_load_retries(self) -> None:
         auth_start = self.javascript.index("async function loadAuthStatus()")
@@ -1308,9 +1366,9 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn('stale ? "数据延迟" : ""', self.javascript)
         self.assertIn('"高收益债利差"', self.javascript)
         self.assertIn("cs.hy_oas", self.javascript)
-        self.assertIn('static/app.js?v=38', self.html)
-        self.assertIn('static/style.css?v=38', self.html)
-        self.assertNotIn('?v=37', self.html)
+        self.assertIn('static/app.js?v=39', self.html)
+        self.assertIn('static/style.css?v=39', self.html)
+        self.assertNotIn('?v=38', self.html)
         self.assertIn(".metric.is-stale", self.css)
 
     def test_macro_events_render_compact_ai_digest_and_bounded_highlights(self) -> None:

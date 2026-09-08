@@ -15,14 +15,17 @@ KOL Tracker v2 — 关键意见领袖动态追踪
     musk                                   # 专门搜索 Musk 近期言论
     digest                                 # 生成今日 KOL 摘要（供日报使用）
     emergency                              # 紧急扫描（供 macro-emergency-check 使用）
+    collect-tiered [max_results]           # 15/30 分钟分层扫描并写入数据库
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 import json
 import os
 import re
 import sys
+import tempfile
 import time
 import urllib.parse
 import urllib.request
@@ -208,6 +211,41 @@ KOLS = {
     },
 }
 
+# Tiered production cadence: these market-moving/direct-source profiles are
+# scanned on every 15-minute run. The remaining directory is scanned only once
+# 30 minutes have elapsed since its last completed batch. Keep this list
+# explicit and reviewable; silently accepting a misspelled key would create a
+# monitoring blind spot.
+HOT_KOL_KEYS = (
+    "trump",
+    "musk",
+    "huangrenxun",
+    "suzifeng",
+    "altman",
+    "zuckerberg",
+    "powell",
+    "pangongsheng",
+    "dimon",
+    "serenity",
+)
+_UNKNOWN_HOT_KOL_KEYS = set(HOT_KOL_KEYS) - set(KOLS)
+if _UNKNOWN_HOT_KOL_KEYS:
+    raise RuntimeError(
+        "unknown hot KOL keys: " + ", ".join(sorted(_UNKNOWN_HOT_KOL_KEYS))
+    )
+if len(HOT_KOL_KEYS) != len(set(HOT_KOL_KEYS)):
+    raise RuntimeError("duplicate hot KOL keys")
+
+REGULAR_KOL_KEYS = tuple(key for key in KOLS if key not in HOT_KOL_KEYS)
+REGULAR_SCAN_INTERVAL = timedelta(minutes=30)
+CADENCE_STATE_VERSION = 1
+_CADENCE_STATE_KEYS = {
+    "version",
+    "regular_keys",
+    "regular_last_completed_at",
+}
+DISCOVERY_TRANSPORT_PROBES: list[tuple[str, bool]] = []
+
 # The shared directory is authoritative for public display metadata.  Keeping
 # retrieval-only search/source settings here avoids a backend -> collector
 # dependency while ensuring `/api/kols` and collected rows use the same names.
@@ -229,6 +267,18 @@ def http_get(url: str, headers: dict | None = None, timeout: int = TIMEOUT) -> s
         return raw.decode(enc, errors="ignore")
     except Exception:
         return ""
+
+
+def _record_discovery_transport(source: str, payload: str) -> None:
+    """Record reachability separately from whether a valid feed has new rows."""
+    DISCOVERY_TRANSPORT_PROBES.append((source, bool(payload)))
+
+
+def _discovery_transport_summary() -> dict[str, int]:
+    return {
+        "attempted": len(DISCOVERY_TRANSPORT_PROBES),
+        "succeeded": sum(1 for _, ok in DISCOVERY_TRANSPORT_PROBES if ok),
+    }
 
 
 def strip_html(s: str | None) -> str:
@@ -360,6 +410,7 @@ def search_bing_rss(query: str, max_results: int = 5) -> list[dict[str, Any]]:
     )
 
     html = http_get(url, headers={"User-Agent": UA})
+    _record_discovery_transport("bing_news", html)
     if not html:
         return []
 
@@ -530,6 +581,7 @@ def search_baidu(query: str, max_results: int = 5) -> list[dict[str, str]]:
         "User-Agent": UA,
         "Referer": "https://news.baidu.com/",
     })
+    _record_discovery_transport("baidu_news", html)
     if not html:
         return results
 
@@ -784,7 +836,7 @@ def scan_kol(kol_key: str, max_results: int = 5) -> list[dict[str, Any]]:
     """扫描单个 KOL 的近期动态"""
     kol = KOLS.get(kol_key)
     if not kol:
-        return []
+        raise ValueError(f"unknown KOL key: {kol_key}")
 
     def annotate(item: dict[str, Any]) -> dict[str, Any] | None:
         item["kol_key"] = kol_key
@@ -846,12 +898,192 @@ def scan_kol(kol_key: str, max_results: int = 5) -> list[dict[str, Any]]:
 def scan_all(max_results: int = 5) -> dict[str, list[Any]]:
     """扫描所有 KOL 的近期动态"""
     X_SOURCE_WARNINGS.clear()
+    return scan_selected(KOLS, max_results)
+
+
+def scan_selected(
+    kol_keys: Iterable[str],
+    max_results: int = 5,
+) -> dict[str, list[Any]]:
+    """Scan an explicit, validated subset without resetting source warnings."""
+    keys = tuple(kol_keys)
+    if len(keys) != len(set(keys)):
+        raise ValueError("duplicate KOL keys")
+    unknown = set(keys) - set(KOLS)
+    if unknown:
+        raise ValueError("unknown KOL keys: " + ", ".join(sorted(unknown)))
     data = {}
-    for kol_key in KOLS:
+    for kol_key in keys:
         items = scan_kol(kol_key, max_results)
         if items:
             data[kol_key] = items
     return data
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _cadence_state_path() -> str:
+    configured = os.environ.get("KOL_CADENCE_STATE_PATH", "").strip()
+    if configured:
+        return configured
+    database = os.environ.get("KOL_DASHBOARD_DB", "").strip()
+    if database:
+        return os.path.join(
+            os.path.dirname(os.path.abspath(database)),
+            "kol-cadence-state.json",
+        )
+    return os.path.join(os.path.dirname(_HERE), "data", "kol-cadence-state.json")
+
+
+def _parse_cadence_timestamp(value: Any) -> datetime:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("regular_last_completed_at must be a timestamp")
+    raw = value.strip()
+    try:
+        parsed = datetime.fromisoformat(
+            raw[:-1] + "+00:00" if raw.endswith(("Z", "z")) else raw
+        )
+    except ValueError as exc:
+        raise ValueError("invalid regular_last_completed_at") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("regular_last_completed_at must include a timezone")
+    return parsed.astimezone(timezone.utc)
+
+
+def _load_cadence_state(path: str) -> dict[str, Any] | None:
+    """Load the aggregate scheduler checkpoint; it is not source health."""
+    if not os.path.exists(path):
+        return None
+    if os.path.islink(path):
+        raise ValueError("cadence state must not be a symlink")
+    with open(path, encoding="utf-8") as handle:
+        state = json.load(handle)
+    if not isinstance(state, dict):
+        raise ValueError("cadence state must be an object")
+    unknown_fields = set(state) - _CADENCE_STATE_KEYS
+    missing_fields = _CADENCE_STATE_KEYS - set(state)
+    if unknown_fields:
+        raise ValueError(
+            "unknown cadence state keys: " + ", ".join(sorted(unknown_fields))
+        )
+    if missing_fields:
+        raise ValueError(
+            "missing cadence state keys: " + ", ".join(sorted(missing_fields))
+        )
+    if (
+        type(state["version"]) is not int
+        or state["version"] != CADENCE_STATE_VERSION
+    ):
+        raise ValueError("unsupported cadence state version")
+    regular_keys = state["regular_keys"]
+    if not isinstance(regular_keys, list) or not all(
+        isinstance(key, str) for key in regular_keys
+    ):
+        raise ValueError("regular_keys must be a list of strings")
+    if len(regular_keys) != len(set(regular_keys)):
+        raise ValueError("duplicate regular KOL keys in cadence state")
+    unknown_kols = set(regular_keys) - set(KOLS)
+    if unknown_kols:
+        raise ValueError(
+            "unknown KOL keys in cadence state: "
+            + ", ".join(sorted(unknown_kols))
+        )
+    _parse_cadence_timestamp(state["regular_last_completed_at"])
+    return state
+
+
+def _save_cadence_state(path: str, completed_at: datetime) -> None:
+    """Durably replace the scheduler checkpoint in the data directory."""
+    if completed_at.tzinfo is None or completed_at.utcoffset() is None:
+        raise ValueError("completed_at must include a timezone")
+    target = os.path.abspath(path)
+    parent = os.path.dirname(target)
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    if os.path.islink(target):
+        raise ValueError("cadence state must not be a symlink")
+    payload = {
+        "version": CADENCE_STATE_VERSION,
+        "regular_keys": list(REGULAR_KOL_KEYS),
+        "regular_last_completed_at": completed_at.astimezone(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat(),
+    }
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=".kol-cadence-state.",
+        dir=parent,
+        text=True,
+    )
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+        directory_fd = os.open(parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except Exception:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _regular_scan_is_due(
+    state: dict[str, Any] | None,
+    now: datetime,
+) -> bool:
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must include a timezone")
+    if state is None:
+        return True
+    if tuple(state["regular_keys"]) != REGULAR_KOL_KEYS:
+        return True
+    completed_at = _parse_cadence_timestamp(
+        state["regular_last_completed_at"]
+    )
+    if completed_at > now.astimezone(timezone.utc) + timedelta(minutes=5):
+        raise ValueError("regular_last_completed_at is in the future")
+    # The systemd timer is anchored to :00/:15/:30/:45 and intentionally adds
+    # jitter. Comparing exact elapsed time would make a batch completed at
+    # 00:02 miss the 00:30 run and drift to 00:45. Compare UTC half-hour
+    # schedule buckets instead; ``completed_at`` remains the auditable wall
+    # clock completion time.
+    interval_seconds = int(REGULAR_SCAN_INTERVAL.total_seconds())
+    current_slot = int(now.astimezone(timezone.utc).timestamp()) // interval_seconds
+    completed_slot = int(completed_at.timestamp()) // interval_seconds
+    return current_slot > completed_slot
+
+
+def _write_scan_batch(
+    data: dict[str, list[Any]],
+    requested: int,
+) -> dict[str, int]:
+    all_items: list[dict[str, Any]] = []
+    for items in data.values():
+        all_items.extend(items)
+    result = {
+        "requested": requested,
+        "with_items": len(data),
+        "scanned": len(all_items),
+        "inserted": 0,
+        "skipped": 0,
+    }
+    if all_items:
+        inserted, skipped = _write_to_db(all_items)
+        result.update({"inserted": inserted, "skipped": skipped})
+    return result
 
 
 # ─── CLI 命令 ──────────────────────────────────────────
@@ -980,6 +1212,85 @@ def cmd_collect(args: list[str]) -> None:
     print(json.dumps(result, ensure_ascii=False))
 
 
+def cmd_collect_tiered(args: list[str]) -> None:
+    """Persist hot KOLs first, then a due 30-minute regular batch.
+
+    The state timestamp means the *aggregate regular batch* completed. It does
+    not claim that every upstream source was healthy; per-source warnings stay
+    in ``source_warnings``.
+    """
+    if len(args) > 1:
+        raise ValueError("usage: collect-tiered [max_results]")
+    max_results = int(args[0]) if args else 5
+    if max_results < 1 or max_results > 20:
+        raise ValueError("max_results must be between 1 and 20")
+
+    X_SOURCE_WARNINGS.clear()
+    DISCOVERY_TRANSPORT_PROBES.clear()
+    hot_data = scan_selected(HOT_KOL_KEYS, max_results)
+    # Persist the fast lane before doing any slower regular-source work. A
+    # later regular failure therefore cannot discard already-found hot events.
+    hot_result = _write_scan_batch(hot_data, len(HOT_KOL_KEYS))
+    hot_transport = _discovery_transport_summary()
+    if hot_transport["attempted"]:
+        hot_result["transport_attempted"] = hot_transport["attempted"]
+        hot_result["transport_succeeded"] = hot_transport["succeeded"]
+
+    state_path = _cadence_state_path()
+    started_at = _utc_now()
+    state = _load_cadence_state(state_path)
+    regular_due = _regular_scan_is_due(state, started_at)
+    payload: dict[str, Any] = {
+        "mode": "tiered",
+        "hot": hot_result,
+        "regular": {"status": "deferred", "requested": len(REGULAR_KOL_KEYS)},
+    }
+
+    if regular_due:
+        DISCOVERY_TRANSPORT_PROBES.clear()
+        regular_data = scan_selected(REGULAR_KOL_KEYS, max_results)
+        regular_transport = _discovery_transport_summary()
+        if (
+            regular_transport["attempted"] > 0
+            and regular_transport["succeeded"] == 0
+        ):
+            raise RuntimeError(
+                "regular discovery transport unavailable: "
+                f"0/{regular_transport['attempted']} probes succeeded"
+            )
+        regular_result: dict[str, Any] = _write_scan_batch(
+            regular_data,
+            len(REGULAR_KOL_KEYS),
+        )
+        if regular_transport["attempted"]:
+            regular_result["transport_attempted"] = regular_transport[
+                "attempted"
+            ]
+            regular_result["transport_succeeded"] = regular_transport[
+                "succeeded"
+            ]
+        completed_at = _utc_now()
+        # Advance only after both the scan and required DB write completed.
+        _save_cadence_state(state_path, completed_at)
+        regular_result["status"] = "completed"
+        payload["regular"] = regular_result
+        payload["regular_last_completed_at"] = (
+            completed_at.astimezone(timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+        )
+    elif state is not None:
+        payload["regular_last_completed_at"] = state[
+            "regular_last_completed_at"
+        ]
+
+    if X_SOURCE_WARNINGS:
+        payload["source_warnings"] = [
+            X_SOURCE_WARNINGS[key] for key in sorted(X_SOURCE_WARNINGS)
+        ]
+    print(json.dumps(payload, ensure_ascii=False))
+
+
 # ─── Dispatcher ────────────────────────────────────────
 
 COMMANDS = {
@@ -990,6 +1301,7 @@ COMMANDS = {
     "digest": cmd_digest,
     "emergency": cmd_emergency,
     "collect": cmd_collect,
+    "collect-tiered": cmd_collect_tiered,
 }
 
 

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import stat
 import sys
+import tempfile
 import types
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -702,6 +704,317 @@ class CollectorFailureTests(unittest.TestCase):
 
         self.assertEqual(result, 1)
         self.assertIn("collector failed", stderr.getvalue())
+
+
+class TieredCollectorTests(unittest.TestCase):
+    def test_hot_lane_includes_serenity_and_partitions_known_directory(
+        self,
+    ) -> None:
+        self.assertIn("serenity", kol_tracker.HOT_KOL_KEYS)
+        self.assertFalse(
+            set(kol_tracker.HOT_KOL_KEYS) & set(kol_tracker.REGULAR_KOL_KEYS)
+        )
+        self.assertEqual(
+            set(kol_tracker.HOT_KOL_KEYS) | set(kol_tracker.REGULAR_KOL_KEYS),
+            set(kol_tracker.KOLS),
+        )
+
+    def test_unknown_kol_keys_are_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unknown KOL key"):
+            kol_tracker.scan_kol("serenitty")
+        with self.assertRaisesRegex(ValueError, "unknown KOL keys"):
+            kol_tracker.scan_selected(["serenity", "serenitty"])
+
+    def test_tiered_collect_persists_hot_before_scanning_regular(self) -> None:
+        start = datetime(2026, 9, 8, 1, 0, tzinfo=timezone.utc)
+        completed = start + timedelta(minutes=2)
+        events: list[str] = []
+
+        def scan(key: str, _max_results: int) -> list[dict[str, str]]:
+            events.append(f"scan:{key}")
+            return [{"title": key, "url": f"https://example.com/{key}"}]
+
+        def write(items: list[dict[str, str]]) -> tuple[int, int]:
+            events.append("write:" + ",".join(item["title"] for item in items))
+            return len(items), 0
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = str(Path(directory) / "cadence.json")
+            stdout = StringIO()
+            with mock.patch.object(
+                kol_tracker, "HOT_KOL_KEYS", ("musk", "serenity")
+            ), mock.patch.object(
+                kol_tracker, "REGULAR_KOL_KEYS", ("buffett",)
+            ), mock.patch.object(
+                kol_tracker, "scan_kol", side_effect=scan
+            ), mock.patch.object(
+                kol_tracker, "_write_to_db", side_effect=write
+            ), mock.patch.object(
+                kol_tracker, "_utc_now", side_effect=[start, completed]
+            ), mock.patch.dict(
+                "os.environ", {"KOL_CADENCE_STATE_PATH": state_path}
+            ), redirect_stdout(stdout):
+                kol_tracker.cmd_collect_tiered(["6"])
+
+            self.assertLess(
+                events.index("write:musk,serenity"),
+                events.index("scan:buffett"),
+            )
+            state = json.loads(Path(state_path).read_text(encoding="utf-8"))
+            self.assertEqual(stat.S_IMODE(Path(state_path).stat().st_mode), 0o600)
+            self.assertEqual(
+                list(Path(directory).glob(".kol-cadence-state.*")),
+                [],
+            )
+            self.assertEqual(state["regular_keys"], ["buffett"])
+            self.assertEqual(
+                state["regular_last_completed_at"],
+                "2026-09-08T01:02:00+00:00",
+            )
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(payload["regular"]["status"], "completed")
+            self.assertNotIn("source_health", payload)
+
+    def test_regular_failure_does_not_advance_checkpoint(self) -> None:
+        start = datetime(2026, 9, 8, 1, 0, tzinfo=timezone.utc)
+        writes: list[list[str]] = []
+
+        def scan(key: str, _max_results: int) -> list[dict[str, str]]:
+            if key == "buffett":
+                raise RuntimeError("regular source failed")
+            return [{"title": key, "url": f"https://example.com/{key}"}]
+
+        def write(items: list[dict[str, str]]) -> tuple[int, int]:
+            writes.append([item["title"] for item in items])
+            return len(items), 0
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = str(Path(directory) / "cadence.json")
+            with mock.patch.object(
+                kol_tracker, "HOT_KOL_KEYS", ("serenity",)
+            ), mock.patch.object(
+                kol_tracker, "REGULAR_KOL_KEYS", ("buffett",)
+            ), mock.patch.object(
+                kol_tracker, "scan_kol", side_effect=scan
+            ), mock.patch.object(
+                kol_tracker, "_write_to_db", side_effect=write
+            ), mock.patch.object(
+                kol_tracker, "_utc_now", return_value=start
+            ), mock.patch.dict(
+                "os.environ", {"KOL_CADENCE_STATE_PATH": state_path}
+            ):
+                with self.assertRaisesRegex(RuntimeError, "regular source failed"):
+                    kol_tracker.cmd_collect_tiered(["6"])
+
+            self.assertEqual(writes, [["serenity"]])
+            self.assertFalse(Path(state_path).exists())
+
+    def test_regular_database_failure_does_not_advance_checkpoint(self) -> None:
+        start = datetime(2026, 9, 8, 1, 0, tzinfo=timezone.utc)
+        writes: list[list[str]] = []
+
+        def scan(key: str, _max_results: int) -> list[dict[str, str]]:
+            return [{"title": key, "url": f"https://example.com/{key}"}]
+
+        def write(items: list[dict[str, str]]) -> tuple[int, int]:
+            writes.append([item["title"] for item in items])
+            if items[0]["title"] == "buffett":
+                raise RuntimeError("regular database write failed")
+            return len(items), 0
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = str(Path(directory) / "cadence.json")
+            with mock.patch.object(
+                kol_tracker, "HOT_KOL_KEYS", ("serenity",)
+            ), mock.patch.object(
+                kol_tracker, "REGULAR_KOL_KEYS", ("buffett",)
+            ), mock.patch.object(
+                kol_tracker, "scan_kol", side_effect=scan
+            ), mock.patch.object(
+                kol_tracker, "_write_to_db", side_effect=write
+            ), mock.patch.object(
+                kol_tracker, "_utc_now", return_value=start
+            ), mock.patch.dict(
+                "os.environ", {"KOL_CADENCE_STATE_PATH": state_path}
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "regular database write failed"
+                ):
+                    kol_tracker.cmd_collect_tiered(["6"])
+
+            self.assertEqual(writes, [["serenity"], ["buffett"]])
+            self.assertFalse(Path(state_path).exists())
+
+    def test_all_regular_discovery_transport_failures_do_not_advance_checkpoint(
+        self,
+    ) -> None:
+        now = datetime(2026, 9, 8, 1, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = str(Path(directory) / "cadence.json")
+            with mock.patch.object(
+                kol_tracker, "HOT_KOL_KEYS", ()
+            ), mock.patch.object(
+                kol_tracker, "REGULAR_KOL_KEYS", ("buffett",)
+            ), mock.patch.object(
+                kol_tracker, "http_get", return_value=""
+            ), mock.patch.object(
+                kol_tracker, "_utc_now", return_value=now
+            ), mock.patch.dict(
+                "os.environ", {"KOL_CADENCE_STATE_PATH": state_path}
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    r"regular discovery transport unavailable: 0/\d+",
+                ):
+                    kol_tracker.cmd_collect_tiered(["1"])
+
+            self.assertFalse(Path(state_path).exists())
+
+    def test_one_healthy_regular_discovery_transport_allows_empty_checkpoint(
+        self,
+    ) -> None:
+        now = datetime(2026, 9, 8, 1, 0, tzinfo=timezone.utc)
+
+        def response(url: str, **_kwargs: object) -> str:
+            if "bing.com" in url:
+                return "<rss><channel></channel></rss>"
+            return ""
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = str(Path(directory) / "cadence.json")
+            stdout = StringIO()
+            with mock.patch.object(
+                kol_tracker, "HOT_KOL_KEYS", ()
+            ), mock.patch.object(
+                kol_tracker, "REGULAR_KOL_KEYS", ("buffett",)
+            ), mock.patch.object(
+                kol_tracker, "http_get", side_effect=response
+            ), mock.patch.object(
+                kol_tracker, "_utc_now", side_effect=[now, now]
+            ), mock.patch.dict(
+                "os.environ", {"KOL_CADENCE_STATE_PATH": state_path}
+            ), redirect_stdout(stdout):
+                kol_tracker.cmd_collect_tiered(["1"])
+
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(payload["regular"]["status"], "completed")
+            self.assertGreater(payload["regular"]["transport_succeeded"], 0)
+            self.assertTrue(Path(state_path).exists())
+
+    def test_recent_regular_checkpoint_defers_only_regular_lane(self) -> None:
+        completed = datetime(2026, 9, 8, 1, 0, tzinfo=timezone.utc)
+        now = completed + timedelta(minutes=15)
+        scanned: list[str] = []
+
+        def scan(key: str, _max_results: int) -> list[dict[str, str]]:
+            scanned.append(key)
+            return []
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = str(Path(directory) / "cadence.json")
+            with mock.patch.object(
+                kol_tracker, "HOT_KOL_KEYS", ("serenity",)
+            ), mock.patch.object(
+                kol_tracker, "REGULAR_KOL_KEYS", ("buffett",)
+            ):
+                kol_tracker._save_cadence_state(state_path, completed)
+                stdout = StringIO()
+                with mock.patch.object(
+                    kol_tracker, "scan_kol", side_effect=scan
+                ), mock.patch.object(
+                    kol_tracker, "_utc_now", return_value=now
+                ), mock.patch.dict(
+                    "os.environ", {"KOL_CADENCE_STATE_PATH": state_path}
+                ), redirect_stdout(stdout):
+                    kol_tracker.cmd_collect_tiered(["6"])
+
+            self.assertEqual(scanned, ["serenity"])
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(payload["regular"]["status"], "deferred")
+            self.assertEqual(
+                payload["regular_last_completed_at"],
+                "2026-09-08T01:00:00+00:00",
+            )
+
+    def test_regular_lane_uses_half_hour_slots_without_timer_jitter_drift(
+        self,
+    ) -> None:
+        completed = datetime(
+            2026, 9, 8, 1, 2, 20, tzinfo=timezone.utc
+        )
+        state = {
+            "version": kol_tracker.CADENCE_STATE_VERSION,
+            "regular_keys": list(kol_tracker.REGULAR_KOL_KEYS),
+            "regular_last_completed_at": completed.isoformat(),
+        }
+        self.assertFalse(
+            kol_tracker._regular_scan_is_due(
+                state,
+                datetime(2026, 9, 8, 1, 15, 40, tzinfo=timezone.utc),
+            )
+        )
+        self.assertTrue(
+            kol_tracker._regular_scan_is_due(
+                state,
+                datetime(2026, 9, 8, 1, 30, 5, tzinfo=timezone.utc),
+            )
+        )
+
+    def test_cadence_state_rejects_unknown_fields_and_kols(self) -> None:
+        cases = (
+            {
+                "version": 1,
+                "regular_keys": ["buffett"],
+                "regular_last_completed_at": "2026-09-08T01:00:00+00:00",
+                "unexpected": True,
+            },
+            {
+                "version": 1,
+                "regular_keys": ["unknown"],
+                "regular_last_completed_at": "2026-09-08T01:00:00+00:00",
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "cadence.json"
+            for payload in cases:
+                with self.subTest(payload=payload):
+                    state_path.write_text(json.dumps(payload), encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, "unknown"):
+                        kol_tracker._load_cadence_state(str(state_path))
+
+    def test_invalid_state_fails_observably_after_hot_lane_is_persisted(
+        self,
+    ) -> None:
+        now = datetime(2026, 9, 8, 1, 0, tzinfo=timezone.utc)
+        writes: list[list[str]] = []
+
+        def scan(key: str, _max_results: int) -> list[dict[str, str]]:
+            return [{"title": key, "url": f"https://example.com/{key}"}]
+
+        def write(items: list[dict[str, str]]) -> tuple[int, int]:
+            writes.append([item["title"] for item in items])
+            return len(items), 0
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "cadence.json"
+            state_path.write_text('{"unknown": true}', encoding="utf-8")
+            with mock.patch.object(
+                kol_tracker, "HOT_KOL_KEYS", ("serenity",)
+            ), mock.patch.object(
+                kol_tracker, "REGULAR_KOL_KEYS", ("buffett",)
+            ), mock.patch.object(
+                kol_tracker, "scan_kol", side_effect=scan
+            ), mock.patch.object(
+                kol_tracker, "_write_to_db", side_effect=write
+            ), mock.patch.object(
+                kol_tracker, "_utc_now", return_value=now
+            ), mock.patch.dict(
+                "os.environ", {"KOL_CADENCE_STATE_PATH": str(state_path)}
+            ):
+                with self.assertRaisesRegex(ValueError, "unknown"):
+                    kol_tracker.cmd_collect_tiered(["6"])
+
+        self.assertEqual(writes, [["serenity"]])
 
 
 if __name__ == "__main__":

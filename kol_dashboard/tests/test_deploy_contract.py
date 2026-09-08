@@ -85,6 +85,46 @@ class DeploymentContractTests(unittest.TestCase):
         self.assertIn("python3 -c 'import db; db.init()'", self.deploy)
         self.assertIn("KOL_DB_WRITE_REQUIRED=1", self.collect)
 
+    def test_kol_collector_uses_one_tiered_writer_every_15_minutes(self) -> None:
+        self.assertIn('"$TRACKER" collect-tiered 6', self.collect)
+        self.assertIn('KOL_CADENCE_STATE_PATH="$KOL_CADENCE_STATE"', self.collect)
+        self.assertIn('flock -n 9', self.collect)
+        self.assertIn('skipped overlapping collection', self.collect)
+        self.assertIn('|| KOL_RC=$?', self.collect)
+        self.assertIn('hot-lane downstream work completed', self.collect)
+        overlap_start = self.collect.index("if ! flock -n 9; then")
+        overlap_end = self.collect.index("    fi", overlap_start)
+        self.assertIn("exit 0", self.collect[overlap_start:overlap_end])
+
+        timer_start = self.deploy.index(
+            'cat > "$REMOTE_STAGE/kol-collect-kol.timer"'
+        )
+        timer_end = self.deploy.index(
+            'cat > "$REMOTE_STAGE/kol-collect-macro.timer"', timer_start
+        )
+        timer = self.deploy[timer_start:timer_end]
+        self.assertIn("OnCalendar=*-*-* *:00,15,30,45:00", timer)
+        self.assertIn("RandomizedDelaySec=2min", timer)
+        self.assertIn("AccuracySec=30s", timer)
+        self.assertIn("Persistent=true", timer)
+        self.assertIn("Unit=kol-collect-kol.service", timer)
+        self.assertNotIn("OnUnitActiveSec=", timer)
+        self.assertIn(
+            "Environment=KOL_CADENCE_STATE_PATH=/opt/kol-dashboard/data/kol-cadence-state.json",
+            self.deploy,
+        )
+        kol_start = self.collect.index("  kol)")
+        macro_start = self.collect.index("  macro)", kol_start)
+        kol_job = self.collect[kol_start:macro_start]
+        self.assertLess(
+            kol_job.index('decision_collect.py" relations'),
+            kol_job.index('exit "$KOL_RC"'),
+        )
+        self.assertLess(
+            kol_job.index("signal_enrichment"),
+            kol_job.index('exit "$KOL_RC"'),
+        )
+
     def test_daily_collector_is_packaged_and_scheduled_hourly(self) -> None:
         self.assertIn("briefing_collect.py", self.deploy)
         daily_start = self.collect.index("  daily)")

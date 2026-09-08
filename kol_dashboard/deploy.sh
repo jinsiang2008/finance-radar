@@ -936,7 +936,9 @@ for job in kol macro decision daily enrich; do
     EXTRA_ENVIRONMENT="EnvironmentFile=-/etc/kol-dashboard/deepseek.env"
     EXTRA_HARDENING="LimitCORE=0"
   fi
-  if [[ "$job" == "daily" ]]; then
+  if [[ "$job" == "kol" ]]; then
+    EXTRA_SCHEDULE="Environment=KOL_CADENCE_STATE_PATH=/opt/kol-dashboard/data/kol-cadence-state.json"
+  elif [[ "$job" == "daily" ]]; then
     EXTRA_SCHEDULE="Environment=KOL_DAILY_REFRESH_SCHEDULE=hourly"
   elif [[ "$job" == "enrich" ]]; then
     EXTRA_EXEC_START_PRE="ExecStartPre=/usr/bin/rm -f /opt/kol-dashboard/data/enrichment.pending"
@@ -989,13 +991,14 @@ install -m 644 "$REMOTE_STAGE/kol-enrich-wakeup.path" \
 
 cat > "$REMOTE_STAGE/kol-collect-kol.timer" <<'UNIT'
 [Unit]
-Description=Scan KOL news every 30 minutes
+Description=Scan priority KOLs every 15 minutes and gate regular KOLs at 30 minutes
 
 [Timer]
-OnBootSec=3min
-OnUnitActiveSec=30min
+OnCalendar=*-*-* *:00,15,30,45:00
 RandomizedDelaySec=2min
+AccuracySec=30s
 Persistent=true
+Unit=kol-collect-kol.service
 
 [Install]
 WantedBy=timers.target

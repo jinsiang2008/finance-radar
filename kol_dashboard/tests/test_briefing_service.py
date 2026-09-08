@@ -337,6 +337,9 @@ class BriefingBuildTests(unittest.TestCase):
                 "dedup_stats",
                 "lead",
                 "highlights",
+                "major_count",
+                "all_major",
+                "highlights_overflow",
                 "firsthand",
                 "watchpoints",
                 "sections",
@@ -351,6 +354,9 @@ class BriefingBuildTests(unittest.TestCase):
         self.assertIsNone(result["source_coverage_stale"])
         self.assertEqual(result["lead"], {})
         self.assertEqual(result["highlights"], [])
+        self.assertEqual(result["major_count"], 0)
+        self.assertEqual(result["all_major"], [])
+        self.assertEqual(result["highlights_overflow"], [])
         self.assertEqual(result["firsthand"], [])
         self.assertEqual(result["watchpoints"], [])
         self.assertEqual(result["coverage_window_hours"], 24)
@@ -651,6 +657,48 @@ class BriefingBuildTests(unittest.TestCase):
         self.assertEqual(result["coverage"]["official"], 1)
         self.assertEqual(result["coverage"]["first_party"], 1)
         self.assertEqual(result["coverage"]["ai_ready"], 1)
+
+    def test_all_major_exposes_critical_and_high_news_beyond_top_five(self) -> None:
+        events = [
+            self.event(
+                index,
+                f"Bank {index} reports a distinct high-impact earnings event",
+                published_at=f"2026-09-04T01:{50-index:02d}:00+00:00",
+                source_url=f"https://www.reuters.com/markets/major-{index}",
+                impact="critical" if index == 0 else "high",
+            )
+            for index in range(7)
+        ]
+
+        result = briefing_service.build_latest_briefing(
+            repository=FakeRepository(events),
+            public_macro=None,
+            decision_record=None,
+            now=NOW,
+        )
+
+        self.assertEqual(result["major_count"], 7)
+        self.assertEqual(len(result["highlights"]), 5)
+        self.assertEqual(len(result["all_major"]), 7)
+        self.assertEqual(len(result["highlights_overflow"]), 2)
+        self.assertEqual(
+            {item["story_key"] for item in result["all_major"]},
+            {
+                item["story_key"] for item in result["highlights"]
+            }
+            | {
+                item["story_key"] for item in result["highlights_overflow"]
+            },
+        )
+        self.assertEqual(result["all_major"][0]["market_impact"], "critical")
+        self.assertEqual(
+            {item["market_impact"] for item in result["all_major"]},
+            {"critical", "high"},
+        )
+        self.assertIn(
+            "market_impact:critical",
+            result["all_major"][0]["rank_reason_codes"],
+        )
 
     def test_daily_assets_use_canonical_name_over_stale_model_label(self) -> None:
         event = self.event(
@@ -2151,7 +2199,7 @@ class BriefingBuildTests(unittest.TestCase):
         self.assertEqual(macro["total_count"], len(titles))
         self.assertEqual(result["dedup_stats"]["semantic_matches"], 0)
 
-    def test_section_freshness_uses_only_displayed_verified_publication_time(self) -> None:
+    def test_high_impact_is_not_hidden_by_lower_impact_source_tier(self) -> None:
         old_items = []
         for index in range(6):
             item = self.event(
@@ -2182,10 +2230,11 @@ class BriefingBuildTests(unittest.TestCase):
             section for section in result["sections"] if section["key"] == "finance"
         )
         self.assertEqual(len(finance["items"]), 6)
-        self.assertTrue(finance["stale"])
-        self.assertEqual(finance["source_as_of"], "2026-09-03T22:00:00+00:00")
-        self.assertTrue(result["stale"])
-        self.assertEqual(result["source_as_of"], "2026-09-03T22:00:00+00:00")
+        self.assertEqual(finance["items"][0]["id"], "99")
+        self.assertFalse(finance["stale"])
+        self.assertEqual(finance["source_as_of"], "2026-09-04T01:58:00+00:00")
+        self.assertFalse(result["stale"])
+        self.assertEqual(result["source_as_of"], "2026-09-04T01:58:00+00:00")
 
         old_only = briefing_service.build_latest_briefing(
             repository=FakeRepository([old_items[0]]),
@@ -2576,6 +2625,12 @@ class BriefingBuildTests(unittest.TestCase):
         self.assertEqual(ai["source_as_of"], "2026-09-04T01:55:00+00:00")
         self.assertEqual(result["content_as_of"], "2026-09-04T01:55:00+00:00")
         self.assertIn("HN 120", item["rank_reason"])
+        self.assertIn("仅作热度排序", item["rank_reason"])
+        self.assertEqual(item["market_impact"], "unknown")
+        self.assertIn(
+            "discovery:hn_engagement_validated",
+            item["rank_reason_codes"],
+        )
         self.assertNotIn(item, result["firsthand"])
 
     def test_featured_only_digest_is_visible_but_not_time_verified(self) -> None:

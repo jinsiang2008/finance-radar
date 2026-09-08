@@ -110,7 +110,14 @@ _EVIDENCE_BASES = {
     "indicator_data",
     "official_body",
 }
-_IMPACT_RANK = {"high": 3, "medium": 2, "low": 1, "none": 0, "unknown": 0}
+_IMPACT_RANK = {
+    "critical": 4,
+    "high": 3,
+    "medium": 2,
+    "low": 1,
+    "none": 0,
+    "unknown": 0,
+}
 _TIER_RANK = {"official": 3, "first_party": 3, "reporting": 1, "discovery": 0}
 _EVIDENCE_RANK = {
     "official_body": 3,
@@ -192,7 +199,32 @@ _ARXIV_URL_RE = re.compile(
     r"(?P<id>[0-9]{4}\.[0-9]{4,5})(?:v[0-9]+)?(?:\.pdf)?(?:[?#].*)?$",
     re.IGNORECASE,
 )
-_IMPACT_LABELS = {"high": "高影响", "medium": "中影响", "low": "低影响"}
+_IMPACT_LABELS = {
+    "critical": "极高影响",
+    "high": "高影响",
+    "medium": "中影响",
+    "low": "低影响",
+    "none": "无明确市场影响",
+}
+_IMPACT_BASIS_LABELS = {
+    "deterministic_rule": "确定性规则",
+    "macro_rule": "宏观规则",
+    "ai_reviewed_rule_medium": "规则中影响 + AI 证据复核",
+    "ai_review_only": "AI 证据复核，最高仅列中影响",
+    "ai_reviewed_demotion": "AI 证据复核后下调",
+    "repository_projection": "已校验上游规则",
+    "not_declared": "上游未声明市场影响",
+}
+_IMPACT_BASES = frozenset(_IMPACT_BASIS_LABELS)
+_IMPACT_BASIS_RANK = {
+    "deterministic_rule": 4,
+    "macro_rule": 4,
+    "ai_reviewed_rule_medium": 3,
+    "ai_reviewed_demotion": 3,
+    "ai_review_only": 2,
+    "repository_projection": 1,
+    "not_declared": 0,
+}
 _AGGREGATOR_SOURCE_RE = re.compile(
     r"(?:\bbing\b|\bbaidu\b|\bgoogle\s+news\b|\bhacker\s+news\b|"
     r"\bai\s+(?:digest|brief)\b|百度(?:新闻|资讯)|必应(?:新闻|资讯))",
@@ -504,6 +536,8 @@ _PUBLIC_ITEM_FIELDS = (
     "summary",
     "why_it_matters",
     "impact",
+    "market_impact",
+    "impact_basis",
     "source_tier",
     "source_label",
     "source_url",
@@ -521,6 +555,7 @@ _PUBLIC_ITEM_FIELDS = (
     "evidence_basis",
     "assets",
     "rank_reason",
+    "rank_reason_codes",
     "story_key",
     "primary_section",
     "cross_tags",
@@ -1591,6 +1626,31 @@ def _impact(value: Any) -> str:
     return normalized if normalized in _IMPACT_RANK else "unknown"
 
 
+def _event_impact_basis(source: Mapping[str, Any], impact: str) -> str:
+    rule_impact = _impact(source.get("rule_impact"))
+    enrichment = source.get("ai_enrichment")
+    ai_impact = (
+        _impact(enrichment.get("impact_level"))
+        if isinstance(enrichment, Mapping)
+        else "unknown"
+    )
+    if rule_impact != "unknown" and impact == rule_impact:
+        return "deterministic_rule"
+    if rule_impact == "medium" and impact == "high" and ai_impact == "high":
+        return "ai_reviewed_rule_medium"
+    if rule_impact == "low" and impact == "medium" and ai_impact in {
+        "high",
+        "medium",
+    }:
+        return "ai_review_only"
+    if rule_impact == "medium" and impact == "low" and ai_impact == "none":
+        return "ai_reviewed_demotion"
+    # Real repository rows include ``rule_impact``.  This fallback keeps the
+    # service compatible with older repository adapters without pretending
+    # that an unlabelled projection came from AI or is a probability.
+    return "repository_projection"
+
+
 def _assets(enrichment: Mapping[str, Any] | None) -> list[dict[str, Any]]:
     if enrichment is None or not isinstance(enrichment.get("assets"), list):
         return []
@@ -1619,11 +1679,41 @@ def _assets(enrichment: Mapping[str, Any] | None) -> list[dict[str, Any]]:
     return output
 
 
-def _rank_reason(item: Mapping[str, Any]) -> str:
+def _rank_reason_details(item: Mapping[str, Any]) -> tuple[str, list[str]]:
     parts: list[str] = []
-    impact = _text(item.get("impact"), 24).lower()
+    codes: list[str] = []
+    impact = _impact(item.get("impact"))
     tier = _text(item.get("source_tier"), 24).lower()
+    impact_basis = _text(item.get("impact_basis"), 48).lower()
     content_kind = _text(item.get("_content_kind"), 32).lower()
+    if impact in _IMPACT_LABELS:
+        basis_label = _IMPACT_BASIS_LABELS.get(impact_basis)
+        parts.append(
+            f"{_IMPACT_LABELS[impact]}（{basis_label}）"
+            if basis_label
+            else _IMPACT_LABELS[impact]
+        )
+        codes.append(f"market_impact:{impact}")
+        if impact_basis in _IMPACT_BASES:
+            codes.append(f"impact_basis:{impact_basis}")
+    else:
+        parts.append("市场影响未声明（不以来源等级或热度代替）")
+        codes.append("market_impact:unknown")
+        if impact_basis in _IMPACT_BASES:
+            codes.append(f"impact_basis:{impact_basis}")
+    if tier in _TIER_LABELS:
+        parts.append(f"{_TIER_LABELS[tier]}（来源等级）")
+        codes.append(f"source_tier:{tier}")
+    if item.get("time_status") == "verified":
+        parts.append(
+            "HN 提交时间已核验"
+            if content_kind == "hn_story"
+            else "发布时间已核验"
+        )
+        codes.append("time:publication_verified")
+    elif item.get("time_status") == "featured_only":
+        parts.append("精选时间已核验；原始发布时间未核验")
+        codes.append("time:featured_verified_only")
     if _strict_integer(item.get("hn_id"), minimum=1, maximum=9_007_199_254_740_991):
         score = _strict_integer(
             item.get("hn_score"), minimum=0, maximum=1_000_000
@@ -1632,22 +1722,23 @@ def _rank_reason(item: Mapping[str, Any]) -> str:
             item.get("hn_comments"), minimum=0, maximum=1_000_000
         )
         if score is not None and comments is not None:
-            parts.append(f"HN {score} 分 / {comments} 评论")
-    if impact in _IMPACT_LABELS:
-        parts.append(_IMPACT_LABELS[impact])
-    if tier in _TIER_LABELS:
-        parts.append(_TIER_LABELS[tier])
-    if item.get("time_status") == "verified":
-        parts.append(
-            "HN 提交时间已核验"
-            if content_kind == "hn_story"
-            else "发布时间已核验"
-        )
-    elif item.get("time_status") == "featured_only":
-        parts.append("精选时间已核验")
+            parts.append(f"HN {score} 分 / {comments} 评论（仅作热度排序）")
+            codes.append("discovery:hn_engagement_validated")
     if item.get("ai_summary_used") is True:
         parts.append("AI 摘要已就绪")
-    return " · ".join(parts[:3])
+        codes.append("summary:ai_ready")
+    return " · ".join(parts[:5]), codes
+
+
+def _set_rank_reason(item: dict[str, Any]) -> None:
+    reason, codes = _rank_reason_details(item)
+    item["rank_reason"] = reason
+    item["rank_reason_codes"] = codes
+
+
+def _rank_reason(item: Mapping[str, Any]) -> str:
+    """Compatibility helper for callers that only need display copy."""
+    return _rank_reason_details(item)[0]
 
 
 def _event_highlight(source: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -1684,6 +1775,7 @@ def _event_highlight(source: Mapping[str, Any]) -> dict[str, Any] | None:
             420,
         ),
         "impact": impact,
+        "impact_basis": _event_impact_basis(source, impact),
         "source_tier": classify_source(
             source,
             evidence_basis=trusted_basis,
@@ -1743,7 +1835,7 @@ def _event_highlight(source: Mapping[str, Any]) -> dict[str, Any] | None:
     last_updated = _latest_timestamp(source, ("published_at",))
     if last_updated:
         item["last_updated_at"] = last_updated
-    item["rank_reason"] = _rank_reason(item)
+    _set_rank_reason(item)
     return item
 
 
@@ -1776,6 +1868,7 @@ def _macro_highlight(source: Mapping[str, Any], macro: Mapping[str, Any]) -> dic
         # Macro severity is the collector's deterministic public gate.  AI is
         # used to compress evidence, never to promote Daily ranking severity.
         "impact": _impact(source.get("severity")),
+        "impact_basis": "macro_rule",
         "source_tier": classify_source(
             source,
             evidence_basis=trusted_basis,
@@ -1830,7 +1923,7 @@ def _macro_highlight(source: Mapping[str, Any], macro: Mapping[str, Any]) -> dic
     last_updated = _latest_timestamp(source, ("published_at",))
     if last_updated:
         item["last_updated_at"] = last_updated
-    item["rank_reason"] = _rank_reason(item)
+    _set_rank_reason(item)
     return item
 
 
@@ -2098,6 +2191,7 @@ def _imported_highlight(
         # Imported priority is derived from validated source directness and
         # publication time instead of trusting an undeclared field.
         "impact": "unknown",
+        "impact_basis": "not_declared",
         "source_tier": tier,
         "source_label": _text(
             source.get("source_label") or source.get("source"), 120
@@ -2173,7 +2267,7 @@ def _imported_highlight(
             break
     if effective_at:
         item["effective_at"] = effective_at
-    item["rank_reason"] = _rank_reason(item)
+    _set_rank_reason(item)
     return item
 
 
@@ -2280,8 +2374,8 @@ def _canonical_url_bucket(item: Mapping[str, Any]) -> str:
 
 def _highlight_rank(item: Mapping[str, Any]) -> tuple[int, int, float, str, str]:
     return (
-        -_TIER_RANK.get(_text(item.get("source_tier"), 24).lower(), 0),
         -_IMPACT_RANK.get(_text(item.get("impact"), 24).lower(), 0),
+        -_TIER_RANK.get(_text(item.get("source_tier"), 24).lower(), 0),
         -_highlight_time(item).timestamp(),
         _text(item.get("kind"), 24),
         _text(item.get("id"), 80),
@@ -2399,12 +2493,21 @@ def _merge_duplicate_group(
         )
     )
     if not prefer_latest_revision:
-        highest_impact = max(
-            (_impact(item.get("impact")) for item in group),
-            key=lambda value: _IMPACT_RANK.get(value, 0),
-            default="unknown",
+        strongest_impact_item = max(
+            group,
+            key=lambda item: (
+                _IMPACT_RANK.get(_impact(item.get("impact")), 0),
+                _IMPACT_BASIS_RANK.get(
+                    _text(item.get("impact_basis"), 48).lower(), 0
+                ),
+                _TIER_RANK.get(_text(item.get("source_tier"), 24).lower(), 0),
+                _highlight_time(item).timestamp(),
+            ),
         )
-        base["impact"] = highest_impact
+        base["impact"] = _impact(strongest_impact_item.get("impact"))
+        base["impact_basis"] = _text(
+            strongest_impact_item.get("impact_basis"), 48
+        ) or "repository_projection"
 
     base_trust = _revision_trust_key(base)
     trusted_group = [
@@ -2440,11 +2543,19 @@ def _merge_duplicate_group(
             }
         )
     if prefer_latest_revision and _impact(base.get("impact")) == "unknown":
-        base["impact"] = max(
-            (_impact(item.get("impact")) for item in trusted_group),
-            key=lambda value: _IMPACT_RANK.get(value, 0),
-            default="unknown",
+        strongest_impact_item = max(
+            trusted_group,
+            key=lambda item: (
+                _IMPACT_RANK.get(_impact(item.get("impact")), 0),
+                _IMPACT_BASIS_RANK.get(
+                    _text(item.get("impact_basis"), 48).lower(), 0
+                ),
+            ),
         )
+        base["impact"] = _impact(strongest_impact_item.get("impact"))
+        base["impact_basis"] = _text(
+            strongest_impact_item.get("impact_basis"), 48
+        ) or "repository_projection"
     observed = [
         value
         for item in trusted_group
@@ -2506,7 +2617,7 @@ def _merge_duplicate_group(
         base["_section_hint"] = section_hints[0]
 
     base["story_key"] = _story_key(group)
-    base["rank_reason"] = _rank_reason(base)
+    _set_rank_reason(base)
     return base
 
 
@@ -2714,11 +2825,35 @@ def _section_rank(
         else 4
     )
     trusted_heat = _trusted_hn_heat(item, now=now)
+    # Market impact and source quality are independent dimensions.  An
+    # explicit critical/high impact therefore leads a lower-impact story even
+    # when the latter comes from a more authoritative source.  Source tier,
+    # recency and HN engagement then order evidence within the same impact
+    # level; HN heat never changes ``impact`` itself.
     return (
+        -_IMPACT_RANK.get(_text(item.get("impact"), 24).lower(), 0),
         freshness_quality,
         -tier,
-        -_IMPACT_RANK.get(_text(item.get("impact"), 24).lower(), 0),
         -trusted_heat,
+        -_highlight_time(item).timestamp(),
+        _text(item.get("story_key"), 80),
+    )
+
+
+def _firsthand_rank(
+    item: Mapping[str, Any],
+    *,
+    now: datetime,
+) -> tuple[int, int, float, str]:
+    selected_at = _selection_time(item)
+    is_fresh = (
+        selected_at is not None
+        and selected_at <= now
+        and (now - selected_at).total_seconds() <= SECTION_STALE_AFTER_SECONDS
+    )
+    return (
+        0 if is_fresh else 1,
+        -_IMPACT_RANK.get(_impact(item.get("impact")), 0),
         -_highlight_time(item).timestamp(),
         _text(item.get("story_key"), 80),
     )
@@ -2730,6 +2865,9 @@ def _public_item(item: Mapping[str, Any]) -> dict[str, Any]:
         for key in _PUBLIC_ITEM_FIELDS
         if key in item
     }
+    # Keep the established ``impact`` field while adding an explicit name that
+    # cannot be confused with source quality or discovery heat.
+    output["market_impact"] = _impact(item.get("impact"))
     content_kind = _text(item.get("_content_kind"), 32).lower()
     if content_kind in _DISCOVERY_KINDS:
         output["kind"] = content_kind
@@ -2786,10 +2924,23 @@ def _top_highlights(
     selected: Mapping[str, list[dict[str, Any]]],
     *,
     now: datetime,
+    major_items: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Select Top 5 from section contents with a one-per-section first pass."""
+    """Select Top 5 without allowing section diversity to hide major news."""
     output: list[dict[str, Any]] = []
     used: set[str] = set()
+    for item in sorted(
+        major_items or [], key=lambda value: _section_rank(value, now=now)
+    ):
+        story_key = _text(item.get("story_key"), 80)
+        if story_key and story_key not in used:
+            used.add(story_key)
+            output.append(item)
+        if len(output) >= MAX_HIGHLIGHTS:
+            return output
+
+    # Once every major item that fits is retained, use a one-per-section pass
+    # to keep the remaining slots broad rather than filling them from one rail.
     heads = [
         items[0]
         for key in SECTION_KEYS
@@ -3063,8 +3214,29 @@ def build_latest_briefing(
     candidates.extend(_imported_candidates(imported_snapshot, now=current))
     ranked, dedup_stats = _deduplicate_with_stats(candidates)
     sections, selected_by_section = _section_payloads(ranked, now=current)
-    highlight_items = _top_highlights(selected_by_section, now=current)
+    major_items = sorted(
+        [
+            item
+            for item in ranked
+            if _impact(item.get("impact")) in {"critical", "high"}
+        ],
+        key=lambda item: _section_rank(item, now=current),
+    )
+    highlight_items = _top_highlights(
+        selected_by_section,
+        now=current,
+        major_items=major_items,
+    )
     highlights = [_public_item(item) for item in highlight_items]
+    highlighted_story_keys = {
+        _text(item.get("story_key"), 80) for item in highlight_items
+    }
+    all_major = [_public_item(item) for item in major_items]
+    highlights_overflow = [
+        _public_item(item)
+        for item in major_items
+        if _text(item.get("story_key"), 80) not in highlighted_story_keys
+    ]
     public_ranked = [_public_item(item) for item in ranked]
     firsthand = sorted(
         (
@@ -3072,7 +3244,7 @@ def build_latest_briefing(
             for item in public_ranked
             if item.get("source_tier") in {"official", "first_party"}
         ),
-        key=lambda item: _section_rank(item, now=current),
+        key=lambda item: _firsthand_rank(item, now=current),
     )[:MAX_FIRSTHAND]
     watchpoints = _watchpoints(decision_record)
     source_coverage_as_of = _imported_source_coverage_as_of(
@@ -3084,6 +3256,8 @@ def build_latest_briefing(
         for item in section_items:
             displayed_items_by_story[_text(item.get("story_key"), 80)] = item
     for item in firsthand:
+        displayed_items_by_story[_text(item.get("story_key"), 80)] = item
+    for item in major_items:
         displayed_items_by_story[_text(item.get("story_key"), 80)] = item
     as_of = _source_as_of(
         list(displayed_items_by_story.values()),
@@ -3137,6 +3311,12 @@ def build_latest_briefing(
         "dedup_stats": dedup_stats,
         "lead": _lead(highlights, macro, safe_history),
         "highlights": highlights,
+        # Top 5 remains a compact compatibility view.  Major news outside
+        # those five is explicit and bounded by the validated input limits,
+        # so a client can retain it in an unread/attention queue.
+        "major_count": len(major_items),
+        "all_major": all_major,
+        "highlights_overflow": highlights_overflow,
         "firsthand": firsthand,
         "watchpoints": watchpoints,
         "sections": sections,

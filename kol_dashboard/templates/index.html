@@ -18,7 +18,7 @@
     } catch (e) {}
   })();
 </script>
-  <link rel="stylesheet" href="static/style.css?v=38" />
+  <link rel="stylesheet" href="static/style.css?v=39" />
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ccircle cx='50' cy='50' r='42' fill='%230b1720' stroke='%2331d69b' stroke-width='6'/%3E%3Ccircle cx='50' cy='50' r='20' fill='none' stroke='%234ab8d8' stroke-width='5'/%3E%3Cpath d='M50 50L82 24' stroke='%23f4b942' stroke-width='6' stroke-linecap='round'/%3E%3Ccircle cx='50' cy='50' r='7' fill='%23eef4f2'/%3E%3C/svg%3E" />
 </head>
 <body>
@@ -171,6 +171,12 @@
         <span class="daily-as-of" id="daily-as-of">数据时间待确认</span>
       </div>
     </header>
+
+    <section class="attention-desk" id="daily-attention-desk"
+             aria-labelledby="daily-attention-title" hidden></section>
+
+    <aside class="freshness-banner" id="daily-update-banner" role="status"
+           aria-live="polite" aria-atomic="true" hidden></aside>
 
     <nav class="daily-jump-nav" aria-label="简报栏目" hidden>
       <a href="#daily-highlights-title">60 秒读完</a>
@@ -352,6 +358,9 @@
       <p>按发布时间、影响和关联记录降噪；重复转载不等于独立确认。</p>
     </header>
 
+    <section class="attention-desk" id="kol-attention-desk"
+             aria-labelledby="kol-attention-title" hidden></section>
+
     <section class="statstrip" id="stats">
       <div class="stat"><span class="stat-num" id="stat-total">–</span><span class="stat-label">窗口内动态</span></div>
       <div class="stat is-high"><span class="stat-num" id="stat-high">–</span><span class="stat-label">高影响</span></div>
@@ -398,6 +407,9 @@
       </div>
     </section>
 
+    <aside class="freshness-banner" id="kol-update-banner" role="status"
+           aria-live="polite" aria-atomic="true" hidden></aside>
+
     <p class="feed-status" id="feed-status" role="status" aria-live="polite">正在加载信号流…</p>
 
     <section id="feed" class="feed" aria-busy="true" aria-labelledby="feed-status">
@@ -415,7 +427,7 @@
   <div class="wrap footer-inner">
     <span>研究辅助 · 风险分值不等于事件概率 · 条件性方向不构成投资建议</span>
     <span class="footer-right">
-      <span>KOL 约 30 分钟采集 · 宏观/决策每小时计算 · Daily 可见时每 5 分钟检查更新</span>
+      <span>重点 KOL 约 15 分钟、全量约 30 分钟采集 · 宏观/决策每小时计算 · 页面可见时每 5 分钟检查更新</span>
       <span id="footer-meta"></span>
       <button type="button" class="footer-support" data-support-open>☕ 支持服务器运行</button>
     </span>
@@ -492,6 +504,6 @@
   </div>
 </div>
 
-  <script src="static/app.js?v=38"></script>
+  <script src="static/app.js?v=39"></script>
 </body>
 </html>

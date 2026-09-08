@@ -19,6 +19,8 @@
     authStatusLoaded: false,
     logoutPending: false,
     dailyData: null,
+    pendingDailyData: null,
+    pendingDailyNewKeys: [],
     dailyRequestGeneration: 0,
     optionsData: null,
     optionsRequestGeneration: 0,
@@ -55,6 +57,7 @@
     kolCatalogLoaded: false,
     loadedKolFilterSignature: "",
     feedItems: [],
+    pendingFeedUpdate: null,
     expandedClusters: new Set(),
     feedLoadedCount: 0,
     feedVisibleCount: 0,
@@ -91,6 +94,7 @@
     aiRequestInFlight: new Map(),
     aiRequestPollTimers: new Map(),
     authReturnFocus: null,
+    publicAttention: null,
   };
 
   let privateSessionChannel = null;
@@ -1392,6 +1396,7 @@
   }
 
   function dailyExternalActionsHTML(item) {
+    const attentionKey = dailyAttentionKey(item);
     const kind = dailyItemKind(item);
     const originalUrl = safeExternalUrl(item?.original_url);
     const sourceUrl = safeExternalUrl(item?.source_url || item?.url);
@@ -1412,11 +1417,11 @@
             ? "打开策展条目"
             : "打开原文";
       links.push(`<a class="daily-source-link" href="${esc(primaryUrl)}" target="_blank"
-        rel="noopener noreferrer">${primaryLabel} <span aria-hidden="true">↗</span></a>`);
+        rel="noopener noreferrer" data-attention-read="${esc(attentionKey)}">${primaryLabel} <span aria-hidden="true">↗</span></a>`);
     }
     if (discussionUrl && discussionUrl !== primaryUrl) {
       links.push(`<a class="daily-context-link" href="${esc(discussionUrl)}" target="_blank"
-        rel="noopener noreferrer">HN 讨论 <span aria-hidden="true">↗</span></a>`);
+        rel="noopener noreferrer" data-attention-read="${esc(attentionKey)}">HN 讨论 <span aria-hidden="true">↗</span></a>`);
     }
     if (
       curatedOriginalUrl &&
@@ -1424,7 +1429,7 @@
       sourceUrl !== curatedOriginalUrl
     ) {
       links.push(`<a class="daily-context-link" href="${esc(sourceUrl)}" target="_blank"
-        rel="noopener noreferrer">策展条目 <span aria-hidden="true">↗</span></a>`);
+        rel="noopener noreferrer" data-attention-read="${esc(attentionKey)}">策展条目 <span aria-hidden="true">↗</span></a>`);
     }
     return links.join("");
   }
@@ -1466,7 +1471,7 @@
   }
 
   function dailyHighlightHTML(item, index) {
-    const impact = String(item?.impact || "unknown").toLowerCase();
+    const impact = String(item?.market_impact || item?.impact || "unknown").toLowerCase();
     const copy = dailyLocalizedCopy(item);
     const title = copy.title;
     const summary = copy.summary || "当前仅有标题线索，请先核对原文。";
@@ -1492,7 +1497,7 @@
     }[evidenceBasis];
     return `<li class="daily-signal is-${esc(impact)}">
       <div class="daily-signal-index" aria-hidden="true">${String(index + 1).padStart(2, "0")}</div>
-      <article class="daily-signal-body">
+      <article class="daily-signal-body" data-attention-key="${esc(dailyAttentionKey(item))}">
         <header class="daily-signal-head">
           <div class="daily-signal-provenance">
             ${dailySourceBadge(item)}
@@ -1517,6 +1522,7 @@
         ${dailySourceExcerptHTML(copy)}
         ${why ? `<p class="daily-why"><span>为什么重要</span>${esc(why)}</p>` : ""}
         ${dailyAssetTags(item?.assets)}
+        ${attentionDimensionsHTML(item, "daily")}
         <footer class="daily-signal-footer">
           <div class="daily-evidence-notes">
             ${basisLabel ? `<span>${esc(basisLabel)}</span>` : ""}
@@ -1544,6 +1550,7 @@
               canOpenEvidence
                 ? `<button type="button" class="daily-evidence-btn"
                      data-daily-event-detail="${eventId}"
+                     data-attention-read="${esc(dailyAttentionKey(item))}"
                      data-event-kol="${esc(item?.kol_key || "")}"
                      data-event-source-url="${esc(sourceUrl)}">核验证据</button>`
                 : ""
@@ -1580,6 +1587,7 @@
           ${
             url
               ? `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer"
+                   data-attention-read="${esc(dailyAttentionKey(item))}"
                    aria-label="打开${esc(shortText(title, 32))}原文，新窗口">原文 ↗</a>`
               : `<span class="daily-source-missing">链接待补</span>`
           }
@@ -1670,6 +1678,823 @@
     const url = dailyPrimarySourceUrl(item);
     if (url) return `url:${url.split("#")[0]}`;
     return `${String(item?.kind || "record")}:${String(item?.id || "unknown")}`;
+  }
+
+  // Public, browser-local reading queue. It never stores private research,
+  // credentials, account data, or a synthetic importance score.
+  const PUBLIC_ATTENTION_STORAGE_KEY = "finance-radar-public-attention-v1";
+  const PUBLIC_ATTENTION_MAX_ITEMS = 200;
+  const PUBLIC_ATTENTION_MAX_SEEN = 200;
+  const PUBLIC_ATTENTION_HIGH_TTL_MS = 7 * 86400_000;
+  const PUBLIC_ATTENTION_MEDIUM_TTL_MS = 72 * 3600_000;
+  const PUBLIC_ATTENTION_IMPACT_RANK = Object.freeze({
+    critical: 4,
+    severe: 3,
+    high: 3,
+    medium: 2,
+    low: 1,
+    unknown: 0,
+  });
+  const PUBLIC_ATTENTION_ASSET_ALIASES = Object.freeze({
+    BTC: "CRYPTO:BTC",
+    BTCUSD: "CRYPTO:BTC",
+    "BTC-USD": "CRYPTO:BTC",
+    ETH: "CRYPTO:ETH",
+    ETHUSD: "CRYPTO:ETH",
+    "ETH-USD": "CRYPTO:ETH",
+    DOGE: "CRYPTO:DOGE",
+    DOGEUSD: "CRYPTO:DOGE",
+    "DOGE-USD": "CRYPTO:DOGE",
+    SOL: "CRYPTO:SOL",
+    SOLUSD: "CRYPTO:SOL",
+    "SOL-USD": "CRYPTO:SOL",
+    ADA: "CRYPTO:ADA",
+    XRP: "CRYPTO:XRP",
+    BNB: "CRYPTO:BNB",
+  });
+
+  function publicAttentionEmpty() {
+    return {
+      version: 1,
+      items: [],
+      baselines: {
+        daily: { initialized: false, observedAt: 0, seen: [], material: [] },
+        kol: { initialized: false, observedAt: 0, seen: [], material: [] },
+      },
+    };
+  }
+
+  function publicText(value, limit) {
+    return String(value || "").replace(/\s+/g, " ").trim().slice(0, limit);
+  }
+
+  function publicAttentionTimestamp(item) {
+    for (const value of [item?.publishedAt, item?.discoveredAt]) {
+      const timestamp = typeof value === "number" ? value : Date.parse(value || "");
+      if (Number.isFinite(timestamp)) return timestamp;
+    }
+    return 0;
+  }
+
+  function publicAttentionCompare(left, right) {
+    const impact =
+      (PUBLIC_ATTENTION_IMPACT_RANK[String(right?.impact || "unknown")] || 0) -
+      (PUBLIC_ATTENTION_IMPACT_RANK[String(left?.impact || "unknown")] || 0);
+    if (impact) return impact;
+    const tier = Number(right?.tier === "immediate") - Number(left?.tier === "immediate");
+    if (tier) return tier;
+    const assetRelevance = Number(Boolean(right?.assets?.length)) -
+      Number(Boolean(left?.assets?.length));
+    if (assetRelevance) return assetRelevance;
+    const evidence = Number(right?.evidenceRank || 0) - Number(left?.evidenceRank || 0);
+    if (evidence) return evidence;
+    const material = Number(right?.materialUpdate === true) -
+      Number(left?.materialUpdate === true);
+    if (material) return material;
+    return (
+      publicAttentionTimestamp(right) - publicAttentionTimestamp(left) ||
+      String(left?.key || "").localeCompare(String(right?.key || ""))
+    );
+  }
+
+  function publicAttentionPrune(store) {
+    const now = Date.now();
+    store.items = (Array.isArray(store.items) ? store.items : [])
+      .filter(
+        (item) =>
+          item &&
+          typeof item === "object" &&
+          typeof item.key === "string" &&
+          Number(item.expiresAt) > now
+      )
+      // Capacity is applied after priority sorting so a burst of newer medium
+      // items cannot evict an older unread high-impact event.
+      .sort(publicAttentionCompare)
+      .slice(0, PUBLIC_ATTENTION_MAX_ITEMS);
+    for (const surface of ["daily", "kol"]) {
+      const baseline = store.baselines?.[surface];
+      if (!baseline || typeof baseline !== "object") {
+        store.baselines[surface] = {
+          initialized: false,
+          observedAt: 0,
+          seen: [],
+          material: [],
+        };
+        continue;
+      }
+      baseline.initialized = baseline.initialized === true;
+      baseline.observedAt = Math.max(0, Number(baseline.observedAt) || 0);
+      baseline.seen = Array.from(
+        new Set((Array.isArray(baseline.seen) ? baseline.seen : []).map(String))
+      ).slice(0, PUBLIC_ATTENTION_MAX_SEEN);
+      const materialKeys = new Set();
+      baseline.material = (Array.isArray(baseline.material) ? baseline.material : [])
+        .filter(
+          (record) =>
+            record &&
+            typeof record === "object" &&
+            typeof record.key === "string" &&
+            typeof record.fingerprint === "string" &&
+            record.key &&
+            record.fingerprint
+        )
+        .map((record) => {
+          return {
+            key: publicText(record.key, 520),
+            fingerprint: publicText(record.fingerprint, 720),
+            impactRank: Math.max(0, Number(record.impactRank) || 0),
+            sourceRank: Math.max(0, Number(record.sourceRank) || 0),
+            basisRank: Math.max(0, Number(record.basisRank) || 0),
+            direct: record.direct === true,
+            verifiedTime: record.verifiedTime === true,
+            assets: Array.from(
+              new Set((Array.isArray(record.assets) ? record.assets : [])
+                .map((value) => publicText(value, 64))
+                .filter(Boolean))
+            ).sort().slice(0, 6),
+            revision: publicText(record.revision, 220),
+          };
+        })
+        .filter((record) => {
+          if (!record.key || !record.fingerprint || materialKeys.has(record.key)) {
+            return false;
+          }
+          materialKeys.add(record.key);
+          return true;
+        })
+        .slice(0, PUBLIC_ATTENTION_MAX_SEEN);
+    }
+    return store;
+  }
+
+  function loadPublicAttention() {
+    const fallback = publicAttentionEmpty();
+    try {
+      const parsed = JSON.parse(
+        localStorage.getItem(PUBLIC_ATTENTION_STORAGE_KEY) || "null"
+      );
+      if (!parsed || parsed.version !== 1 || typeof parsed !== "object") {
+        state.publicAttention = fallback;
+      } else {
+        state.publicAttention = publicAttentionPrune({
+          ...fallback,
+          ...parsed,
+          baselines: { ...fallback.baselines, ...(parsed.baselines || {}) },
+        });
+      }
+    } catch (error) {
+      state.publicAttention = fallback;
+    }
+    return state.publicAttention;
+  }
+
+  function publicAttentionStore() {
+    const store = publicAttentionPrune(
+      state.publicAttention || loadPublicAttention()
+    );
+    try {
+      localStorage.setItem(PUBLIC_ATTENTION_STORAGE_KEY, JSON.stringify(store));
+    } catch (error) {}
+    return store;
+  }
+
+  function eventAttentionKey(item) {
+    const id = Number(item?.id);
+    if (Number.isInteger(id) && id > 0) return `event:${id}`;
+    return `event:${eventIdentity(item) || "unknown"}`;
+  }
+
+  function dailyAttentionKey(item) {
+    const kind = dailyItemKind(item);
+    const id = Number(item?.id);
+    if (["event", "kol_event"].includes(kind) && Number.isInteger(id) && id > 0) {
+      return `event:${id}`;
+    }
+    return `daily:${dailyStoryKey(item)}`;
+  }
+
+  function attentionAliases(item, surface) {
+    const aliases = new Set([
+      surface === "kol" ? eventAttentionKey(item) : dailyAttentionKey(item),
+    ]);
+    const urls = [
+      item?.canonical_url,
+      item?.original_url,
+      item?.source_url,
+      item?.url,
+    ];
+    urls.forEach((value) => {
+      const url = safeExternalUrl(value);
+      if (url) aliases.add(`url:${url.split("#")[0].toLowerCase()}`);
+    });
+    if (surface === "daily") aliases.add(`daily:${dailyStoryKey(item)}`);
+    return Array.from(aliases).map((value) => publicText(value, 520)).slice(0, 6);
+  }
+
+  function attentionAssetLabels(item, surface) {
+    const enrichment = surface === "kol" ? eventEnrichment(item) : null;
+    const candidates =
+      surface === "kol"
+        ? (enrichment?.assets || []).map((asset) => asset?.asset_key).filter(Boolean)
+        : Array.isArray(item?.assets)
+          ? item.assets
+          : [];
+    const fallback = surface === "kol" ? item?.tickers || [] : [];
+    return Array.from(new Set((candidates.length ? candidates : fallback).map((asset) => {
+      if (asset && typeof asset === "object") {
+        return publicText(
+          asset.label || asset.asset_label || asset.name_zh || asset.asset_key,
+          48
+        );
+      }
+      const key = String(asset || "");
+      return publicText(key.includes(":") ? assetLabel(key) : key, 48);
+    }).filter(Boolean))).slice(0, 6);
+  }
+
+  function attentionAssetIdentities(item, surface) {
+    const enrichment = surface === "kol" ? eventEnrichment(item) : null;
+    const candidates = surface === "kol"
+      ? (enrichment?.assets || []).map((asset) => asset?.asset_key).filter(Boolean)
+      : Array.isArray(item?.assets) ? item.assets : [];
+    const fallback = surface === "kol" ? item?.tickers || [] : [];
+    return Array.from(new Set([...candidates, ...fallback]
+      .map((asset) => publicText(
+        asset && typeof asset === "object"
+          ? asset.asset_key || asset.key || asset.label || asset.name_zh
+          : asset,
+        64
+      ).toUpperCase())
+      .map((key) => {
+        if (PUBLIC_ATTENTION_ASSET_ALIASES[key]) {
+          return PUBLIC_ATTENTION_ASSET_ALIASES[key];
+        }
+        if (/^[A-Z][A-Z0-9.-]{0,9}$/.test(key)) return `US:${key}`;
+        if (/^\d{6}$/.test(key)) return `CN:${key}`;
+        return key;
+      })
+      .filter(Boolean)))
+      .sort()
+      .slice(0, 6);
+  }
+
+  function attentionAssessment(item, surface) {
+    const impact = String(
+      surface === "daily"
+        ? item?.market_impact || item?.impact || "unknown"
+        : item?.impact || "unknown"
+    ).toLowerCase();
+    const majorImpact = ["critical", "severe", "high"].includes(impact);
+    const url = surface === "kol"
+      ? eventExternalUrl(item)
+      : dailyPrimarySourceUrl(item);
+    const source = surface === "kol"
+      ? sourceKind(item)
+      : dailySourceView(item?.source_tier);
+    const direct = surface === "kol"
+      ? source.key === "is-direct"
+      : ["official", "first_party"].includes(source.key);
+    const timeStatus = String(
+      item?.time_status || (item?.published_at ? "verified" : "unknown")
+    ).toLowerCase();
+    const verifiedTime = surface === "daily"
+      ? dailyPublicationIsVerified(item)
+      : Boolean(item?.published_at) && timeStatus === "verified";
+    const assets = attentionAssetLabels(item, surface);
+    const assetKeys = attentionAssetIdentities(item, surface);
+    const locatableEvidence = Boolean(url) && ![
+      "discovery",
+      "is-unverified",
+    ].includes(source.key);
+    const sufficientMedium =
+      impact === "medium" && direct && verifiedTime && Boolean(url);
+    const qualifies = majorImpact || sufficientMedium;
+    const immediate = majorImpact && verifiedTime && locatableEvidence;
+    const evidence = direct
+      ? verifiedTime
+        ? `${surface === "kol" ? "本人动态" : source.label} · 发布时间已核验`
+        : `${surface === "kol" ? "本人动态" : source.label} · 时间待核验`
+      : verifiedTime
+        ? `${source.label || "转述线索"} · 发布时间已核验`
+        : `${source.label || "来源待核验"} · 时间待核验`;
+    const reasons = [];
+    if (majorImpact) reasons.push(impact === "critical" ? "极高市场影响" : "高市场影响");
+    else if (sufficientMedium) reasons.push("中影响且有直接、可定位证据");
+    if (direct) reasons.push(surface === "kol" ? "本人直接发布" : "官方或一手来源");
+    if (assets.length) reasons.push(`关联 ${assets.slice(0, 3).join("、")}`);
+    if (surface === "daily" && dailyHasHnSignal(item)) {
+      reasons.push("Hacker News 社区关注较高；热度不等于事实确认");
+    }
+    const rankReason = surface === "daily" ? publicText(item?.rank_reason, 120) : "";
+    if (rankReason) reasons.push(rankReason);
+    return {
+      qualifies,
+      immediate,
+      tier: immediate ? "immediate" : qualifies ? "important" : "regular",
+      tierLabel: immediate ? "立即复核" : qualifies ? "重点待读" : "常规",
+      impact,
+      impactLabel: `${DAILY_IMPACT_LABEL[impact] || "影响待评估"}`,
+      evidence,
+      direct,
+      verifiedTime,
+      assets,
+      assetKeys,
+      reason: reasons.join(" · ") || "按时间进入最新流；尚未达到待读重点门槛",
+      url,
+    };
+  }
+
+  function attentionMaterialFingerprint(item, surface, assessment = null) {
+    const evaluated = assessment || attentionAssessment(item, surface);
+    const sourceKey = surface === "kol"
+      ? sourceKind(item).key
+      : dailySourceView(item?.source_tier).key;
+    const materialCodes = (Array.isArray(item?.rank_reason_codes)
+      ? item.rank_reason_codes
+      : [])
+      .map((value) => publicText(value, 80))
+      .filter((value) => /^(?:market_impact|impact_basis|time):/.test(value))
+      .sort()
+      .slice(0, 8);
+    return publicText(JSON.stringify([
+      evaluated.impact,
+      sourceKey,
+      evaluated.direct === true,
+      evaluated.verifiedTime === true,
+      [...evaluated.assetKeys].sort(),
+      publicText(item?.effective_at, 48),
+      publicText(item?.disclosed_at, 48),
+      publicText(item?.material_phase, 48),
+      publicText(item?.correction_version, 80),
+      publicText(item?.material_revision, 80),
+      materialCodes,
+    ]), 720);
+  }
+
+  function attentionMaterialState(item, surface, key, assessment = null) {
+    const evaluated = assessment || attentionAssessment(item, surface);
+    const sourceKey = surface === "kol"
+      ? sourceKind(item).key
+      : dailySourceView(item?.source_tier).key;
+    const sourceRank = {
+      official: 3,
+      first_party: 3,
+      reporting: 2,
+      discovery: 0,
+      "is-direct": 3,
+      "is-media": 2,
+      "is-person": 1,
+      "is-company": 1,
+      "is-unverified": 0,
+    }[sourceKey] || 0;
+    const basis = publicText(item?.impact_basis, 48).toLowerCase();
+    const basisRank = {
+      deterministic_rule: 4,
+      macro_rule: 4,
+      ai_reviewed_rule_medium: 3,
+      ai_reviewed_demotion: 3,
+      ai_review_only: 2,
+      repository_projection: 1,
+      not_declared: 0,
+    }[basis] || 0;
+    return {
+      key: publicText(key, 520),
+      fingerprint: attentionMaterialFingerprint(item, surface, evaluated),
+      impactRank: PUBLIC_ATTENTION_IMPACT_RANK[evaluated.impact] || 0,
+      sourceRank,
+      basisRank,
+      direct: evaluated.direct === true,
+      verifiedTime: evaluated.verifiedTime === true,
+      assets: [...evaluated.assetKeys].map((value) => publicText(value, 64)).sort(),
+      revision: publicText([
+        item?.material_phase,
+        item?.correction_version,
+        item?.material_revision,
+        item?.effective_at,
+        item?.disclosed_at,
+      ].filter(Boolean).join("|"), 220),
+    };
+  }
+
+  function attentionHasMaterialPromotion(previous, current) {
+    if (!previous || previous.fingerprint === current.fingerprint) return false;
+    // Market impact is the primary dimension. A lower current impact can
+    // never be offset by a secondary evidence/basis improvement.
+    if (current.impactRank !== previous.impactRank) {
+      return current.impactRank > previous.impactRank;
+    }
+    // At equal impact, do not call a mixed downgrade an upgrade. This keeps a
+    // stale AI cache or lost direct-source attribution from reviving a read row.
+    if (current.sourceRank < previous.sourceRank) return false;
+    if (current.basisRank < previous.basisRank) return false;
+    if (previous.direct && !current.direct) return false;
+    if (previous.verifiedTime && !current.verifiedTime) return false;
+    if (current.sourceRank > previous.sourceRank) return true;
+    if (current.basisRank > previous.basisRank) return true;
+    if (current.direct && !previous.direct) return true;
+    if (current.verifiedTime && !previous.verifiedTime) return true;
+    const priorAssets = new Set(previous.assets || []);
+    if ((current.assets || []).some((asset) => !priorAssets.has(asset))) return true;
+    return Boolean(current.revision && current.revision !== previous.revision);
+  }
+
+  function attentionObservedTimestamp(item) {
+    for (const value of [
+      item?.first_seen_at,
+      item?.last_updated_at,
+      item?.fetched_at,
+      item?.published_at,
+    ]) {
+      const timestamp = Date.parse(value || "");
+      if (Number.isFinite(timestamp)) return timestamp;
+    }
+    return 0;
+  }
+
+  function attentionSnapshot(
+    item,
+    surface,
+    assessment,
+    aliases,
+    { materialUpdate = false } = {}
+  ) {
+    const copy = surface === "kol" ? eventCopy(item) : dailyLocalizedCopy(item);
+    const eventId = Number(item?.id);
+    const now = Date.now();
+    const sourceLabel = surface === "kol"
+      ? item?.kol_name_cn || item?.kol_name || item?.source
+      : item?.source_label || item?.source;
+    return {
+      key: aliases[0],
+      aliases,
+      surfaces: [surface],
+      eventId:
+        Number.isInteger(eventId) && eventId > 0 &&
+        (surface === "kol" || ["event", "kol_event"].includes(dailyItemKind(item)))
+          ? eventId
+          : null,
+      kolKey: publicText(item?.kol_key, 80),
+      title: publicText(copy.title || copy.headline || item?.title, 180),
+      summary: publicText(copy.summary || item?.summary || item?.snippet, 280),
+      impact: assessment.impact,
+      tier: assessment.tier,
+      tierLabel: assessment.tierLabel,
+      evidence: publicText(assessment.evidence, 140),
+      evidenceRank: (assessment.direct ? 2 : 0) + (assessment.verifiedTime ? 1 : 0),
+      assets: assessment.assets.map((asset) => publicText(asset, 48)).slice(0, 6),
+      reason: publicText(assessment.reason, 240),
+      sourceLabel: publicText(sourceLabel, 80),
+      sourceUrl: publicText(assessment.url, 520),
+      publishedAt: publicText(item?.published_at, 48),
+      discoveredAt: now,
+      materialUpdate,
+      expiresAt:
+        now +
+        (["critical", "severe", "high"].includes(assessment.impact)
+          ? PUBLIC_ATTENTION_HIGH_TTL_MS
+          : PUBLIC_ATTENTION_MEDIUM_TTL_MS),
+    };
+  }
+
+  function addPublicAttention(
+    item,
+    surface,
+    assessment,
+    { materialUpdate = false } = {}
+  ) {
+    const store = state.publicAttention || loadPublicAttention();
+    const aliases = attentionAliases(item, surface);
+    const aliasSet = new Set(aliases);
+    const index = store.items.findIndex((record) =>
+      (record.aliases || [record.key]).some((alias) => aliasSet.has(alias))
+    );
+    const snapshot = attentionSnapshot(
+      item,
+      surface,
+      assessment,
+      aliases,
+      { materialUpdate }
+    );
+    if (index >= 0) {
+      const previous = store.items[index];
+      const upgradedKey = snapshot.key.startsWith("event:")
+        ? snapshot.key
+        : previous.key;
+      store.items[index] = {
+        ...previous,
+        ...snapshot,
+        key: upgradedKey,
+        aliases: Array.from(
+          new Set([...(previous.aliases || [previous.key]), ...aliases, upgradedKey])
+        ).slice(0, 6),
+        surfaces: Array.from(
+          new Set([...(previous.surfaces || []), surface])
+        ),
+        discoveredAt: materialUpdate
+          ? snapshot.discoveredAt
+          : Number(previous.discoveredAt) || snapshot.discoveredAt,
+        materialUpdate: previous.materialUpdate === true || materialUpdate,
+        expiresAt: materialUpdate
+          ? snapshot.expiresAt
+          : Number(previous.expiresAt) || snapshot.expiresAt,
+      };
+    } else {
+      store.items.unshift(snapshot);
+    }
+  }
+
+  function syncExistingPublicAttention(item, surface, assessment, materialUpdate) {
+    const store = state.publicAttention || loadPublicAttention();
+    const aliases = attentionAliases(item, surface);
+    const aliasSet = new Set(aliases);
+    const index = store.items.findIndex((record) =>
+      (record.aliases || [record.key]).some((alias) => aliasSet.has(alias))
+    );
+    if (index < 0) return false;
+    if (!assessment.qualifies) {
+      const remainingSurfaces = (store.items[index].surfaces || [])
+        .filter((value) => value !== surface);
+      if (remainingSurfaces.length) {
+        store.items[index] = {
+          ...store.items[index],
+          surfaces: remainingSurfaces,
+        };
+      } else {
+        store.items.splice(index, 1);
+      }
+      return true;
+    }
+    addPublicAttention(item, surface, assessment, { materialUpdate });
+    return true;
+  }
+
+  function publicAttentionObserve(
+    surface,
+    items,
+    { allowUnread = false, suppressUnread = false } = {}
+  ) {
+    const store = state.publicAttention || loadPublicAttention();
+    const baseline = store.baselines[surface];
+    const unique = [];
+    const seenCurrent = new Set();
+    (Array.isArray(items) ? items : []).forEach((item) => {
+      const key = surface === "kol" ? eventAttentionKey(item) : dailyAttentionKey(item);
+      if (!key || seenCurrent.has(key)) return;
+      seenCurrent.add(key);
+      unique.push({ item, key });
+    });
+    if (!baseline.initialized) {
+      baseline.initialized = true;
+      baseline.observedAt = Date.now();
+      baseline.seen = unique.map(({ key }) => key).slice(0, PUBLIC_ATTENTION_MAX_SEEN);
+      baseline.material = unique
+        .map(({ item, key }) => attentionMaterialState(item, surface, key))
+        .slice(0, PUBLIC_ATTENTION_MAX_SEEN);
+      publicAttentionStore();
+      renderPublicAttentionDesks();
+      return;
+    }
+    const prior = new Set(baseline.seen);
+    const priorMaterial = new Map(
+      (baseline.material || []).map((record) => [record.key, record])
+    );
+    const currentMaterial = [];
+    unique.forEach(({ item, key }) => {
+      const assessment = attentionAssessment(item, surface);
+      const material = attentionMaterialState(item, surface, key, assessment);
+      currentMaterial.push(material);
+      const known = prior.has(key);
+      const materialPromotion = known && attentionHasMaterialPromotion(
+        priorMaterial.get(key),
+        material
+      );
+      const materialChanged = known && Boolean(priorMaterial.get(key)) &&
+        priorMaterial.get(key).fingerprint !== material.fingerprint;
+      if (known) {
+        syncExistingPublicAttention(
+          item,
+          surface,
+          assessment,
+          materialChanged
+        );
+      }
+      if (known && !materialPromotion) return;
+      // Changing a filter must not backfill historical new keys, but a known
+      // event's material promotion remains actionable across filters.
+      if (suppressUnread && !materialPromotion) return;
+      const observedAt = attentionObservedTimestamp(item);
+      const plausiblyNew =
+        materialPromotion ||
+        allowUnread ||
+        (observedAt > 0 && observedAt >= baseline.observedAt - 120_000);
+      if (!plausiblyNew) return;
+      if (assessment.qualifies && !syncExistingPublicAttention(
+        item,
+        surface,
+        assessment,
+        materialPromotion
+      )) {
+        addPublicAttention(item, surface, assessment, {
+          materialUpdate: materialPromotion,
+        });
+      }
+    });
+    baseline.observedAt = Date.now();
+    baseline.seen = Array.from(
+      new Set([...unique.map(({ key }) => key), ...baseline.seen])
+    ).slice(0, PUBLIC_ATTENTION_MAX_SEEN);
+    const currentKeys = new Set(currentMaterial.map((record) => record.key));
+    baseline.material = [
+      ...currentMaterial,
+      ...(baseline.material || []).filter((record) => !currentKeys.has(record.key)),
+    ].slice(0, PUBLIC_ATTENTION_MAX_SEEN);
+    publicAttentionStore();
+    renderPublicAttentionDesks();
+  }
+
+  function recordMatchesAttentionKey(record, key) {
+    return record.key === key || (record.aliases || []).includes(key);
+  }
+
+  function markPublicAttentionRead(key) {
+    if (!key) return;
+    const store = state.publicAttention || loadPublicAttention();
+    store.items = store.items.filter(
+      (record) => !recordMatchesAttentionKey(record, String(key))
+    );
+    publicAttentionStore();
+    renderPublicAttentionDesks();
+  }
+
+  function publicAttentionItemHTML(item) {
+    const assetLabel = item.assets?.length ? item.assets.join("、") : "未识别到具体资产";
+    const sourceUrl = safeExternalUrl(item.sourceUrl);
+    return `<article class="attention-item is-${esc(item.impact)}">
+      <div class="attention-item-index" aria-hidden="true"></div>
+      <div class="attention-item-copy">
+        <div class="attention-item-kicker">
+          <span class="attention-tier is-${esc(item.tier)}">${esc(item.tierLabel)}</span>
+          ${item.materialUpdate ? '<span class="attention-revision">有实质更新</span>' : ""}
+          <span>${esc(item.sourceLabel || "来源待核验")}</span>
+          ${item.publishedAt ? `<time datetime="${esc(item.publishedAt)}">${esc(fmtTime(item.publishedAt))}</time>` : ""}
+        </div>
+        <h3>${esc(item.title || "未命名重点")}</h3>
+        ${item.summary ? `<p>${esc(item.summary)}</p>` : ""}
+        <dl class="attention-dimensions">
+          <div><dt>市场影响</dt><dd>${esc(DAILY_IMPACT_LABEL[item.impact] || "中")}</dd></div>
+          <div><dt>证据</dt><dd>${esc(item.evidence)}</dd></div>
+          <div><dt>相关资产 / 关注</dt><dd>${esc(assetLabel)}</dd></div>
+        </dl>
+        <p class="attention-reason"><span>重要原因</span>${esc(item.reason)}</p>
+      </div>
+      <div class="attention-item-actions">
+        ${
+          item.eventId
+            ? `<button type="button" data-attention-open-evidence="${esc(item.key)}"
+                 data-event-id="${esc(item.eventId)}" data-event-kol="${esc(item.kolKey || "")}"
+                 data-event-source-url="${esc(sourceUrl)}">核验证据</button>`
+            : ""
+        }
+        ${
+          sourceUrl
+            ? `<a href="${esc(sourceUrl)}" target="_blank" rel="noopener noreferrer"
+                 data-attention-read="${esc(item.key)}">打开原文 ↗</a>`
+            : ""
+        }
+        <button type="button" data-attention-read="${esc(item.key)}">标为已读</button>
+      </div>
+    </article>`;
+  }
+
+  function renderPublicAttentionDesk(surface) {
+    const host = $(`#${surface}-attention-desk`);
+    if (!host) return;
+    const store = state.publicAttention || loadPublicAttention();
+    const items = store.items.filter((item) =>
+      (item.surfaces || []).includes(surface)
+    );
+    host.hidden = items.length === 0;
+    if (!items.length) {
+      host.innerHTML = "";
+      return;
+    }
+    const firstPage = items.slice(0, 5);
+    const remaining = items.slice(5);
+    host.innerHTML = `<header class="attention-desk-head">
+        <div>
+          <p>不会被新流覆盖</p>
+          <h2 id="${surface}-attention-title">待读重点 <span>${items.length}</span></h2>
+          <small>只保留高影响，以及证据直接、时间已核验的中影响；仅存于当前浏览器。</small>
+        </div>
+        <button type="button" data-attention-read-visible="${surface}">全部可见已读</button>
+      </header>
+      <div class="attention-list">${firstPage.map(publicAttentionItemHTML).join("")}</div>
+      ${
+        remaining.length
+          ? `<details class="attention-overflow">
+              <summary>展开其余 ${remaining.length} 条待读重点</summary>
+              <div class="attention-list">${remaining.map(publicAttentionItemHTML).join("")}</div>
+            </details>`
+          : ""
+      }`;
+  }
+
+  function renderPublicAttentionDesks() {
+    renderPublicAttentionDesk("daily");
+    renderPublicAttentionDesk("kol");
+  }
+
+  function markVisiblePublicAttentionRead(surface) {
+    const store = state.publicAttention || loadPublicAttention();
+    store.items = store.items.filter(
+      (item) => !(item.surfaces || []).includes(surface)
+    );
+    publicAttentionStore();
+    renderPublicAttentionDesks();
+  }
+
+  function attentionDimensionsHTML(item, surface) {
+    const assessment = attentionAssessment(item, surface);
+    const assets = assessment.assets.length
+      ? assessment.assets.join("、")
+      : "未识别到具体资产";
+    const community = surface === "daily" && dailyHasHnSignal(item)
+      ? `<div><dt>社区关注</dt><dd>Hacker News 热度仅代表社区关注，不是事实确认</dd></div>`
+      : "";
+    return `<dl class="story-dimensions">
+      <div><dt>市场影响</dt><dd>${esc(assessment.impactLabel)}</dd></div>
+      <div><dt>证据</dt><dd>${esc(assessment.evidence)}</dd></div>
+      <div><dt>相关资产 / 关注</dt><dd>${esc(assets)}</dd></div>
+      ${community}
+    </dl>
+    <p class="story-importance"><span>重要原因</span>${esc(assessment.reason)}</p>`;
+  }
+
+  function renderFreshnessBanner(
+    surface,
+    changedCount,
+    importantCount,
+    revisedCount = 0
+  ) {
+    const host = $(`#${surface}-update-banner`);
+    if (!host) return;
+    host.hidden = changedCount < 1;
+    if (changedCount < 1) {
+      host.innerHTML = "";
+      return;
+    }
+    const changeLabel = revisedCount === changedCount
+      ? `${changedCount} 条实质更新`
+      : revisedCount > 0
+        ? `${changedCount - revisedCount} 条新增、${revisedCount} 条实质更新`
+        : `${changedCount} 条新增`;
+    host.innerHTML = `<div>
+        <strong>发现 ${changeLabel}</strong>
+        <span>${importantCount > 0 ? `其中 ${importantCount} 条进入待读重点。` : "暂无变化达到待读重点门槛。"} 当前版面保持不动。</span>
+      </div>
+      <button type="button" data-apply-public-update="${surface}">查看更新</button>`;
+  }
+
+  function dailyAllStoryItems(data) {
+    const sections = dailyNormalizedSections(data);
+    return dailyUniqueItems([
+      ...sections.flatMap((section) => section.items),
+      ...(Array.isArray(data?.highlights) ? data.highlights : []),
+      ...(Array.isArray(data?.all_major) ? data.all_major : []),
+      ...(Array.isArray(data?.highlights_overflow) ? data.highlights_overflow : []),
+      ...(Array.isArray(data?.firsthand) ? data.firsthand : []),
+    ]);
+  }
+
+  function changedPublicItems(surface, nextItems, currentItems) {
+    const keyFor = surface === "kol" ? eventAttentionKey : dailyAttentionKey;
+    const current = new Map((currentItems || []).map((item) => {
+      const key = keyFor(item);
+      const assessment = attentionAssessment(item, surface);
+      return [key, attentionMaterialState(item, surface, key, assessment)];
+    }));
+    const added = [];
+    const revised = [];
+    (nextItems || []).forEach((item) => {
+      const key = keyFor(item);
+      const previous = current.get(key);
+      if (!previous) {
+        added.push(item);
+        return;
+      }
+      const assessment = attentionAssessment(item, surface);
+      const material = attentionMaterialState(item, surface, key, assessment);
+      if (previous.fingerprint !== material.fingerprint) revised.push(item);
+    });
+    const changed = [...added, ...revised];
+    return {
+      added,
+      revised,
+      changed,
+      important: changed.filter(
+        (item) => attentionAssessment(item, surface).qualifies
+      ),
+    };
   }
 
   function dailyStoryAnchor(item) {
@@ -1903,7 +2728,35 @@
     return dailyUniqueItems(interleaved).slice(0, 5);
   }
 
-  function dailyOverviewHTML(items, sectionItemsByKey) {
+  function dailyMajorOverflowHTML(items, sectionItemsByKey) {
+    const rows = dailyUniqueItems(items);
+    if (!rows.length) return "";
+    return `<details class="daily-major-overflow">
+      <summary>另有 ${rows.length} 条重大消息未被 Top 5 隐藏</summary>
+      <ol>${rows
+        .map((item) => {
+          const storyKey = dailyStoryKey(item);
+          const sectionItem = sectionItemsByKey.get(storyKey);
+          const anchor = sectionItem ? dailyStoryAnchor(sectionItem) : "";
+          const url = dailyPrimarySourceUrl(item);
+          const copy = dailyLocalizedCopy(item);
+          return `<li data-attention-key="${esc(dailyAttentionKey(item))}">
+            <div>${dailySourceBadge(item, { compact: true })}<strong>${esc(copy.title)}</strong></div>
+            ${
+              anchor
+                ? `<a href="#${esc(anchor)}" data-daily-story-target="${esc(anchor)}">定位到正文 ↓</a>`
+                : url
+                  ? `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer"
+                       data-attention-read="${esc(dailyAttentionKey(item))}">核对原文 ↗</a>`
+                  : `<span>原文链接待补</span>`
+            }
+          </li>`;
+        })
+        .join("")}</ol>
+    </details>`;
+  }
+
+  function dailyOverviewHTML(items, sectionItemsByKey, overflowItems = []) {
     if (!items.length) {
       return `<div class="daily-section-empty" role="note">
         <strong>当前没有达到简报门槛的重点记录</strong>
@@ -1951,7 +2804,7 @@
           }
         </li>`;
       })
-      .join("")}</ol>`;
+      .join("")}</ol>${dailyMajorOverflowHTML(overflowItems, sectionItemsByKey)}`;
   }
 
   function dailySectionItemHTML(item, index) {
@@ -1975,7 +2828,7 @@
     const anchor = dailyStoryAnchor(item);
     return `<article class="daily-stream-item is-${esc(impact)}" id="${esc(
       anchor
-    )}" tabindex="-1"${index >= 3 ? " hidden data-daily-extra" : ""}>
+    )}" tabindex="-1" data-attention-key="${esc(dailyAttentionKey(item))}"${index >= 3 ? " hidden data-daily-extra" : ""}>
       <div class="daily-stream-sequence" aria-hidden="true">${String(index + 1).padStart(2, "0")}</div>
       <div class="daily-stream-copy">
         <header>
@@ -2008,6 +2861,7 @@
           ${why ? `<p class="daily-stream-why"><span>影响</span>${esc(why)}</p>` : ""}
         </div>
         ${dailyAssetTags(item?.assets, 5)}
+        ${attentionDimensionsHTML(item, "daily")}
         ${
           crossTags.length
             ? `<div class="daily-cross-tags" aria-label="同时关联栏目">${crossTags
@@ -2024,6 +2878,7 @@
               canOpenEvidence
                 ? `<button type="button" class="daily-evidence-btn"
                      data-daily-event-detail="${eventId}"
+                     data-attention-read="${esc(dailyAttentionKey(item))}"
                      data-event-kol="${esc(item?.kol_key || "")}"
                      data-event-source-url="${esc(sourceUrl)}">核验证据</button>`
                 : ""
@@ -2220,7 +3075,7 @@
           <div><span class="daily-section-label">先读这五条</span><h2 id="daily-highlights-title">60 秒读完</h2></div>
           <p>同一故事只进入一个主栏目；点击后定位到栏目正文。</p>
         </header>
-        ${dailyOverviewHTML(highlights, sectionItemsByKey)}
+        ${dailyOverviewHTML(highlights, sectionItemsByKey, data?.highlights_overflow)}
       </section>
 
       <div class="daily-stream" aria-label="六栏目情报流">
@@ -2258,17 +3113,60 @@
   }
 
   async function loadDaily() {
+    const { background = false } = arguments[0] || {};
     const generation = ++state.dailyRequestGeneration;
     const url = api("api/briefings/latest");
     const stage = $("#daily-stage");
-    stage?.setAttribute("aria-busy", "true");
-    announceDailyStatus("正在加载每日简报。");
+    if (!background) {
+      stage?.setAttribute("aria-busy", "true");
+      announceDailyStatus("正在加载每日简报。");
+    }
     try {
       const data = await fetchJSON(url, 12_000);
       if (generation !== state.dailyRequestGeneration) return false;
       recordViewLastGoodDataAt("daily", data);
       clearViewLoadError("daily");
-      renderDaily(data || { available: false });
+      const nextData = data || { available: false };
+      const nextItems = dailyAllStoryItems(nextData);
+      const currentItems = state.dailyData?.available
+        ? dailyAllStoryItems(state.dailyData)
+        : [];
+      publicAttentionObserve("daily", nextItems, {
+        allowUnread: background || Boolean(state.dailyData?.available),
+      });
+      if (background && state.dailyData?.available) {
+        if (nextData.available) {
+          const changes = changedPublicItems("daily", nextItems, currentItems);
+          if (changes.changed.length) {
+            state.pendingDailyData = nextData;
+            state.pendingDailyNewKeys = changes.changed.map(dailyAttentionKey);
+            renderFreshnessBanner(
+              "daily",
+              changes.changed.length,
+              changes.important.length,
+              changes.revised.length
+            );
+            announceDailyStatus(
+              `发现 ${changes.changed.length} 条新增或实质更新；当前版面保持不动。`
+            );
+          } else {
+            // Every successful background response supersedes an older staged
+            // snapshot, including when a previously seen item was withdrawn.
+            state.pendingDailyData = null;
+            state.pendingDailyNewKeys = [];
+            renderFreshnessBanner("daily", 0, 0);
+          }
+        } else {
+          state.pendingDailyData = null;
+          state.pendingDailyNewKeys = [];
+          renderFreshnessBanner("daily", 0, 0);
+        }
+        return true;
+      }
+      state.pendingDailyData = null;
+      state.pendingDailyNewKeys = [];
+      renderFreshnessBanner("daily", 0, 0);
+      renderDaily(nextData);
       return true;
     } catch (error) {
       if (generation !== state.dailyRequestGeneration) return false;
@@ -2284,6 +3182,20 @@
       setViewLoadError("daily", error, url);
       return false;
     }
+  }
+
+  function applyPendingDailyUpdate() {
+    const data = state.pendingDailyData;
+    if (!data) return;
+    const focusKeys = new Set(state.pendingDailyNewKeys || []);
+    state.pendingDailyData = null;
+    state.pendingDailyNewKeys = [];
+    renderFreshnessBanner("daily", 0, 0);
+    renderDaily(data);
+    const target = Array.from(
+      document.querySelectorAll("#daily-stage [data-attention-key]")
+    ).find((node) => focusKeys.has(node.dataset.attentionKey));
+    requestAnimationFrame(() => target?.focus({ preventScroll: true }));
   }
 
   // ─── Decision cockpit ──────────────────────
@@ -8152,12 +9064,24 @@
 
   function mergePriorityEvents(priorityItems, regularItems) {
     const seen = new Set();
-    return [...priorityItems, ...regularItems].filter((item) => {
-      const key = eventIdentity(item);
-      if (key && seen.has(key)) return false;
-      if (key) seen.add(key);
-      return true;
-    });
+    return [...priorityItems, ...regularItems]
+      .filter((item) => {
+        const key = eventIdentity(item);
+        if (key && seen.has(key)) return false;
+        if (key) seen.add(key);
+        return true;
+      })
+      .sort((left, right) => {
+        const timestamp = (item) => {
+          const verified = String(item?.time_status || "") === "verified";
+          const value = verified
+            ? item?.published_at
+            : item?.first_seen_at || item?.fetched_at;
+          const parsed = Date.parse(value || "");
+          return Number.isFinite(parsed) ? parsed : 0;
+        };
+        return timestamp(right) - timestamp(left) || Number(right?.id || 0) - Number(left?.id || 0);
+      });
   }
 
   function updateFeedStatus() {
@@ -8181,6 +9105,68 @@
     if (state.feedHighPriority) parts.push("高影响已优先");
     if (state.feedRegularCapped) parts.push("普通流仅展示前150条");
     host.textContent = parts.join(" · ");
+  }
+
+  function applyFeedPayload(items, meta, requestFilterSignature) {
+    state.feedLoadedCount = Number(meta.loadedCount) || 0;
+    state.feedHighPriority = meta.highPriority === true;
+    state.feedRegularCapped = meta.regularCapped === true;
+    state.pendingFeedUpdate = null;
+    renderFreshnessBanner("kol", 0, 0);
+    renderEvents(items);
+    updateFeedStatus();
+    state.loadedKolFilterSignature = requestFilterSignature;
+  }
+
+  function stageOrApplyFeedPayload(
+    items,
+    meta,
+    requestFilterSignature,
+    { background = false } = {}
+  ) {
+    const filterChanged = Boolean(state.feedItems.length) &&
+      state.loadedKolFilterSignature !== requestFilterSignature;
+    publicAttentionObserve("kol", items, {
+      allowUnread: background || (!filterChanged && Boolean(state.feedItems.length)),
+      suppressUnread: filterChanged,
+    });
+    if (background && state.feedItems.length) {
+      const changes = changedPublicItems("kol", items, state.feedItems);
+      if (changes.changed.length) {
+        state.pendingFeedUpdate = {
+          items,
+          meta,
+          requestFilterSignature,
+          newKeys: changes.changed.map(eventAttentionKey),
+        };
+        renderFreshnessBanner(
+          "kol",
+          changes.changed.length,
+          changes.important.length,
+          changes.revised.length
+        );
+      } else {
+        state.pendingFeedUpdate = null;
+        renderFreshnessBanner("kol", 0, 0);
+      }
+      return;
+    }
+    applyFeedPayload(items, meta, requestFilterSignature);
+  }
+
+  function applyPendingFeedUpdate() {
+    const pending = state.pendingFeedUpdate;
+    if (!pending) return;
+    const focusKeys = new Set(pending.newKeys || []);
+    applyFeedPayload(
+      pending.items,
+      pending.meta,
+      pending.requestFilterSignature
+    );
+    const target = Array.from(
+      document.querySelectorAll("#feed [data-attention-key]")
+    ).find((node) => focusKeys.has(node.dataset.attentionKey));
+    requestAnimationFrame(() => target?.focus({ preventScroll: true }));
   }
 
   function eventBody(item) {
@@ -8357,7 +9343,7 @@
           .join("");
         const heat =
           it.source_count > 1
-            ? `<span class="heat">🔗 ${it.source_count} 条来源链接</span>`
+            ? `<span class="heat">${it.source_count} 条关联记录 · 非独立确认</span>`
             : "";
         const related = group.relatedCount
           ? `<button type="button" class="cluster-count"
@@ -8401,7 +9387,8 @@
           copy.enrichment && copy.original.headline
             ? `<p class="card-original"><span>原文</span>${esc(copy.original.headline)}</p>`
             : "";
-        return `<article class="card" style="--lvl:${lvl}" aria-labelledby="${titleId}">
+        return `<article class="card" style="--lvl:${lvl}" aria-labelledby="${titleId}"
+                 tabindex="-1" data-attention-key="${esc(eventAttentionKey(it))}">
           <div class="card-head">
             <span class="card-kol">${esc(it.kol_name_cn || it.kol_name)}</span>
             ${
@@ -8429,6 +9416,7 @@
           <h2 class="card-title" id="${titleId}">${esc(copy.headline)}</h2>
           <p class="card-snippet">${esc(copy.summary)}</p>
           ${original}
+          ${attentionDimensionsHTML(it, "kol")}
           ${
             tickers || heat || related
               ? `<div class="card-foot">${tickers}${heat}${related}</div>`
@@ -8437,7 +9425,8 @@
           <div class="card-actions">
             <button type="button" class="card-evidence-btn" data-event-detail="${esc(
               it.id
-            )}" data-event-kol="${esc(it.source_url ? it.kol_key || "" : "")}"
+            )}" data-attention-read="${esc(eventAttentionKey(it))}"
+                    data-event-kol="${esc(it.source_url ? it.kol_key || "" : "")}"
                     data-event-source-url="${esc(it.source_url || "")}"
                     aria-haspopup="dialog" aria-controls="intel-drawer"
                     aria-label="查看${esc(shortText(copy.headline, 36))}的证据链">
@@ -8448,6 +9437,7 @@
                 ? `<a class="card-original-link" href="${esc(
                     externalUrl
                   )}" target="_blank" rel="noopener noreferrer"
+                     data-attention-read="${esc(eventAttentionKey(it))}"
                      aria-label="打开${esc(shortText(copy.original.headline || copy.headline, 36))}原文，新窗口">原文 ↗</a>`
                 : `<span class="card-link-unavailable">原文链接不可用</span>`
             }
@@ -9056,6 +10046,8 @@
   }
 
   async function loadEvents() {
+    const { background = false } = arguments[0] || {};
+    const hadLoadedKolSignature = Boolean(state.loadedKolFilterSignature);
     const generation = ++state.feedRequestGeneration;
     const requestFilterSignature = kolFilterSignature();
     state.feedAbortController?.abort();
@@ -9067,8 +10059,10 @@
       !requestController.signal.aborted &&
       requestFilterSignature === kolFilterSignature();
     const feed = $("#feed");
-    feed.setAttribute("aria-busy", "true");
-    $("#feed-status").textContent = "正在更新信号流…";
+    if (!background) {
+      feed.setAttribute("aria-busy", "true");
+      $("#feed-status").textContent = "正在更新信号流…";
+    }
     const p = new URLSearchParams();
     if (state.hours) p.set("hours", state.hours);
     if (state.impact) p.set("impact", state.impact);
@@ -9085,13 +10079,22 @@
       const regularItems = Array.isArray(regularData?.items)
         ? regularData.items
         : [];
-      state.feedLoadedCount = regularItems.length;
-      state.feedHighPriority = false;
-      state.feedRegularCapped = regularItems.length >= 150;
+      const regularMeta = {
+        loadedCount: regularItems.length,
+        highPriority: false,
+        regularCapped: regularItems.length >= 150,
+      };
       recordViewLastGoodDataAt("kol", regularData);
       clearViewLoadError("kol");
-      renderEvents(regularItems);
-      updateFeedStatus();
+      if (!background) {
+        state.feedLoadedCount = regularMeta.loadedCount;
+        state.feedHighPriority = false;
+        state.feedRegularCapped = regularMeta.regularCapped;
+        state.pendingFeedUpdate = null;
+        renderFreshnessBanner("kol", 0, 0);
+        renderEvents(regularItems);
+        updateFeedStatus();
+      }
 
       const regularHighCount = regularItems.filter(
         (item) => String(item?.impact || "").toLowerCase() === "high"
@@ -9101,13 +10104,28 @@
         regularItems.length >= 150 &&
         regularHighCount < 50;
       if (!shouldSupplementHighImpact) {
+        if (background) {
+          stageOrApplyFeedPayload(
+            regularItems,
+            regularMeta,
+            requestFilterSignature,
+            { background: true }
+          );
+        } else {
+          const filterChanged = Boolean(state.loadedKolFilterSignature) &&
+            state.loadedKolFilterSignature !== requestFilterSignature;
+          publicAttentionObserve("kol", regularItems, {
+            allowUnread: !filterChanged && Boolean(state.loadedKolFilterSignature),
+            suppressUnread: filterChanged,
+          });
+        }
         state.loadedKolFilterSignature = requestFilterSignature;
         return true;
       }
       // The regular page is useful immediately, but it is not yet complete
       // for this filter.  Clearing a previously identical signature ensures
       // an aborted or failed supplement is retried on the next view load.
-      state.loadedKolFilterSignature = "";
+      if (!background) state.loadedKolFilterSignature = "";
 
       const highParams = new URLSearchParams(p);
       highParams.set("impact", "high");
@@ -9122,15 +10140,48 @@
           ? highData.items
           : [];
         const items = mergePriorityEvents(priorityItems, regularItems);
-        state.feedLoadedCount = items.length;
-        state.feedHighPriority = true;
-        renderEvents(items);
-        updateFeedStatus();
+        const priorityMeta = {
+          loadedCount: items.length,
+          highPriority: true,
+          regularCapped: regularMeta.regularCapped,
+        };
+        if (background) {
+          stageOrApplyFeedPayload(
+            items,
+            priorityMeta,
+            requestFilterSignature,
+            { background: true }
+          );
+        } else {
+          state.feedLoadedCount = priorityMeta.loadedCount;
+          state.feedHighPriority = true;
+          state.feedRegularCapped = priorityMeta.regularCapped;
+          renderEvents(items);
+          updateFeedStatus();
+          const filterChanged = Boolean(state.loadedKolFilterSignature) &&
+            state.loadedKolFilterSignature !== requestFilterSignature;
+          publicAttentionObserve("kol", items, {
+            allowUnread: !filterChanged && Boolean(state.loadedKolFilterSignature),
+            suppressUnread: filterChanged,
+          });
+        }
         state.loadedKolFilterSignature = requestFilterSignature;
       } catch (highError) {
         if (!requestIsCurrent()) return false;
         if (highError?.name !== "AbortError") {
           console.warn("high impact feed", highError);
+        }
+        if (background) {
+          stageOrApplyFeedPayload(
+            regularItems,
+            regularMeta,
+            requestFilterSignature,
+            { background: true }
+          );
+        } else {
+          publicAttentionObserve("kol", regularItems, {
+            allowUnread: hadLoadedKolSignature,
+          });
         }
         return true;
       }
@@ -9157,7 +10208,7 @@
         if (state.feedAbortController === requestController) {
           state.feedAbortController = null;
         }
-        feed.setAttribute("aria-busy", "false");
+        if (!background) feed.setAttribute("aria-busy", "false");
       }
     }
   }
@@ -9200,7 +10251,7 @@
           <span class="support-card-title">这个面板是自费在跑的</span>
         </div>
         <p class="support-card-body">
-          每 30 分钟扫一遍 18 位 KOL，每小时重算一次宏观风险快照，跑在一台自己掏钱的云服务器上。
+          重点 KOL 约 15 分钟扫一次、18 位 KOL 约 30 分钟完成一轮，每小时重算一次宏观风险快照，跑在一台自己掏钱的云服务器上。
           没有广告，不收集数据，也不打算做会员。如果它帮你提前避开过一次风险，或者看到过一个机会，
           可以请我喝杯咖啡。
         </p>
@@ -9346,6 +10397,33 @@
     });
   }
 
+  function bindPublicAttention() {
+    document.addEventListener("click", (event) => {
+      const apply = event.target.closest("[data-apply-public-update]");
+      if (apply) {
+        if (apply.dataset.applyPublicUpdate === "daily") applyPendingDailyUpdate();
+        if (apply.dataset.applyPublicUpdate === "kol") applyPendingFeedUpdate();
+        return;
+      }
+      const clearVisible = event.target.closest("[data-attention-read-visible]");
+      if (clearVisible) {
+        markVisiblePublicAttentionRead(clearVisible.dataset.attentionReadVisible);
+        return;
+      }
+      const evidence = event.target.closest("[data-attention-open-evidence]");
+      if (evidence) {
+        const eventId = Number(evidence.dataset.eventId);
+        if (Number.isInteger(eventId) && eventId > 0) {
+          openIntelDrawer(eventId, evidence);
+        }
+        markPublicAttentionRead(evidence.dataset.attentionOpenEvidence);
+        return;
+      }
+      const read = event.target.closest("[data-attention-read]");
+      if (read) markPublicAttentionRead(read.dataset.attentionRead);
+    });
+  }
+
   const VIEW_REFRESH_MS = 300_000;
 
   function scheduleIdle(task) {
@@ -9356,7 +10434,7 @@
     }
   }
 
-  async function ensureViewLoaded(view, { force = false } = {}) {
+  async function ensureViewLoaded(view, { force = false, background = false } = {}) {
     const loadedAt = Number(state.viewLoadedAt[view] || 0);
     const kolFiltersAreCurrent =
       view !== "kol" ||
@@ -9389,7 +10467,9 @@
           decisionResult.value === true;
         if (!state.macroHistory.length) scheduleIdle(() => void loadMacroHistory());
       } else if (view === "daily") {
-        const [dailyResult] = await Promise.allSettled([loadDaily()]);
+        const [dailyResult] = await Promise.allSettled([
+          loadDaily({ background }),
+        ]);
         criticalSucceeded =
           dailyResult.status === "fulfilled" && dailyResult.value === true;
       } else if (view === "macro") {
@@ -9420,7 +10500,7 @@
         if (loadGeneration !== state.viewLoadGeneration[view]) return false;
         const [, eventsResult] = await Promise.allSettled([
           statsPromise,
-          loadEvents(),
+          loadEvents({ background }),
         ]);
         criticalSucceeded =
           catalogSucceeded === true &&
@@ -9488,7 +10568,7 @@
     $("#last-update").textContent = `${pad(t.getHours())}:${pad(t.getMinutes())}`;
   }
 
-  async function refreshCurrentView({ showSpinner = false } = {}) {
+  async function refreshCurrentView({ showSpinner = false, background = false } = {}) {
     const button = $("#refresh-btn");
     if (state.view === "options" && state.optionsPolicySaving) {
       optionsPolicySetFeedback("接货边界正在保存，请等待服务端响应后再刷新。", "pending");
@@ -9519,7 +10599,7 @@
     }
     if (showSpinner) button.classList.add("spinning");
     try {
-      await ensureViewLoaded(state.view, { force: true });
+      await ensureViewLoaded(state.view, { force: true, background });
     } finally {
       if (showSpinner) button.classList.remove("spinning");
     }
@@ -9530,13 +10610,15 @@
     state.refreshTimer = null;
     if (document.hidden) return;
     state.refreshTimer = setTimeout(async () => {
-      await refreshCurrentView();
+      await refreshCurrentView({ background: true });
       scheduleRefresh();
     }, VIEW_REFRESH_MS);
   }
 
   document.addEventListener("DOMContentLoaded", async () => {
     initializePrivateSessionChannel();
+    loadPublicAttention();
+    renderPublicAttentionDesks();
     loadDecisionWatchlist();
     loadKolSelection();
     updateKolSelectionUi();
@@ -9558,6 +10640,7 @@
     bindSupport();
     bindIntelDrawer();
     bindViewRetries();
+    bindPublicAttention();
     $("#view-options")?.addEventListener("click", (event) => {
       const unlock = event.target.closest("[data-options-unlock]");
       if (unlock) {
@@ -9800,6 +10883,11 @@
     });
 
     window.addEventListener("storage", (event) => {
+      if (event.key === PUBLIC_ATTENTION_STORAGE_KEY) {
+        loadPublicAttention();
+        renderPublicAttentionDesks();
+        return;
+      }
       if (event.key === DECISION_WATCHLIST_STORAGE_KEY) {
         loadDecisionWatchlist();
         if (state.decisionData) renderDecisions(state.decisionData);
@@ -9846,7 +10934,9 @@
         return;
       }
       const age = Date.now() - Number(state.viewLoadedAt[state.view] || 0);
-      if (age >= VIEW_REFRESH_MS) void refreshCurrentView();
+      if (age >= VIEW_REFRESH_MS) {
+        void refreshCurrentView({ background: true });
+      }
       resumeAiRequestPolls();
       scheduleRefresh();
     });

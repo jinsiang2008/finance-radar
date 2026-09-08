@@ -2667,6 +2667,62 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(musk_items[0]["kol_key"], "musk")
         self.assertEqual(public["ai_request_eligible"], 1)
 
+    def test_ai_cannot_promote_rule_low_event_to_public_high(self) -> None:
+        now = datetime(2026, 8, 6, 5, 15, tzinfo=timezone.utc)
+        db.insert_events(
+            [
+                self.event(
+                    title="Elon Musk comments on stock market valuations",
+                    snippet="The interview discussed broad market valuations.",
+                    url="https://example.com/musk-market-commentary",
+                    kol_key="musk",
+                    kol_name="Elon Musk",
+                    kol_name_cn="马斯克",
+                    published_at=(now - timedelta(hours=1)).isoformat(),
+                )
+            ]
+        )
+        candidate = db.query_enrichment_candidates(now=now)[0]
+        event_input, input_hash = llm_enrichment.build_event_input(candidate)
+        claim = {
+            "event_id": candidate["id"],
+            "input_hash": input_hash,
+            "prompt_version": llm_enrichment.PROMPT_VERSION,
+            "model": llm_enrichment.DEFAULT_MODEL,
+            "evidence_basis": event_input["evidence_basis"],
+        }
+        claim_token = db.claim_event_enrichment(**claim, now=now)
+        self.assertIsInstance(claim_token, str)
+        self.assertTrue(
+            db.save_event_enrichment(
+                **claim,
+                claim_token=claim_token,
+                result=ready_enrichment(
+                    impact_level="high",
+                    confidence=0.99,
+                    cluster_key="musk-market-commentary",
+                ),
+                generated_at=now.isoformat(),
+            )
+        )
+
+        deterministic = db.query_events(hours=24, now=now)[0]
+        public = db.query_events(hours=24, now=now, use_ai_impact=True)[0]
+
+        self.assertEqual(deterministic["rule_impact"], "low")
+        self.assertEqual(deterministic["impact"], "low")
+        self.assertEqual(public["impact"], "medium")
+        self.assertEqual(public["impact_basis"], "ai_review_only")
+        self.assertEqual(
+            db.query_events(
+                impact="high",
+                hours=24,
+                now=now,
+                use_ai_impact=True,
+            ),
+            [],
+        )
+
     def test_stale_enrichment_is_fail_closed_after_event_evidence_changes(self) -> None:
         now = datetime.now(timezone.utc).replace(microsecond=0)
         original = self.event(
@@ -2730,6 +2786,7 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(public[0]["ai_status"], "pending")
         self.assertIsNone(public[0]["ai_enrichment"])
         self.assertEqual(public[0]["impact"], "medium")
+        self.assertEqual(public[0]["impact_basis"], "deterministic_rule")
         self.assertEqual(stale_search, [])
         self.assertEqual(stale_high, [])
         self.assertEqual(summary["high"], 0)

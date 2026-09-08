@@ -1,6 +1,6 @@
 #!/bin/bash
 # Scheduled collection for the dashboard.
-#   collect.sh kol     — scan every KOL into the events table
+#   collect.sh kol     — scan hot KOLs; scan the full directory when due
 #   collect.sh macro   — store one macro risk snapshot
 #   collect.sh decision — refresh relations, market checks, and portfolio
 #   collect.sh enrich  — add cached Chinese intelligence with DeepSeek
@@ -29,6 +29,9 @@ mkdir -p "$(dirname "$KOL_DASHBOARD_DB")" "$LOG_DIR"
 ERROR_LOG="$LOG_DIR/collect.err.log"
 ENRICHMENT_MARKER="${KOL_ENRICH_WAKE_PATH:-$(dirname "$KOL_DASHBOARD_DB")/enrichment.pending}"
 DAILY_SNAPSHOT="${KOL_DAILY_SNAPSHOT_PATH:-$DATA_DIR/daily-briefing-latest.json}"
+KOL_CADENCE_STATE="${KOL_CADENCE_STATE_PATH:-$DATA_DIR/kol-cadence-state.json}"
+KOL_COLLECT_LOCK="${KOL_COLLECT_LOCK_PATH:-$DATA_DIR/kol-collect.lock}"
+export KOL_CADENCE_STATE_PATH="$KOL_CADENCE_STATE"
 
 TRACKER="$LIB_DIR/kol_tracker.py"
 [[ -f "$TRACKER" ]] || {
@@ -70,11 +73,31 @@ run_capture() {
 
 case "${1:-kol}" in
   kol)
-    OUT=$(run_capture python3 "$TRACKER" collect 6)
+    command -v flock >/dev/null || {
+      echo "missing required command: flock" >&2
+      exit 1
+    }
+    exec 9>"$KOL_COLLECT_LOCK"
+    chmod 600 "$KOL_COLLECT_LOCK"
+    if ! flock -n 9; then
+      echo "[$(stamp)] kol: skipped overlapping collection" \
+        >> "$LOG_DIR/collect.log"
+      exit 0
+    fi
+    KOL_RC=0
+    OUT=$(run_capture python3 "$TRACKER" collect-tiered 6) || KOL_RC=$?
     RELATIONS=$(run_capture python3 "$DIR/decision_collect.py" relations)
     signal_enrichment
+    if (( KOL_RC != 0 )); then
+      OUT="tiered collector failed after the hot-lane write"
+    fi
     OUT="$OUT; $RELATIONS"
     echo "[$(stamp)] kol: $OUT" >> "$LOG_DIR/collect.log"
+    if (( KOL_RC != 0 )); then
+      printf '[%s] kol collection degraded (exit=%s); hot-lane downstream work completed\n' \
+        "$(stamp)" "$KOL_RC" | tee -a "$ERROR_LOG" >&2
+      exit "$KOL_RC"
+    fi
     ;;
   macro)
     OUT=$(run_capture python3 "$DIR/macro_collect.py")

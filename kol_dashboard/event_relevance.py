@@ -28,7 +28,7 @@ except ModuleNotFoundError:  # Flat production bundle in /opt/kol-dashboard.
     )
 
 
-CLASSIFIER_VERSION = "kol-event-relevance-v1"
+CLASSIFIER_VERSION = "kol-event-relevance-v2"
 
 # Public, dependency-free directory used by both the collector and API.  Search
 # terms and source credentials remain private to the collector configuration.
@@ -106,27 +106,6 @@ _AFFILIATED_COMPANIES: dict[str, tuple[str, ...]] = {
     "burry": ("Scion Asset Management", "Scion"),
     "howardmarks": ("Oaktree Capital", "Oaktree", "橡树资本"),
     "cathiewood": ("ARK Invest", "ARK Investment", "方舟投资"),
-}
-
-_BASELINE_IMPACT = {
-    "trump": "high",
-    "musk": "high",
-    "buffett": "medium",
-    "dalio": "medium",
-    "duanyongping": "medium",
-    "danbin": "low",
-    "renzeping": "low",
-    "huangrenxun": "high",
-    "suzifeng": "high",
-    "altman": "high",
-    "zuckerberg": "high",
-    "powell": "high",
-    "pangongsheng": "high",
-    "dimon": "high",
-    "burry": "medium",
-    "howardmarks": "medium",
-    "cathiewood": "medium",
-    "serenity": "medium",
 }
 
 _DIRECT_HANDLES = {
@@ -472,6 +451,17 @@ _BUSINESS_METRIC_RE = re.compile(
     r"(?:出货|交付|交付预期|毛利率|利润率|订单积压|预订量|销量|市占率|价格)",
     re.I,
 )
+_CAPITAL_ALLOCATION_RE = re.compile(
+    r"\b(?:raise|raises|raised|increase|increases|increased|cut|cuts|cutting|"
+    r"reduce|reduces|reduced)\b.{0,18}\b(?:capex|capital expenditure|"
+    r"investment|spending)\b|"
+    r"\b(?:capex|capital expenditure|investment|spending)\b.{0,18}"
+    r"\b(?:rise|rises|rose|increase|increases|increased|fall|falls|fell|"
+    r"decline|declines|declined|cut|cuts|reduced)\b|"
+    r"(?:提高|增加|上调|削减|降低|下调).{0,10}(?:资本开支|资本支出|投资额)|"
+    r"(?:资本开支|资本支出|投资额).{0,10}(?:提高|增加|上调|削减|降低|下调)",
+    re.I,
+)
 _RATE_HOLD_RE = re.compile(
     r"\b(?:hold|holds|held|keep|keeps|kept|leave|leaves|left)\b.{0,20}"
     r"\b(?:interest\s+)?rates?\b.{0,12}\b(?:steady|unchanged)\b|"
@@ -520,7 +510,9 @@ def _has_business_signal(
     """Require a real action/metric, not merely a business-looking noun."""
     if _NON_BUSINESS_CONTEXT_RE.search(text):
         return False
-    metric = bool(_BUSINESS_METRIC_RE.search(text))
+    metric = bool(
+        _BUSINESS_METRIC_RE.search(text) or _CAPITAL_ALLOCATION_RE.search(text)
+    )
     corporate_action = bool(_CORPORATE_ACTION_RE.search(text))
     corporate_event = bool(_CORPORATE_EVENT_RE.search(text))
     trade_action = bool(_TRADE_ACTION_RE.search(text))
@@ -644,13 +636,21 @@ def classify_rule_impact(
         or policy_direct_war
     ):
         return "high"
-    if _MEDIUM_RE.search(text):
+    if _is_owned_direct_source(event):
+        attribution_basis = "direct_source"
+    else:
+        _, _, attribution_basis = matches_kol_entity(event)
+    if _MEDIUM_RE.search(text) or _has_business_signal(
+        text,
+        attribution_basis,
+        key,
+    ):
         return "medium"
 
-    baseline = str(
-        event.get("kol_baseline_impact") or _BASELINE_IMPACT.get(key, "low")
-    ).strip().casefold()
-    return "medium" if baseline in {"high", "medium"} else "low"
+    # A person's prominence is useful for collection cadence, but is not
+    # evidence that this particular event moves markets.  Only an explicit
+    # event/action pattern above may establish medium or high impact.
+    return "low"
 
 
 def assess_event_relevance(

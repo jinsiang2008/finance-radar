@@ -1334,8 +1334,9 @@ class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
         listed = listing.json()["items"][0]
         self.assertEqual(listed["id"], candidate["id"])
         self.assertEqual(listed["tickers"], ["NVDA"])
-        self.assertEqual(listed["rule_impact"], "medium")
-        self.assertEqual(listed["impact"], "high")
+        self.assertEqual(listed["rule_impact"], "low")
+        self.assertEqual(listed["impact"], "medium")
+        self.assertEqual(listed["impact_basis"], "ai_review_only")
         self.assertEqual(listed["ai_status"], "ready")
         self.assertEqual(
             listed["ai_enrichment"]["headline_zh"],
@@ -1401,7 +1402,7 @@ class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(primary["tickers"], ["NVDA"])
         self.assertEqual(primary["ai_status"], "ready")
         self.assertTrue(primary["ai_request_eligible"])
-        self.assertEqual(primary["impact"], "high")
+        self.assertEqual(primary["impact"], "medium")
         self.assertEqual(primary["relations"][0]["asset_key"], "US:NVDA")
         self.assertEqual(primary["market_reactions"], [])
         self.assertEqual(
@@ -1689,6 +1690,9 @@ class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
                 "dedup_stats",
                 "lead",
                 "highlights",
+                "major_count",
+                "all_major",
+                "highlights_overflow",
                 "firsthand",
                 "next_refresh_at",
                 "refresh_schedule_status",
