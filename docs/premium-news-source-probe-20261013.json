@@ -1,0 +1,69 @@
+{
+  "verified_date_cst": "2026-10-13",
+  "scope": "One-time public endpoint GET and feed metadata parsing from the KOL server. No production configuration, scheduler, subscription or application changes.",
+  "status": "feasibility_verified_in_part_not_integrated",
+  "sources": [
+    {
+      "publisher": "Bloomberg",
+      "feed": "Markets",
+      "url": "https://www.bloomberg.com/feeds/markets/news.rss",
+      "http_status": 200,
+      "content_type": "text/xml; charset=utf-8",
+      "items": 20,
+      "items_with_title_link_description": 20,
+      "items_with_content_encoded": 0,
+      "latest_published_utc": "2026-10-12T16:17:23+00:00",
+      "note": "https://feeds.bloomberg.com/markets/news.rss redirects to this canonical URL; these are one feed, not independent sources. Public RSS does not establish the coverage or latency of Bloomberg Event-Driven Feeds.",
+      "institutional_product": "https://professional.bloomberg.com/products/data/enterprise-catalog/event-driven-feeds/"
+    },
+    {
+      "publisher": "WSJ / Dow Jones",
+      "feed": "Markets",
+      "url": "https://feeds.content.dowjones.io/public/rss/RSSMarketsMain",
+      "http_status": 200,
+      "content_type": "application/xml; charset=utf-8",
+      "items": 61,
+      "items_with_title_link_description": 61,
+      "items_with_content_encoded": 0,
+      "latest_published_utc": "2026-10-12T14:28:00+00:00"
+    },
+    {
+      "publisher": "WSJ / Dow Jones",
+      "feed": "US Business",
+      "url": "https://feeds.content.dowjones.io/public/rss/WSJcomUSBusiness",
+      "http_status": 200,
+      "content_type": "application/xml; charset=utf-8",
+      "items": 85,
+      "items_with_title_and_link": 85,
+      "items_with_description": 82,
+      "items_with_content_encoded": 0,
+      "latest_published_utc": "2026-10-12T16:20:00+00:00"
+    },
+    {
+      "publisher": "财联社",
+      "url": "https://www.cls.cn/telegraph",
+      "http_status": 200,
+      "access_verified": "Public HTML entry point reachable; no RSS feed or structured article extraction established.",
+      "official_free_api_status": "Not confirmed. No stable official public free API/RSS documentation verified.",
+      "coverage_example": {
+        "url": "https://m.cls.cn/detail/2500422",
+        "published_cst": "2026-10-09 15:14",
+        "topic": "LME copper price threshold alert; historical example, not current price or latency evidence."
+      },
+      "official_cooperation": "https://image.cls.cn/html/business/cooperation_671.html"
+    }
+  ],
+  "limitations": [
+    "A successful GET is a point-in-time connectivity check, not a long-term availability, automation permission or latency guarantee.",
+    "Feed entries provide metadata/descriptions; complete paid article text was not fetched or verified.",
+    "Publication time and the time an item first becomes available in a feed are different. A single probe cannot measure provider delivery delay.",
+    "WSJ feeds may overlap; item counts must not be added as unique stories. Multiple publishers can also repeat the same original report."
+  ],
+  "proposed_next_step": {
+    "status": "proposed_not_deployed",
+    "rss_poll_minutes": 5,
+    "priority": ["Bloomberg Markets RSS", "WSJ Markets RSS", "WSJ US Business RSS", "财联社 official structured access feasibility"],
+    "measure": ["source publication time", "first observed time", "ingestion time", "card availability time", "source availability and duplicates"],
+    "processing": "Commodity event ingestion independent of person-name searches; price/keyword rules can create factual cards before optional DeepSeek analysis. Keep Bing as supplementary discovery."
+  }
+}

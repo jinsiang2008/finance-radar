@@ -34,6 +34,7 @@ Environment:
 from __future__ import annotations
 
 import json
+from html import escape
 import os
 import re
 import sqlite3
@@ -44,7 +45,7 @@ from typing import Any, Literal, Optional
 from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Path as ApiPath, Query, Request
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -56,6 +57,9 @@ import decision_service
 import llm_enrichment
 import options_policy
 import options_research_service
+import reading_service
+import news_service
+import news_enrichment
 
 BASE = Path(__file__).parent
 app = FastAPI(title="KOL Dashboard + Macro Risk Radar", version="2.0")
@@ -79,6 +83,12 @@ _AI_ACTION_HEADER = "X-Finance-Radar-Action"
 _AI_ACTION_VALUE = "request-ai-enrichment"
 _OPTIONS_POLICY_ACTION_VALUE = "update-options-policy"
 _OPTIONS_POLICY_MAX_BODY_BYTES = 16 * 1024
+_READING_ASSET_VERSION = "41"
+_READING_ASSETS = frozenset({"app.js", "style.css", "wechat.js", "wechat.css", "reader-auth.js", "reader-auth.css"})
+_READING_WEB = BASE.parent / "research" / "podcast_poc" / "web"
+# The atomic release flattens kol_dashboard alongside the shared research package.
+if not _READING_WEB.is_dir():
+    _READING_WEB = BASE / "research" / "podcast_poc" / "web"
 _AI_SUBJECT_TYPES = {"event", "macro_event"}
 _EVENT_SUBJECT_ID = re.compile(r"^[1-9][0-9]{0,18}$")
 _SQLITE_MAX_INTEGER = (1 << 63) - 1
@@ -209,6 +219,26 @@ def _init_db() -> None:
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
+
+
+@app.get("/api/news")
+def news(
+    limit: int = Query(default=40, ge=1, le=200),
+    commodity: Literal["copper", "gold", "silver", "aluminum", "oil", "gas"] | None = None,
+    publisher: Literal["Bloomberg", "WSJ"] | None = None,
+) -> JSONResponse:
+    """Persisted public feed evidence; HTTP reads never fetch or call the model."""
+    try:
+        snapshot = news_service.get_news_snapshot(
+            limit=limit, commodity=commodity, publisher=publisher, db_path=db.DB_PATH,
+        )
+        snapshot = news_enrichment.decorate_snapshot(snapshot, db_path=db.DB_PATH)
+    except sqlite3.Error:
+        return JSONResponse(
+            {"detail": "news_temporarily_unavailable"},
+            status_code=503, headers=_NO_STORE_HEADERS,
+        )
+    return JSONResponse(snapshot, headers=_PUBLIC_CACHE_HEADERS)
 
 
 @app.get("/api/auth/status")
@@ -1201,6 +1231,132 @@ def api_prune(
     _: dict[str, Any] = Depends(require_private_session),
 ) -> JSONResponse:
     return _private_response({"pruned": db.prune_old()})
+
+
+def _reading_page(name: str) -> HTMLResponse:
+    """Only the public page shell; all reading data requires the existing session."""
+    base = _auth_config().cookie_path.rstrip("/")
+    source = (_READING_WEB / name).read_text(encoding="utf-8")
+    source = source.replace("<html ", f'<html data-reading-mode="kol" data-kol-base="{escape(base, quote=True)}" ', 1)
+    for asset in _READING_ASSETS:
+        for prefix in ("./", "/", ""):
+            source = source.replace(f'="{prefix}{asset}"', f'="{escape(base, quote=True)}/reading-assets/{asset}?v={_READING_ASSET_VERSION}"')
+    return HTMLResponse(source, headers={**_NO_STORE_HEADERS,
+        "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; media-src 'self' https:; img-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
+        "X-Content-Type-Options": "nosniff", "Referrer-Policy": "same-origin"})
+
+
+@app.get("/wechat", response_class=HTMLResponse)
+def wechat_reader() -> HTMLResponse:
+    return _reading_page("wechat.html")
+
+
+@app.get("/podcasts", response_class=HTMLResponse)
+def podcast_reader() -> HTMLResponse:
+    return _reading_page("index.html")
+
+
+@app.get("/reading-assets/{name}")
+def reading_asset(name: str) -> FileResponse:
+    if name not in _READING_ASSETS or not (_READING_WEB / name).is_file():
+        raise HTTPException(status_code=404, detail="reading_asset_not_found")
+    return FileResponse(_READING_WEB / name, headers={"Cache-Control": "public, max-age=604800, immutable",
+        "X-Content-Type-Options": "nosniff"})
+
+
+@app.get("/api/private/reading/wechat")
+def private_wechat_reading(_: dict[str, Any] = Depends(require_private_session)) -> JSONResponse:
+    return _private_response(reading_service.wechat_payload())
+
+
+@app.get("/api/private/reading/podcasts")
+def private_podcast_reading(_: dict[str, Any] = Depends(require_private_session)) -> JSONResponse:
+    return _private_response(reading_service.podcast_payload())
+
+
+@app.get("/api/private/reading/status")
+def private_reading_status(_: dict[str, Any] = Depends(require_private_session)) -> JSONResponse:
+    return _private_response(reading_service.runtime_status())
+
+
+@app.post("/api/private/reading/summary")
+async def request_reading_summary(request: Request,
+    _: dict[str, Any] = Depends(require_private_session)) -> JSONResponse:
+    _require_same_origin(request, error_detail="reading_same_origin_required")
+    if (request.headers.get(_AI_ACTION_HEADER) != "request-reading-summary"
+            or request.headers.get("sec-fetch-site", "same-origin") not in {"none", "same-origin"}):
+        _ai_request_error(403, "reading_action_header_required")
+    if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json":
+        _ai_request_error(415, "reading_json_body_required")
+    raw = bytearray()
+    async for chunk in request.stream():
+        if len(raw) + len(chunk) > 1024:
+            _ai_request_error(413, "reading_request_too_large")
+        raw.extend(chunk)
+    try:
+        value = json.loads(raw, object_pairs_hook=_strict_json_object)
+        if (not isinstance(value, dict) or set(value) != {"id"} or not isinstance(value["id"], str)
+                or not re.fullmatch(r"[a-zA-Z0-9_-]{1,100}", value["id"])):
+            raise ValueError("Invalid reading identity")
+    except (ValueError, UnicodeDecodeError):
+        _ai_request_error(422, "invalid_reading_request")
+    try:
+        job = reading_service.enqueue_summary(value["id"])
+    except FileNotFoundError:
+        _ai_request_error(404, "reading_item_not_found")
+    except ValueError:
+        _ai_request_error(422, "reading_body_unavailable")
+    except (OSError, RuntimeError, sqlite3.Error):
+        _ai_request_error(503, "reading_service_unavailable")
+    return _private_response({"job": job}, status_code=200 if job["state"] == "completed" else 202)
+
+
+@app.get("/api/private/reading/media/{name}")
+def private_reading_audio(name: str, request: Request,
+    _: dict[str, Any] = Depends(require_private_session)) -> Response:
+    if not re.fullmatch(r"[a-zA-Z0-9_-]{1,100}\.wav", name):
+        _ai_request_error(404, "reading_media_not_found")
+    try:
+        path = reading_service.media_path(name[:-4])
+    except (ValueError, FileNotFoundError):
+        path = None
+    if path is None:
+        _ai_request_error(404, "reading_media_not_found")
+    size = path.stat().st_size
+    start, end, code = 0, size - 1, 200
+    headers = {**_NO_STORE_HEADERS, "Accept-Ranges": "bytes", "X-Content-Type-Options": "nosniff"}
+    byte_range = request.headers.get("range")
+    if byte_range:
+        match = re.fullmatch(r"bytes=(\d*)-(\d*)", byte_range)
+        if not match or not any(match.groups()) or size == 0:
+            return Response(status_code=416, headers={**headers, "Content-Range": f"bytes */{size}"})
+        # Limit parsing work before int conversion, including pathological headers.
+        if any(len(part) > 20 for part in match.groups()):
+            return Response(status_code=416, headers={**headers, "Content-Range": f"bytes */{size}"})
+        if not match[1]:
+            start = max(0, size - int(match[2]))
+        else:
+            start = int(match[1])
+            end = min(int(match[2]) if match[2] else size - 1, size - 1)
+        if start >= size or end < start:
+            return Response(status_code=416, headers={**headers, "Content-Range": f"bytes */{size}"})
+        code = 206
+        headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+    length = max(0, end - start + 1)
+    headers["Content-Length"] = str(length)
+
+    def content():
+        with path.open("rb") as stream:
+            stream.seek(start)
+            remaining = length
+            while remaining:
+                chunk = stream.read(min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                yield chunk
+
+    return StreamingResponse(content(), status_code=code, media_type="audio/wav", headers=headers)
 
 
 @app.get("/")

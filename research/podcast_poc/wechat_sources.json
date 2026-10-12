@@ -1,0 +1,47 @@
+{
+  "provider_note": "第三方公开免费 RSS，仅为 POC 样本，不是实时热榜；正文未与微信原页面核实完整。",
+  "sources": [
+    {
+      "id": "maobidao",
+      "name": "猫笔刀",
+      "category": "finance",
+      "feed_url": "https://wechat2rss.xlab.app/feed/33d986064f59be5263de2ca822fb3e0bdd59eb81.xml",
+      "provider": "Wechat2RSS"
+    },
+    {
+      "id": "jisilu",
+      "name": "集思录",
+      "category": "finance",
+      "feed_url": "https://wechat2rss.xlab.app/feed/f75bbb0bffd9fd6e0dda725282202ccc23a2bdff.xml",
+      "provider": "Wechat2RSS"
+    },
+    {
+      "id": "jiqizhixin",
+      "name": "机器之心",
+      "category": "ai",
+      "feed_url": "https://wechat2rss.xlab.app/feed/51e92aad2728acdd1fda7314be32b16639353001.xml",
+      "provider": "Wechat2RSS"
+    },
+    {
+      "id": "liangziwei",
+      "name": "量子位",
+      "category": "ai",
+      "feed_url": "https://wechat2rss.xlab.app/feed/7131b577c61365cb47e81000738c10d872685908.xml",
+      "provider": "Wechat2RSS"
+    },
+    {
+      "id": "tencent-engineering",
+      "name": "腾讯技术工程",
+      "category": "tech",
+      "feed_url": "https://wechat2rss.xlab.app/feed/9685937b45fe9c7a526dbc32e4f24ba879a65b9a.xml",
+      "provider": "Wechat2RSS"
+    },
+    {
+      "id": "meituan-tech",
+      "name": "美团技术团队",
+      "category": "tech",
+      "feed_url": "https://wechat2rss.xlab.app/feed/eb4d04149424a874693a51c6fdda0dba8673f5e4.xml",
+      "provider": "Wechat2RSS"
+    }
+  ]
+}

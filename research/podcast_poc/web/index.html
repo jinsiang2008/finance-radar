@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>播客阅读 · KOL</title>
+  <link rel="stylesheet" href="./style.css">
+  <link rel="stylesheet" href="/reader-auth.css">
+  <script src="/reader-auth.js" defer></script>
+  <script src="./app.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#reader">跳到阅读区</a>
+  <header class="masthead">
+    <div class="brand"><span class="brand-mark" aria-hidden="true">◖</span><span>KOL <b>阅读</b></span></div>
+    <nav class="content-nav" aria-label="内容导航"><a href="/" aria-current="page">播客</a><a href="/wechat">公众号</a></nav>
+    <span class="local-label"><span aria-hidden="true"></span>本地体验版</span>
+  </header>
+  <section class="intro">
+    <div><h1>长对话，慢慢读。</h1><p>关注 AI、科技与商业，从中文摘要回到每一段原话。</p></div>
+    <div class="update"><p id="collection-status" aria-live="polite">正在读取节目…</p><button id="refresh" class="quiet-button" type="button">刷新列表</button></div>
+  </section>
+  <div class="workspace">
+    <aside class="inbox" aria-label="节目列表">
+      <div class="inbox-heading"><h2>阅读清单</h2><span id="episode-count">—</span></div>
+      <div id="episode-list" class="episode-list"><p class="empty">正在加载…</p></div>
+      <p class="inbox-note">点开观点查看出处。音频只在你点击后加载。</p>
+    </aside>
+    <main id="reader" class="reader" tabindex="-1"><div class="welcome"><span aria-hidden="true">◖</span><h2>从一集好对话开始</h2><p>节目加载后，在左侧选择要阅读的内容。</p></div></main>
+  </div>
+  <footer class="page-footer">摘要是阅读入口。涉及数字、判断或重要决策时，请结合原文与节目语境。</footer>
+</body>
+</html>

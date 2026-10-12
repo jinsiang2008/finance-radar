@@ -1,0 +1,91 @@
+{
+  "verified_at": "2026-10-03T05:45:53.779278+00:00",
+  "scope": "local_free_poc_not_deployed",
+  "sources": [
+    {
+      "name": "猫笔刀",
+      "category": "finance",
+      "status": "ok",
+      "retrieval_mode": "live_public_rss",
+      "latest_published_at": "2026-09-28T14:24:00+00:00",
+      "article_count": 2
+    },
+    {
+      "name": "集思录",
+      "category": "finance",
+      "status": "ok",
+      "retrieval_mode": "live_public_rss",
+      "latest_published_at": "2026-09-27T14:36:00+00:00",
+      "article_count": 2
+    },
+    {
+      "name": "机器之心",
+      "category": "ai",
+      "status": "ok",
+      "retrieval_mode": "live_public_rss",
+      "latest_published_at": "2026-09-28T03:30:00+00:00",
+      "article_count": 2
+    },
+    {
+      "name": "量子位",
+      "category": "ai",
+      "status": "ok",
+      "retrieval_mode": "live_public_rss",
+      "latest_published_at": "2026-09-28T10:30:00+00:00",
+      "article_count": 2
+    },
+    {
+      "name": "腾讯技术工程",
+      "category": "tech",
+      "status": "ok",
+      "retrieval_mode": "live_public_rss",
+      "latest_published_at": "2026-09-24T09:36:00+00:00",
+      "article_count": 2
+    },
+    {
+      "name": "美团技术团队",
+      "category": "tech",
+      "status": "ok",
+      "retrieval_mode": "live_public_rss",
+      "latest_published_at": "2026-09-22T03:01:00+00:00",
+      "article_count": 2
+    }
+  ],
+  "article_count": 12,
+  "body_count": 12,
+  "summary_count": 6,
+  "assistant_reviewed_count": 3,
+  "paid_api_calls": 0,
+  "summary_elapsed_seconds_total": 192.02,
+  "unit_tests": {
+    "passed": 20,
+    "failed": 0
+  },
+  "browser": {
+    "tested_at": "2026-10-03T05:44:55.368Z",
+    "sources": 6,
+    "articles": 12,
+    "summaries_at_test": 6,
+    "checks": [
+      "live API",
+      "6 source states",
+      "3 category filters",
+      "title search",
+      "paragraph citations",
+      "original link",
+      "390px overflow",
+      "podcast regression",
+      "no JS errors",
+      "no third-party browser requests"
+    ],
+    "page_errors": []
+  },
+  "limits": [
+    "third_party_RSS_text_not_verified_complete_against_WeChat_original",
+    "images_not_parsed",
+    "no_popularity_metrics",
+    "local_model_semantic_errors_need_review",
+    "no_scheduled_refresh",
+    "not_deployed"
+  ]
+}

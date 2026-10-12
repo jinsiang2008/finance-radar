@@ -4,7 +4,15 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
+import json
+import io
+from contextlib import redirect_stdout
+from unittest.mock import patch
 from pathlib import Path
+import re
+import shlex
+import sqlite3
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -42,9 +50,122 @@ class DeploymentContractTests(unittest.TestCase):
             "options_policy.py",
             "options_research_service.py",
             "options_strategy.py",
+            "reading_service.py",
+            "reading_worker.py",
+            "reading_import.py",
+            "news_service.py",
+            "news_collect.py",
+            "news_enrichment.py",
             "collect.sh",
         ):
             self.assertIn(filename, self.deploy)
+
+    def test_news_workers_are_quiesced_backed_up_and_restored(self) -> None:
+        for name in ("prepare_unit_state_rollback", "restore_unit_states", "cleanup_remote"):
+            start = self.deploy.index(name + "() {")
+            end = self.deploy.index("\n}\n", start)
+            for unit in ("kol-collect-news.timer", "kol-enrich-news.timer"):
+                self.assertIn(unit, self.deploy[start:end], (name, unit))
+        for action in ("backup_path", "restore_path"):
+            self.assertIn(action + ' /etc/systemd/system/kol-enrich-news.service', self.deploy)
+            self.assertIn(action + ' /etc/systemd/system/kol-enrich-news.timer', self.deploy)
+        for section in ("rollback_configuration() {", 'backup_path /etc/systemd/system/kol-dashboard.service'):
+            start = self.deploy.index(section)
+            self.assertIn("for job in kol macro decision daily enrich news; do", self.deploy[start:])
+        start = self.deploy.index("systemctl stop kol-enrich-wakeup.path")
+        end = self.deploy.index("SERVICES_STOPPED=1", start)
+        for unit in ("kol-collect-news.service", "kol-enrich-news.service"):
+            # Stop first, then independently verify that each writer stopped.
+            self.assertEqual(self.deploy[start:end].count(unit), 2)
+        record = self.deploy.index("record_unit_state \"$unit\"")
+        self.assertIn("kol-enrich-news.timer", self.deploy[record - 350:record])
+
+    def test_generated_news_collection_unit_has_no_model_dependency(self) -> None:
+        start = self.deploy.index("for job in kol macro decision daily enrich news; do\n  EXTRA_ENVIRONMENT=")
+        end = self.deploy.index("\n# Only this worker", start)
+        with tempfile.TemporaryDirectory() as directory:
+            script = "REMOTE_STAGE=" + shlex.quote(directory) + "\ninstall() { :; }\n" + self.deploy[start:end]
+            result = subprocess.run(["bash"], input=script, text=True, capture_output=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            unit = (Path(directory) / "kol-collect-news.service").read_text()
+            self.assertIn("ExecStart=/usr/bin/python3 /opt/kol-dashboard/current/news_collect.py", unit)
+            self.assertIn("TimeoutStartSec=3min", unit)
+            self.assertIn("User=kol-dashboard", unit)
+            self.assertIn("Environment=KOL_DASHBOARD_DB=/opt/kol-dashboard/data/kol_dashboard.db", unit)
+            self.assertNotIn("deepseek.env", unit)
+            self.assertNotIn("reading_worker", unit)
+            self.assertNotIn("collect.sh news", unit)
+            old_unit = (Path(directory) / "kol-collect-enrich.service").read_text()
+            self.assertIn("TimeoutStartSec=20min", old_unit)
+            self.assertIn("ExecStart=/bin/bash /opt/kol-dashboard/current/collect.sh enrich", old_unit)
+
+    def test_news_enrichment_has_a_separate_bounded_secret_bearing_unit(self) -> None:
+        start = self.deploy.index('cat > "$REMOTE_STAGE/kol-enrich-news.service"')
+        end = self.deploy.index("\nUNIT\n", start)
+        unit = self.deploy[start:end]
+        self.assertIn("EnvironmentFile=-/etc/kol-dashboard/deepseek.env", unit)
+        self.assertIn("ExecStart=/usr/bin/python3 /opt/kol-dashboard/current/news_enrichment.py --limit 4", unit)
+        for line in ("User=kol-dashboard", "UMask=0077", "LimitCORE=0", "NoNewPrivileges=true", "TimeoutStartSec=5min"):
+            self.assertIn(line, unit)
+        self.assertNotIn("/opt/kol-dashboard/private", unit)
+
+    def test_news_timers_have_five_minute_polling_and_acceptance_before_commit(self) -> None:
+        for unit in ("kol-collect-news", "kol-enrich-news"):
+            start = self.deploy.index('cat > "$REMOTE_STAGE/' + unit + '.timer"')
+            end = self.deploy.index("\nUNIT\n", start)
+            timer = self.deploy[start:end]
+            for line in ("OnCalendar=*-*-* *:00/5:00", "RandomizedDelaySec=15s", "AccuracySec=5s", "Persistent=true", "Unit=" + unit + ".service"):
+                self.assertIn(line, timer)
+        preflight = self.deploy.index("/usr/bin/python3 -c 'import news_service, news_collect, news_enrichment'")
+        stop = self.deploy.index("systemctl stop kol-enrich-wakeup.path")
+        self.assertLess(preflight, stop)
+        candidate = self.deploy.index("\nsystemctl start kol-collect-news.service\n")
+        acceptance = self.deploy.index('validate_news_api "$NEWS_ACCEPTANCE_NOT_BEFORE"', candidate)
+        timers = self.deploy.index("systemctl start kol-collect-kol.timer", acceptance)
+        committed = self.deploy.index("\nCOMMITTED=1\n", timers)
+        self.assertLess(candidate, acceptance)
+        self.assertLess(acceptance, timers)
+        self.assertLess(timers, committed)
+        enabled = self.deploy.index("systemctl enable -q kol-dashboard")
+        for unit in ("kol-collect-news.timer", "kol-enrich-news.timer"):
+            self.assertIn(unit, self.deploy[enabled:candidate])
+            self.assertIn(unit, self.deploy[timers:committed])
+        self.assertIn("https://zlstreet.xyz/kol/api/news", self.deploy)
+
+    def test_news_acceptance_rejects_partial_stale_or_empty_successes(self) -> None:
+        function = self.deploy.index("validate_news_api() {")
+        start = self.deploy.index("<<'PY_NEWS'\n", function) + len("<<'PY_NEWS'\n")
+        end = self.deploy.index("\nPY_NEWS\n", start)
+        validator = compile(self.deploy[start:end], "news-release-acceptance", "exec")
+        now = datetime.now(timezone.utc)
+        source_ids = ("bloomberg_markets", "wsj_markets", "wsj_business")
+
+        def payload() -> dict:
+            return {"sources": [{"id": source_id, "status": "ok", "stale": False, "last_checked_at": now.isoformat(), "last_success_at": now.isoformat(), "item_count": 2} for source_id in source_ids], "items": [{"title": "Accepted news item"}]}
+
+        def run(value: dict) -> None:
+            response = io.StringIO(json.dumps(value))
+            response.status = 200
+            with patch("urllib.request.urlopen", return_value=response), patch.object(sys, "argv", ["acceptance", str(int(now.timestamp()) - 1)]), redirect_stdout(io.StringIO()):
+                exec(validator, {})
+
+        run(payload())
+        mutations = {
+            "missing source": lambda value: value["sources"].pop(),
+            "failed source": lambda value: value["sources"][0].update(status="error"),
+            "stale source": lambda value: value["sources"][0].update(stale=True),
+            "no source entries": lambda value: value["sources"][0].update(item_count=0),
+            "old run": lambda value: value["sources"][0].update(last_success_at=(now - timedelta(minutes=10)).isoformat()),
+            "future run": lambda value: value["sources"][0].update(last_checked_at=(now + timedelta(minutes=10)).isoformat()),
+            "naive time": lambda value: value["sources"][0].update(last_checked_at=now.replace(tzinfo=None).isoformat()),
+            "empty api": lambda value: value.update(items=[]),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                value = payload()
+                mutate(value)
+                with self.assertRaises(SystemExit):
+                    run(value)
 
     def test_deploy_bundle_omits_macos_appledouble_metadata(self) -> None:
         self.assertIn("COPYFILE_DISABLE=1 tar --no-xattrs -czf", self.deploy)
@@ -75,7 +196,8 @@ class DeploymentContractTests(unittest.TestCase):
             "Environment=KOL_DASHBOARD_PASSCODE_HASH",
             self.deploy,
         )
-        self.assertIn("TimeoutStartSec=20min", self.deploy)
+        self.assertIn("JOB_TIMEOUT=20min", self.deploy)
+        self.assertIn("TimeoutStartSec=${JOB_TIMEOUT}", self.deploy)
 
     def test_decision_collection_is_scheduled_and_fail_fast(self) -> None:
         self.assertIn("set -euo pipefail", self.collect)
@@ -219,7 +341,7 @@ class DeploymentContractTests(unittest.TestCase):
 
     def test_daily_units_are_quiesced_enabled_and_rollback_safe(self) -> None:
         self.assertGreaterEqual(
-            self.deploy.count("for job in kol macro decision daily enrich; do"),
+            self.deploy.count("for job in kol macro decision daily enrich news; do"),
             3,
         )
         self.assertIn(
@@ -311,7 +433,7 @@ class DeploymentContractTests(unittest.TestCase):
             self.deploy.count(
                 "EnvironmentFile=-/etc/kol-dashboard/deepseek.env"
             ),
-            1,
+            3,
         )
         self.assertIn('EXTRA_HARDENING="LimitCORE=0"', self.deploy)
         self.assertNotIn("DEEPSEEK_API_KEY=", self.deploy)
@@ -370,7 +492,7 @@ class DeploymentContractTests(unittest.TestCase):
         )
         self.assertIn("systemctl stop kol-enrich-wakeup.path", self.deploy)
         self.assertIn("kol-collect-enrich.timer", self.deploy)
-        self.assertIn("kol-enrich-wakeup.path; do", self.deploy)
+        self.assertIn("kol-enrich-wakeup.path kol-reading-worker.service; do", self.deploy)
 
         enable = self.deploy.index("systemctl enable -q kol-dashboard")
         nginx_test = self.deploy.index("nginx -t", enable)
@@ -714,6 +836,8 @@ class DeploymentContractTests(unittest.TestCase):
             "kol-collect-decision.service",
             "kol-collect-daily.service",
             "kol-collect-enrich.service",
+            "kol-collect-news.service",
+            "kol-enrich-news.service",
         ):
             self.assertIn(unit, self.deploy)
         self.assertIn("PRAGMA wal_checkpoint(TRUNCATE)", self.deploy)
@@ -749,11 +873,15 @@ class DeploymentContractTests(unittest.TestCase):
             "kol-collect-decision.timer",
             "kol-collect-daily.timer",
             "kol-collect-enrich.timer",
+            "kol-collect-news.timer",
+            "kol-enrich-news.timer",
             "kol-collect-kol.service",
             "kol-collect-macro.service",
             "kol-collect-decision.service",
             "kol-collect-daily.service",
             "kol-collect-enrich.service",
+            "kol-collect-news.service",
+            "kol-enrich-news.service",
             "kol-dashboard.service",
         ):
             self.assertIn(unit, guard_setup)
@@ -841,6 +969,260 @@ class DeploymentContractTests(unittest.TestCase):
             proxy_check,
         )
         self.assertGreater(timer_start, proxy_check)
+
+    def test_reading_bundle_is_an_explicit_runtime_allowlist(self) -> None:
+        runtime = re.search(r'cp "\$READING_SOURCE"/\{([^}]+)\}', self.deploy)
+        assets = re.search(r'cp "\$READING_SOURCE/web"/\{([^}]+)\}', self.deploy)
+        self.assertIsNotNone(runtime)
+        self.assertIsNotNone(assets)
+        self.assertEqual(set(runtime.group(1).split(",")), {
+            "poc.py", "wechat.py", "reading_jobs.py", "schedule_policy.py",
+            "inference.py", "wechat_sources.json",
+        })
+        self.assertEqual(set(assets.group(1).split(",")), {
+            "index.html", "wechat.html", "app.js", "wechat.js", "style.css",
+            "wechat.css", "reader-auth.js", "reader-auth.css",
+        })
+        bundle = self.deploy[self.deploy.index('READING_SOURCE='):self.deploy.index('COPYFILE_DISABLE=1 tar')]
+        self.assertNotIn('cp -R', bundle)
+        self.assertNotIn('configure_deepseek.py', bundle)
+        self.assertNotIn('reader_control.py', bundle)
+        self.assertNotIn('deepseek-credentials.json', bundle)
+        for name in assets.group(1).split(","):
+            self.assertTrue((ROOT.parent / "research/podcast_poc/web" / name).is_file(), name)
+
+    def test_reading_worker_has_private_data_and_secrets_only_in_background_units(self) -> None:
+        start = self.deploy.index('cat > "$REMOTE_STAGE/kol-reading-worker.service"')
+        end = self.deploy.index('\nUNIT\n', start)
+        worker = self.deploy[start:end]
+        for required in (
+            'User=kol-dashboard', 'Group=kol-dashboard',
+            'WorkingDirectory=/opt/kol-dashboard/current',
+            'ExecStart=/usr/bin/python3 /opt/kol-dashboard/current/reading_worker.py',
+            'Environment=KOL_READING_DATA_DIR=/opt/kol-dashboard/private/reading',
+            'Environment=KOL_READING_ENABLED=1',
+            'Environment=KOL_DASHBOARD_DB=/opt/kol-dashboard/data/kol_dashboard.db',
+            'EnvironmentFile=-/etc/kol-dashboard/deepseek.env',
+            'LimitCORE=0', 'UMask=0077', 'ProtectSystem=strict',
+            'ReadWritePaths=/opt/kol-dashboard/private/reading /var/log/kol-dashboard',
+        ):
+            self.assertIn(required, worker)
+        self.assertNotIn('EnvironmentFile=-/etc/kol-dashboard.env', worker)
+        self.assertNotIn('kol-reading-worker.timer', self.deploy)
+        without_worker = self.deploy[:start] + self.deploy[end:]
+        news_start = without_worker.index('cat > "$REMOTE_STAGE/kol-enrich-news.service"')
+        news_end = without_worker.index('\nUNIT\n', news_start)
+        without_worker = without_worker[:news_start] + without_worker[news_end:]
+        without_workers = without_worker.replace(
+            'EXTRA_ENVIRONMENT="EnvironmentFile=-/etc/kol-dashboard/deepseek.env"', '')
+        self.assertNotIn('EnvironmentFile=-/etc/kol-dashboard/deepseek.env', without_workers)
+        web_start = self.deploy.index('cat > "$REMOTE_STAGE/kol-dashboard.service"')
+        web_end = self.deploy.index('\nUNIT\n', web_start)
+        web = self.deploy[web_start:web_end]
+        self.assertIn('Environment=KOL_READING_DATA_DIR=/opt/kol-dashboard/private/reading', web)
+        self.assertNotIn('deepseek.env', web)
+
+    def test_reading_worker_participates_in_every_stop_and_restore_boundary(self) -> None:
+        for name in ('prepare_unit_state_rollback', 'restore_unit_states', 'rollback_configuration', 'cleanup_remote'):
+            start = self.deploy.index(name + '() {')
+            end = self.deploy.index('\n}\n', start)
+            self.assertIn('kol-reading-worker.service', self.deploy[start:end], name)
+        record = self.deploy.index('backup_path /etc/systemd/system/kol-reading-worker.service')
+        ready = self.deploy.index('\nROLLBACK_READY=1\n', record)
+        self.assertIn('kol-reading-worker.service; do', self.deploy[record:ready])
+        stopping = self.deploy.index('systemctl stop kol-enrich-wakeup.path', ready)
+        stopped = self.deploy.index('\nSERVICES_STOPPED=1\n', stopping)
+        stop = self.deploy[stopping:stopped]
+        self.assertEqual(stop.count('kol-dashboard.service kol-reading-worker.service; do'), 2)
+        self.assertIn('systemctl show --property=LoadState --value', stop)
+        self.assertIn('systemctl show --property=ActiveState --value', stop)
+        self.assertIn('"$unit_state" != inactive && "$unit_state" != failed', stop)
+        self.assertIn('"$unit_load_state" == not-found', stop)
+        backup = self.deploy.index('\nbackup_reading_queue\n', stopped)
+        self.assertGreater(backup, stopped)
+        rollback = self.deploy.index('cleanup_remote() {')
+        guard = self.deploy.index('if [[ $rollback_safe == 1 ]]; then', rollback)
+        restore = self.deploy.index('rollback_reading_queue || rollback_failed=1', guard)
+        self.assertGreater(restore, guard)
+        self.assertIn('systemctl is-active --quiet kol-reading-worker.service || rollback_failed=1', self.deploy)
+
+    def test_reading_preflight_happens_before_stopping_existing_services(self) -> None:
+        preflight = self.deploy.index("/usr/bin/python3 -c 'import bs4, reading_service'")
+        stop = self.deploy.index('systemctl stop kol-enrich-wakeup.path')
+        self.assertLess(preflight, stop)
+        self.assertIn('beautifulsoup4>=4.12,<5', (ROOT.parent / 'requirements.txt').read_text())
+        self.assertNotIn('pip install', self.deploy)
+        self.assertNotIn('pip3 install', self.deploy)
+        self.assertIn('install -d -o kol-dashboard -g kol-dashboard -m 700 "$reading_path"', self.deploy)
+
+    def test_optional_reading_seed_is_imported_only_inside_stopped_release_transaction(self) -> None:
+        self.assertIn('READING_SEED_ARCHIVE="${KOL_READING_SEED_ARCHIVE:-}"', self.deploy)
+        self.assertIn('"$VPS" put "$READING_SEED_ARCHIVE" "$REMOTE_STAGE/reading-seed.tgz"', self.deploy)
+        self.assertIn('! -L "$READING_SEED_ARCHIVE"', self.deploy)
+        bundle = self.deploy[self.deploy.index('mkdir -p "$WORK/pkg/lib"'):self.deploy.index('echo "→ 创建远端私有暂存区"')]
+        self.assertNotIn('reading-seed.tgz', bundle)
+        self.assertNotIn('"$READING_SEED_ARCHIVE"', bundle)
+        stopped = self.deploy.index('\nSERVICES_STOPPED=1\n')
+        backup = self.deploy.index('\nbackup_reading_queue\n', stopped)
+        importer = self.deploy.index('PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 "$RELEASE_DIR/reading_import.py"', backup)
+        switch = self.deploy.index('ln -s "$RELEASE_DIR" "$CURRENT_NEXT"', importer)
+        start_worker = self.deploy.index('\nsystemctl start kol-reading-worker.service\n', switch)
+        self.assertLess(stopped, backup)
+        self.assertLess(backup, importer)
+        self.assertLess(importer, switch)
+        self.assertLess(switch, start_worker)
+        self.assertIn('--archive "$REMOTE_STAGE/reading-seed.tgz"', self.deploy[importer:switch])
+        self.assertIn('--data-dir "$READING_DATA_DIR" --owner kol-dashboard', self.deploy[importer:switch])
+
+    def test_reading_queue_backup_captures_committed_wal_rows(self) -> None:
+        function = self.deploy.index('backup_reading_queue() {')
+        start = self.deploy.index("<<'PY'\n", function) + len("<<'PY'\n")
+        end = self.deploy.index('\nPY\n', start)
+        program = self.deploy[start:end]
+        maintenance = self.deploy.index('reading_database_integrity() {')
+        check_start = self.deploy.index("<<'PY'\n", maintenance) + len("<<'PY'\n")
+        check_end = self.deploy.index('\nPY\n', check_start)
+        checkpoint = self.deploy[check_start:check_end]
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'reading source.sqlite3'
+            target = Path(directory) / 'before-release.sqlite3'
+            connection = sqlite3.connect(source)
+            self.addCleanup(connection.close)
+            connection.execute('PRAGMA journal_mode=WAL')
+            connection.execute('CREATE TABLE jobs (id TEXT PRIMARY KEY, state TEXT)')
+            connection.execute("INSERT INTO jobs VALUES ('keep-me', 'queued')")
+            connection.commit()
+            self.assertTrue(Path(str(source) + '-wal').exists())
+            self.assertGreater(Path(str(source) + '-wal').stat().st_size, 0)
+            result = subprocess.run([sys.executable, '-', str(source), 'checkpoint'],
+                                    input=checkpoint, text=True, capture_output=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            connection.close()
+            # All writers are stopped and checkpointed. Root's snapshot read
+            # must not recreate sidecars under its different service identity.
+            for suffix in ('-wal', '-shm'):
+                Path(str(source) + suffix).unlink(missing_ok=True)
+            result = subprocess.run([sys.executable, '-', str(source), str(target)],
+                                    input=program, text=True, capture_output=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with sqlite3.connect(target) as saved:
+                self.assertEqual(saved.execute('SELECT * FROM jobs').fetchall(), [('keep-me', 'queued')])
+                self.assertEqual(saved.execute('PRAGMA integrity_check').fetchone(), ('ok',))
+                self.assertEqual(saved.execute('PRAGMA journal_mode').fetchone(), ('delete',))
+            for path in (source, target):
+                for suffix in ('-wal', '-shm'):
+                    self.assertFalse(Path(str(path) + suffix).exists())
+            self.assertFalse(target.with_name(target.name + '.next').exists())
+            connection.close()
+
+    def test_reading_live_integrity_and_checkpoint_use_service_identity(self) -> None:
+        start = self.deploy.index('reading_database_integrity() {')
+        end = self.deploy.index('\n}\n', start)
+        integrity = self.deploy[start:end]
+        self.assertIn('runuser -u kol-dashboard -- /usr/bin/python3', integrity)
+        self.assertIn('info.st_uid != os.geteuid()', integrity)
+        self.assertNotIn('immutable=1', integrity)
+        backup_start = self.deploy.index('backup_reading_queue() {')
+        backup_end = self.deploy.index('\n}\n', backup_start)
+        backup = self.deploy[backup_start:backup_end]
+        self.assertLess(backup.index('reading_database_integrity "$READING_DB_PATH" checkpoint'),
+                        backup.index('source = sqlite3.connect'))
+        self.assertIn('mode=ro&immutable=1', backup)
+        self.assertNotRegex(self.deploy, r'(?m)^\s+database_integrity "\$READING_DB_(?:NEXT|PATH)"')
+        self.assertIn('\nreading_database_integrity "$READING_DB_PATH"\n', self.deploy)
+
+    def test_reading_checkpoint_fails_closed_while_a_writer_is_active(self) -> None:
+        function = self.deploy.index('reading_database_integrity() {')
+        start = self.deploy.index("<<'PY'\n", function) + len("<<'PY'\n")
+        end = self.deploy.index('\nPY\n', start)
+        # Only shorten SQLite's busy wait in this contention fixture.
+        program = self.deploy[start:end].replace('timeout=30', 'timeout=0.05')
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'blocked.sqlite3'
+            with sqlite3.connect(path) as connection:
+                connection.execute('PRAGMA journal_mode=WAL').fetchone()
+                connection.execute('CREATE TABLE jobs (id TEXT)')
+                connection.commit()
+                connection.execute('BEGIN IMMEDIATE')
+                connection.execute("INSERT INTO jobs VALUES ('uncommitted')")
+                result = subprocess.run([sys.executable, '-', str(path), 'checkpoint'],
+                    input=program, text=True, capture_output=True, check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('checkpoint did not finish', result.stderr)
+                connection.rollback()
+
+    def test_reading_queue_rollback_restores_old_queue_and_keeps_first_install_data(self) -> None:
+        start = self.deploy.index('rollback_reading_queue() {')
+        end = self.deploy.index('\n}\n', start) + 3
+        function = self.deploy[start:end]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rollback = root / 'rollback'; rollback.mkdir()
+            live = root / 'live queue.sqlite3'
+            saved = rollback / 'reading-queue.before-release'
+            with sqlite3.connect(saved) as connection:
+                connection.execute('CREATE TABLE jobs (id TEXT)')
+                connection.execute("INSERT INTO jobs VALUES ('before-release')")
+            live.write_bytes(b'changed')
+            Path(str(live) + '-wal').write_bytes(b'changed-wal')
+            Path(str(live) + '-shm').write_bytes(b'changed-shm')
+            articles = root / 'article.json'; articles.write_text('preserved')
+            setup = '\n'.join([
+                'set -euo pipefail', 'READING_DB_ROLLBACK_READY=1',
+                'ROLLBACK_DIR=' + shlex.quote(str(rollback)),
+                'READING_DB_PATH=' + shlex.quote(str(live)),
+                'READING_DB_NEXT=' + shlex.quote(str(live) + '.next'),
+                'chown() { :; }', 'database_integrity() { test -s "$1"; }',
+                'reading_database_integrity() { test -s "$1"; }',
+                function, 'rollback_reading_queue',
+            ])
+            result = subprocess.run(['bash'], input=setup, text=True, capture_output=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with sqlite3.connect(live) as restored:
+                self.assertEqual(restored.execute('SELECT id FROM jobs').fetchall(), [('before-release',)])
+            self.assertEqual(live.stat().st_mode & 0o777, 0o600)
+            self.assertFalse(Path(str(live) + '-wal').exists())
+            self.assertFalse(Path(str(live) + '-shm').exists())
+            saved.unlink()
+            live.write_bytes(b'newly-created-queue-must-remain')
+            result = subprocess.run(['bash'], input=setup, text=True, capture_output=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(live.read_bytes(), b'newly-created-queue-must-remain')
+            self.assertEqual(articles.read_text(), 'preserved')
+
+    def test_reading_acceptance_rejects_stale_or_wrong_process_heartbeat(self) -> None:
+        function = self.deploy.index('validate_reading_worker() {')
+        start = self.deploy.index("<<'PY'\n", function) + len("<<'PY'\n")
+        end = self.deploy.index('\nPY\n', start)
+        program = self.deploy[start:end]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'heartbeat.json'
+            valid = {'state': 'running', 'pid': 123,
+                     'updated_at': datetime.now(timezone.utc).isoformat()}
+            for changes, expected in (({}, 0), ({'state': 'stopped'}, 1), ({'pid': 999}, 1),
+                                      ({'updated_at': (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()}, 1),
+                                      ({'updated_at': 'not a timestamp'}, 1)):
+                with self.subTest(changes=changes):
+                    path.write_text(json.dumps({**valid, **changes}))
+                    result = subprocess.run([sys.executable, '-', str(path), '123'],
+                        input=program, text=True, capture_output=True, check=False)
+                    self.assertEqual(result.returncode, expected, result.stderr)
+
+    def test_reading_worker_acceptance_and_durable_backup_precede_commit(self) -> None:
+        start = self.deploy.index('\nsystemctl start kol-reading-worker.service\n')
+        acceptance = self.deploy.index('[[ "$READING_WORKER_HEALTH" == ok ]]', start)
+        integrity = self.deploy.index('reading_database_integrity "$READING_DB_PATH"', acceptance)
+        backup = self.deploy.index('DURABLE_READING_BACKUP=', integrity)
+        committed = self.deploy.index('COMMITTED=1', backup)
+        self.assertLess(start, acceptance)
+        self.assertLess(acceptance, integrity)
+        self.assertLess(integrity, backup)
+        self.assertLess(backup, committed)
+        block = self.deploy[backup:committed]
+        self.assertIn('"$ROLLBACK_DIR/reading-queue.before-release"', block)
+        self.assertIn('install -o root -g root -m 600', block)
+        self.assertIn('database_integrity "$DURABLE_READING_BACKUP"', block)
+        self.assertIn('os.fsync(directory_fd)', block)
 
 
 if __name__ == "__main__":

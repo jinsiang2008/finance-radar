@@ -1,0 +1,93 @@
+{
+  "runtime": {
+    "python": "3.11.14",
+    "machine": "arm64",
+    "macos": "27.0.1",
+    "packages": [
+      "annotated-doc==0.0.5",
+      "anyio==4.15.1",
+      "beautifulsoup4==4.15.0",
+      "certifi==2026.7.22",
+      "charset-normalizer==3.5.2",
+      "click==8.5.0",
+      "filelock==4.0.9",
+      "fsspec==2026.9.0",
+      "h11==0.16.0",
+      "hf-xet==1.6.0",
+      "httpcore==1.0.9",
+      "httpx==0.28.1",
+      "huggingface_hub==1.33.0",
+      "idna==3.20",
+      "Jinja2==3.1.6",
+      "llvmlite==0.50.0",
+      "markdown-it-py==4.2.0",
+      "MarkupSafe==3.0.4",
+      "mdurl==0.1.2",
+      "mlx==0.32.3",
+      "mlx-lm==0.32.0",
+      "mlx-metal==0.32.3",
+      "mlx-whisper==0.4.3",
+      "more-itertools==11.1.0",
+      "mpmath==1.3.0",
+      "networkx==3.6.1",
+      "numba==0.68.0",
+      "numpy==2.4.6",
+      "packaging==26.3",
+      "protobuf==7.36.2",
+      "Pygments==2.21.0",
+      "PyYAML==6.0.3",
+      "regex==2026.9.29",
+      "requests==2.34.2",
+      "rich==15.0.0",
+      "safetensors==0.8.0",
+      "scipy==1.17.1",
+      "sentencepiece==0.2.2",
+      "shellingham==1.5.4",
+      "socksio==1.0.0",
+      "soupsieve==2.10",
+      "sympy==1.14.0",
+      "tiktoken==0.14.0",
+      "tokenizers==0.23.2",
+      "torch==2.14.1",
+      "tqdm==4.70.1",
+      "transformers==5.18.0",
+      "typer==0.27.2",
+      "typing_extensions==4.16.0",
+      "urllib3==2.8.0"
+    ],
+    "paid_api_calls": 0
+  },
+  "llm": {
+    "repo": "mlx-community/Qwen3-4B-Instruct-2507-4bit",
+    "revision": "50d427756c6b1b2fe0c0a10f67fbda1fc8e82c1b",
+    "selected_bytes": 2278969697,
+    "path": "/Users/jinsiang/WorkSpace/mySkills/.worktrees/finance-radar-podcast/.podcast-models/hub/models--mlx-community--Qwen3-4B-Instruct-2507-4bit/snapshots/50d427756c6b1b2fe0c0a10f67fbda1fc8e82c1b",
+    "download_seconds": 60.65
+  },
+  "llm_smoke": {
+    "passed": true,
+    "elapsed_seconds": 6.66,
+    "result": {
+      "summary": "演讲者指出，AI编程工具可以加速常规任务，但团队仍需进行测试和代码审查。她描述了一项小型内部实验，而非受控研究，且该实验未测量长期维护成本。",
+      "key_points": [
+        "AI编程工具可以加速常规任务",
+        "团队仍需进行测试和代码审查",
+        "实验为小型内部实验，非受控研究",
+        "实验未测量长期维护成本"
+      ],
+      "uncertainties": [
+        "实验是否具有代表性或可推广性未知",
+        "长期维护成本的影响未被评估"
+      ]
+    },
+    "metal_available": true,
+    "peak_memory_bytes": 2539847360
+  },
+  "asr": {
+    "repo": "mlx-community/whisper-small-mlx",
+    "revision": "45f3915923c7a79a5a5b5a7d909d39aeb0e5630e",
+    "selected_bytes": 481307858,
+    "path": "/Users/jinsiang/WorkSpace/mySkills/.worktrees/finance-radar-podcast/.podcast-models/hub/models--mlx-community--whisper-small-mlx/snapshots/45f3915923c7a79a5a5b5a7d909d39aeb0e5630e",
+    "download_seconds": 15.28
+  }
+}

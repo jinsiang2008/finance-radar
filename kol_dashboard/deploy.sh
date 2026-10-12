@@ -46,6 +46,7 @@ LOCAL_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$LOCAL_DIR/.." && pwd)"
 LIB_DIR="${KOL_LIB_DIR:-$REPO_DIR/lib}"
 DB="${KOL_DASHBOARD_DB:-$REPO_DIR/data/kol_dashboard.db}"
+READING_SEED_ARCHIVE="${KOL_READING_SEED_ARCHIVE:-}"
 SEND_DB=0
 CONFIGURE_AUTH=0
 for arg in "$@"; do
@@ -80,10 +81,18 @@ trap cleanup_local EXIT INT TERM
 
 echo "→ 打包应用与采集器"
 mkdir -p "$WORK/pkg/lib"
-cp "$LOCAL_DIR"/{app.py,auth.py,briefing_collect.py,briefing_import.py,briefing_service.py,briefing_topics.py,daily_enrichment.py,content_quality.py,event_relevance.py,db.py,decision_collect.py,decision_service.py,decision_snapshot.py,market_data.py,portfolio.py,relation_engine.py,macro_alert_service.py,macro_collect.py,llm_enrichment.py,enrichment_collect.py,options_capacity.py,options_policy.py,options_research_service.py,options_strategy.py,collect.sh} "$WORK/pkg/"
+cp "$LOCAL_DIR"/{app.py,auth.py,briefing_collect.py,briefing_import.py,briefing_service.py,briefing_topics.py,daily_enrichment.py,content_quality.py,event_relevance.py,db.py,decision_collect.py,decision_service.py,decision_snapshot.py,market_data.py,portfolio.py,relation_engine.py,macro_alert_service.py,macro_collect.py,llm_enrichment.py,enrichment_collect.py,options_capacity.py,options_policy.py,options_research_service.py,options_strategy.py,reading_service.py,reading_worker.py,reading_import.py,news_service.py,news_collect.py,news_enrichment.py,collect.sh} "$WORK/pkg/"
 cp -R "$LOCAL_DIR"/templates "$LOCAL_DIR"/static "$WORK/pkg/"
 cp "$LIB_DIR"/{kol_tracker.py,macro_fetcher.py,risk_radar.py} "$WORK/pkg/lib/"
 cp "$LIB_DIR/serenity_tracker.py" "$WORK/pkg/lib/"
+# Explicit runtime allowlist: never copy POC data, credentials, models, tests,
+# local setup helpers, virtualenvs, or a second HTTP server/automation launcher.
+READING_SOURCE="$REPO_DIR/research/podcast_poc"
+mkdir -p "$WORK/pkg/research/podcast_poc/web"
+cp "$READING_SOURCE"/{poc.py,wechat.py,reading_jobs.py,schedule_policy.py,inference.py,wechat_sources.json} \
+  "$WORK/pkg/research/podcast_poc/"
+cp "$READING_SOURCE/web"/{index.html,app.js,style.css,wechat.html,wechat.js,wechat.css,reader-auth.js,reader-auth.css} \
+  "$WORK/pkg/research/podcast_poc/web/"
 # macOS tar otherwise serializes extended attributes as AppleDouble `._*`
 # files, which Linux compileall mistakes for Python source files.
 COPYFILE_DISABLE=1 tar --no-xattrs -czf "$WORK/app.tgz" \
@@ -93,6 +102,13 @@ echo "→ 创建远端私有暂存区"
 "$VPS" run "install -d -m 700 '$REMOTE_STAGE'"
 REMOTE_STAGE_CREATED=1
 "$VPS" put "$WORK/app.tgz" "$REMOTE_STAGE/app.tgz"
+if [[ -n "$READING_SEED_ARCHIVE" ]]; then
+  [[ -f "$READING_SEED_ARCHIVE" && ! -L "$READING_SEED_ARCHIVE" ]] || {
+    echo "阅读种子归档必须是本地普通文件，不能是符号链接" >&2
+    exit 1
+  }
+  "$VPS" put "$READING_SEED_ARCHIVE" "$REMOTE_STAGE/reading-seed.tgz"
+fi
 
 if [[ $CONFIGURE_AUTH == 0 && -n "$CAPTURED_PASSCODE" ]]; then
   echo "⚠ 已忽略 KOL_DASHBOARD_PASSCODE；轮换认证必须显式传入 --auth" >&2
@@ -175,6 +191,9 @@ STAGING_DIR="$BASE_DIR/.staging"
 RELEASES_DIR="$BASE_DIR/releases"
 DATA_DIR="$BASE_DIR/data"
 PRIVATE_DIR="$BASE_DIR/private"
+READING_DATA_DIR="$PRIVATE_DIR/reading"
+READING_DB_PATH="$READING_DATA_DIR/runtime/reading-jobs.sqlite3"
+READING_DB_NEXT="$READING_DB_PATH.next.$RELEASE_ID"
 BACKUPS_DIR="$BASE_DIR/backups"
 DB_PATH="$DATA_DIR/kol_dashboard.db"
 DAILY_SNAPSHOT_PATH="$DATA_DIR/daily-briefing-latest.json"
@@ -187,6 +206,7 @@ PREVIOUS_TARGET=""
 SERVICES_STOPPED=0
 ROLLBACK_READY=0
 DB_ROLLBACK_READY=0
+READING_DB_ROLLBACK_READY=0
 COMMITTED=0
 
 case "$REMOTE_STAGE" in
@@ -231,8 +251,8 @@ prepare_unit_state_rollback() {
   local unit enabled active failed=0
   for unit in kol-dashboard.service kol-collect-kol.timer \
     kol-collect-macro.timer kol-collect-decision.timer \
-    kol-collect-daily.timer kol-collect-enrich.timer \
-    kol-enrich-wakeup.path; do
+    kol-collect-daily.timer kol-collect-enrich.timer kol-collect-news.timer kol-enrich-news.timer \
+    kol-enrich-wakeup.path kol-reading-worker.service; do
     read -r enabled active < "$ROLLBACK_DIR/config/$unit.state" || {
       failed=1
       continue
@@ -249,8 +269,8 @@ restore_unit_states() {
   local unit enabled active failed=0
   for unit in kol-dashboard.service kol-collect-kol.timer \
     kol-collect-macro.timer kol-collect-decision.timer \
-    kol-collect-daily.timer kol-collect-enrich.timer \
-    kol-enrich-wakeup.path; do
+    kol-collect-daily.timer kol-collect-enrich.timer kol-collect-news.timer kol-enrich-news.timer \
+    kol-enrich-wakeup.path kol-reading-worker.service; do
     read -r enabled active < "$ROLLBACK_DIR/config/$unit.state" || {
       failed=1
       continue
@@ -283,6 +303,110 @@ try:
         raise SystemExit(f"Database integrity check failed: {result!r}")
 finally:
     connection.close()
+PY
+}
+
+reading_database_integrity() {
+  # SQLite may create WAL/SHM files even for a read-only connection. Always
+  # access the live queue as its service owner, including during rollback.
+  runuser -u kol-dashboard -- /usr/bin/python3 - "$1" "${2:-check}" <<'PY'
+from pathlib import Path
+from urllib.parse import quote
+import os
+import sqlite3
+import stat
+import sys
+
+path = Path(sys.argv[1])
+checkpoint = sys.argv[2] == "checkpoint"
+mode = "rw" if checkpoint else "ro"
+connection = sqlite3.connect("file:" + quote(str(path.resolve()), safe="/") + "?mode=" + mode,
+                             uri=True, timeout=30)
+try:
+    if checkpoint:
+        result = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if result not in {(0, 0, 0), (0, -1, -1)}:
+            raise SystemExit(f"Reading queue checkpoint did not finish: {result!r}")
+    if connection.execute("PRAGMA integrity_check").fetchone() != ("ok",):
+        raise SystemExit("Reading queue integrity check failed")
+finally:
+    connection.close()
+for candidate in (path, Path(str(path) + "-wal"), Path(str(path) + "-shm")):
+    try:
+        info = candidate.lstat()
+    except FileNotFoundError:
+        continue
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+        raise SystemExit("Reading queue files must belong to the service user")
+PY
+}
+
+backup_reading_queue() {
+  if [[ -e "$READING_DB_PATH" || -L "$READING_DB_PATH" ]]; then
+    [[ -f "$READING_DB_PATH" && ! -L "$READING_DB_PATH" ]] || {
+      echo "阅读队列必须是普通文件，不能是符号链接" >&2
+      return 1
+    }
+    # Writers are already stopped. Flush committed WAL rows as their owner
+    # before root opens a genuinely immutable, sidecar-free source snapshot.
+    reading_database_integrity "$READING_DB_PATH" checkpoint
+    python3 - "$READING_DB_PATH" \
+      "$ROLLBACK_DIR/reading-queue.before-release" <<'PY'
+from pathlib import Path
+from urllib.parse import quote
+import os
+import sqlite3
+import sys
+
+source_path, final_path = map(Path, sys.argv[1:])
+next_path = final_path.with_name(final_path.name + ".next")
+source = sqlite3.connect("file:" + quote(str(source_path.resolve()), safe="/") + "?mode=ro&immutable=1", uri=True, timeout=30)
+destination = sqlite3.connect(next_path)
+try:
+    source.backup(destination)
+    # Keep the root-only recovery artifact standalone; restoring it must not
+    # require root-owned WAL or shared-memory sidecars.
+    if destination.execute("PRAGMA journal_mode=DELETE").fetchone() != ("delete",):
+        raise SystemExit("Reading queue backup is not a standalone database")
+    if destination.execute("PRAGMA integrity_check").fetchone() != ("ok",):
+        raise SystemExit("Reading queue backup failed integrity check")
+finally:
+    destination.close()
+    source.close()
+with next_path.open("rb") as handle:
+    os.fsync(handle.fileno())
+os.replace(next_path, final_path)
+directory_fd = os.open(final_path.parent, os.O_RDONLY)
+try:
+    os.fsync(directory_fd)
+finally:
+    os.close(directory_fd)
+PY
+    chmod 600 "$ROLLBACK_DIR/reading-queue.before-release"
+  else
+    : > "$ROLLBACK_DIR/reading-queue.absent"
+  fi
+  READING_DB_ROLLBACK_READY=1
+}
+
+validate_reading_worker() {
+  local expected_pid
+  expected_pid=$(systemctl show --property=MainPID --value kol-reading-worker.service) || return 1
+  python3 - "$READING_DATA_DIR/runtime/worker-heartbeat.json" "$expected_pid" <<'PY'
+from datetime import datetime, timezone
+from pathlib import Path
+import json
+import sys
+
+try:
+    value = json.loads(Path(sys.argv[1]).read_text())
+    updated_at = datetime.fromisoformat(value["updated_at"])
+    age = (datetime.now(timezone.utc) - updated_at).total_seconds()
+    valid = (value.get("state") == "running" and 0 <= age <= 120
+             and int(value.get("pid", 0)) == int(sys.argv[2]) and int(sys.argv[2]) > 0)
+except (OSError, ValueError, TypeError, KeyError):
+    valid = False
+raise SystemExit(0 if valid else 1)
 PY
 }
 
@@ -377,6 +501,46 @@ print(
 PY
 }
 
+validate_news_api() {
+  local acceptance_not_before=$1
+  python3 - "$acceptance_not_before" <<'PY_NEWS'
+from datetime import datetime, timedelta, timezone
+import json
+import sys
+from urllib.request import Request, urlopen
+
+not_before = datetime.fromtimestamp(int(sys.argv[1]), timezone.utc)
+now = datetime.now(timezone.utc)
+request = Request("http://127.0.0.1:8088/api/news", headers={"Accept": "application/json"})
+with urlopen(request, timeout=8) as response:
+    if response.status != 200:
+        raise SystemExit(f"News API returned HTTP {response.status}")
+    payload = json.load(response)
+if not isinstance(payload, dict) or not isinstance(payload.get("sources"), list):
+    raise SystemExit("News API did not expose source health")
+sources = {item.get("id"): item for item in payload["sources"] if isinstance(item, dict)}
+required = {"bloomberg_markets", "wsj_markets", "wsj_business"}
+for source_id in sorted(required):
+    source = sources.get(source_id)
+    if not source or source.get("status") != "ok" or source.get("stale") is not False:
+        raise SystemExit(f"News source is not healthy: {source_id}")
+    try:
+        checked = datetime.fromisoformat(source["last_checked_at"].replace("Z", "+00:00"))
+        succeeded = datetime.fromisoformat(source["last_success_at"].replace("Z", "+00:00"))
+        count = int(source["item_count"])
+    except (KeyError, TypeError, ValueError, AttributeError):
+        raise SystemExit(f"News source health is incomplete: {source_id}") from None
+    for timestamp in (checked, succeeded):
+        if timestamp.tzinfo is None or not_before - timedelta(seconds=5) > timestamp or timestamp > now + timedelta(seconds=5):
+            raise SystemExit(f"News source was not verified during this release: {source_id}")
+    if count < 1:
+        raise SystemExit(f"News source did not retain valid entries: {source_id}")
+if not isinstance(payload.get("items"), list) or not payload["items"]:
+    raise SystemExit("News API did not expose any accepted news items")
+print("news api: accepted Bloomberg Markets, WSJ Markets and WSJ Business")
+PY_NEWS
+}
+
 activate_nginx() {
   nginx -t || return 1
   if systemctl is-active --quiet nginx; then
@@ -406,6 +570,22 @@ rollback_database() {
   return 0
 }
 
+rollback_reading_queue() {
+  [[ $READING_DB_ROLLBACK_READY == 1 ]] || return 0
+  if [[ -f "$ROLLBACK_DIR/reading-queue.before-release" ]]; then
+    database_integrity "$ROLLBACK_DIR/reading-queue.before-release" || return 1
+    install -m 600 "$ROLLBACK_DIR/reading-queue.before-release" "$READING_DB_NEXT" || return 1
+    chown kol-dashboard:kol-dashboard "$READING_DB_NEXT" || return 1
+    reading_database_integrity "$READING_DB_NEXT" || return 1
+    rm -f "$READING_DB_PATH-wal" "$READING_DB_PATH-shm" || return 1
+    mv -f "$READING_DB_NEXT" "$READING_DB_PATH" || return 1
+    reading_database_integrity "$READING_DB_PATH" || return 1
+  fi
+  # No prior queue means no migration to undo: retain newly created reading
+  # data. Articles, media and credentials are never deleted by code rollback.
+  return 0
+}
+
 rollback_daily_snapshot() {
   restore_path "$DAILY_SNAPSHOT_PATH" daily-briefing-latest.json || return 1
   if [[ -f "$DAILY_SNAPSHOT_PATH" ]]; then
@@ -420,12 +600,18 @@ rollback_configuration() {
   restore_path /etc/kol-dashboard.env kol-dashboard.env || failed=1
   restore_path /etc/systemd/system/kol-dashboard.service \
     kol-dashboard.service || failed=1
-  for job in kol macro decision daily enrich; do
+  restore_path /etc/systemd/system/kol-reading-worker.service \
+    kol-reading-worker.service || failed=1
+  for job in kol macro decision daily enrich news; do
     restore_path "/etc/systemd/system/kol-collect-${job}.service" \
       "kol-collect-${job}.service" || failed=1
     restore_path "/etc/systemd/system/kol-collect-${job}.timer" \
       "kol-collect-${job}.timer" || failed=1
   done
+  restore_path /etc/systemd/system/kol-enrich-news.service \
+    kol-enrich-news.service || failed=1
+  restore_path /etc/systemd/system/kol-enrich-news.timer \
+    kol-enrich-news.timer || failed=1
   restore_path /etc/systemd/system/kol-enrich-wakeup.path \
     kol-enrich-wakeup.path || failed=1
   restore_path /etc/nginx/snippets/kol-dashboard.conf \
@@ -439,7 +625,7 @@ cleanup_remote() {
   local rc=$?
   trap - EXIT
   set +e
-  rm -f "$CURRENT_NEXT" "$DB_NEXT"
+  rm -f "$CURRENT_NEXT" "$DB_NEXT" "$READING_DB_NEXT"
   if [[ $rc != 0 && $ROLLBACK_READY == 1 && $COMMITTED == 0 ]]; then
     local rollback_failed=0 rollback_safe=1 unit unit_load_state unit_state
     local unit_query_rc active_target rollback_health
@@ -447,10 +633,11 @@ cleanup_remote() {
       kol-enrich-wakeup.path
       kol-collect-kol.timer kol-collect-macro.timer
       kol-collect-decision.timer kol-collect-daily.timer
-      kol-collect-enrich.timer
+      kol-collect-enrich.timer kol-collect-news.timer kol-enrich-news.timer
       kol-collect-kol.service kol-collect-macro.service
       kol-collect-decision.service kol-collect-daily.service
-      kol-collect-enrich.service
+      kol-collect-enrich.service kol-collect-news.service kol-enrich-news.service
+      kol-reading-worker.service
       kol-dashboard.service
     )
     echo "部署失败，恢复上一版本、数据库和配置" >&2
@@ -479,6 +666,7 @@ cleanup_remote() {
 
     if [[ $rollback_safe == 1 ]]; then
       rollback_database || rollback_failed=1
+      rollback_reading_queue || rollback_failed=1
       rollback_daily_snapshot || rollback_failed=1
       prepare_unit_state_rollback || rollback_failed=1
       rollback_configuration || rollback_failed=1
@@ -492,6 +680,9 @@ cleanup_remote() {
       fi
       systemctl daemon-reload || rollback_failed=1
       restore_unit_states || rollback_failed=1
+      if unit_was_active kol-reading-worker.service; then
+        systemctl is-active --quiet kol-reading-worker.service || rollback_failed=1
+      fi
       activate_nginx >/dev/null 2>&1 || rollback_failed=1
       if unit_was_active kol-dashboard.service; then
         rollback_health=FAILED
@@ -584,10 +775,17 @@ if ! id -u kol-dashboard >/dev/null 2>&1; then
 fi
 install -d -o kol-dashboard -g kol-dashboard -m 700 \
   "$DATA_DIR" "$PRIVATE_DIR"
+for reading_path in "$READING_DATA_DIR" "$READING_DATA_DIR/runtime"; do
+  [[ ! -L "$reading_path" && ( ! -e "$reading_path" || -d "$reading_path" ) ]] || {
+    echo "阅读数据目录不能是符号链接或非目录" >&2
+    exit 1
+  }
+  install -d -o kol-dashboard -g kol-dashboard -m 700 "$reading_path"
+done
 install -d -o kol-dashboard -g kol-dashboard -m 750 \
   /var/log/kol-dashboard
 chown -R kol-dashboard:kol-dashboard /var/log/kol-dashboard
-for log_file in out.log err.log collect.log collect.err.log; do
+for log_file in out.log err.log collect.log collect.err.log reading.log reading.err.log; do
   if [[ ! -e "/var/log/kol-dashboard/$log_file" ]]; then
     install -o kol-dashboard -g kol-dashboard -m 600 /dev/null \
       "/var/log/kol-dashboard/$log_file"
@@ -634,15 +832,23 @@ chown -R root:root "$RELEASE_DIR"
 chgrp -R kol-dashboard "$RELEASE_DIR"
 chmod -R u=rwX,g=rX,o= "$RELEASE_DIR"
 chmod 750 "$RELEASE_DIR/collect.sh" "$RELEASE_DIR/decision_collect.py" \
-  "$RELEASE_DIR/enrichment_collect.py"
+  "$RELEASE_DIR/enrichment_collect.py" "$RELEASE_DIR/news_collect.py" \
+  "$RELEASE_DIR/news_enrichment.py"
 runuser -u kol-dashboard -- test -r "$RELEASE_DIR/app.py"
 runuser -u kol-dashboard -- test -x "$RELEASE_DIR"
 
-python3 -c 'import fastapi, uvicorn' 2>/dev/null || {
-  echo "服务器缺少 fastapi/uvicorn；请先维护运行环境" >&2
+python3 -c 'import fastapi, uvicorn, bs4' 2>/dev/null || {
+  echo "服务器缺少 fastapi/uvicorn/beautifulsoup4；请先维护运行环境" >&2
   exit 1
 }
 python3 -m compileall -q "$RELEASE_DIR"
+runuser -u kol-dashboard -- /usr/bin/env \
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$RELEASE_DIR" \
+  KOL_READING_DATA_DIR="$READING_DATA_DIR" \
+  /usr/bin/python3 -c 'import bs4, reading_service'
+runuser -u kol-dashboard -- /usr/bin/env \
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$RELEASE_DIR" \
+  /usr/bin/python3 -c 'import news_service, news_collect, news_enrichment'
 
 if [[ ! -f /etc/kol-dashboard.env &&
       ! -f "$REMOTE_STAGE/auth.env" &&
@@ -664,18 +870,24 @@ fi
 backup_path "$DAILY_SNAPSHOT_PATH" daily-briefing-latest.json
 backup_path /etc/systemd/system/kol-dashboard.service \
   kol-dashboard.service
-for job in kol macro decision daily enrich; do
+backup_path /etc/systemd/system/kol-reading-worker.service \
+  kol-reading-worker.service
+for job in kol macro decision daily enrich news; do
   backup_path "/etc/systemd/system/kol-collect-${job}.service" \
     "kol-collect-${job}.service"
   backup_path "/etc/systemd/system/kol-collect-${job}.timer" \
     "kol-collect-${job}.timer"
 done
+backup_path /etc/systemd/system/kol-enrich-news.service \
+  kol-enrich-news.service
+backup_path /etc/systemd/system/kol-enrich-news.timer \
+  kol-enrich-news.timer
 backup_path /etc/systemd/system/kol-enrich-wakeup.path \
   kol-enrich-wakeup.path
 for unit in kol-dashboard.service kol-collect-kol.timer \
   kol-collect-macro.timer kol-collect-decision.timer \
-  kol-collect-daily.timer kol-collect-enrich.timer \
-  kol-enrich-wakeup.path; do
+  kol-collect-daily.timer kol-collect-enrich.timer kol-collect-news.timer kol-enrich-news.timer \
+  kol-enrich-wakeup.path kol-reading-worker.service; do
   record_unit_state "$unit"
 done
 backup_path /etc/nginx/snippets/kol-dashboard.conf \
@@ -687,11 +899,11 @@ ROLLBACK_READY=1
 systemctl stop kol-enrich-wakeup.path \
   kol-collect-kol.timer kol-collect-macro.timer \
   kol-collect-decision.timer kol-collect-daily.timer \
-  kol-collect-enrich.timer 2>/dev/null || true
+  kol-collect-enrich.timer kol-collect-news.timer kol-enrich-news.timer 2>/dev/null || true
 for unit in kol-collect-kol.service kol-collect-macro.service \
   kol-collect-decision.service kol-collect-daily.service \
-  kol-collect-enrich.service \
-  kol-dashboard.service; do
+  kol-collect-enrich.service kol-collect-news.service kol-enrich-news.service \
+  kol-dashboard.service kol-reading-worker.service; do
   systemctl stop "$unit" 2>/dev/null || true
 done
 for unit in kol-enrich-wakeup.path \
@@ -699,15 +911,26 @@ for unit in kol-enrich-wakeup.path \
   kol-collect-decision.timer kol-collect-daily.timer \
   kol-collect-kol.service \
   kol-collect-macro.service kol-collect-decision.service \
-  kol-collect-daily.service kol-collect-enrich.timer \
-  kol-collect-enrich.service \
-  kol-dashboard.service; do
-  if systemctl is-active --quiet "$unit"; then
-    echo "active database writer remains: $unit" >&2
+  kol-collect-daily.service kol-collect-enrich.timer kol-collect-news.timer kol-enrich-news.timer \
+  kol-collect-enrich.service kol-collect-news.service kol-enrich-news.service \
+  kol-dashboard.service kol-reading-worker.service; do
+  if ! unit_load_state=$(systemctl show --property=LoadState --value "$unit"); then
+    echo "无法确认发布前写入单元: $unit" >&2
+    exit 1
+  fi
+  [[ "$unit_load_state" == not-found ]] && continue
+  [[ -n "$unit_load_state" ]] || { echo "发布前单元状态为空: $unit" >&2; exit 1; }
+  if ! unit_state=$(systemctl show --property=ActiveState --value "$unit"); then
+    echo "无法确认发布前写入进程状态: $unit" >&2
+    exit 1
+  fi
+  if [[ "$unit_state" != inactive && "$unit_state" != failed ]]; then
+    echo "active database writer remains: $unit ($unit_state)" >&2
     exit 1
   fi
 done
 SERVICES_STOPPED=1
+backup_reading_queue
 
 if [[ -f "$DB_PATH" ]]; then
   python3 - "$DB_PATH" \
@@ -875,6 +1098,14 @@ runuser -u kol-dashboard -- /usr/bin/env \
   /usr/bin/python3 "$RELEASE_DIR/decision_collect.py" snapshot
 database_integrity "$DB_PATH"
 
+if [[ -f "$REMOTE_STAGE/reading-seed.tgz" ]]; then
+  # Root-only staging stays inaccessible to service users. The importer
+  # validates the entire whitelist and owns only newly imported files.
+  PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 "$RELEASE_DIR/reading_import.py" \
+    --archive "$REMOTE_STAGE/reading-seed.tgz" \
+    --data-dir "$READING_DATA_DIR" --owner kol-dashboard
+fi
+
 ln -s "$RELEASE_DIR" "$CURRENT_NEXT"
 mv -Tf "$CURRENT_NEXT" "$CURRENT_LINK"
 
@@ -892,6 +1123,7 @@ EnvironmentFile=-/etc/kol-dashboard.env
 Environment=KOL_DASHBOARD_PORT=8088
 Environment=KOL_DASHBOARD_HOST=127.0.0.1
 Environment=KOL_DASHBOARD_DB=/opt/kol-dashboard/data/kol_dashboard.db
+Environment=KOL_READING_DATA_DIR=/opt/kol-dashboard/private/reading
 Environment=KOL_DAILY_REFRESH_SCHEDULE=hourly
 Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStart=/usr/bin/python3 /opt/kol-dashboard/current/app.py
@@ -927,11 +1159,50 @@ if [[ -e /etc/kol-dashboard/deepseek.env || \
   }
 fi
 
-for job in kol macro decision daily enrich; do
+cat > "$REMOTE_STAGE/kol-reading-worker.service" <<'UNIT'
+[Unit]
+Description=KOL private reading queue and RSS worker
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=kol-dashboard
+Group=kol-dashboard
+WorkingDirectory=/opt/kol-dashboard/current
+EnvironmentFile=-/etc/kol-dashboard/deepseek.env
+Environment=KOL_DASHBOARD_DB=/opt/kol-dashboard/data/kol_dashboard.db
+Environment=KOL_READING_DATA_DIR=/opt/kol-dashboard/private/reading
+Environment=KOL_READING_ENABLED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 /opt/kol-dashboard/current/reading_worker.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=150s
+UMask=0077
+LimitCORE=0
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/opt/kol-dashboard/private/reading /var/log/kol-dashboard
+StandardOutput=append:/var/log/kol-dashboard/reading.log
+StandardError=append:/var/log/kol-dashboard/reading.err.log
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+install -m 644 "$REMOTE_STAGE/kol-reading-worker.service" \
+  /etc/systemd/system/kol-reading-worker.service
+
+for job in kol macro decision daily enrich news; do
   EXTRA_ENVIRONMENT=""
   EXTRA_SCHEDULE=""
   EXTRA_HARDENING=""
   EXTRA_EXEC_START_PRE=""
+  EXEC_START="/bin/bash /opt/kol-dashboard/current/collect.sh ${job}"
+  JOB_TIMEOUT=20min
   if [[ "$job" == "daily" || "$job" == "enrich" ]]; then
     EXTRA_ENVIRONMENT="EnvironmentFile=-/etc/kol-dashboard/deepseek.env"
     EXTRA_HARDENING="LimitCORE=0"
@@ -940,6 +1211,9 @@ for job in kol macro decision daily enrich; do
     EXTRA_SCHEDULE="Environment=KOL_CADENCE_STATE_PATH=/opt/kol-dashboard/data/kol-cadence-state.json"
   elif [[ "$job" == "daily" ]]; then
     EXTRA_SCHEDULE="Environment=KOL_DAILY_REFRESH_SCHEDULE=hourly"
+  elif [[ "$job" == "news" ]]; then
+    EXEC_START="/usr/bin/python3 /opt/kol-dashboard/current/news_collect.py"
+    JOB_TIMEOUT=3min
   elif [[ "$job" == "enrich" ]]; then
     EXTRA_EXEC_START_PRE="ExecStartPre=/usr/bin/rm -f /opt/kol-dashboard/data/enrichment.pending"
   fi
@@ -967,13 +1241,60 @@ ProtectHome=true
 ProtectSystem=strict
 ${EXTRA_HARDENING}
 ReadWritePaths=/opt/kol-dashboard/data /opt/kol-dashboard/private /var/log/kol-dashboard
-TimeoutStartSec=20min
+TimeoutStartSec=${JOB_TIMEOUT}
 ${EXTRA_EXEC_START_PRE}
-ExecStart=/bin/bash /opt/kol-dashboard/current/collect.sh ${job}
+ExecStart=${EXEC_START}
 UNIT
   install -m 644 "$REMOTE_STAGE/kol-collect-${job}.service" \
     "/etc/systemd/system/kol-collect-${job}.service"
 done
+
+# Only this worker receives the provider credential; news collection and the
+# web API remain independent of paid inference. Its CLI gates peak/off-peak
+# cadence before claiming work, so the timer is only a cheap wake-up check.
+cat > "$REMOTE_STAGE/kol-enrich-news.service" <<'UNIT'
+[Unit]
+Description=Enrich official news with bounded peak/off-peak DeepSeek work
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=kol-dashboard
+Group=kol-dashboard
+WorkingDirectory=/opt/kol-dashboard/current
+EnvironmentFile=-/etc/kol-dashboard/deepseek.env
+Environment=KOL_DASHBOARD_DB=/opt/kol-dashboard/data/kol_dashboard.db
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 /opt/kol-dashboard/current/news_enrichment.py --limit 4
+TimeoutStartSec=5min
+UMask=0077
+LimitCORE=0
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/opt/kol-dashboard/data /var/log/kol-dashboard
+UNIT
+install -m 644 "$REMOTE_STAGE/kol-enrich-news.service" \
+  /etc/systemd/system/kol-enrich-news.service
+
+cat > "$REMOTE_STAGE/kol-enrich-news.timer" <<'UNIT'
+[Unit]
+Description=Check official news enrichment cadence every five minutes
+
+[Timer]
+OnCalendar=*-*-* *:00/5:00
+RandomizedDelaySec=15s
+AccuracySec=5s
+Persistent=true
+Unit=kol-enrich-news.service
+
+[Install]
+WantedBy=timers.target
+UNIT
+install -m 644 "$REMOTE_STAGE/kol-enrich-news.timer" \
+  /etc/systemd/system/kol-enrich-news.timer
 
 cat > "$REMOTE_STAGE/kol-enrich-wakeup.path" <<'UNIT'
 [Unit]
@@ -1061,7 +1382,22 @@ Persistent=true
 WantedBy=timers.target
 UNIT
 
-for job in kol macro decision daily enrich; do
+cat > "$REMOTE_STAGE/kol-collect-news.timer" <<'UNIT'
+[Unit]
+Description=Poll official Bloomberg and WSJ news feeds every five minutes
+
+[Timer]
+OnCalendar=*-*-* *:00/5:00
+RandomizedDelaySec=15s
+AccuracySec=5s
+Persistent=true
+Unit=kol-collect-news.service
+
+[Install]
+WantedBy=timers.target
+UNIT
+
+for job in kol macro decision daily enrich news; do
   install -m 644 "$REMOTE_STAGE/kol-collect-${job}.timer" \
     "/etc/systemd/system/kol-collect-${job}.timer"
 done
@@ -1125,8 +1461,8 @@ fi
 systemctl daemon-reload
 systemctl enable -q kol-dashboard kol-collect-kol.timer \
   kol-collect-macro.timer kol-collect-decision.timer \
-  kol-collect-daily.timer kol-collect-enrich.timer \
-  kol-enrich-wakeup.path
+  kol-collect-daily.timer kol-collect-enrich.timer kol-collect-news.timer kol-enrich-news.timer \
+  kol-enrich-wakeup.path kol-reading-worker.service
 nginx -t
 systemctl restart kol-dashboard.service
 
@@ -1160,6 +1496,16 @@ done
   exit 1
 }
 
+echo "→ 验收权威新闻候选采集"
+NEWS_ACCEPTANCE_NOT_BEFORE=$(date -u +%s)
+systemctl start kol-collect-news.service
+[[ "$(systemctl show --property=Result --value kol-collect-news.service)" == success ]] || {
+  echo "权威新闻采集进程未成功完成" >&2
+  exit 1
+}
+database_integrity "$DB_PATH"
+validate_news_api "$NEWS_ACCEPTANCE_NOT_BEFORE"
+
 echo "→ 验收 Daily 候选采集"
 DAILY_ACCEPTANCE_NOT_BEFORE=$(date -u +%s)
 systemctl start kol-collect-daily.service
@@ -1169,10 +1515,10 @@ validate_daily_api
 
 systemctl start kol-collect-kol.timer kol-collect-macro.timer \
   kol-collect-decision.timer kol-collect-daily.timer \
-  kol-collect-enrich.timer kol-enrich-wakeup.path
+  kol-collect-enrich.timer kol-collect-news.timer kol-enrich-news.timer kol-enrich-wakeup.path
 for unit in kol-collect-kol.timer kol-collect-macro.timer \
   kol-collect-decision.timer kol-collect-daily.timer \
-  kol-collect-enrich.timer; do
+  kol-collect-enrich.timer kol-collect-news.timer kol-enrich-news.timer; do
   systemctl is-enabled --quiet "$unit" || {
     echo "采集定时器未启用: $unit" >&2
     exit 1
@@ -1190,6 +1536,26 @@ systemctl is-active --quiet kol-enrich-wakeup.path || {
   echo "enrichment 唤醒 path 未运行" >&2
   exit 1
 }
+
+systemctl start kol-reading-worker.service
+READING_WORKER_HEALTH=FAILED
+for _ in $(seq 1 15); do
+  if systemctl is-active --quiet kol-reading-worker.service && \
+     validate_reading_worker; then
+    READING_WORKER_HEALTH=ok
+    break
+  fi
+  sleep 2
+done
+[[ "$READING_WORKER_HEALTH" == ok ]] || {
+  echo "阅读 worker 未运行或心跳无效" >&2
+  exit 1
+}
+systemctl is-enabled --quiet kol-reading-worker.service || {
+  echo "阅读 worker 未启用" >&2
+  exit 1
+}
+reading_database_integrity "$READING_DB_PATH"
 
 # Schema migrations are forward-only. Keep the verified pre-release database
 # outside the disposable staging tree so an operator can pair an old binary
@@ -1214,9 +1580,31 @@ finally:
     os.close(directory_fd)
 PY
 fi
+if [[ -f "$ROLLBACK_DIR/reading-queue.before-release" ]]; then
+  DURABLE_READING_BACKUP="$BACKUPS_DIR/reading-queue.before-$RELEASE_ID.sqlite3"
+  install -o root -g root -m 600 \
+    "$ROLLBACK_DIR/reading-queue.before-release" "$DURABLE_READING_BACKUP"
+  database_integrity "$DURABLE_READING_BACKUP"
+  python3 - "$DURABLE_READING_BACKUP" <<'PY'
+from pathlib import Path
+import os
+import sys
+
+backup_path = Path(sys.argv[1])
+with backup_path.open("rb") as handle:
+    os.fsync(handle.fileno())
+directory_fd = os.open(backup_path.parent, os.O_RDONLY)
+try:
+    os.fsync(directory_fd)
+finally:
+    os.close(directory_fd)
+PY
+fi
 SERVICES_STOPPED=0
 COMMITTED=1
 echo "service: $(systemctl is-active kol-dashboard)  health: ok"
+echo "reading worker: $(systemctl is-active kol-reading-worker.service)  heartbeat: ok"
+echo "official news: verified three feeds  collection/enrichment timers: active"
 REMOTE
 } > "$WORK/remote.sh"
 chmod 700 "$WORK/remote.sh"
@@ -1231,4 +1619,7 @@ curl -sf --max-time 12 -o /dev/null \
 curl -sf --max-time 12 -o /dev/null \
   -w "  /kol/api/briefings/latest → HTTP %{http_code}\n" \
   https://zlstreet.xyz/kol/api/briefings/latest
+curl -sf --max-time 12 -o /dev/null \
+  -w "  /kol/api/news → HTTP %{http_code}\n" \
+  https://zlstreet.xyz/kol/api/news
 echo "✓ 完成 — https://zlstreet.xyz/kol/"

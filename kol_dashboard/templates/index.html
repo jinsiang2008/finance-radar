@@ -18,7 +18,7 @@
     } catch (e) {}
   })();
 </script>
-  <link rel="stylesheet" href="static/style.css?v=39" />
+  <link rel="stylesheet" href="static/style.css?v=41" />
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ccircle cx='50' cy='50' r='42' fill='%230b1720' stroke='%2331d69b' stroke-width='6'/%3E%3Ccircle cx='50' cy='50' r='20' fill='none' stroke='%234ab8d8' stroke-width='5'/%3E%3Cpath d='M50 50L82 24' stroke='%23f4b942' stroke-width='6' stroke-linecap='round'/%3E%3Ccircle cx='50' cy='50' r='7' fill='%23eef4f2'/%3E%3C/svg%3E" />
 </head>
 <body>
@@ -37,6 +37,10 @@
       <button class="tab active" id="tab-decision" data-view="decision" role="tab"
               aria-selected="true" aria-controls="view-decision" tabindex="0">
         今日态势
+      </button>
+      <button class="tab" id="tab-news" data-view="news" role="tab"
+              aria-selected="false" aria-controls="view-news" tabindex="-1">
+        市场快讯
       </button>
       <button class="tab" id="tab-daily" data-view="daily" role="tab"
               aria-selected="false" aria-controls="view-daily" tabindex="-1">
@@ -77,6 +81,7 @@
     </div>
   </div>
 </header>
+<nav class="reading-entry-nav" aria-label="内容阅读"><a href="podcasts" data-reading-link="podcasts">播客阅读</a><a href="wechat" data-reading-link="wechat">公众号阅读</a></nav>
 
 <!-- ══════════════ 今日态势 ══════════════ -->
 <main class="view active" id="view-decision" role="tabpanel" aria-labelledby="tab-decision">
@@ -153,6 +158,48 @@
     </section>
 
     <div class="support-slot" data-support-slot></div>
+  </div>
+</main>
+
+<!-- ══════════════ 市场快讯 ══════════════ -->
+<main class="view" id="view-news" role="tabpanel" aria-labelledby="tab-news">
+  <div class="wrap news-wrap">
+    <header class="news-masthead">
+      <div>
+        <h1>市场快讯</h1>
+        <p>从铜、黄金到全球市场，直接核对媒体发布的新闻线索。</p>
+      </div>
+      <div class="news-cadence" id="news-cadence">采集频率待确认</div>
+    </header>
+    <div class="news-filter-bar">
+      <div class="news-commodity-filters" id="news-commodity-filters" role="group" aria-label="按商品筛选新闻">
+        <button type="button" data-news-commodity="" aria-pressed="true">全部</button>
+        <button type="button" data-news-commodity="copper" aria-pressed="false">铜</button>
+        <button type="button" data-news-commodity="gold" aria-pressed="false">黄金</button>
+        <button type="button" data-news-commodity="silver" aria-pressed="false">白银</button>
+        <button type="button" data-news-commodity="aluminum" aria-pressed="false">铝</button>
+        <button type="button" data-news-commodity="oil" aria-pressed="false">原油</button>
+        <button type="button" data-news-commodity="gas" aria-pressed="false">天然气</button>
+      </div>
+      <label class="news-publisher-filter" for="news-publisher">来源
+        <select id="news-publisher"><option value="">全部来源</option></select>
+      </label>
+    </div>
+    <p class="news-evidence-note">目前收录公开订阅源的标题及可用简介。全文请打开原文；采集频率不代表新闻延迟。</p>
+    <div class="news-layout">
+      <section class="news-stream" aria-labelledby="news-stream-title">
+        <div class="news-stream-head"><h2 id="news-stream-title">最新消息</h2><span id="news-count">正在读取</span></div>
+        <aside class="freshness-banner" id="news-update-banner" role="status" aria-live="polite" hidden></aside>
+        <p class="sr-only" id="news-live-status" role="status" aria-live="polite" aria-atomic="true">正在加载市场快讯。</p>
+        <div id="news-items" aria-busy="true"><div class="skeleton skeleton-card"></div></div>
+      </section>
+      <aside class="news-sources" aria-labelledby="news-sources-title">
+        <h2 id="news-sources-title">来源状态</h2>
+        <p class="news-source-note">检查成功仅表示订阅源可读，上游发布延迟仍需观察。</p>
+        <div id="news-source-list"><p class="news-source-pending">正在确认采集记录。</p></div>
+        <p class="news-timezone">所有时间均为北京时间。</p>
+      </aside>
+    </div>
   </div>
 </main>
 
@@ -504,6 +551,6 @@
   </div>
 </div>
 
-  <script src="static/app.js?v=39"></script>
+  <script src="static/app.js?v=41"></script>
 </body>
 </html>

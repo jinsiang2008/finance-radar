@@ -1,0 +1,197 @@
+{
+  "verified_at": "2026-10-12T14:47:09.444637+00:00",
+  "scope": "read-only production metadata and aggregate SQL; no private article bodies, portfolios or credentials exported",
+  "release": "20261008T151130Z-42886-3685dee3",
+  "deployment_performed": false,
+  "measurement": {
+    "population": "events whose fetched_at is within the trailing window, deduplicated event rows, not frontend-visible count",
+    "delay": "nonnegative fetched_at minus published_at for published_at_status=verified, hours; source timestamps not independently verified",
+    "commodity_mentions": "case-insensitive title plus snippet match: 铜 or whole-word copper; 黄金/金价 or whole-word gold; 白银 or whole-word silver; 原油/石油 or whole-word crude/brent/WTI",
+    "discovery_channel_note": "Bing News is a discovery channel; it does not identify the original publisher or prove source independence"
+  },
+  "windows": [
+    {
+      "days": 1,
+      "events": 95,
+      "discovery_channels": {
+        "Bing News": 95
+      },
+      "delay_samples": 95,
+      "median_delay_hours": 7.68,
+      "p90_delay_hours": 17.97,
+      "commodity_mentions": {
+        "copper": 0,
+        "gold": 1,
+        "silver": 0,
+        "oil": 1
+      }
+    },
+    {
+      "days": 7,
+      "events": 1016,
+      "discovery_channels": {
+        "Bing News": 1008,
+        "Truth Social @realDonaldTrump": 8
+      },
+      "delay_samples": 1016,
+      "median_delay_hours": 7.8,
+      "p90_delay_hours": 17.51,
+      "commodity_mentions": {
+        "copper": 0,
+        "gold": 13,
+        "silver": 1,
+        "oil": 4
+      }
+    }
+  ],
+  "live_cadence": {
+    "kol_timer": "every 15 minutes",
+    "macro_timer": "1 hour",
+    "decision_timer": "1 hour",
+    "daily_timer": "hourly at minute 05"
+  },
+  "healthy_services": [
+    "kol-dashboard",
+    "kol-reading-worker",
+    "nginx"
+  ],
+  "verified_source_sha256": {
+    "lib/kol_tracker.py": "1f41cae19b22096bdd51053ed0af109756a086f2cac6ac4077fd4231cb4fe1c5",
+    "lib/macro_fetcher.py": "28b199c3be490ef88fbebfcd0e0a008cf03761619f04d9d00e6476492e5016a7",
+    "kol_dashboard/market_data.py": "fc5328d51eda5408b0abb3dc450a1deca0daccc71959ed29a26c099f97ac392a",
+    "kol_dashboard/collect.sh": "eaecfcb89f68c8051e9f169a41ae9260dab498a5d7e8d04fcac96d4ee453f127"
+  },
+  "user_confirmed_preferences": {
+    "instruments": "Stocks and ETFs primarily, global markets",
+    "latency_target": "Low-cost 5–15-minute monitoring; provider delay must be separately stated",
+    "priority": "Copper and gold, broaden commodities"
+  },
+  "architecture_gaps": [
+    "Person-based retrieval and attribution gate excludes independent commodity events",
+    "Bing-first concatenation with per-person result cap can crowd out alternate discovery",
+    "No copper provider/benchmark mapping",
+    "Gold/oil quote snapshots do not feed upward price anomaly detectors",
+    "Daily-bar 1D/3D/5D post-event validation is not intraday detection",
+    "monitored_events not consumed by macro_relations",
+    "Source channel and original publisher lack separate fields",
+    "Existing browser attention state is not server-side push"
+  ],
+  "source_evidence": [
+    {
+      "url": "https://www.lme.com/en/metals/non-ferrous/lme-copper",
+      "finding": "Intraday web data delayed at least 15 minutes; not proof of a free licensed API"
+    },
+    {
+      "url": "https://www.lme.com/en/market-data/reports-and-data/warehouse-and-stocks-reports",
+      "finding": "Public stocks breakdown daily Excel delayed two days; other inventory products have distinct delivery terms"
+    },
+    {
+      "url": "https://www.cmegroup.com/market-data/connect-data.html",
+      "finding": "10-minute delayed JSON and real-time WebSocket products require appropriate access and licensing"
+    },
+    {
+      "url": "https://www.shfe.com.cn/reports/tradedata/",
+      "finding": "Daily trading/warrant and weekly inventory reports, with upstream frequency preserved"
+    },
+    {
+      "url": "https://www.eia.gov/reports/upcoming.php",
+      "finding": "Calendar-driven energy reports, honor holiday changes"
+    },
+    {
+      "url": "https://www.gold.org/goldhub/data/gold-etfs-holdings-and-flows",
+      "finding": "Weekly/monthly fund-flow background, not intraday flows"
+    },
+    {
+      "url": "https://copper.com.au/news/mining/copper-weekly-brief-week-ending-9-october-2026/",
+      "finding": "Industry association bulletin published October 9 reports October 8 prices and physical-market context; not an October 12 live quote"
+    }
+  ],
+  "proposal_status": "Design proposal only; no new collector, monitoring rule or notification deployed",
+  "additional_audit_at": "2026-10-12T14:49:38.871200+00:00",
+  "ai_evidence_basis_7d": [
+    {
+      "status": "failed",
+      "evidence_basis": "title_and_snippet",
+      "count": 1
+    },
+    {
+      "status": "pending",
+      "evidence_basis": "title_and_snippet",
+      "count": 1
+    },
+    {
+      "status": "ready",
+      "evidence_basis": "post_text",
+      "count": 13
+    },
+    {
+      "status": "ready",
+      "evidence_basis": "title_and_snippet",
+      "count": 989
+    }
+  ],
+  "commodity_price_records": [
+    {
+      "asset_key": "COMMODITY:GOLD",
+      "provider_symbol": "GC=F",
+      "samples": 190
+    },
+    {
+      "asset_key": "COMMODITY:OIL",
+      "provider_symbol": "CL=F",
+      "samples": 113
+    }
+  ],
+  "public_page_connectivity_only": {
+    "SHFE_daily_weekly": 200,
+    "LME_copper": 403,
+    "Freeport_IR": 200,
+    "EIA_schedule": 200,
+    "WGC_ETF": 200
+  },
+  "connectivity_limit": "One direct server GET per public entry page; HTTP 200 does not prove data completeness, parsing, permission for automation, or a stable API. LME 403 is the result of this probe, not a permanent availability claim.",
+  "proposed_design": {
+    "priority_commodities": [
+      "copper",
+      "gold"
+    ],
+    "next_commodities": [
+      "silver",
+      "aluminium",
+      "crude oil",
+      "natural gas"
+    ],
+    "discovery_tracks": [
+      "Licensed/permissioned instrument prices and rule-based anomalies",
+      "First-party company/regulatory/exchange event feeds",
+      "Calendar-driven inventory/supply/fund-flow releases",
+      "Industry reporting and KOL interpretation as supporting context"
+    ],
+    "latency_contract": {
+      "fast_path": "As soon as fresh eligible facts enter the system, deterministic rules create a fact card before AI interpretation",
+      "target": "Source-available-to-visible p95 <= 15 minutes for selected enabled feeds, proposed and not yet measured",
+      "separate_source_delay": true,
+      "price_demo": "15-minute source delay + 0–5-minute poll wait + processing is at least 15–20 minutes plus processing; not 5-minute real-time"
+    },
+    "proposed_triggers": [
+      "Per-instrument volatility-normalized 15m/1h/1d changes",
+      "20/60-session breakout with sufficient history",
+      "Price/volume or cross-market confirmation where timestamps and sessions align",
+      "Inventory/available-warrant changes and nearby spreads on their real release schedule",
+      "Operational shutdown/guidance/policy events and revisions"
+    ],
+    "instrument_registry": "Separate commodity theme, exchange, contract, spot/ETF/share, currency, unit and trading calendar. ETF exposure and company revenue exposure require dated evidence; commodity moves are not stock returns.",
+    "event_storage": "Persist source event and revisions, raw observation timestamps, availability/capture/alert times and entity links. Do not mix minute and daily bars under the old interval-free unique key.",
+    "ranking": "Separate urgency from research value; use source quality, novelty, exposure relevance, magnitude, market reaction and evidence maturity. No invented buy probability.",
+    "notification_design": "Durable event outbox and delivery dedupe, cooldown and material-update notifications, retract or downgrade corrections; independent of browser being open. Delivery channel remains to be selected.",
+    "model_cost": "Keep critical fact detection independent of DeepSeek. Summarize material new evidence once, cache by evidence version, use budget caps; longer background reading can retain peak/off-peak cadence.",
+    "delivery_order": [
+      "Verify permissions, actual timestamps and server access for a narrow copper/gold price universe; fix source/publisher labeling and define first-party feed set",
+      "Connect copper/gold observation/rules/persistent events/stocks-ETF mapping with two separate latency metrics",
+      "Add evidence-driven research cards and a reliable delivery outbox; run 7–14 days of shadow evaluation before broadening"
+    ],
+    "acceptance": "Historical replay must use information availability times without look-ahead; measure defined-event recall, false positives, duplicate notifications, source availability and end-to-end latency. Hypotheses and thresholds remain proposed.",
+    "ui_prototype": "docs/commodity-radar-prototype.html",
+    "prototype_status": "Offline scenario demonstration, no market data or notification delivery; browser syntax/interaction/keyboard and desktop/mobile overflow checks passed"
+  }
+}

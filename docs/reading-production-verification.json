@@ -1,0 +1,141 @@
+{
+  "verified_at": "2026-10-08T23:17:00+08:00",
+  "scope": "final production release",
+  "base_commit": "da8f453b22940b2ad13f2617d16a5fec55b9e889",
+  "source_worktree": "codex/podcast-free-poc; local uncommitted changes",
+  "tests": {
+    "kol_unittest": 870,
+    "poc_unittest": 86,
+    "repository_contract": 3,
+    "browser": "local authenticated + public unauthenticated"
+  },
+  "reading": {
+    "wechat": {
+      "count": 122,
+      "states": {
+        "summarized": 68,
+        "body_ready": 53,
+        "metadata_only": 1
+      },
+      "reviewed": 3,
+      "sources": [
+        {
+          "name": "猫笔刀",
+          "status": "ok"
+        },
+        {
+          "name": "集思录",
+          "status": "ok"
+        },
+        {
+          "name": "机器之心",
+          "status": "ok"
+        },
+        {
+          "name": "量子位",
+          "status": "ok"
+        },
+        {
+          "name": "腾讯技术工程",
+          "status": "stale"
+        },
+        {
+          "name": "美团技术团队",
+          "status": "stale"
+        }
+      ]
+    },
+    "podcasts": {
+      "count": 28,
+      "states": {
+        "summarized": 2,
+        "transcribed": 1,
+        "discovered": 25
+      }
+    },
+    "scheduler": {
+      "enabled": true,
+      "provider": "deepseek",
+      "model": "deepseek-v4-flash",
+      "period": "off_peak",
+      "peak_minutes": 240,
+      "off_peak_minutes": 60,
+      "worker_alive": true,
+      "last_check_at": "2026-10-08T15:06:39.965574+00:00",
+      "last_success_at": "2026-10-08T15:06:52.578048+00:00",
+      "next_check_at": "2026-10-08T16:07:00+00:00",
+      "successful_sources": 6,
+      "podcast_successful_sources": 6,
+      "provider_blocked": null,
+      "automatic_paused_reason": null
+    },
+    "jobs": {
+      "completed": 63
+    },
+    "audio_range": {
+      "status": 206,
+      "content_range": "bytes 0-11/5760394"
+    },
+    "anonymous": {
+      "wechat": {
+        "status": 401,
+        "cache_control": "no-store"
+      },
+      "podcasts": {
+        "status": 401,
+        "cache_control": "no-store"
+      },
+      "status": {
+        "status": 401,
+        "cache_control": "no-store"
+      },
+      "media/latent-unknown.wav": {
+        "status": 401,
+        "cache_control": "no-store"
+      }
+    },
+    "summary_citations_valid": true
+  },
+  "deepseek_completed": 62,
+  "usage": {
+    "prompt_tokens": 205296,
+    "completion_tokens": 21869,
+    "total_tokens": 227165
+  },
+  "limits": [
+    "Podcast ASR and transcript fetching are not automatic",
+    "RSS body completeness against WeChat original not verified",
+    "Evidence IDs checked; no semantic correctness guarantee"
+  ],
+  "automation": "previous paused Codex heartbeat deleted after real server generation succeeded",
+  "release": "20261008T151130Z-42886-3685dee3",
+  "reading_asset_version": "41",
+  "main_asset_version": "40",
+  "validation_boundary": "Citation IDs and source presence were checked remotely; semantic excerpt export was blocked by automatic approval and was not performed.",
+  "source_sha256": {
+    "kol_dashboard/app.py": "0554333787268ca5a1debb6711e58620912c91dafc3af1cd3c2e659de30b706a",
+    "kol_dashboard/deploy.sh": "00ae76fe6ac6fa9efda8168991ef590446674685f581acc3a8a2fc821ce2b78c",
+    "kol_dashboard/reading_import.py": "ade783c46b60513781b1fc137b105bc1b123866e9c229be7c6fada74910f6920",
+    "kol_dashboard/reading_service.py": "df3c2e4fc754d66c520a58e6893a93f6c51cbddd7276b39243b83ba49d6101d3",
+    "kol_dashboard/reading_worker.py": "3ef7da60b74b6561d3e0135ae33739ac12796b37a930d758e58040717119a1a5",
+    "kol_dashboard/static/app.js": "b03aa04371291cac3eec53caf6d430c0bd9023fc2711edd0f6b530ae35e84589",
+    "kol_dashboard/static/style.css": "3a033a283ba444985bf32b8b7084ac759d0b9efe3f4f415c05d875eb1c426fbd",
+    "kol_dashboard/templates/index.html": "a598e8d887f880718c503bee373e1999e9c3ec489d669298ca80053644072522",
+    "research/podcast_poc/configure_deepseek.py": "6d0aa97a32080a511c59035db7e72c79aec03a4faf9f0e65f81f2c5fd5aa7e66",
+    "research/podcast_poc/inference.py": "5bc1b3fd38bbf8c95c1dffe70ae011e8afd2c26bd1a96d7e054118c18375517e",
+    "research/podcast_poc/poc.py": "d7834cf174fb6da043299c7de606d510d2680805d7bee22664ea6a51e1bc6c49",
+    "research/podcast_poc/reader_control.py": "5452ee860dc8451e26afcc32e5a0242bce358e0eeffb7e804f211920aa668d2e",
+    "research/podcast_poc/reading_jobs.py": "fb1ba613008ef5bf42faf4f8f41605b30411caa76c7b6864b7059e609e537914",
+    "research/podcast_poc/schedule_policy.py": "50efb2de970fef8904df59bfe20eb507af790ba1511e8a4cc642c32710f99d20",
+    "research/podcast_poc/setup_models.py": "effe880c1cd15a10848f435ede07371e2fdc24b9e7a4434f0c396db513353de3",
+    "research/podcast_poc/web/app.js": "aee2b0c0975712cf09a1f1301d07a69f91602b47bdd6e3b893b4765343b09b22",
+    "research/podcast_poc/web/index.html": "4810b3a5e57937d9b27332e630d7ac1ed5138b49c646185310e4838a26963d0b",
+    "research/podcast_poc/web/reader-auth.css": "9b919d3f78431d1e6f1b22bb215a5cb22e2089bd020584d470145266fe1ff424",
+    "research/podcast_poc/web/reader-auth.js": "aa7610f3164580552d7ba1e2a9f1fd021f009a8420b7fae6bb44600451f366f1",
+    "research/podcast_poc/web/style.css": "4f4e06d62e0de67d9afe6459a9b4cac54ce2e75786750863a6fec3febdb02f5b",
+    "research/podcast_poc/web/wechat.css": "1e95fd637ad5666dfdb1438735930f6e4c265f189483182d2fc1416d4d1732e2",
+    "research/podcast_poc/web/wechat.html": "3bd73f4be5a367e5cd9ce4c532876233422176905a37180ab53fb193912018f0",
+    "research/podcast_poc/web/wechat.js": "49f6cc62f70a2c7b9c6b56d44f35057efa8b27310a92f7553bdb1500f1713a8d",
+    "research/podcast_poc/wechat.py": "1de37985fa106c6caf98a9fdb694086ea5e003d7bc72ed8bb6e933f075f0fbc2"
+  }
+}

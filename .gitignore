@@ -31,3 +31,7 @@ kol_dashboard/private/*
 *.log
 *.tmp
 *.bak
+
+# Local-only podcast proof of concept: models, runtimes and personal reading data.
+.venv-podcast/
+.podcast-models/
