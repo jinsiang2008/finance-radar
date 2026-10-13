@@ -53,12 +53,14 @@ AI_BRIEF_FEED_URL = "https://ai-brief.liziran.com/zh/feed.xml"
 HN_WINDOW = timedelta(hours=24)
 RSS_WINDOW = timedelta(hours=24)
 DEFAULT_TIMEOUT_SECONDS = 4.0
+DEFAULT_ROOT_TIMEOUT_SECONDS = 12.0
 DEFAULT_COLLECTION_DEADLINE_SECONDS = 40.0
 DEFAULT_HN_SCAN_LIMIT = 40
 DEFAULT_HN_ITEM_LIMIT = 10
 DEFAULT_RSS_SCAN_LIMIT = 4
 DEFAULT_RSS_ITEM_LIMIT = 6
 MAX_TIMEOUT_SECONDS = 10.0
+MAX_ROOT_TIMEOUT_SECONDS = 12.0
 MAX_COLLECTION_DEADLINE_SECONDS = 120.0
 MAX_HN_SCAN_LIMIT = 60
 MAX_HN_ITEM_LIMIT = 20
@@ -693,6 +695,7 @@ class BriefingCollector:
         *,
         opener: Callable[..., Any] | None = None,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        root_timeout: float = DEFAULT_ROOT_TIMEOUT_SECONDS,
         deadline_seconds: float = DEFAULT_COLLECTION_DEADLINE_SECONDS,
         clock: Callable[[], datetime] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
@@ -715,6 +718,17 @@ class BriefingCollector:
                 f"timeout must be greater than 0 and at most {MAX_TIMEOUT_SECONDS:g} seconds"
             )
         if (
+            isinstance(root_timeout, bool)
+            or not isinstance(root_timeout, (int, float))
+            or not math.isfinite(float(root_timeout))
+            or root_timeout <= 0
+            or root_timeout > MAX_ROOT_TIMEOUT_SECONDS
+        ):
+            raise ValueError(
+                "root_timeout must be greater than 0 and at most "
+                f"{MAX_ROOT_TIMEOUT_SECONDS:g} seconds"
+            )
+        if (
             isinstance(deadline_seconds, bool)
             or not isinstance(deadline_seconds, (int, float))
             or not math.isfinite(float(deadline_seconds))
@@ -735,6 +749,7 @@ class BriefingCollector:
                 raise ValueError(f"{label} must be a positive integer")
         self.opener = opener or _default_opener()
         self.timeout = timeout
+        self.root_timeout = root_timeout
         self.deadline_seconds = float(deadline_seconds)
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.monotonic = monotonic
@@ -763,14 +778,15 @@ class BriefingCollector:
     def _start_deadline(self) -> None:
         self.deadline_at = self.monotonic() + self.deadline_seconds
 
-    def _request_timeout(self) -> float:
+    def _request_timeout(self, *, timeout_ceiling: float | None = None) -> float:
         if self.deadline_at is None:
             self._start_deadline()
         assert self.deadline_at is not None
         remaining = self.deadline_at - self.monotonic()
         if remaining <= 0:
             raise FetchError("collection deadline exceeded")
-        return min(self.timeout, remaining)
+        ceiling = self.timeout if timeout_ceiling is None else timeout_ceiling
+        return min(ceiling, remaining)
 
     def _ensure_deadline(self) -> None:
         if self.deadline_at is None:
@@ -779,7 +795,13 @@ class BriefingCollector:
         if self.deadline_at - self.monotonic() <= 0:
             raise FetchError("collection deadline exceeded while parsing")
 
-    def _fetch(self, url: str, *, maximum: int) -> FetchResult:
+    def _fetch(
+        self,
+        url: str,
+        *,
+        maximum: int,
+        timeout_ceiling: float | None = None,
+    ) -> FetchResult:
         request = urllib.request.Request(
             url,
             headers={
@@ -789,7 +811,7 @@ class BriefingCollector:
             },
             method="GET",
         )
-        request_timeout = self._request_timeout()
+        request_timeout = self._request_timeout(timeout_ceiling=timeout_ceiling)
         completed = threading.Event()
         cancelled = threading.Event()
         state_lock = threading.Lock()
@@ -1095,7 +1117,25 @@ class BriefingCollector:
         current: datetime,
     ) -> tuple[list[Story], bool]:
         try:
-            result = self._fetch(spec.feed_url, maximum=MAX_XML_BYTES)
+            # Root feeds contain entire issues and can take longer to stream
+            # than item pages. Pass a per-request ceiling: source collection
+            # is concurrent, so changing self.timeout here would race HN and
+            # item fetches. The shared collection deadline still bounds both.
+            for attempt in range(2):
+                try:
+                    result = self._fetch(
+                        spec.feed_url,
+                        maximum=MAX_XML_BYTES,
+                        timeout_ceiling=self.root_timeout,
+                    )
+                    break
+                except FetchError as exc:
+                    # Retry only this root request once after its wall-clock
+                    # limit. _fetch recalculates the shared remaining budget
+                    # and refuses to open another request after it expires.
+                    # HTTP, redirect, byte-limit and parse errors stay final.
+                    if attempt or str(exc) != "request wall-clock deadline exceeded":
+                        raise
             items = _rss_items(result.body)
         except (FetchError, ET.ParseError, ValueError) as exc:
             self._error(f"{spec.source} feed failed: {exc}")
@@ -1802,6 +1842,7 @@ def collect_briefing(
     *,
     opener: Callable[..., Any] | None = None,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    root_timeout: float = DEFAULT_ROOT_TIMEOUT_SECONDS,
     deadline_seconds: float = DEFAULT_COLLECTION_DEADLINE_SECONDS,
     now: datetime | None = None,
     monotonic: Callable[[], float] = time.monotonic,
@@ -1817,6 +1858,7 @@ def collect_briefing(
     return BriefingCollector(
         opener=opener,
         timeout=timeout,
+        root_timeout=root_timeout,
         deadline_seconds=deadline_seconds,
         clock=clock,
         monotonic=monotonic,
@@ -1870,6 +1912,7 @@ def produce_briefing(
     repository: Any = db,
     opener: Callable[..., Any] | None = None,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    root_timeout: float = DEFAULT_ROOT_TIMEOUT_SECONDS,
     deadline_seconds: float = DEFAULT_COLLECTION_DEADLINE_SECONDS,
     now: datetime | None = None,
     monotonic: Callable[[], float] = time.monotonic,
@@ -1884,6 +1927,7 @@ def produce_briefing(
     result = collect_briefing(
         opener=opener,
         timeout=timeout,
+        root_timeout=root_timeout,
         deadline_seconds=deadline_seconds,
         now=now,
         monotonic=monotonic,
@@ -1928,7 +1972,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Import the validated payload with the existing v1 importer",
     )
     parser.add_argument("--db", dest="database_path", help="SQLite database path")
-    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_TIMEOUT_SECONDS,
+        help="Per-request wall-clock limit for HN and RSS item pages in seconds",
+    )
+    parser.add_argument(
+        "--root-timeout",
+        type=float,
+        default=DEFAULT_ROOT_TIMEOUT_SECONDS,
+        help="Per-request wall-clock limit for RSS root feeds in seconds (maximum 12)",
+    )
     parser.add_argument(
         "--deadline",
         type=float,
@@ -1955,6 +2010,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             output_path=None if args.output == "-" else args.output,
             import_snapshot=args.import_snapshot,
             timeout=args.timeout,
+            root_timeout=args.root_timeout,
             deadline_seconds=args.deadline,
             hn_scan_limit=args.hn_scan_limit,
             hn_item_limit=args.hn_limit,

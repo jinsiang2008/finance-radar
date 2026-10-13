@@ -8,6 +8,7 @@ import threading
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from email.message import Message
 from pathlib import Path
@@ -1428,6 +1429,243 @@ class FullProducerTests(unittest.TestCase):
 
 
 class CollectionBudgetTests(unittest.TestCase):
+    def test_root_wall_clock_timeout_retries_once_and_recovers(self) -> None:
+        closed = threading.Event()
+        calls: list[float] = []
+
+        class BlockingRootResponse(FakeResponse):
+            def read(self, maximum: int) -> bytes:
+                closed.wait(2)
+                return super().read(maximum)
+
+            def close(self) -> None:
+                closed.set()
+                super().close()
+
+        def opener(request, *, timeout: float):
+            calls.append(timeout)
+            response_type = BlockingRootResponse if len(calls) == 1 else FakeResponse
+            return response_type(rss_document())
+
+        collector = briefing_collect.BriefingCollector(
+            opener=opener, root_timeout=0.05
+        )
+
+        stories, succeeded = collector.collect_feed(
+            briefing_collect._FEEDS[0], current=datetime.now(timezone.utc)
+        )
+
+        self.assertTrue(succeeded)
+        self.assertEqual(stories, [])
+        self.assertEqual(calls, [0.05, 0.05])
+        self.assertTrue(closed.is_set())
+        self.assertEqual(collector.errors, [])
+
+    def test_two_root_wall_clock_timeouts_remain_failed(self) -> None:
+        opener = FakeOpener({
+            briefing_collect.AI_BRIEF_FEED_URL: briefing_collect.FetchError(
+                "request wall-clock deadline exceeded"
+            ),
+        })
+        collector = briefing_collect.BriefingCollector(opener=opener)
+
+        stories, succeeded = collector.collect_feed(
+            briefing_collect._FEEDS[1], current=datetime.now(timezone.utc)
+        )
+
+        self.assertFalse(succeeded)
+        self.assertEqual(stories, [])
+        self.assertEqual(len(opener.calls), 2)
+        self.assertEqual(len(collector.errors), 1)
+        self.assertIn("request wall-clock deadline exceeded", collector.errors[0])
+
+    def test_root_retry_does_not_open_after_collection_deadline_expires(self) -> None:
+        ticks = iter((0.0, 1.0, 41.0))
+        opener = FakeOpener({
+            briefing_collect.AI_BRIEF_FEED_URL: briefing_collect.FetchError(
+                "request wall-clock deadline exceeded"
+            ),
+        })
+        collector = briefing_collect.BriefingCollector(
+            opener=opener, monotonic=lambda: next(ticks)
+        )
+
+        _, succeeded = collector.collect_feed(
+            briefing_collect._FEEDS[1], current=datetime.now(timezone.utc)
+        )
+
+        self.assertFalse(succeeded)
+        self.assertEqual(len(opener.calls), 1)
+        self.assertIn("collection deadline exceeded", collector.errors[0])
+
+    def test_root_retry_uses_remaining_shared_budget(self) -> None:
+        ticks = iter((0.0, 1.0, 35.0))
+        budgets: list[float] = []
+
+        def opener(request, *, timeout: float):
+            budgets.append(timeout)
+            if len(budgets) == 1:
+                raise briefing_collect.FetchError("request wall-clock deadline exceeded")
+            return FakeResponse(rss_document())
+
+        collector = briefing_collect.BriefingCollector(
+            opener=opener, monotonic=lambda: next(ticks)
+        )
+
+        _, succeeded = collector.collect_feed(
+            briefing_collect._FEEDS[1], current=datetime.now(timezone.utc)
+        )
+
+        self.assertTrue(succeeded)
+        self.assertEqual(budgets, [12.0, 5.0])
+
+    def test_root_non_wall_clock_failures_are_never_retried(self) -> None:
+        failures = (
+            briefing_collect.FetchError("HTTP 503"),
+            briefing_collect.FetchError("cross-origin redirect rejected"),
+            briefing_collect.FetchError("response exceeds the configured byte limit"),
+            OSError("timed out"),
+            briefing_collect.FetchError("collection deadline exceeded"),
+            b"<rss><invalid",
+            b"<html><body>Maintenance</body></html>",
+        )
+        for response in failures:
+            with self.subTest(response=response):
+                opener = FakeOpener({briefing_collect.AI_BRIEF_FEED_URL: response})
+                collector = briefing_collect.BriefingCollector(opener=opener)
+
+                _, succeeded = collector.collect_feed(
+                    briefing_collect._FEEDS[1], current=datetime.now(timezone.utc)
+                )
+
+                self.assertFalse(succeeded)
+                self.assertEqual(len(opener.calls), 1)
+
+    def test_item_wall_clock_timeout_is_not_retried(self) -> None:
+        item_url = f"{briefing_collect.HN_API_BASE}/item/101.json"
+        opener = FakeOpener({item_url: briefing_collect.FetchError(
+            "request wall-clock deadline exceeded"
+        )})
+        collector = briefing_collect.BriefingCollector(opener=opener)
+
+        with self.assertRaisesRegex(briefing_collect.FetchError, "wall-clock"):
+            collector._fetch_json(item_url)
+
+        self.assertEqual(len(opener.calls), 1)
+
+    def test_six_second_root_body_keeps_concurrent_hn_and_item_budget_at_four(
+        self,
+    ) -> None:
+        now = datetime(2026, 9, 5, 3, 0, tzinfo=timezone.utc)
+        root_url = briefing_collect.AI_DIGEST_FEED_URL
+        issue_url = "https://ai-digest.liziran.com/zh/digest/today.html"
+        hn_url = f"{briefing_collect.HN_API_BASE}/item/101.json"
+        routes = {
+            root_url: rss_document(
+                rss_item(
+                    title="Daily issue",
+                    link=issue_url,
+                    pub_date="Sat, 05 Sep 2026 02:00:00 +0000",
+                    content="<h2>1. An AI report</h2><p>Report evidence.</p>",
+                )
+            ),
+            issue_url: page_metadata(modified="2026-09-05T10:30:00+08:00"),
+            hn_url: b"{}",
+        }
+        recorded = FakeOpener(routes)
+        root_read_started = threading.Event()
+
+        class SlowRootResponse(FakeResponse):
+            def read(self, maximum: int) -> bytes:
+                root_read_started.set()
+                # Regression: production sends headers promptly but streams
+                # its ~200 KB feed body over six seconds, exceeding the old
+                # four-second wall-clock budget.
+                time.sleep(6.05)
+                return super().read(maximum)
+
+        def opener(request, *, timeout: float):
+            response = recorded(request, timeout=timeout)
+            if request.full_url == root_url:
+                return SlowRootResponse(response.body)
+            return response
+
+        collector = briefing_collect.BriefingCollector(
+            opener=opener, clock=lambda: now
+        )
+        collector._start_deadline()
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            root = executor.submit(
+                collector.collect_feed, briefing_collect._FEEDS[0], current=now
+            )
+            self.assertTrue(root_read_started.wait(1))
+            hn = executor.submit(collector._fetch_json, hn_url)
+            self.assertEqual(hn.result()[0], {})
+            _, succeeded = root.result()
+
+        self.assertTrue(succeeded)
+        budgets = dict(recorded.calls)
+        self.assertEqual(budgets[root_url], 12.0)
+        self.assertEqual(budgets[hn_url], 4.0)
+        self.assertEqual(budgets[issue_url], 4.0)
+        self.assertEqual(collector.timeout, 4.0)
+        self.assertEqual(collector.errors, [])
+
+    def test_root_timeout_is_clamped_to_remaining_collection_budget(self) -> None:
+        ticks = iter((0.0, 1.5))
+        opener = FakeOpener({briefing_collect.AI_DIGEST_FEED_URL: rss_document()})
+        collector = briefing_collect.BriefingCollector(
+            opener=opener,
+            deadline_seconds=3,
+            monotonic=lambda: next(ticks),
+        )
+
+        _, succeeded = collector.collect_feed(
+            briefing_collect._FEEDS[0], current=datetime.now(timezone.utc)
+        )
+
+        self.assertTrue(succeeded)
+        self.assertEqual(opener.calls[0][1], 1.5)
+
+    def test_explicit_root_timeout_is_independent_of_other_request_timeout(
+        self,
+    ) -> None:
+        opener = FakeOpener({briefing_collect.AI_BRIEF_FEED_URL: rss_document()})
+        collector = briefing_collect.BriefingCollector(
+            opener=opener, timeout=0.5, root_timeout=7
+        )
+
+        _, succeeded = collector.collect_feed(
+            briefing_collect._FEEDS[1], current=datetime.now(timezone.utc)
+        )
+
+        self.assertTrue(succeeded)
+        self.assertEqual(opener.calls[0][1], 7)
+        self.assertEqual(collector._request_timeout(), 0.5)
+
+    def test_invalid_root_timeout_is_rejected_before_network(self) -> None:
+        for value in (0, -1, True, "12", None, float("nan"), float("inf"), 12.01):
+            with self.subTest(value=value):
+                opener = FakeOpener({})
+                with self.assertRaisesRegex(ValueError, "root_timeout must"):
+                    briefing_collect.BriefingCollector(
+                        opener=opener, root_timeout=value
+                    )
+                self.assertEqual(opener.calls, [])
+
+    def test_cli_forwards_both_timeout_controls(self) -> None:
+        result = briefing_collect.CollectionResult(payload={}, errors=())
+        with mock.patch.object(
+            briefing_collect, "produce_briefing", return_value=(result, None)
+        ) as produce, redirect_stdout(io.StringIO()):
+            exit_code = briefing_collect.main(
+                ["--timeout", "2", "--root-timeout", "8", "--no-ai-enrichment"]
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(produce.call_args.kwargs["timeout"], 2)
+        self.assertEqual(produce.call_args.kwargs["root_timeout"], 8)
+
     def test_blocking_close_cannot_extend_the_wall_clock_deadline(self) -> None:
         read_started = threading.Event()
         close_started = threading.Event()
