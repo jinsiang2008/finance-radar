@@ -1,0 +1,379 @@
+{
+  "application_commit": "7b410253c6945076612013fd5339f49c72d5d850",
+  "production_url": "https://zlstreet.xyz/kol/",
+  "podcast_url": "https://zlstreet.xyz/kol/podcasts?episode=alan-justinsun-20261010",
+  "production": {
+    "verified_at": "2026-10-13T14:41:10.692049+00:00",
+    "release": "/opt/kol-dashboard/releases/20261013T142354Z-15573-7d129621",
+    "runtime_files_verified": 54,
+    "reading_schedule": {
+      "enabled": true,
+      "model": "deepseek-v4-flash",
+      "worker_alive": true,
+      "period": "off_peak",
+      "off_peak_only": true,
+      "off_peak_minutes": 60,
+      "execution_allowed": true,
+      "next_run_at": "2026-10-13T14:41:10.490858+00:00",
+      "next_check_at": "2026-10-13T15:03:00+00:00",
+      "manual_execution_policy": "off_peak_only",
+      "automatic_audio_transcription": false,
+      "paid_call_boundary": "before_each_request",
+      "provider_blocked": null
+    },
+    "boundary_checks": {
+      "2026-10-13T09:00:00+08:00": {
+        "execution_allowed": false,
+        "next_run_at": "2026-10-13T12:00:00+08:00"
+      },
+      "2026-10-13T12:00:00+08:00": {
+        "execution_allowed": true,
+        "next_run_at": "2026-10-13T12:00:00+08:00"
+      },
+      "2026-10-13T14:00:00+08:00": {
+        "execution_allowed": false,
+        "next_run_at": "2026-10-13T18:00:00+08:00"
+      },
+      "2026-10-13T18:00:00+08:00": {
+        "execution_allowed": true,
+        "next_run_at": "2026-10-13T18:00:00+08:00"
+      },
+      "2026-10-10T10:00:00+08:00": {
+        "execution_allowed": true,
+        "next_run_at": "2026-10-10T10:00:00+08:00"
+      },
+      "2026-10-01T10:00:00+08:00": {
+        "execution_allowed": true,
+        "next_run_at": "2026-10-01T10:00:00+08:00"
+      }
+    },
+    "justinsun_directory": {
+      "kol_key": "justinsun",
+      "kol_name": "Justin Sun",
+      "kol_name_cn": "孙宇晨",
+      "total": 1,
+      "last_id": 21937,
+      "last_fetched": "2026-10-13T14:32:35+00:00",
+      "last_published": "2026-10-12T19:18:00+00:00",
+      "high_total": 0,
+      "medium_total": 1,
+      "high_24h": 0,
+      "total_24h": 1,
+      "configured": true,
+      "category": "investor"
+    },
+    "podcast": {
+      "id": "alan-justinsun-20261010",
+      "status": "summarized",
+      "source_kind": "third_party_transcript",
+      "coverage": {
+        "scope": "partial",
+        "start_seconds": 0,
+        "end_seconds": 15736,
+        "segments_total": 1694,
+        "segments_processed": 1694,
+        "note": "第三方自动转写，未经原音频逐句核验。原稿1743条发言已排除作者标注疑似不符原音频的00:28–00:33转录块，其余重叠和说话人不确定保留；这是部分可用转录，不能视为已核验完整字幕。原始视频和转录来源均可回查。",
+        "chunks_processed": 14,
+        "chunks_total": 14
+      },
+      "source_url": "https://www.youtube.com/watch?v=0Z-vhBvBmUY",
+      "transcript_source_url": "https://github.com/wousp112/justin-sun-alan-shao-ai-notes/blob/db8ddd2c2578837a3c900901b24a3108a290d1ea/%E5%85%A8%E6%96%87.md",
+      "excluded_regions": [
+        {
+          "source_block_start_seconds": 1680,
+          "source_block_end_seconds": 1980,
+          "reason": "转录作者标注本块与上一块的重叠内容对不上，其中一段可能不是录音原文；本块不进入阅读证据或模型摘要。排除按源转录块而非精确音频删节，邻块仍存在重叠。",
+          "excluded_segments": 49
+        }
+      ],
+      "summary_points": 8,
+      "all_references_valid": true,
+      "quality_review": {
+        "status": "assistant_reviewed",
+        "reviewer": "本轮助手复核",
+        "reviewed_at": "2026-10-13T14:40:21.303355+00:00",
+        "issues": [
+          "文字对照复核：只使用已导入的第三方自动转录，未逐句对照原音频；保留来源不确定性，不将本次修订标为音频听校。",
+          "原8条要点的最晚引用仅为s0924（02:19:40），后续约两小时的重要主题缺少引用。合并重复AI条目，补入财富自由、婚姻的不确定性、商业学习参照、不同体验视角与创造消费平衡。",
+          "原“不建议结婚”遗漏后续限制：s1291与s1332明确表示婚姻家庭仍在摸索、没有固定答案；修订同时呈现早段流动性考虑和后段保留意见。",
+          "健康与投资说法均改为嘉宾个人主张；不把身体训练投资回报最高、加密货币机器可读或比特币竞争黄金写成已核实事实或系统建议。",
+          "未独立核实自动转录中的身体训练专名，采用身体管理的上位概括，不将原模型摘要中的“搏击必练”等表述当作准确专业术语或医疗建议。",
+          "原概览包含先自由后财富、先体验再下结论而要点无相应引用；本次分别补s1074/s1094/s1106及s1402/s1542/s1544。",
+          "各条保留最直接的1至3个原有证据ID；没有使用已排除的00:28–00:33存疑源块，没有修改原始转录、说话人或时间戳。"
+        ],
+        "note": "本轮助手对照文字稿修订；这一步不属于本地自动流程，也未逐秒核对音频。"
+      },
+      "model_draft_preserved": true,
+      "processing": {
+        "paid_api_calls": 16,
+        "summary_model": "deepseek-v4-flash",
+        "inference": "deepseek",
+        "prompt_version": "podcast-evidence-v2-third-party-partial-v1-deepseek-v2-bounded",
+        "usage_signature": "052a3e2be2865800d17741411fea971dcd1d47992fdc9377da2bd700c3a78137",
+        "usage_unreported_calls": 0,
+        "usage": {
+          "prompt_tokens": 129426,
+          "completion_tokens": 6530,
+          "total_tokens": 135956
+        },
+        "elapsed_seconds": 51.43
+      },
+      "job": {
+        "id": "e5d844c9ff38413c92cfd67473283c2c",
+        "type": "summary",
+        "article_id": "alan-justinsun-20261010",
+        "input_version": "052a3e2be2865800d17741411fea971dcd1d47992fdc9377da2bd700c3a78137",
+        "state": "completed",
+        "manual": true,
+        "attempts": 1,
+        "error": null,
+        "created_at": "2026-10-13T14:30:21.704436+00:00",
+        "updated_at": "2026-10-13T14:31:14.219152+00:00",
+        "started_at": "2026-10-13T14:30:22.609166+00:00",
+        "completed_at": "2026-10-13T14:31:14.219152+00:00",
+        "reused": false,
+        "not_before": null,
+        "deferred_reason": null
+      }
+    },
+    "news_sources": [
+      {
+        "id": "bloomberg_markets",
+        "status": "ok",
+        "stale": false,
+        "last_checked_at": "2026-10-13T14:40:09+00:00"
+      },
+      {
+        "id": "wsj_markets",
+        "status": "ok",
+        "stale": false,
+        "last_checked_at": "2026-10-13T14:40:10+00:00"
+      },
+      {
+        "id": "wsj_business",
+        "status": "ok",
+        "stale": false,
+        "last_checked_at": "2026-10-13T14:40:10+00:00"
+      },
+      {
+        "id": "bloomberg_technology",
+        "status": "ok",
+        "stale": false,
+        "last_checked_at": "2026-10-13T14:40:09+00:00"
+      },
+      {
+        "id": "wsj_technology",
+        "status": "ok",
+        "stale": false,
+        "last_checked_at": "2026-10-13T14:40:10+00:00"
+      }
+    ],
+    "news_analysis_schedule": {
+      "period": "off_peak",
+      "interval_minutes": 5,
+      "batch_limit": 8,
+      "daily_attempt_limit": 400,
+      "daily_attempts": 230,
+      "daily_remaining": 170,
+      "configured": true,
+      "last_run_at": "2026-10-13T14:35:14.541176+00:00",
+      "next_check_at": "2026-10-13T14:41:10.207761+00:00",
+      "due": true,
+      "calendar_status": "verified"
+    },
+    "protected_endpoints": {
+      "/api/private/reading/podcasts": {
+        "anonymous_status": 401,
+        "cache_control": "no-store"
+      },
+      "/api/private/reading/wechat": {
+        "anonymous_status": 401,
+        "cache_control": "no-store"
+      },
+      "/api/private/reading/status": {
+        "anonymous_status": 401,
+        "cache_control": "no-store"
+      }
+    },
+    "units": {
+      "kol-dashboard.service": "active",
+      "kol-reading-worker.service": "active",
+      "nginx.service": "active",
+      "kol-collect-kol.timer": "active",
+      "kol-collect-news.timer": "active",
+      "kol-enrich-news.timer": "active"
+    }
+  },
+  "first_activation": [
+    {
+      "podcast_job": {
+        "id": "e5d844c9ff38413c92cfd67473283c2c",
+        "article_id": "alan-justinsun-20261010",
+        "state": "queued",
+        "not_before": null,
+        "deferred_reason": null
+      },
+      "segments": 1694
+    },
+    {
+      "justinsun_scan": {
+        "found": 1,
+        "inserted": 1,
+        "skipped": 0,
+        "source_warnings": {
+          "justinsuntron": {
+            "source": "X @justinsuntron",
+            "code": "source_parse_empty"
+          }
+        },
+        "items": [
+          {
+            "source": "Bing News",
+            "url": "http://www.bing.com/news/apiclick.aspx?ref=FexRss&aid=&tid=6ace4088d2714b7fb4965b26e76d694a&url=https%3a%2f%2fent.sina.cn%2f2026-10-13%2fdetail-iniuzear5064287.d.html%3fvt%3d4&c=3116665092011274779&mkt=en-us",
+            "relevance_kind": null
+          }
+        ]
+      }
+    }
+  ],
+  "public_browser": {
+    "passed": true,
+    "kol": "justinsun",
+    "readingAssetVersion": 42,
+    "anonymousPrivateContentHidden": true,
+    "widths": [
+      1440,
+      390
+    ],
+    "errors": []
+  },
+  "local_validation": {
+    "main_unittests": 982,
+    "reading_unittests": 104,
+    "clean_export_repository_tests": 3,
+    "total": 1089,
+    "reader_browser_contracts": "passed including peak deferral, queued/running polling cadence, private session boundaries, unsafe URL handling, provenance and partial transcript",
+    "public_transcript_browser": {
+      "passed": true,
+      "segments": 1694,
+      "initial_rendered_segments": 30,
+      "expanded_segments": 80,
+      "last_segment_search": true,
+      "search_preserved_on_refresh": true,
+      "widths": [
+        1440,
+        390
+      ],
+      "page_errors": 0,
+      "unexpected_network_requests": 0
+    },
+    "flat_production_layout": "imports and peak exception identity verified",
+    "syntax": "Python compile, JS and shell syntax passed"
+  },
+  "pricing_reference": {
+    "url": "https://api-docs.deepseek.com/zh-cn/quick_start/pricing/",
+    "verified_date": "2026-10-13",
+    "timezone": "Asia/Shanghai",
+    "peak_weekdays_excluding_cn_holidays": [
+      "09:00-12:00",
+      "14:00-18:00"
+    ],
+    "off_peak_price_ratio": 0.5,
+    "scope": "DeepSeek input/output token unit prices; excludes RSS/local ASR/infrastructure"
+  },
+  "private_seed": {
+    "episode_id": "alan-justinsun-20261010",
+    "sha256": "e5daf6af17a87da43b0d8659e6777d3c6be51e79e9f55bc207df5e86fac6bef1",
+    "episode_sha256_at_import": "12f59d5fbe1b4ffe093822b7ca6938fd060d7361f8e7d04981a6794cbf747279",
+    "segments": 1694,
+    "text_characters": 93409,
+    "excluded_segments": 49,
+    "imported": 1,
+    "existing_records_overwritten": 0,
+    "full_transcript_in_git": false
+  },
+  "runtime_sha256": {
+    "app.py": "f107b77e5d7e82a22412f15890944de6deb18b3185acd645546431beb3cfd192",
+    "auth.py": "f193f831096565f0db069658a44e68ba9c3bf2f4022ffdec30d93d9e25b676c2",
+    "briefing_collect.py": "77e952d27a85f8b90657c73c721a58c55b0c2dc018a25a66a2276b8936dafe3c",
+    "briefing_import.py": "0cc8bd7c927a917d108695f2c9d44db8f2068be28edbadc602895b18bbcb37b0",
+    "briefing_service.py": "0a96ea58d4783a9786e95e9d43df1b18c189f8a9dfc784c6578ae837672c9981",
+    "briefing_topics.py": "bcebeac451ab4179c8045729d5e320a1f7e2d092f2786df990a787d8046b09b8",
+    "daily_enrichment.py": "279f46a23c964d6601a3e40bbe2f8f6da9f25a7468bc8df92f37e98178a4d9d7",
+    "content_quality.py": "09ec119f65db4efe022fbb31b24c31373cbb76158a22c6892bd14dc3ca9489c1",
+    "event_relevance.py": "7515a6644aded97735b5a2f690039f50d285841f692d7007c7065b3dda4ed290",
+    "db.py": "c2cd21be96230b3cff319fd79a8152d72218542bb17322c25f3b9a568af74cb0",
+    "decision_collect.py": "b37731ab526bd2662d245374a2a7f60b2a2f19008b6164f61f22e4759c173f92",
+    "decision_service.py": "e9bc7896bf4fa5daeef806867548fe4cd78e2080c725a3706f1a7ea9589131e3",
+    "decision_snapshot.py": "51b219dd6f2039af871491b66d08fae0e2b9e78ac707d90d7b141e0b840304f6",
+    "market_data.py": "fc5328d51eda5408b0abb3dc450a1deca0daccc71959ed29a26c099f97ac392a",
+    "portfolio.py": "8120a8be33d925c80a20a9d7863cc01373cbb5007ba573d8fcff9f71ff62ce60",
+    "relation_engine.py": "8a52a9794cd4a4ed41e7e122b9840690ebca77312affd2c59679da43e5c82692",
+    "macro_alert_service.py": "ee9ad871b753eaa268b004a8a7a55638579860b1984fb0ebbb491fbcbb2e2be5",
+    "macro_collect.py": "821d20bfd14b26966b7688554e8b57fa7bef386c1a84948d0ac4ebc217b8b26e",
+    "llm_enrichment.py": "fe0b28dd108d6aa0fc802549a4483799512b4e29cb2d3e3f4ab64f8a7c2be108",
+    "enrichment_collect.py": "c705766053ef7f948e131dc044843162aff447655dc1aec6ca5998b3b5b97ed0",
+    "options_capacity.py": "23ca00e407c3c8d9c5bcb1ae4c1f6cd35bf93533e9c3382b4ffb6371d7e46fe0",
+    "options_policy.py": "7ad105195a8b91d69ae44027054ddfa8dd0020f13347508dba2c4994d1f539cf",
+    "options_research_service.py": "5a0e200e07470717e05330edf5b9436e055077358911e43fc00ac1bf26a9e7e9",
+    "options_strategy.py": "d8e686b1d7b6e84b3f412ac76bc0c23b32d44fdff8d68c7bd4f18fcaa51683a6",
+    "reading_service.py": "4ab2913cda047551a299dc3e6857e996d175a690ec8d266b26592f366b0163f4",
+    "reading_worker.py": "dbc1f343ea6e4d27b3460f73d33c70230f7401518f8e3717fa50d889f5f997a5",
+    "reading_import.py": "ade783c46b60513781b1fc137b105bc1b123866e9c229be7c6fada74910f6920",
+    "news_service.py": "1ca7b6df0a2a3be3e0ebec1c2ced02bb0a09c28b5808a0debb1017d93c73e5f3",
+    "news_collect.py": "62988623edd40e0f3bed17fba0c74c389fe91302e733be636e33f874b369b1bb",
+    "news_enrichment.py": "9d1de75ced37f0cace6818b3bca887ffb8fee12c010b63cf4dc28efc84d9d143",
+    "collect.sh": "eaecfcb89f68c8051e9f169a41ae9260dab498a5d7e8d04fcac96d4ee453f127",
+    "templates/index.html": "c64b159222f37070b6cb936d7dd02648b976f6591073893a08f514842de07417",
+    "static/style.css": "c47982f45c1eaebadd35f3db641951e3f38620278fce94732e86bb848970e9b5",
+    "static/app.js": "3af1b0db3ff786f3df5e5463cb835a7e0a59bdbcb45e39136c0fe745e75210fa",
+    "static/img/donate-qrcode.png": "458b1626cec6579301a6b8aa6ea48545b39a9f444b02c102df25aad53a441c98",
+    "lib/kol_tracker.py": "1395cfe85cb5b17eaf9751f9c73e7f5c52b1e2fb81e03e804ef96c873af045a7",
+    "lib/macro_fetcher.py": "28b199c3be490ef88fbebfcd0e0a008cf03761619f04d9d00e6476492e5016a7",
+    "lib/risk_radar.py": "3ce479c423cf6b79e8b87cdb4e9550b8d18a489768456d9185eb262c72dfea24",
+    "lib/serenity_tracker.py": "8494c1070144448d5c4b4392f8314982f2c35c4a94eb2dee2c7d13ffac88dfd5",
+    "research/podcast_poc/poc.py": "0c603a24a04f8091e79b872e1844ff4e25f1c53d7dc6e706c522bad7656c5d54",
+    "research/podcast_poc/wechat.py": "3d7b43641eeb8fa5bf405c7e434f13386ced6362b0059d2462e505e463169740",
+    "research/podcast_poc/reading_jobs.py": "9539a2f4f9253d8fc02cfdab87940e1ad9924b4981844f0837c52c3093500a1e",
+    "research/podcast_poc/schedule_policy.py": "31a7f84d0845e639319da318829e09df2e277cd9bfa691dcf0f7554c56a2219c",
+    "research/podcast_poc/inference.py": "5bc1b3fd38bbf8c95c1dffe70ae011e8afd2c26bd1a96d7e054118c18375517e",
+    "research/podcast_poc/wechat_sources.json": "ca5d0a5199f849f02c9513b0a7d5f3ba75301c9a04b3d843d32c3ac2b82f5573",
+    "research/podcast_poc/web/index.html": "f44780ef52da47840cf1f6f046333dc6a93da11a805ae53da252d734dde62053",
+    "research/podcast_poc/web/app.js": "5a2eefd84ab1a3d7e8c4f5d4a4dd3417be3a188f9bc1dc7501621fc415e74d6e",
+    "research/podcast_poc/web/style.css": "4f4e06d62e0de67d9afe6459a9b4cac54ce2e75786750863a6fec3febdb02f5b",
+    "research/podcast_poc/web/wechat.html": "3bd73f4be5a367e5cd9ce4c532876233422176905a37180ab53fb193912018f0",
+    "research/podcast_poc/web/wechat.js": "59a761e539134edb99aefb4c33d2134be2e685a50ef53fdf0a9a3bee6a0a13f9",
+    "research/podcast_poc/web/wechat.css": "1e95fd637ad5666dfdb1438735930f6e4c265f189483182d2fc1416d4d1732e2",
+    "research/podcast_poc/web/reader-auth.js": "aa7610f3164580552d7ba1e2a9f1fd021f009a8420b7fae6bb44600451f366f1",
+    "research/podcast_poc/web/reader-auth.css": "9b919d3f78431d1e6f1b22bb215a5cb22e2089bd020584d470145266fe1ff424",
+    "news_catalog.py": "661d4aecbb55e7cdc14f9cafd006d7ea174aca9246d16ea7cc82e8393771e555"
+  },
+  "limitations": [
+    "Transcript is a third-party automatic transcription with overlapping blocks and uncertain speakers, not independently audio verified.",
+    "Suspect 00:28-00:33 source block excluded; coverage remains partial.",
+    "Automatic full-episode ASR and automatic fetching of new official transcripts remain unimplemented.",
+    "Justin Sun official X parsing returned source_parse_empty in the first scan; news fallback inserted one item.",
+    "First browser attempt ran during release and timed out; post-release retest passed.",
+    "This episode summary was explicitly revised against the available third-party transcript after finding early-half bias and a missing marriage caveat; original model draft retained. This is not audio verification or verification of the speaker claims. Other automatic summaries remain unreviewed drafts."
+  ],
+  "podcast_cost_estimate": {
+    "currency": "CNY",
+    "off_peak_uncached_input_estimate": 0.155546,
+    "peak_same_usage_uncached_input_estimate": 0.311092,
+    "basis": "2026-10-13 official Flash price; assumes all input cache misses; actual bill can be lower with cache hits; not an account billing statement",
+    "prompt_tokens": 129426,
+    "completion_tokens": 6530
+  },
+  "transcript_review": {
+    "status": "assistant_reviewed",
+    "applied_to_production": true,
+    "original_model_draft_preserved": true,
+    "audio_verified": false,
+    "before_last_cited_segment": "s0924",
+    "before_last_cited_seconds": 8380,
+    "after_last_cited_segment": "s1650",
+    "after_last_cited_seconds": 15376,
+    "points": 8,
+    "additional_model_calls": 0
+  }
+}

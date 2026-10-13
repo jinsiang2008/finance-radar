@@ -95,4 +95,5 @@ bash -n kol_dashboard/deploy.sh
 - 已确认的邵艾伦 × 孙宇晨访谈使用原始 YouTube 节目链接；本次取得的是公开第三方转录，非官方字幕。来源 commit/checksum 与版权归属保存在 `research/podcast_poc/sources/alan-justinsun-20261010.json`，完整文字只进入私人阅读目录，不进入 Git。
 - 适配器排除了来源自行标注疑似不符原音频的 00:28–00:33 转录块；其他重叠和说话人不确定性保留，`source_kind=third_party_transcript`、`coverage.scope=partial`。不补齐缺失音频、说话人或发布日期。自动摘要是待复核初稿，每条观点仍须有已收录段落 ID。
 - 该单集通过受控发布的 `KOL_READING_SEED_ARCHIVE` 导入，只创建不存在的记录，不覆盖已有阅读数据。`import_public_interview.py` 仅在本地校验固定来源并制作私有临时归档，不是自动追踪该 YouTube 频道的订阅器。
-- 完成后的实际发布、测试和摘要元数据见 `offpeak-reading-production-verification.json`。上述配置不代表已自动下载或转写其他播客整集音频。
+- 本期实际处理 14 个分块；模型初稿的 8 个要点偏向前半程，经过明确的文字对照复核补齐后半程，并保留婚姻观点的前后条件。通过既有 `apply_review` 保存修订与原模型初稿，页面标注“摘要已对照转写复核”，没有改写转录或声称完成音频听校；其他自动稿仍待复核。
+- 实际发布、测试和摘要元数据见 `offpeak-reading-production-verification.json`。上述配置不代表已自动下载或转写其他播客整集音频。
