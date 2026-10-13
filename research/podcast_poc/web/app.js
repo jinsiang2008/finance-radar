@@ -8,7 +8,9 @@ const states = { summarized: ['模型初稿 · 待复核', 'pending'], summarizi
 let episodes = [];
 let selectedId = new URL(location.href).searchParams.get('episode');
 let automation=null, csrfToken='', pollTimer=null, inFlight=null, selectedSignature='', currentEpisode=null, listSignature='';
+let sources=[], discovery=null, groupFilter='primary', sourceFilter='all', filtersInitialized=false, filterSignature='', sourceSignature='';
 const readingStates=new Map(), submitting=new Set(), requestErrors=new Map();
+const groupLabels={all:'全部',primary:'英文重点',chinese:'中文',additional:'英文补充'};
 
 function el(tag, className, text) {
   const node = document.createElement(tag);
@@ -87,12 +89,66 @@ function externalLink(url, label) {
   a.href = clean; a.target = '_blank'; a.rel = 'noopener noreferrer';
   return a;
 }
+function sourceFor(ep) { return sources.find(source=>source.id===ep.source_id) || sources.find(source=>source.name===ep.show); }
+function inGroup(item, group) {
+  if(group==='all')return true;
+  const source=sourceFor(item),language=item.language||source?.language||'',priority=item.source_priority||item.priority||source?.priority;
+  if(group==='chinese')return language.startsWith('zh');
+  return language==='en'&&(group==='primary'?priority==='primary':priority!=='primary');
+}
+function visibleEpisodes() { return episodes.filter(ep=>inGroup(ep,groupFilter)&&(sourceFilter==='all'||(ep.source_id||sourceFor(ep)?.id)===sourceFilter)); }
+function count(value) { return Number.isFinite(value)&&value>=0?Math.floor(value):0; }
+function renderFilters() {
+  const container=document.querySelector('#podcast-filters'),groups=document.querySelector('#podcast-groups'),selectSource=document.querySelector('#podcast-source');
+  container.hidden=false;
+  const available=sources.filter(source=>inGroup(source,groupFilter));
+  if(sourceFilter!=='all'&&!available.some(source=>source.id===sourceFilter))sourceFilter='all';
+  const signature=JSON.stringify([sources.length>0,groupFilter,sourceFilter,available.map(source=>[source.id,source.name])]);
+  if(signature===filterSignature)return;filterSignature=signature;groups.replaceChildren();
+  for(const group of sources.length?Object.keys(groupLabels):['all']){
+    const button=el('button','podcast-group',groupLabels[group]);button.type='button';button.dataset.group=group;button.setAttribute('aria-pressed',String(group===groupFilter));
+    button.addEventListener('click',()=>{if(groupFilter===group)return;groupFilter=group;sourceFilter='all';selectedId=null;renderCollection();});groups.append(button);
+  }
+  selectSource.replaceChildren();const all=el('option','','全部节目来源');all.value='all';selectSource.append(all);
+  for(const source of available){const option=el('option','',source.name||'未命名来源');option.value=source.id;selectSource.append(option);}
+  selectSource.value=sourceFilter;selectSource.hidden=!sources.length;document.querySelector('.podcast-source-label').hidden=!sources.length;
+}
+function renderSources() {
+  const panel=document.querySelector('#podcast-sources'),content=document.querySelector('#podcast-source-list');panel.hidden=!sources.length;
+  const signature=JSON.stringify([sources,discovery]);if(signature===sourceSignature)return;sourceSignature=signature;content.replaceChildren();
+  const primaryGroups=Number.isFinite(discovery?.primary_group_count)?count(discovery.primary_group_count):new Set(sources.filter(source=>source.priority==='primary').map(source=>source.group||source.id)).size;
+  document.querySelector('#podcast-sources-heading').textContent=`订阅来源与更新 · ${primaryGroups} 个英文重点频道`;
+  const labels={pending:['等待首次检查','pending'],ok:['节目列表已读取','done'],empty:['暂无节目','pending'],failed:['暂时无法读取','failed']};
+  for(const source of sources){
+    const row=el('section','podcast-source-card'),heading=el('div','podcast-source-heading');
+    heading.append(el('h3','',source.name||'未命名来源'));const [label,kind]=labels[source.status]||labels.pending;heading.append(el('span',`status ${kind}`,label));row.append(heading);
+    if(typeof source.focus==='string'&&source.focus)row.append(el('p','podcast-source-focus',source.focus));
+    row.append(el('p','podcast-source-counts',`已收录 ${count(source.discovered_count)} 集 · 文字稿 ${count(source.transcript_count)} 集 · 摘要 ${count(source.summary_count)} 集`));
+    row.append(el('p','podcast-source-check',source.last_checked_at?`最近检查：${beijingDate(source.last_checked_at)}（北京时间）`:'尚未检查，等待后台更新。'));
+    if(source.latest_published_at)row.append(el('p','podcast-source-latest',`最新节目：${beijingDate(source.latest_published_at)}（北京时间）`));
+    if(source.status==='failed')row.append(el('p','podcast-source-failure',source.last_success_at?`保留历史节目。上次读取成功：${beijingDate(source.last_success_at)}（北京时间）。`:'稍后将再次检查；已有阅读内容不受影响。'));
+    const homepage=externalLink(source.homepage_url,'节目主页');if(homepage)row.append(homepage);content.append(row);
+  }
+}
+function renderCollection() {
+  renderFilters();renderSources();
+  const items=visibleEpisodes();
+  document.querySelector('#collection-status').textContent=`${groupLabels[groupFilter]} · ${collectionStatus(items)}`;
+  const selected=items.find(ep=>ep.id===selectedId)||items.find(isReviewed)||items.find(summaryReady)||items[0];
+  if(selected){if(selected.id!==selectedId||selectedSignature!==JSON.stringify(selected))select(selected,{preserve:selected.id===selectedId});else{currentEpisode=selected;updateGeneration();showList();}}
+  else {
+    const audio=reader.querySelector('audio');if(audio){audio.pause();audio.removeAttribute('src');audio.load();}
+    selectedId=null;currentEpisode=null;selectedSignature='';showList();
+    reader.replaceChildren(el('h2','','这个范围暂时没有节目'),el('p','empty',sources.length?'可以切换节目范围或来源；后台检查后会收录可获取的新节目。':'导入或订阅节目后刷新列表，即可开始阅读。'));
+  }
+}
 function showList() {
-  const signature=JSON.stringify([selectedId,episodes.map(ep=>[ep.id,ep.title,ep.show,ep.published_at,status(ep)])]);if(signature===listSignature)return;listSignature=signature;
+  const items=visibleEpisodes();
+  const signature=JSON.stringify([selectedId,groupFilter,sourceFilter,episodes.length,items.map(ep=>[ep.id,ep.title,ep.show,ep.published_at,status(ep)])]);if(signature===listSignature)return;listSignature=signature;
   const scroll=list.scrollTop;
   list.replaceChildren();
-  document.querySelector('#episode-count').textContent = `${episodes.length} 集`;
-  for (const ep of episodes) {
+  document.querySelector('#episode-count').textContent = `${items.length} / ${episodes.length} 集`;
+  for (const ep of items) {
     const button = el('button', 'episode');
     button.type = 'button'; button.dataset.episodeId=ep.id;button.setAttribute('aria-current', String(ep.id === selectedId));
     button.append(el('span', 'episode-show', ep.show || '未命名节目'), el('span', 'episode-title', ep.title || '未命名单集'));
@@ -103,7 +159,7 @@ function showList() {
     button.addEventListener('click', () => select(episodes.find(item=>item.id===ep.id)||ep));
     list.append(button);
   }
-  if (!episodes.length) list.append(el('p', 'empty', '还没有节目。导入样本后点击“刷新列表”。'));
+  if (!items.length) list.append(el('p', 'empty', '当前范围暂无节目，可以切换筛选或稍后刷新。'));
   list.scrollTop=scroll;
 }
 function section(title, meta) {
@@ -296,12 +352,12 @@ async function fetchEpisodes() {
     if(!session.valid(generation))return;
     if (!Array.isArray(data.episodes)) throw new Error('接口缺少节目列表');
     episodes = data.episodes.filter(ep => ep && typeof ep === 'object' && typeof ep.id === 'string');
+    sources=array(data.sources).filter(source=>source&&typeof source==='object'&&typeof source.id==='string');discovery=data.discovery||null;
     automation=data.automation||null;csrfToken=!session.isKol&&typeof data.csrf_token==='string'?data.csrf_token:'';
     updateSchedule();if(!selectedId)selectedId=new URL(location.href).searchParams.get('episode');
-    document.querySelector('#collection-status').textContent = collectionStatus(episodes);
-    const selected = episodes.find(ep => ep.id === selectedId) || episodes.find(isReviewed) || episodes.find(ep => ep.status === 'summarized') || episodes[0];
-    if (selected) {if(selected.id!==selectedId||selectedSignature!==JSON.stringify(selected))select(selected,{preserve:selected.id===selectedId});else{currentEpisode=selected;updateGeneration();showList();}}
-    else { showList(); reader.replaceChildren(el('p', 'empty', '尚无节目样本。导入后刷新列表，即可开始阅读。')); }
+    if(!sources.length)groupFilter='all';
+    if(!filtersInitialized){groupFilter=sources.length?'primary':'all';const linked=episodes.find(ep=>ep.id===selectedId);if(linked&&!inGroup(linked,groupFilter))groupFilter='all';filtersInitialized=true;}
+    renderCollection();
   } catch (error) {
     if(!session.valid(generation)||error.authExpired)return;
     document.querySelector('#collection-status').textContent = '节目列表读取失败';
@@ -313,6 +369,8 @@ async function fetchEpisodes() {
 }
 function load(){if(!session.authenticated())return Promise.resolve();if(inFlight)return inFlight;clearTimeout(pollTimer);const pending=fetchEpisodes().finally(()=>{if(inFlight===pending){inFlight=null;schedulePoll();}});inFlight=pending;return pending;}
 refresh.addEventListener('click',()=>load());
+document.querySelector('#podcast-source').addEventListener('change',event=>{sourceFilter=event.target.value;selectedId=null;renderCollection();});
 session.on('lock',()=>{clearTimeout(pollTimer);inFlight=null;pollTimer=null;const audio=reader.querySelector('audio');if(audio){audio.pause();audio.removeAttribute('src');audio.load();}episodes=[];selectedId=null;currentEpisode=null;selectedSignature='';listSignature='';automation=null;csrfToken='';readingStates.clear();requestErrors.clear();submitting.clear();reader.replaceChildren();list.replaceChildren();document.querySelector('#episode-count').textContent='—';document.querySelector('#collection-status').textContent='请先解锁阅读';refresh.disabled=false;});
 session.on('lock',()=>{document.querySelector('#podcast-schedule').textContent='';});
+session.on('lock',()=>{sources=[];discovery=null;groupFilter='primary';sourceFilter='all';filtersInitialized=false;filterSignature='';sourceSignature='';document.querySelector('#podcast-filters').hidden=true;document.querySelector('#podcast-groups').replaceChildren();document.querySelector('#podcast-source').replaceChildren();const panel=document.querySelector('#podcast-sources');panel.hidden=true;panel.open=false;document.querySelector('#podcast-source-list').replaceChildren();document.querySelector('#podcast-sources-heading').textContent='订阅来源与更新';});
 session.on('unlock',()=>load());session.init().then(ready=>{if(ready)load();});

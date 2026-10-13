@@ -15,6 +15,7 @@ import re
 import subprocess
 import time
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -32,14 +33,31 @@ MODEL_REVISIONS = {
 PROMPT_VERSION = "podcast-evidence-v2"
 _RUNTIME = None
 FEEDS = {
+    "dwarkesh": ("Dwarkesh Podcast", "en", "https://apple.dwarkesh-podcast.workers.dev/feed.rss"),
+    "lex": ("Lex Fridman Podcast", "en", "https://lexfridman.com/feed/podcast/"),
+    "allin": ("All-In Podcast", "en", "https://rss.libsyn.com/shows/254861/destinations/1928300.xml"),
+    "nikhil_people": ("People by WTF — Nikhil Kamath", "en", "https://feeds.hubhopper.com/db41907e6c28518ffe336b392c715ef1.rss"),
+    "nikhil_wtf": ("WTF is with Nikhil Kamath", "en", "https://feeds.hubhopper.com/664690fdea0d7a6f61a052da119934d3.rss"),
+    "jre": ("The Joe Rogan Experience", "en", "https://feeds.megaphone.fm/GLT1412515089"),
+    "diary": ("The Diary Of A CEO", "en", "https://rss2.flightcast.com/xmsftuzjjykcmqwolaqn6mdn"),
     "sv101": ("硅谷101", "zh", "https://feeds.fireside.fm/sv101/rss"),
     "latepost": ("晚点聊", "zh", "https://podcast.latepost.com/rss"),
     "luanfanshu": ("乱翻书", "zh", "https://feed.xyzfm.space/yxuruh3f9mc4"),
     "xiaojun": ("张小珺商业访谈录", "zh", "https://feed.xyzfm.space/dk4yh3pkpjp3"),
     "latent": ("Latent Space", "en", "https://api.substack.com/feed/podcast/1084089.rss"),
-    "dwarkesh": ("Dwarkesh Podcast", "en", "https://apple.dwarkesh-podcast.workers.dev/feed.rss"),
     "acquired": ("Acquired", "en", "https://feeds.transistor.fm/acquired"),
     "iltb": ("Invest Like the Best", "en", "https://feeds.megaphone.fm/CLS2859450455"),
+}
+# Fixed, verified publisher feeds; multiple series can belong to one creator.
+# Retain existing keys and URLs because stored episode IDs derive from RSS GUIDs.
+FEED_DETAILS = {
+    "dwarkesh": {"priority": "primary", "group": "dwarkesh", "homepage_url": "https://www.dwarkesh.com/", "focus": "AI、前沿技术与深度访谈"},
+    "lex": {"priority": "primary", "group": "lex", "homepage_url": "https://lexfridman.com/podcast/", "focus": "AI、科技与长篇人物访谈"},
+    "allin": {"priority": "primary", "group": "allin", "homepage_url": "https://allin.com/", "focus": "科技商业、投资与宏观"},
+    "nikhil_people": {"priority": "primary", "group": "nikhil", "homepage_url": "https://www.youtube.com/@nikhil.kamath", "focus": "全球企业家与投资人；部分节目英印混合"},
+    "nikhil_wtf": {"priority": "primary", "group": "nikhil", "homepage_url": "https://www.youtube.com/@nikhil.kamath", "focus": "行业圆桌、商业与投资；部分节目英印混合"},
+    "jre": {"priority": "primary", "group": "jre", "homepage_url": "https://www.joerogan.com/", "focus": "人物长访谈，含科技，也含文化与体育"},
+    "diary": {"priority": "primary", "group": "diary", "homepage_url": "https://stevenbartlett.com/doac", "focus": "企业家、商业与人生访谈，也含健康话题"},
 }
 
 
@@ -194,23 +212,82 @@ def duration(value):
         return None
 
 
+def published_timestamp(value):
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            stamp = parsedate_to_datetime(value)
+        except (ValueError, TypeError, OverflowError):
+            return None
+    if stamp.tzinfo is None:
+        return None
+    return stamp.timestamp()
+
+
+def discovery_states():
+    path = DATA / "discovery.json"
+    if not path.exists():
+        return {}
+    state = json.loads(path.read_text())
+    # Older snapshots had one batch timestamp and no per-source timestamps.
+    return {row["feed"]: {**row, "last_checked_at": row.get("last_checked_at", state.get("checked_at"))}
+            for row in state.get("results", []) if isinstance(row, dict) and row.get("feed") in FEEDS}
+
+
+def eligible_podcast_item(key, item):
+    title = item.findtext("title") or ""
+    kind = item.findtext("{http://www.itunes.com/dtds/podcast-1.0.dtd}episodeType") or ""
+    if FEED_DETAILS.get(key, {}).get("priority") == "primary":
+        trailer_label = re.search(r"^(?:official\s+)?trailer(?:\s*[:|—–-]|\s*$)|[|—–:(-]\s*(?:official\s+)?trailer\s*(?:$|[|)—–:])|\bep\.?\s*\d+\s+trailer\b", title, re.I)
+        if kind.strip().lower() == "trailer" or trailer_label:
+            return False
+    # Publisher marks both English and dubbed items as language=en. Only remove
+    # explicitly labelled localized duplicates, not mixed-language interviews.
+    if key.startswith("nikhil_"):
+        localized = re.search(r"\bhindi\s*(?:dubbed|version|edition|dub)\b|\b(?:in|dubbed\s+in)\s+hindi\b|[\[(]\s*hindi\s*[\])]", title, re.I)
+        # The publisher's dubbed Musk episode has a Hindi title without the
+        # English word "Hindi"; a short quoted term alone is not sufficient.
+        if localized or len(re.findall(r"[\u0900-\u097f]", title)) >= 8:
+            return False
+    return True
+
+
 def discover(names, limit):
+    if not isinstance(limit, int) or limit < 1:
+        raise ValueError("Discovery limit must be positive")
+    names = list(names)
+    if any(key not in FEEDS for key in names):
+        raise ValueError("Unknown podcast source")
+    states = discovery_states()
     result = []
     for key in names:
         show, language, url = FEEDS[key]
         try:
             root = ET.fromstring(fetch(url, limit=40_000_000))
-            found = 0
+            candidates = []
             for item in root.findall("./channel/item"):
                 audio = next((e for e in item.findall("enclosure")
-                              if e.get("type", "").startswith("audio/")), None)
-                if audio is None:
+                              if e.get("type", "").startswith("audio/")
+                              and urlparse(e.get("url", "")).scheme in {"https", "http"}
+                              and urlparse(e.get("url", "")).hostname), None)
+                if audio is None or not eligible_podcast_item(key, item):
                     continue
+                candidates.append((item, audio))
+            candidates.sort(key=lambda pair: published_timestamp(pair[0].findtext("pubDate")) or 0, reverse=True)
+            found = 0
+            seen = set()
+            for item, audio in candidates:
                 identity = item.findtext("guid") or audio.get("url")
+                if identity in seen:
+                    continue
+                seen.add(identity)
                 eid = key + "-" + hashlib.sha256(identity.encode()).hexdigest()[:12]
                 if not episode_path(eid).exists():
                     secs = duration(item.findtext("{http://www.itunes.com/dtds/podcast-1.0.dtd}duration"))
-                    save_episode({"id": eid, "show": show, "language": language,
+                    save_episode({"id": eid, "show": show, "language": language, "source_id": key,
                         "title": item.findtext("title"), "published_at": item.findtext("pubDate"),
                         "source_url": item.findtext("link"), "audio_url": audio.get("url"),
                         "feed_url": url, "guid": identity, "duration_seconds": secs,
@@ -221,13 +298,23 @@ def discover(names, limit):
                 found += 1
                 if found >= limit:
                     break
-            result.append({"feed": key, "success": True, "items": found})
+            checked = now()
+            latest = next((item.findtext("pubDate") for item, _ in candidates
+                           if published_timestamp(item.findtext("pubDate")) is not None), None)
+            row = {"feed": key, "success": bool(found), "status": "ok" if found else "empty", "items": found,
+                   "last_checked_at": checked, "last_success_at": checked if found else states.get(key, {}).get("last_success_at"),
+                   "latest_published_at": latest, "error": None}
         except local_module("schedule_policy").OffPeakDeferred:
             raise
         except Exception as exc:
-            result.append({"feed": key, "success": False, "error": str(exc)})
+            row = {**states.get(key, {}), "feed": key, "success": False, "status": "failed",
+                   "items": 0, "last_checked_at": now(), "error": str(exc)[:300]}
+        states[key] = row
+        result.append(row)
+        # Persist completed sources before the next fetch can pause at a peak
+        # boundary. Unvisited sources keep their own real check timestamps.
+        write_json(DATA / "discovery.json", {"checked_at": now(), "results": list(states.values())})
         print(json.dumps(result[-1], ensure_ascii=False), flush=True)
-    write_json(DATA / "discovery.json", {"checked_at": now(), "results": result})
     return result
 
 
@@ -647,9 +734,33 @@ def apply_review(eid, review_path):
 
 def payload():
     episodes = [json.loads(p.read_text()) for p in sorted((DATA / "episodes").glob("*.json"))]
+    states = discovery_states()
+    sources = []
+    for key, (name, language, feed_url) in FEEDS.items():
+        details = {"priority": "standard", "group": key, "homepage_url": None, "focus": "", **FEED_DETAILS.get(key, {})}
+        matching = []
+        for episode in episodes:
+            source_id = episode.get("source_id")
+            if source_id == key or (not source_id and (episode.get("feed_url") == feed_url
+                    or episode["id"].startswith(key + "-") or episode.get("show") == name)):
+                episode.update(source_id=key, source_priority=details["priority"], source_group=details["group"])
+                matching.append(episode)
+        state = states.get(key, {})
+        latest = state.get("latest_published_at") or next(iter(sorted(
+            (e.get("published_at") for e in matching if published_timestamp(e.get("published_at")) is not None),
+            key=published_timestamp, reverse=True)), None)
+        sources.append({"id": key, "name": name, "language": language, "feed_url": feed_url, **details,
+                        "status": state.get("status") or ("ok" if state.get("success") and state.get("items") else "failed" if state.get("error") else "empty" if state else "pending"),
+                        "last_checked_at": state.get("last_checked_at"), "last_success_at": state.get("last_success_at"),
+                        "latest_published_at": latest, "error": state.get("error"),
+                        "discovered_count": len(matching), "transcript_count": sum(bool(e.get("segments")) for e in matching),
+                        "summary_count": sum(bool(e.get("segments") and (e.get("summary") or {}).get("points")) for e in matching)})
     order = {"summarized": 0, "summarizing": 1, "transcribed": 2, "audio_ready": 3, "failed": 4, "discovered": 5}
-    episodes.sort(key=lambda e: (order.get(e["status"], 6), e["id"]))
-    return {"generated_at": now(), "mode": "local_free_poc", "episodes": episodes}
+    episodes.sort(key=lambda e: (order.get(e["status"], 6), -(published_timestamp(e.get("published_at")) or 0), e["id"]))
+    return {"generated_at": now(), "mode": "local_free_poc", "episodes": episodes, "sources": sources,
+            "discovery": {"scope": "metadata_only", "automatic_transcript_fetch": False,
+                          "automatic_audio_transcription": False,
+                          "primary_group_count": len({s["group"] for s in sources if s["priority"] == "primary"})}}
 
 
 def serve(port, *, return_server=False, start_worker=True):

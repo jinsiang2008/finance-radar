@@ -1,0 +1,127 @@
+{
+  "checked_at": "2026-10-13T14:58:17.219080+00:00",
+  "network": "production_direct_no_proxy",
+  "max_bytes": 41943040,
+  "timeout_seconds": 30,
+  "sources": [
+    {
+      "source_id": "dwarkesh",
+      "url": "https://apple.dwarkesh-podcast.workers.dev/feed.rss",
+      "http_status": 200,
+      "final_url": "https://apple.dwarkesh-podcast.workers.dev/feed.rss",
+      "bytes": 575002,
+      "items": 142,
+      "latest": [
+        {
+          "title": "Si Sheppard – How did a few hundred Spanish soldiers topple two empires?",
+          "published_at": "Thu, 01 Oct 2026 15:28:28 GMT",
+          "audio_enclosure": true
+        }
+      ],
+      "success": true,
+      "elapsed_seconds": 0.34
+    },
+    {
+      "source_id": "lex-fridman",
+      "url": "https://lexfridman.com/feed/podcast/",
+      "http_status": 200,
+      "final_url": "https://lexfridman.com/feed/podcast/",
+      "bytes": 2121803,
+      "items": 502,
+      "latest": [
+        {
+          "title": "#502 – Psychiatry, Insane Asylums, Mental Illness, ECT, Lobotomies, Freud & Jung",
+          "published_at": "Thu, 17 Sep 2026 00:40:49 +0000",
+          "audio_enclosure": true
+        }
+      ],
+      "success": true,
+      "elapsed_seconds": 2.22
+    },
+    {
+      "source_id": "all-in",
+      "url": "https://rss.libsyn.com/shows/254861/destinations/1928300.xml",
+      "http_status": 200,
+      "final_url": "https://rss.libsyn.com/shows/254861/destinations/1928300.xml",
+      "bytes": 4193045,
+      "items": 435,
+      "latest": [
+        {
+          "title": "Martin Shkreli: Big Pharma's Blind Spot, Betting Against Quantum & What Prison Taught Him",
+          "published_at": "Mon, 12 Oct 2026 15:49:00 +0000",
+          "audio_enclosure": true
+        }
+      ],
+      "success": true,
+      "elapsed_seconds": 112.01
+    },
+    {
+      "source_id": "nikhil-people",
+      "url": "https://feeds.hubhopper.com/db41907e6c28518ffe336b392c715ef1.rss",
+      "http_status": 200,
+      "final_url": "https://feeds.hubhopper.com/db41907e6c28518ffe336b392c715ef1.rss",
+      "bytes": 344676,
+      "items": 48,
+      "latest": [
+        {
+          "title": "The Crypto Skeptic vs The Coinbase CEO | Brian Armstrong x Nikhil Kamath | People by WTF",
+          "published_at": "Thu, 16 Jul 2026 17:55:35 +0000",
+          "audio_enclosure": true
+        }
+      ],
+      "success": true,
+      "elapsed_seconds": 0.26
+    },
+    {
+      "source_id": "nikhil-wtf",
+      "url": "https://feeds.hubhopper.com/664690fdea0d7a6f61a052da119934d3.rss",
+      "http_status": 200,
+      "final_url": "https://feeds.hubhopper.com/664690fdea0d7a6f61a052da119934d3.rss",
+      "bytes": 721847,
+      "items": 55,
+      "latest": [
+        {
+          "title": "Will ChatGPT Book Your Next Holiday? | MakeMyTrip x Taj Hotels | WTF is Travel?",
+          "published_at": "Fri, 11 Sep 2026 05:46:49 +0000",
+          "audio_enclosure": true
+        }
+      ],
+      "success": true,
+      "elapsed_seconds": 0.09
+    },
+    {
+      "source_id": "jre",
+      "url": "https://feeds.megaphone.fm/GLT1412515089",
+      "http_status": 200,
+      "final_url": "https://feeds.megaphone.fm/GLT1412515089",
+      "bytes": 5442970,
+      "items": 2762,
+      "latest": [
+        {
+          "title": "#2563 - Dan Richards",
+          "published_at": "Thu, 08 Oct 2026 17:00:00 -0000",
+          "audio_enclosure": true
+        }
+      ],
+      "success": true,
+      "elapsed_seconds": 0.31
+    },
+    {
+      "source_id": "diary-of-a-ceo",
+      "url": "https://rss2.flightcast.com/xmsftuzjjykcmqwolaqn6mdn",
+      "http_status": 200,
+      "final_url": "https://rss2.flightcast.com/xmsftuzjjykcmqwolaqn6mdn",
+      "bytes": 6442122,
+      "items": 896,
+      "latest": [
+        {
+          "title": "AI Extinction Risk Expert: If Your Job Is Repetitive, AI Will Do It Better Than You! | Eric Weinstein",
+          "published_at": "Mon, 12 Oct 2026 05:00:00 -0000",
+          "audio_enclosure": true
+        }
+      ],
+      "success": true,
+      "elapsed_seconds": 5.14
+    }
+  ]
+}

@@ -24,6 +24,16 @@
   <div class="workspace">
     <aside class="inbox" aria-label="节目列表">
       <div class="inbox-heading"><h2>阅读清单</h2><span id="episode-count">—</span></div>
+      <div id="podcast-filters" class="podcast-filters" hidden>
+        <div id="podcast-groups" class="podcast-groups" role="group" aria-label="节目范围"></div>
+        <label class="podcast-source-label" for="podcast-source">节目来源</label>
+        <select id="podcast-source" class="podcast-source" aria-label="节目来源"></select>
+      </div>
+      <details id="podcast-sources" class="podcast-sources" hidden>
+        <summary id="podcast-sources-heading">订阅来源与更新</summary>
+        <p class="podcast-source-boundary">订阅更新会发现新节目。读取节目列表不代表已有全文或摘要；取得文字稿后才能整理中文要点。</p>
+        <div id="podcast-source-list" class="podcast-source-list"></div>
+      </details>
       <div id="episode-list" class="episode-list"><p class="empty">正在加载…</p></div>
       <p class="inbox-note">点开观点查看出处。音频只在你点击后加载。</p>
       <p id="podcast-schedule" class="inbox-note" aria-live="polite">摘要按后台队列安排。</p>
