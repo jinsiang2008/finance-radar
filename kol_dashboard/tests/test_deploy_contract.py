@@ -53,6 +53,7 @@ class DeploymentContractTests(unittest.TestCase):
             "reading_service.py",
             "reading_worker.py",
             "reading_import.py",
+            "news_catalog.py",
             "news_service.py",
             "news_collect.py",
             "news_enrichment.py",
@@ -104,8 +105,8 @@ class DeploymentContractTests(unittest.TestCase):
         end = self.deploy.index("\nUNIT\n", start)
         unit = self.deploy[start:end]
         self.assertIn("EnvironmentFile=-/etc/kol-dashboard/deepseek.env", unit)
-        self.assertIn("ExecStart=/usr/bin/python3 /opt/kol-dashboard/current/news_enrichment.py --limit 4", unit)
-        for line in ("User=kol-dashboard", "UMask=0077", "LimitCORE=0", "NoNewPrivileges=true", "TimeoutStartSec=5min"):
+        self.assertIn("ExecStart=/usr/bin/python3 /opt/kol-dashboard/current/news_enrichment.py --limit 8", unit)
+        for line in ("User=kol-dashboard", "UMask=0077", "LimitCORE=0", "NoNewPrivileges=true", "TimeoutStartSec=420s"):
             self.assertIn(line, unit)
         self.assertNotIn("/opt/kol-dashboard/private", unit)
 
@@ -116,7 +117,7 @@ class DeploymentContractTests(unittest.TestCase):
             timer = self.deploy[start:end]
             for line in ("OnCalendar=*-*-* *:00/5:00", "RandomizedDelaySec=15s", "AccuracySec=5s", "Persistent=true", "Unit=" + unit + ".service"):
                 self.assertIn(line, timer)
-        preflight = self.deploy.index("/usr/bin/python3 -c 'import news_service, news_collect, news_enrichment'")
+        preflight = self.deploy.index("/usr/bin/python3 -c 'import news_catalog, news_service, news_collect, news_enrichment'")
         stop = self.deploy.index("systemctl stop kol-enrich-wakeup.path")
         self.assertLess(preflight, stop)
         candidate = self.deploy.index("\nsystemctl start kol-collect-news.service\n")
@@ -132,13 +133,39 @@ class DeploymentContractTests(unittest.TestCase):
             self.assertIn(unit, self.deploy[timers:committed])
         self.assertIn("https://zlstreet.xyz/kol/api/news", self.deploy)
 
+    def test_news_contexts_are_accepted_before_timers_and_commit(self) -> None:
+        acceptance = self.deploy.index('validate_news_api "$NEWS_ACCEPTANCE_NOT_BEFORE"')
+        contexts = self.deploy.index("\nvalidate_news_context_api\n", acceptance)
+        timers = self.deploy.index("systemctl start kol-collect-kol.timer", contexts)
+        self.assertLess(acceptance, contexts)
+        self.assertLess(contexts, timers)
+        function = self.deploy.index("validate_news_context_api() {")
+        start = self.deploy.index("<<'PY_CONTEXT'\n", function) + len("<<'PY_CONTEXT'\n")
+        end = self.deploy.index("\nPY_CONTEXT\n", start)
+        validator = compile(self.deploy[start:end], "news-context-acceptance", "exec")
+        def response(request, timeout):
+            from urllib.parse import parse_qs, urlsplit
+            view = parse_qs(urlsplit(request.full_url).query)["view"][0]
+            value = {"view": view, "items": [], "sources": [], "generated_at": "2026-10-13T00:00:00+00:00", "analysis_schedule": {}}
+            stream = io.StringIO(json.dumps(value))
+            stream.status = 200
+            return stream
+        with patch("urllib.request.urlopen", side_effect=response) as fetch, redirect_stdout(io.StringIO()):
+            exec(validator, {})
+        self.assertEqual(fetch.call_count, 4)
+        self.assertIn("asset=US%3ANVDA", fetch.call_args_list[-1].args[0].full_url)
+        bad = io.StringIO(json.dumps({"view": "home", "items": [], "sources": []}))
+        bad.status = 200
+        with patch("urllib.request.urlopen", return_value=bad), self.assertRaises(SystemExit):
+            exec(validator, {})
+
     def test_news_acceptance_rejects_partial_stale_or_empty_successes(self) -> None:
         function = self.deploy.index("validate_news_api() {")
         start = self.deploy.index("<<'PY_NEWS'\n", function) + len("<<'PY_NEWS'\n")
         end = self.deploy.index("\nPY_NEWS\n", start)
         validator = compile(self.deploy[start:end], "news-release-acceptance", "exec")
         now = datetime.now(timezone.utc)
-        source_ids = ("bloomberg_markets", "wsj_markets", "wsj_business")
+        source_ids = ("bloomberg_markets", "bloomberg_technology", "wsj_markets", "wsj_business", "wsj_technology")
 
         def payload() -> dict:
             return {"sources": [{"id": source_id, "status": "ok", "stale": False, "last_checked_at": now.isoformat(), "last_success_at": now.isoformat(), "item_count": 2} for source_id in source_ids], "items": [{"title": "Accepted news item"}]}

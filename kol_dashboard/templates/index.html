@@ -18,7 +18,7 @@
     } catch (e) {}
   })();
 </script>
-  <link rel="stylesheet" href="static/style.css?v=41" />
+  <link rel="stylesheet" href="static/style.css?v=42" />
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ccircle cx='50' cy='50' r='42' fill='%230b1720' stroke='%2331d69b' stroke-width='6'/%3E%3Ccircle cx='50' cy='50' r='20' fill='none' stroke='%234ab8d8' stroke-width='5'/%3E%3Cpath d='M50 50L82 24' stroke='%23f4b942' stroke-width='6' stroke-linecap='round'/%3E%3Ccircle cx='50' cy='50' r='7' fill='%23eef4f2'/%3E%3C/svg%3E" />
 </head>
 <body>
@@ -89,6 +89,8 @@
     <section class="decision-hero" id="decision-hero">
       <div class="skeleton skeleton-hero"></div>
     </section>
+
+    <section class="shared-news" id="news-context-home" aria-label="相关媒体新闻" aria-busy="true"><p class="shared-news-loading">正在读取相关媒体新闻。</p></section>
 
     <section class="decision-lenses" aria-labelledby="decision-lenses-title">
       <div class="decision-lenses-copy">
@@ -167,10 +169,14 @@
     <header class="news-masthead">
       <div>
         <h1>市场快讯</h1>
-        <p>从铜、黄金到全球市场，直接核对媒体发布的新闻线索。</p>
+        <p>按行业、公司和 ETF 阅读全球市场新闻，先看中文摘要，再核对原文。</p>
       </div>
       <div class="news-cadence" id="news-cadence">采集频率待确认</div>
     </header>
+    <div class="news-topic-bar" id="news-topic-filters" role="group" aria-label="按行业主题筛选新闻">
+      <button type="button" data-news-topic="" aria-pressed="true">全部主题</button>
+    </div>
+    <p class="news-directory-note">主题数量统计近 7 天全部来源；股票 / ETF 筛选只匹配直接提及。</p>
     <div class="news-filter-bar">
       <div class="news-commodity-filters" id="news-commodity-filters" role="group" aria-label="按商品筛选新闻">
         <button type="button" data-news-commodity="" aria-pressed="true">全部</button>
@@ -185,6 +191,11 @@
         <select id="news-publisher"><option value="">全部来源</option></select>
       </label>
     </div>
+    <div class="news-instrument-row"><label for="news-instrument">股票 / ETF
+      <select id="news-instrument"><option value="">全部标的</option></select>
+    </label><button type="button" class="news-reset-btn" data-news-reset>清除筛选</button></div>
+    <div class="news-instrument-focus" id="news-instrument-focus" hidden></div>
+    <p class="news-summary-coverage" id="news-summary-coverage" role="status" aria-live="polite"></p>
     <p class="news-evidence-note">目前收录公开订阅源的标题及可用简介。全文请打开原文；采集频率不代表新闻延迟。</p>
     <div class="news-layout">
       <section class="news-stream" aria-labelledby="news-stream-title">
@@ -218,6 +229,8 @@
         <span class="daily-as-of" id="daily-as-of">数据时间待确认</span>
       </div>
     </header>
+
+    <section class="shared-news" id="news-context-daily" aria-label="相关媒体新闻" aria-busy="true"><p class="shared-news-loading">正在读取相关媒体新闻。</p></section>
 
     <section class="attention-desk" id="daily-attention-desk"
              aria-labelledby="daily-attention-title" hidden></section>
@@ -261,6 +274,8 @@
     <section class="hero" id="macro-hero">
       <div class="skeleton skeleton-hero"></div>
     </section>
+
+    <section class="shared-news" id="news-context-macro" aria-label="相关媒体新闻" aria-busy="true"><p class="shared-news-loading">正在读取相关媒体新闻。</p></section>
 
     <section class="block macro-alerts-block" id="macro-alerts-block"
              aria-labelledby="macro-alerts-title">
@@ -454,6 +469,8 @@
       </div>
     </section>
 
+    <section class="shared-news" id="news-context-kol" aria-label="KOL 相关媒体报道" aria-busy="true"><p class="shared-news-loading">正在读取相关媒体报道。</p></section>
+
     <aside class="freshness-banner" id="kol-update-banner" role="status"
            aria-live="polite" aria-atomic="true" hidden></aside>
 
@@ -551,6 +568,6 @@
   </div>
 </div>
 
-  <script src="static/app.js?v=41"></script>
+  <script src="static/app.js?v=42"></script>
 </body>
 </html>

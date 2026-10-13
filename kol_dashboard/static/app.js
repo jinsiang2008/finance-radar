@@ -22,7 +22,11 @@
     newsData: null,
     pendingNewsData: null,
     newsCommodity: "",
+    newsTopic: "",
+    newsInstrument: "",
     newsPublisher: "",
+    newsCatalog: { topics: [], instruments: [] },
+    newsContexts: {},
     newsRequestGeneration: 0,
     newsAbortController: null,
     dailyData: null,
@@ -1003,32 +1007,55 @@
     return analysis;
   }
 
-  function newsItemHTML(item) {
+  function newsSummaryStatus(item) {
+    const status = item?.analysis?.status || item?.analysis_status;
+    if (status === "pending" || status === "running") return "中文摘要待生成";
+    if (status === "error") return "中文摘要生成失败，等待重试";
+    if (status === "not_scheduled") return item.published_at_status === "provided"
+      ? "未自动解读 · 超出近期处理范围" : "未自动解读 · 发布时间待核实";
+    return "暂未生成中文摘要";
+  }
+
+  function newsItemHTML(item, { compact = false, detail = false, contextAsset = "" } = {}) {
     const analysis = newsAnalysis(item);
     const titleOnly = newsEvidenceScope(item) === "title_only";
     const url = safeExternalUrl(item.url);
     const title = String(analysis?.headline_zh || item.title || "标题待确认");
     const tags = Array.isArray(item.commodity_tags)
       ? item.commodity_tags.filter((tag) => Object.hasOwn(NEWS_COMMODITIES, tag)) : [];
+    const topics = Array.isArray(item.topic_tags) ? item.topic_tags : [];
+    const topicLabels = topics.map((key) => state.newsCatalog.topics.find((topic) => topic.key === key)?.label).filter(Boolean);
+    const assets = Array.isArray(item.assets) ? item.assets : [];
+    const directAssets = assets.filter((asset) => asset.relation === "direct_mention");
+    const relatedAssets = assets.filter((asset) => asset.relation === "topic_related");
+    const contextRelation = assets.find((asset) => asset.asset_key === contextAsset)?.relation;
+    const mentions = Array.isArray(item.kol_mentions) ? item.kol_mentions : [];
+    const heading = detail ? "h4" : "h3";
     const publication = item.published_at_status === "provided"
       ? newsTimeHTML(item.published_at, "发布")
       : `<span class="news-time-unknown">发布时间${item.published_at_status === "future" ? "异常，待核验" : "待确认"}</span>`;
     const watchpoints = Array.isArray(analysis?.watchpoints)
       ? analysis.watchpoints.filter((point) => typeof point === "string" && point.trim()).slice(0, 4) : [];
     const analysisHTML = analysis ? `<section class="news-analysis" aria-label="AI 解读">
-      <span class="news-analysis-label">AI 解读，${titleOnly ? "仅基于标题" : "基于标题与简介"}，待复核</span>
+      <span class="news-summary-status is-ready">${titleOnly ? "中文标题解读" : "中文摘要"}</span>
       ${analysis.summary_zh ? `<p>${esc(analysis.summary_zh)}</p>` : ""}
-      ${analysis.why_it_matters_zh ? `<p class="news-relevance"><strong>值得关注</strong>${esc(analysis.why_it_matters_zh)}</p>` : ""}
-      ${watchpoints.length ? `<details class="news-watchpoints"><summary>需核验 ${watchpoints.length} 项</summary><ul>${watchpoints.map((point) => `<li>${esc(point)}</li>`).join("")}</ul></details>` : ""}
-    </section>` : `<p class="news-snippet">${esc(titleOnly ? "仅收录标题，请查看原文。" : item.snippet)}</p>`;
-    return `<article class="news-item" data-news-id="${esc(item.id)}">
-      <div class="news-item-meta"><strong>${esc(item.publisher || "来源待确认")}</strong>${tags.map((tag) => `<span class="news-commodity-tag">${esc(NEWS_COMMODITIES[tag])}</span>`).join("")}<span class="news-evidence-label">${titleOnly ? "仅标题" : "标题与简介"}</span></div>
-      <h3>${url ? `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(title)}</a>` : esc(title)}</h3>
+      <span class="news-analysis-label">AI 解读，${titleOnly ? "仅基于标题" : "基于标题与简介"}，待复核</span>
+      ${!compact && analysis.why_it_matters_zh ? `<p class="news-relevance"><strong>值得关注</strong>${esc(analysis.why_it_matters_zh)}</p>` : ""}
+      ${!compact && watchpoints.length ? `<details class="news-watchpoints"><summary>需核验 ${watchpoints.length} 项</summary><ul>${watchpoints.map((point) => `<li>${esc(point)}</li>`).join("")}</ul></details>` : ""}
+      ${compact && (analysis.why_it_matters_zh || watchpoints.length) ? `<details class="news-watchpoints"><summary>影响与核验</summary>${analysis.why_it_matters_zh ? `<p>${esc(analysis.why_it_matters_zh)}</p>` : ""}${watchpoints.length ? `<ul>${watchpoints.map((point) => `<li>${esc(point)}</li>`).join("")}</ul>` : ""}</details>` : ""}
+    </section>` : `<section class="news-summary-pending"><span class="news-summary-status">${esc(newsSummaryStatus(item))}</span><p class="news-snippet">${esc(titleOnly ? "来源只有标题，无法据此补写正文摘要。" : item.snippet)}</p>${!titleOnly ? `<span class="news-analysis-label">以上为来源简介，尚非中文摘要。</span>` : ""}</section>`;
+    return `<article class="news-item${compact ? " is-compact" : ""}" data-news-id="${esc(item.id)}">
+      <div class="news-item-meta"><strong>${esc(item.publisher || "来源待确认")}</strong>${tags.map((tag) => `<span class="news-commodity-tag">${esc(NEWS_COMMODITIES[tag])}</span>`).join("")}${contextRelation ? `<span class="news-context-relation">${contextRelation === "direct_mention" ? "直接提及该标的" : "仅主题相关"}</span>` : ""}<span class="news-evidence-label">${titleOnly ? "仅标题" : "标题与简介"}</span></div>
+      <${heading} class="news-item-title">${url ? `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(title)}</a>` : esc(title)}</${heading}>
+      ${mentions.length ? `<p class="news-attribution">${mentions.map((mention) => `${String(mention.attribution_basis || "").includes("company") ? "关联公司报道" : "媒体提及"}：${esc(mention.name || mention.key)}`).join("；")}。不等同于本人表态。</p>` : ""}
       ${analysisHTML}
+      ${!compact && (topicLabels.length || directAssets.length) ? `<div class="news-entity-row">${topicLabels.map((label) => `<span>${esc(label)}</span>`).join("")}${directAssets.map((asset) => `<button type="button" data-news-instrument="${esc(asset.asset_key)}" title="查看直接提及该标的的报道">${esc(asset.name || asset.ticker || asset.asset_key)}${asset.ticker ? ` ${esc(asset.ticker)}` : ""}</button>`).join("")}</div>` : ""}
       <details class="news-original"><summary>原文证据${analysis ? "与原文标题" : "与收录范围"}</summary>
         <h4>${esc(item.title || "标题待确认")}</h4>
         ${titleOnly ? "" : `<p>${esc(item.snippet)}</p>`}
-        <p class="news-original-scope">${titleOnly ? "收录证据仅为来源标题" : "以上为来源提供的标题与简介"}，未读取全文；商品标签为关键词筛选线索。</p>
+        <p class="news-original-scope">${titleOnly ? "收录证据仅为来源标题" : "以上为来源提供的标题与简介"}，未读取全文；主题和商品标签为筛选线索。</p>
+        ${directAssets.length ? `<p class="news-asset-evidence"><strong>原文直接提及</strong> ${directAssets.map((asset) => esc(asset.name || asset.ticker || asset.asset_key)).join("、")}</p>` : ""}
+        ${relatedAssets.length ? `<p class="news-asset-evidence"><strong>主题相关，原文未直接提及</strong> ${relatedAssets.map((asset) => esc(asset.name || asset.ticker || asset.asset_key)).join("、")}。仅供延伸核验，不代表已确认影响。</p>` : ""}
         ${url ? `<a class="news-original-link" href="${esc(url)}" target="_blank" rel="noopener noreferrer">打开 ${esc(item.publisher || "来源")} 原文</a>` : `<p>原文链接不可用。</p>`}
       </details>
       <footer class="news-item-times">${publication}${newsTimeHTML(item.first_seen_at, "首次发现")}</footer>
@@ -1052,6 +1079,129 @@
       ${failed && source.last_error ? `<p class="news-source-error">${esc(String(source.last_error).slice(0, 180))}</p>` : ""}
       <p class="news-source-delay">上游延迟未知</p>
     </section>`;
+  }
+
+  function updateNewsCatalog(catalog) {
+    if (!catalog || !Array.isArray(catalog.topics) || !Array.isArray(catalog.instruments)) return;
+    state.newsCatalog = catalog;
+  }
+
+  function renderNewsCatalog(data) {
+    updateNewsCatalog(data?.catalog);
+    const topicHost = $("#news-topic-filters");
+    const focusedTopic = document.activeElement?.dataset?.newsTopic;
+    if (topicHost) {
+      topicHost.innerHTML = `<button type="button" data-news-topic="" aria-pressed="${!state.newsTopic}">全部主题</button>${state.newsCatalog.topics.map((topic) => `<button type="button" data-news-topic="${esc(topic.key)}" aria-pressed="${state.newsTopic === topic.key}">${esc(topic.label)}<span>${Math.max(0, Number(topic.count) || 0)}</span></button>`).join("")}`;
+      if (focusedTopic !== undefined) requestAnimationFrame(() => $$("[data-news-topic]").find((button) => button.dataset.newsTopic === focusedTopic)?.focus({ preventScroll: true }));
+    }
+    const select = $("#news-instrument");
+    if (select) {
+      select.innerHTML = `<option value="">全部标的</option>${state.newsCatalog.instruments.map((instrument) => `<option value="${esc(instrument.key)}">${esc(instrument.label)}${instrument.ticker ? ` · ${esc(instrument.ticker)}` : ""}（${Math.max(0, Number(instrument.direct_count) || 0)} 条直接提及）</option>`).join("")}`;
+      select.value = state.newsInstrument;
+    }
+    const focus = $("#news-instrument-focus");
+    const instrument = state.newsCatalog.instruments.find((entry) => entry.key === state.newsInstrument);
+    if (focus) {
+      focus.hidden = !instrument;
+      focus.innerHTML = instrument ? `<strong>${esc(instrument.label)}${instrument.ticker ? ` ${esc(instrument.ticker)}` : ""}</strong><span>${esc(instrument.market || "")} ${instrument.type === "etf" ? "ETF" : instrument.type === "stock" ? "股票" : esc(instrument.type || "")}</span><p>只显示标题或简介直接提及该标的的新闻；行业相关报道不会计为直接提及。</p>` : "";
+    }
+  }
+
+  const NEWS_CONTEXT_LABELS = {
+    home: "全球市场新闻", daily: "媒体新闻摘要", macro: "宏观相关报道", asset: "该标的相关报道", kol: "相关媒体报道",
+  };
+
+  function newsContextState(view) {
+    if (!Object.hasOwn(NEWS_CONTEXT_LABELS, view)) return null;
+    if (!state.newsContexts[view]) state.newsContexts[view] = {
+      data: null, pending: null, asset: "", filterKey: "", generation: 0, controller: null, loadedAt: 0, error: false,
+    };
+    return state.newsContexts[view];
+  }
+
+  function renderNewsContext(view, { keepArticles = false } = {}) {
+    const host = $(`#news-context-${view}`);
+    const context = newsContextState(view);
+    if (!host || !context) return;
+    const title = NEWS_CONTEXT_LABELS[view];
+    const heading = view === "asset" ? "h3" : "h2";
+    const items = Array.isArray(context.data?.items) ? context.data.items : [];
+    const updated = newsTimeHTML(context.data?.generated_at, "读取");
+    const status = context.error
+      ? `<span>相关新闻刷新失败${context.data ? "，保留上次结果。" : "。"}</span><button type="button" data-news-context-retry="${view}">重试新闻</button>`
+      : context.pending
+        ? `<span>报道或摘要有更新。</span><button type="button" data-news-context-apply="${view}">查看更新</button>` : "";
+    if (keepArticles && host.querySelector(".shared-news-items")) {
+      const banner = host.querySelector(".shared-news-status");
+      if (banner) { banner.innerHTML = status; banner.hidden = !status; }
+      return;
+    }
+    host.setAttribute("aria-busy", "false");
+    host.innerHTML = `<header class="shared-news-head"><div><${heading} id="news-context-${view}-title">${title}</${heading}><p>媒体报道与原文证据；${view === "asset" ? "相关性不等于已确认影响。" : "独立于 KOL 观点与风险评分。"}</p></div><button type="button" data-news-context-more="${view}">阅读更多</button></header>
+      <div class="shared-news-status" role="status" aria-live="polite"${status ? "" : " hidden"}>${status}</div>
+      <div class="shared-news-items">${items.length ? items.map((item) => newsItemHTML(item, { compact: true, detail: view === "asset", contextAsset: context.asset })).join("") : `<p class="shared-news-empty">${context.error ? "新闻暂时无法读取，原页面内容仍可使用。" : "暂未收录匹配的报道；不会用不相关消息补齐。"}</p>`}</div>
+      <footer class="shared-news-footer">${context.data ? updated : ""}<span>标题与可用简介，全文请查看原文。</span></footer>`;
+  }
+
+  async function loadNewsContext(view, { asset = "", background = false, force = false } = {}) {
+    const context = newsContextState(view);
+    const host = $(`#news-context-${view}`);
+    if (!context || !host || (view === "asset" && !asset)) return false;
+    const kols = view === "kol" ? selectedKolKeys().slice().sort() : [];
+    const filterKey = JSON.stringify({ asset, kols });
+    if (!force && context.filterKey === filterKey && context.loadedAt && Date.now() - context.loadedAt < 300_000) {
+      renderNewsContext(view);
+      return true;
+    }
+    const generation = ++context.generation;
+    context.controller?.abort();
+    const controller = new AbortController();
+    context.controller = controller;
+    if (context.filterKey !== filterKey) {
+      context.data = null; context.pending = null; context.loadedAt = 0; context.error = false;
+    }
+    context.asset = asset;
+    context.filterKey = filterKey;
+    if (!context.data) {
+      host.setAttribute("aria-busy", "true");
+      host.innerHTML = `<p class="shared-news-loading">正在读取${view === "asset" ? "该标的" : "相关"}媒体报道。</p>`;
+    }
+    const params = new URLSearchParams({ view, limit: view === "asset" ? "4" : "3" });
+    if (asset) params.set("asset", asset);
+    if (kols.length) params.set("kols", kols.join(","));
+    try {
+      const data = await fetchJSON(api(`api/news/context?${params}`), 12_000, { signal: controller.signal });
+      if (generation !== context.generation || context.filterKey !== filterKey) return false;
+      if (!data || !Array.isArray(data.items)) throw new Error("invalid_news_context");
+      updateNewsCatalog(data.catalog);
+      context.error = false;
+      context.loadedAt = Date.now();
+      host.setAttribute("aria-busy", "false");
+      if (background && context.data) {
+        context.pending = newsContentSignature(data) !== newsContentSignature(context.data) ? data : null;
+        renderNewsContext(view, { keepArticles: true });
+      } else {
+        context.data = data; context.pending = null;
+        renderNewsContext(view);
+      }
+      return true;
+    } catch (error) {
+      if (generation !== context.generation) return false;
+      context.error = true; context.pending = null;
+      host.setAttribute("aria-busy", "false");
+      renderNewsContext(view, { keepArticles: Boolean(context.data) });
+      return false;
+    } finally {
+      if (context.controller === controller) context.controller = null;
+    }
+  }
+
+  function clearAssetNewsContext() {
+    const context = state.newsContexts.asset;
+    if (context) { context.generation += 1; context.controller?.abort(); }
+    delete state.newsContexts.asset;
+    const host = $("#news-context-asset");
+    if (host) host.innerHTML = "";
   }
 
   function renderNewsSources(data) {
@@ -1086,17 +1236,24 @@
 
   function renderNews(data) {
     state.newsData = data;
+    renderNewsCatalog(data);
     const items = Array.isArray(data?.items) ? data.items : [];
     const host = $("#news-items");
     if (host) {
       host.setAttribute("aria-busy", "false");
-      host.innerHTML = items.length ? items.map(newsItemHTML).join("") : `<div class="news-empty"><h3>当前筛选暂无收录消息</h3><p>这不代表市场没有变化。可切换商品或来源，并检查来源的采集状态。</p>${state.newsCommodity || state.newsPublisher ? `<button type="button" class="view-retry-btn" data-news-reset>查看全部消息</button>` : ""}</div>`;
+      host.innerHTML = items.length ? items.map((item) => newsItemHTML(item)).join("") : `<div class="news-empty"><h3>当前筛选暂无收录消息</h3><p>这不代表市场没有变化。可切换主题、标的或来源，并检查采集状态。</p>${state.newsCommodity || state.newsPublisher || state.newsTopic || state.newsInstrument ? `<button type="button" class="view-retry-btn" data-news-reset>查看全部消息</button>` : ""}</div>`;
     }
     const count = $("#news-count");
     const total = Number(data?.total);
     if (count) count.textContent = Number.isFinite(total) && total > items.length
       ? `显示最新 ${items.length} 条，共 ${total} 条` : `${items.length} 条消息`;
     renderNewsSources(data);
+    const coverage = $("#news-summary-coverage");
+    if (coverage) {
+      const titleOnly = items.filter((item) => newsEvidenceScope(item) === "title_only").length;
+      const ready = items.filter((item) => newsAnalysis(item)?.summary_zh && newsEvidenceScope(item) !== "title_only").length;
+      coverage.textContent = `当前 ${items.length} 条中，${ready} 条已有中文摘要，${titleOnly} 条仅标题，${items.length - ready - titleOnly} 条摘要待补齐。`;
+    }
     announceNews(`已读取 ${items.length} 条市场快讯。`);
   }
 
@@ -1104,7 +1261,8 @@
     return JSON.stringify((data?.items || []).map((item) => ({
       id: item.id, title: item.title, snippet: item.snippet, url: item.url, publisher: item.publisher,
       published_at: item.published_at, published_at_status: item.published_at_status,
-      commodity_tags: item.commodity_tags, evidence_scope: newsEvidenceScope(item), analysis: newsAnalysis(item),
+      commodity_tags: item.commodity_tags, topic_tags: item.topic_tags, assets: item.assets,
+      evidence_scope: newsEvidenceScope(item), analysis_status: item.analysis?.status || item.analysis_status, analysis: newsAnalysis(item),
     })));
   }
 
@@ -1121,6 +1279,8 @@
     state.newsAbortController = controller;
     const params = new URLSearchParams({ limit: "40" });
     if (state.newsCommodity) params.set("commodity", state.newsCommodity);
+    if (state.newsTopic) params.set("topic", state.newsTopic);
+    if (state.newsInstrument) params.set("instrument", state.newsInstrument);
     if (state.newsPublisher) params.set("publisher", state.newsPublisher);
     const url = api(`api/news?${params}`);
     const host = $("#news-items");
@@ -1134,6 +1294,7 @@
       host?.setAttribute("aria-busy", "false");
       if (background && state.newsData) {
         renderNewsSources(data);
+        renderNewsCatalog(data);
         if (newsContentSignature(data) !== newsContentSignature(state.newsData)) {
           state.pendingNewsData = data;
           const banner = $("#news-update-banner");
@@ -1168,10 +1329,12 @@
     }
   }
 
-  function changeNewsFilters({ commodity = state.newsCommodity, publisher = state.newsPublisher } = {}) {
+  function changeNewsFilters({ commodity = state.newsCommodity, publisher = state.newsPublisher, topic = state.newsTopic, instrument = state.newsInstrument } = {}) {
     if (commodity && !Object.hasOwn(NEWS_COMMODITIES, commodity)) return;
     state.newsCommodity = commodity;
     state.newsPublisher = publisher;
+    state.newsTopic = topic;
+    state.newsInstrument = instrument;
     state.newsData = null;
     clearPendingNews();
     state.viewLoadedAt.news = 0;
@@ -1181,6 +1344,7 @@
     $$("[data-news-commodity]").forEach((button) => button.setAttribute("aria-pressed", String(button.dataset.newsCommodity === commodity)));
     const publisherSelect = $("#news-publisher");
     if (publisherSelect) publisherSelect.value = publisher;
+    renderNewsCatalog(null);
     const host = $("#news-items");
     if (host) host.innerHTML = `<div class="skeleton skeleton-card"></div>`;
     const count = $("#news-count");
@@ -5363,6 +5527,7 @@
           )} · 不是概率</small></div>
         </div>
       </div>
+      <section class="shared-news shared-news-asset" id="news-context-asset" aria-label="该标的相关媒体新闻" aria-busy="true"></section>
       <div class="evidence-spine" aria-label="六段证据脊柱">
         <section class="evidence-spine-step" data-spine-step="facts" aria-labelledby="spine-facts-title">
           <header class="spine-step-head">
@@ -5453,6 +5618,7 @@
       <p class="decision-disclaimer">${esc(
         `${card.human_review_required ? "候选行动，待人工确认。" : ""}${localizedPolicy} 页面展示可审计记录、规则关联和明确提供的结构化假设；不展示模型隐藏思维过程。`
       )}</p>`;
+    void loadNewsContext("asset", { asset: String(card.asset_key || "") });
   }
 
   function renderDecisionDetailConflict(key) {
@@ -5570,6 +5736,7 @@
   }
 
   function clearDecisionView(message = "私人数据已从当前页面清除") {
+    clearAssetNewsContext();
     state.decisionDetailRequestGeneration += 1;
     state.decisionLensRequestGeneration += 1;
     state.decisionDetailCache.clear();
@@ -10266,6 +10433,7 @@
 
   async function loadEvents() {
     const { background = false } = arguments[0] || {};
+    if (state.view === "kol") void loadNewsContext("kol", { background });
     const hadLoadedKolSignature = Boolean(state.loadedKolFilterSignature);
     const generation = ++state.feedRequestGeneration;
     const requestFilterSignature = kolFilterSignature();
@@ -10676,10 +10844,12 @@
       let criticalSucceeded = false;
       if (view === "decision") {
         const macroPromise = loadMacro({ includeHistory: false });
+        const newsPromise = loadNewsContext("home", { background, force });
         if (!state.authStatusLoaded) await loadAuthStatus();
         const [decisionResult] = await Promise.allSettled([
           loadDecisions(),
           macroPromise,
+          newsPromise,
         ]);
         criticalSucceeded =
           decisionResult.status === "fulfilled" &&
@@ -10690,12 +10860,14 @@
       } else if (view === "daily") {
         const [dailyResult] = await Promise.allSettled([
           loadDaily({ background }),
+          loadNewsContext("daily", { background, force }),
         ]);
         criticalSucceeded =
           dailyResult.status === "fulfilled" && dailyResult.value === true;
       } else if (view === "macro") {
         const [macroResult] = await Promise.allSettled([
           loadMacro({ includeHistory: true }),
+          loadNewsContext("macro", { background, force }),
         ]);
         criticalSucceeded =
           macroResult.status === "fulfilled" && macroResult.value === true;
@@ -10862,17 +11034,60 @@
     bindIntelDrawer();
     bindViewRetries();
     bindPublicAttention();
+    $("#news-topic-filters")?.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-news-topic]");
+      if (button) changeNewsFilters({ topic: button.dataset.newsTopic, commodity: "", instrument: "" });
+    });
     $("#news-commodity-filters")?.addEventListener("click", (event) => {
       const button = event.target.closest("[data-news-commodity]");
       if (button && button.dataset.newsCommodity !== state.newsCommodity) {
-        changeNewsFilters({ commodity: button.dataset.newsCommodity });
+        changeNewsFilters({ commodity: button.dataset.newsCommodity, topic: "", instrument: "" });
       }
     });
     $("#news-publisher")?.addEventListener("change", (event) => {
       changeNewsFilters({ publisher: event.target.value });
     });
+    $("#news-instrument")?.addEventListener("change", (event) => {
+      changeNewsFilters({ instrument: event.target.value, topic: "", commodity: "" });
+    });
+    document.addEventListener("click", (event) => {
+      const asset = event.target.closest("[data-news-instrument]");
+      if (asset) {
+        switchView("news", { load: false });
+        changeNewsFilters({ instrument: asset.dataset.newsInstrument, topic: "", commodity: "" });
+        return;
+      }
+      const retry = event.target.closest("[data-news-context-retry]");
+      if (retry) {
+        const view = retry.dataset.newsContextRetry;
+        const context = newsContextState(view);
+        if (context) void loadNewsContext(view, { asset: context.asset, force: true });
+        return;
+      }
+      const apply = event.target.closest("[data-news-context-apply]");
+      if (apply) {
+        const view = apply.dataset.newsContextApply;
+        const context = newsContextState(view);
+        if (context?.pending) {
+          context.data = context.pending; context.pending = null;
+          renderNewsContext(view);
+          const heading = $(`#news-context-${view}-title`);
+          heading?.setAttribute("tabindex", "-1");
+          heading?.focus({ preventScroll: true });
+        }
+        return;
+      }
+      const more = event.target.closest("[data-news-context-more]");
+      if (more) {
+        const view = more.dataset.newsContextMore;
+        const asset = view === "asset" ? newsContextState(view)?.asset || "" : "";
+        const knownAsset = state.newsCatalog.instruments.some((instrument) => instrument.key === asset);
+        switchView("news", { load: false });
+        changeNewsFilters({ topic: view === "macro" ? "macro" : "", instrument: knownAsset ? asset : "", commodity: "", publisher: "" });
+      }
+    });
     $("#view-news")?.addEventListener("click", (event) => {
-      if (event.target.closest("[data-news-reset]")) changeNewsFilters({ commodity: "", publisher: "" });
+      if (event.target.closest("[data-news-reset]")) changeNewsFilters({ commodity: "", publisher: "", topic: "", instrument: "" });
       if (event.target.closest("[data-news-apply]") && state.pendingNewsData) {
         const data = state.pendingNewsData;
         clearPendingNews();
@@ -11191,6 +11406,9 @@
       state.drawerAbortController?.abort();
       state.newsRequestGeneration += 1;
       state.newsAbortController?.abort();
+      Object.values(state.newsContexts).forEach((context) => {
+        context.generation += 1; context.controller?.abort();
+      });
     });
     window.addEventListener("pageshow", (event) => {
       if (!event.persisted) return;
@@ -11212,6 +11430,11 @@
           scheduleRefresh();
         } else {
           await loadAuthStatus();
+        }
+        const newsView = { decision: "home", daily: "daily", macro: "macro", kol: "kol" }[state.view];
+        if (newsView) {
+          await loadNewsContext(newsView, { force: true });
+          scheduleRefresh();
         }
       })();
     });

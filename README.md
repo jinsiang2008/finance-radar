@@ -9,7 +9,7 @@ Finance Radar 是一个面向投资研究的 FastAPI 仪表盘，组合了 KOL �
 
 - 聚合并去重 KOL 新闻与观点，包含 Serenity 等重点来源；重点 KOL 约 15 分钟
   扫描一次，全量目录约 30 分钟完成一轮。
-- “市场快讯”独立读取 Bloomberg Markets、WSJ Markets 和 WSJ Business 官方 RSS，
+- 市场快讯、首页、每日简报、风险图谱及相关标的/KOL 媒体区共用 Bloomberg 和 WSJ 官方 RSS，
   每 5 分钟检查，支持铜、黄金、白银、铝、原油、天然气筛选；不要求消息提及某个 KOL。
 - 提供私人公众号与播客阅读，来源、原文证据与模型摘要分开显示；发布和能力边界见
   [`docs/reading-production.md`](docs/reading-production.md)。
@@ -78,22 +78,34 @@ python3 kol_dashboard/news_enrichment.py --limit 4
 
 界面入口 `/#news`（生产路径 `/kol/#news`），只读 API 为 `/api/news`，支持
 `commodity=copper|gold|silver|aluminum|oil|gas`、`publisher=Bloomberg|WSJ`、
-`limit=1..200`；不传筛选参数时返回全部来源。公开 GET 只读取缓存，不抓取网页、不调用模型。
+`topic=ai_chips|technology|space|energy|macro|commodities|stocks_etfs`、
+`instrument=US:SPCX`（`asset` 为别名）、`limit=1..200`；不传筛选参数时返回全部来源。
+公开 GET 只读取缓存，不抓取网页、不调用模型。
 
-`kol-collect-news.timer` 每 5 分钟执行独立采集器。三个固定 HTTPS RSS 并行获取，
+`kol-collect-news.timer` 每 5 分钟执行独立采集器。五个固定 HTTPS RSS
+（Bloomberg Markets/Technology，WSJ Markets/Business/Technology）并行获取，
 验证 XML、发布者链接、日期和内容长度，使用 ETag/Last-Modified 条件请求；规范 URL
 跨 WSJ 栏目去重。单源故障保留旧消息并标明错误；缺失、未来或无效日期不伪造为当前时间。
 初次每源最多 60 条，初次及后续只发现最近 48 小时的消息，页面展示近 7 天，存储保留 14 天。
 无日期消息保留明确标记，不进入自动 AI 处理。RSS 标题/简介不等于付费全文；缺简介时标为“仅标题”。
 
-`kol-enrich-news.timer` 每 5 分钟唤醒独立 worker，实际模型处理按北京时间空闲 15 分钟、
-高峰 60 分钟检查，每次最多 4 条，铜金等商品线索优先，只处理最近 24 小时且日期有效的消息。
+`kol-enrich-news.timer` 每 5 分钟唤醒独立 worker，实际模型处理按北京时间空闲 5 分钟、
+高峰 30 分钟检查，每次最多 8 / 4 条；每日最多 400 次调用尝试（失败也计数，重启不清零）。
+最近消息与积压消息轮换处理，只处理最近 48 小时且日期有效的消息；候选上限 1000，
+不受页面 200 条截断影响。超期或无可信发布时间会明确显示未安排自动解读。
 峰谷沿用阅读模块中的用户指定规则及 2026 年节假日日历；不是对供应商未来价格的保证。
 仅此后台单元加载现有 `deepseek.env`，不将凭据传给 Web 或 RSS 采集器。每条基于标题/简介
 生成中文标题、概括、条件式影响和待核验点；事实卡不等待 AI。来源文字或日期更正后旧解读失效，
 同一版本最多尝试 3 次，鉴权/余额/限流错误停止批次并退避，已有解读不重复付费生成。
 
-新闻和解读保存在主 SQLite 的独立 `news_*` 表，不写入人物事件表或冒充完整的投资决策。
+新闻和解读保存在主 SQLite 的独立 `news_*` 表。`/api/news/context?view=home|daily|macro|asset|kol`
+为各页提供就地可读的实时摘要和原文证据；资产 context 需 `asset`，KOL context 可带 `kols=musk,altman`。
+该接口独立于决策 snapshot/ETag，新新闻无需等待小时级决策计算；不更改决策评分或冒充人物发言。
+Daily 六栏也合并过去 24 小时的媒体报道，并独立公开媒体源健康度。
+
+目录提供 7 类主题与 28 个股票/ETF 观察标的，包括 SpaceX `US:SPCX`；仅直接文本提及计入标的筛选。
+主题相关项用于延伸阅读，明确不等于原文提及或确定受益。SpaceX 身份按 2026-10-13 SEC/Nasdaq 官方披露核验，
+核验链接保存在 `news_catalog.py`。这份目录是新闻匹配范围，不代表完整证券行情覆盖。
 此版本不提供财联社自动采集、盘中行情突破检测、手机推送或付费全文读取；财联社结构化渠道仍待核验。
 来源状态表示采集可用性，不能证明上游消息实时；发布时间、首次发现时间和初次导入标记
 分别保留，不能把历史首次导入的差值算作持续运行延迟。

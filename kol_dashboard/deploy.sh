@@ -81,7 +81,7 @@ trap cleanup_local EXIT INT TERM
 
 echo "→ 打包应用与采集器"
 mkdir -p "$WORK/pkg/lib"
-cp "$LOCAL_DIR"/{app.py,auth.py,briefing_collect.py,briefing_import.py,briefing_service.py,briefing_topics.py,daily_enrichment.py,content_quality.py,event_relevance.py,db.py,decision_collect.py,decision_service.py,decision_snapshot.py,market_data.py,portfolio.py,relation_engine.py,macro_alert_service.py,macro_collect.py,llm_enrichment.py,enrichment_collect.py,options_capacity.py,options_policy.py,options_research_service.py,options_strategy.py,reading_service.py,reading_worker.py,reading_import.py,news_service.py,news_collect.py,news_enrichment.py,collect.sh} "$WORK/pkg/"
+cp "$LOCAL_DIR"/{app.py,auth.py,briefing_collect.py,briefing_import.py,briefing_service.py,briefing_topics.py,daily_enrichment.py,content_quality.py,event_relevance.py,db.py,decision_collect.py,decision_service.py,decision_snapshot.py,market_data.py,portfolio.py,relation_engine.py,macro_alert_service.py,macro_collect.py,llm_enrichment.py,enrichment_collect.py,options_capacity.py,options_policy.py,options_research_service.py,options_strategy.py,reading_service.py,reading_worker.py,reading_import.py,news_catalog.py,news_service.py,news_collect.py,news_enrichment.py,collect.sh} "$WORK/pkg/"
 cp -R "$LOCAL_DIR"/templates "$LOCAL_DIR"/static "$WORK/pkg/"
 cp "$LIB_DIR"/{kol_tracker.py,macro_fetcher.py,risk_radar.py} "$WORK/pkg/lib/"
 cp "$LIB_DIR/serenity_tracker.py" "$WORK/pkg/lib/"
@@ -519,7 +519,7 @@ with urlopen(request, timeout=8) as response:
 if not isinstance(payload, dict) or not isinstance(payload.get("sources"), list):
     raise SystemExit("News API did not expose source health")
 sources = {item.get("id"): item for item in payload["sources"] if isinstance(item, dict)}
-required = {"bloomberg_markets", "wsj_markets", "wsj_business"}
+required = {"bloomberg_markets", "bloomberg_technology", "wsj_markets", "wsj_business", "wsj_technology"}
 for source_id in sorted(required):
     source = sources.get(source_id)
     if not source or source.get("status") != "ok" or source.get("stale") is not False:
@@ -537,8 +537,34 @@ for source_id in sorted(required):
         raise SystemExit(f"News source did not retain valid entries: {source_id}")
 if not isinstance(payload.get("items"), list) or not payload["items"]:
     raise SystemExit("News API did not expose any accepted news items")
-print("news api: accepted Bloomberg Markets, WSJ Markets and WSJ Business")
+print("news api: accepted all five Bloomberg and WSJ market/business/technology feeds")
 PY_NEWS
+}
+
+validate_news_context_api() {
+  python3 - <<'PY_CONTEXT'
+import json
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+
+for view in ("home", "daily", "macro", "asset"):
+    query = {"view": view}
+    if view == "asset":
+        query["asset"] = "US:NVDA"
+    request = Request("http://127.0.0.1:8088/api/news/context?" + urlencode(query),
+                      headers={"Accept": "application/json"})
+    with urlopen(request, timeout=8) as response:
+        if response.status != 200:
+            raise SystemExit(f"News context returned HTTP {response.status}: {view}")
+        payload = json.load(response)
+    if (not isinstance(payload, dict) or payload.get("view") != view
+            or not isinstance(payload.get("items"), list)
+            or not isinstance(payload.get("sources"), list)
+            or not payload.get("generated_at")
+            or not isinstance(payload.get("analysis_schedule"), dict)):
+        raise SystemExit(f"News context projection is incomplete: {view}")
+print("news contexts: accepted home, daily, macro and asset read models")
+PY_CONTEXT
 }
 
 activate_nginx() {
@@ -848,7 +874,7 @@ runuser -u kol-dashboard -- /usr/bin/env \
   /usr/bin/python3 -c 'import bs4, reading_service'
 runuser -u kol-dashboard -- /usr/bin/env \
   PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$RELEASE_DIR" \
-  /usr/bin/python3 -c 'import news_service, news_collect, news_enrichment'
+  /usr/bin/python3 -c 'import news_catalog, news_service, news_collect, news_enrichment'
 
 if [[ ! -f /etc/kol-dashboard.env &&
       ! -f "$REMOTE_STAGE/auth.env" &&
@@ -1251,7 +1277,8 @@ done
 
 # Only this worker receives the provider credential; news collection and the
 # web API remain independent of paid inference. Its CLI gates peak/off-peak
-# cadence before claiming work, so the timer is only a cheap wake-up check.
+# cadence and daily budget before claiming work. Eight bounded provider calls
+# can take up to six minutes; keep the independent five-minute collector free.
 cat > "$REMOTE_STAGE/kol-enrich-news.service" <<'UNIT'
 [Unit]
 Description=Enrich official news with bounded peak/off-peak DeepSeek work
@@ -1265,8 +1292,8 @@ WorkingDirectory=/opt/kol-dashboard/current
 EnvironmentFile=-/etc/kol-dashboard/deepseek.env
 Environment=KOL_DASHBOARD_DB=/opt/kol-dashboard/data/kol_dashboard.db
 Environment=PYTHONDONTWRITEBYTECODE=1
-ExecStart=/usr/bin/python3 /opt/kol-dashboard/current/news_enrichment.py --limit 4
-TimeoutStartSec=5min
+ExecStart=/usr/bin/python3 /opt/kol-dashboard/current/news_enrichment.py --limit 8
+TimeoutStartSec=420s
 UMask=0077
 LimitCORE=0
 NoNewPrivileges=true
@@ -1505,6 +1532,7 @@ systemctl start kol-collect-news.service
 }
 database_integrity "$DB_PATH"
 validate_news_api "$NEWS_ACCEPTANCE_NOT_BEFORE"
+validate_news_context_api
 
 echo "→ 验收 Daily 候选采集"
 DAILY_ACCEPTANCE_NOT_BEFORE=$(date -u +%s)
@@ -1604,7 +1632,7 @@ SERVICES_STOPPED=0
 COMMITTED=1
 echo "service: $(systemctl is-active kol-dashboard)  health: ok"
 echo "reading worker: $(systemctl is-active kol-reading-worker.service)  heartbeat: ok"
-echo "official news: verified three feeds  collection/enrichment timers: active"
+echo "official news: verified five feeds  collection/enrichment timers: active"
 REMOTE
 } > "$WORK/remote.sh"
 chmod 700 "$WORK/remote.sh"
@@ -1622,4 +1650,7 @@ curl -sf --max-time 12 -o /dev/null \
 curl -sf --max-time 12 -o /dev/null \
   -w "  /kol/api/news → HTTP %{http_code}\n" \
   https://zlstreet.xyz/kol/api/news
+curl -sf --max-time 12 -o /dev/null \
+  -w "  /kol/api/news/context → HTTP %{http_code}\n" \
+  "https://zlstreet.xyz/kol/api/news/context?view=home"
 echo "✓ 完成 — https://zlstreet.xyz/kol/"

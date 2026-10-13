@@ -60,6 +60,8 @@ import options_research_service
 import reading_service
 import news_service
 import news_enrichment
+import news_catalog
+from event_relevance import KOL_DIRECTORY, assess_event_relevance
 
 BASE = Path(__file__).parent
 app = FastAPI(title="KOL Dashboard + Macro Risk Radar", version="2.0")
@@ -226,19 +228,84 @@ def news(
     limit: int = Query(default=40, ge=1, le=200),
     commodity: Literal["copper", "gold", "silver", "aluminum", "oil", "gas"] | None = None,
     publisher: Literal["Bloomberg", "WSJ"] | None = None,
+    topic: str | None = Query(default=None, max_length=40),
+    instrument: str | None = Query(default=None, max_length=32),
+    asset: str | None = Query(default=None, max_length=32),
 ) -> JSONResponse:
     """Persisted public feed evidence; HTTP reads never fetch or call the model."""
     try:
         snapshot = news_service.get_news_snapshot(
-            limit=limit, commodity=commodity, publisher=publisher, db_path=db.DB_PATH,
+            limit=limit, commodity=commodity, publisher=publisher, topic=topic,
+            instrument=instrument, asset=asset, db_path=db.DB_PATH,
         )
         snapshot = news_enrichment.decorate_snapshot(snapshot, db_path=db.DB_PATH)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="unsupported_news_filter")
     except sqlite3.Error:
         return JSONResponse(
             {"detail": "news_temporarily_unavailable"},
             status_code=503, headers=_NO_STORE_HEADERS,
         )
     return JSONResponse(snapshot, headers=_PUBLIC_CACHE_HEADERS)
+
+
+@app.get("/api/news/context")
+def news_context(
+    view: Literal["home", "daily", "macro", "asset", "kol"] = "home",
+    asset: str | None = Query(default=None, max_length=32),
+    kols: str | None = Query(default=None, max_length=1280),
+    limit: int = Query(default=6, ge=1, le=20),
+) -> JSONResponse:
+    """Live media context is independent of decision snapshot IDs and ETags."""
+    if view == "asset" and not asset:
+        raise HTTPException(status_code=422, detail="asset_required")
+    selected = [key for key in (kols or "").split(",") if key]
+    if len(selected) > 20 or any(key not in KOL_DIRECTORY for key in selected):
+        raise HTTPException(status_code=422, detail="unsupported_kol")
+    try:
+        known_asset = not asset or asset.upper() in news_catalog.INSTRUMENT_BY_KEY
+        snapshot = news_service.get_news_snapshot(
+            limit=200 if view == "kol" else limit,
+            topic="macro" if view == "macro" else None,
+            asset=asset if view == "asset" and known_asset else None,
+            include_related=view == "asset", db_path=db.DB_PATH,
+        )
+        if view == "asset" and not known_asset:
+            snapshot.update(items=[], total=0, notice="该标的暂未配置媒体映射；不会用不相关报道补齐。")
+        if view == "kol":
+            matched = []
+            for original in snapshot["items"]:
+                mentions = []
+                for key in selected or KOL_DIRECTORY:
+                    person = KOL_DIRECTORY[key]
+                    event = {**original, "kol_key": key, "kol_name": person["name"],
+                             "kol_name_cn": person["name_cn"], "source": original["publisher"],
+                             "source_url": original["url"]}
+                    assessment = assess_event_relevance(event)
+                    if assessment["intelligence_eligible"]:
+                        mentions.append({"key": key, "name": person["name_cn"],
+                                         "attribution_basis": assessment["attribution_basis"],
+                                         "matched_alias": assessment["matched_alias"]})
+                if mentions:
+                    matched.append({**original, "kol_mentions": mentions})
+            snapshot.update(items=matched[:limit], total=len(matched),
+                            notice="媒体对人物或关联公司的报道，不代表本人发言；匹配最近200篇已收录新闻。")
+        snapshot = news_enrichment.decorate_snapshot(snapshot, db_path=db.DB_PATH)
+        snapshot.update(view=view, context_asset=asset, context_kols=selected)
+    except (sqlite3.Error, OSError):
+        return JSONResponse({"detail": "news_temporarily_unavailable"}, status_code=503, headers=_NO_STORE_HEADERS)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="unsupported_news_filter")
+    return JSONResponse(snapshot, headers=_PUBLIC_CACHE_HEADERS)
+
+
+def _daily_publisher_news() -> dict:
+    # A failed independent news store must not hide the existing Daily content.
+    try:
+        snapshot = news_service.get_news_snapshot(limit=200, db_path=db.DB_PATH)
+        return news_enrichment.decorate_snapshot(snapshot, db_path=db.DB_PATH)
+    except (sqlite3.Error, OSError):
+        return {"items": [], "sources": [], "status": "unavailable"}
 
 
 @app.get("/api/auth/status")
@@ -578,6 +645,7 @@ def api_latest_briefing() -> JSONResponse:
         decision_record=decision_record,
         imported_snapshot=imported_snapshot,
         refresh_schedule=os.environ.get("KOL_DAILY_REFRESH_SCHEDULE", ""),
+        publisher_news=_daily_publisher_news(),
     )
     return JSONResponse(payload, headers=_BRIEFING_CACHE_HEADERS)
 

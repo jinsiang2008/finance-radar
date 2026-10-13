@@ -26,7 +26,7 @@ class CollectionTests(unittest.TestCase):
     def test_all_sources_succeed_without_a_model_and_wsj_deduplicates(self):
         result = news_collect.run_once(db_path=self.path, now=NOW, fetcher=self.successful)
         self.assertEqual(result["status"], "ok")
-        self.assertEqual(result["successful_sources"], 3)
+        self.assertEqual(result["successful_sources"], len(news_service.SOURCES))
         self.assertEqual(result["inserted"], 2)
         self.assertEqual(news_service.get_news_snapshot(db_path=self.path, now=NOW)["total"], 2)
 
@@ -38,7 +38,7 @@ class CollectionTests(unittest.TestCase):
             return self.successful(source, **kwargs)
         result = news_collect.run_once(db_path=self.path, now=NOW + timedelta(minutes=5), fetcher=partial)
         self.assertEqual(result["status"], "degraded")
-        self.assertEqual(result["successful_sources"], 2)
+        self.assertEqual(result["successful_sources"], sum(source.publisher != "Bloomberg" for source in news_service.SOURCES))
         self.assertEqual(result["sources"][0]["error"], "collection_error")
         snapshot = news_service.get_news_snapshot(db_path=self.path, now=NOW + timedelta(minutes=5))
         self.assertEqual(snapshot["total"], 2)
@@ -52,7 +52,7 @@ class CollectionTests(unittest.TestCase):
             seen.append(kwargs)
             return {"status": 304}
         result = news_collect.run_once(db_path=self.path, now=NOW + timedelta(minutes=5), fetcher=unchanged)
-        self.assertEqual(result["successful_sources"], 3)
+        self.assertEqual(result["successful_sources"], len(news_service.SOURCES))
         self.assertEqual(result["inserted"], 0)
         self.assertTrue(all(item["etag"] == '"version1"' for item in seen))
 

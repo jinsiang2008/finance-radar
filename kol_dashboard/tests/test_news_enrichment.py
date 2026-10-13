@@ -22,8 +22,8 @@ class NewsEnrichmentTests(unittest.TestCase):
         self.path = Path(self.directory.name) / "news.db"
         self.now = datetime(2026, 10, 13, 12, 30, tzinfo=timezone.utc)
         self.config = llm_enrichment.DeepSeekConfig(api_key="test-placeholder")
-        self.items = [self.item(str(i)) for i in range(6)]
-        self.snapshot = patch.object(subject.news_service, "get_news_snapshot", return_value={"items": self.items})
+        self.items = [self.item(str(i)) for i in range(10)]
+        self.snapshot = patch.object(subject.news_service, "get_enrichment_candidates", return_value=self.items, create=True)
         self.snapshot.start()
         self.clock = patch.object(subject, "_now", return_value=self.now)
         self.clock.start()
@@ -56,12 +56,12 @@ class NewsEnrichmentTests(unittest.TestCase):
 
     def test_batch_cap_and_repeated_timer_do_not_repeat_paid_calls(self):
         result = self.run_worker(limit=100)
-        self.assertEqual(result["ready"], 4)
+        self.assertEqual(result["ready"], 8)
         self.assertEqual(self.run_worker()["status"], "not_due")
-        self.assertEqual(self.provider.call_count, 4)
+        self.assertEqual(self.provider.call_count, 8)
         later = subject.run(db_path=self.path, now=self.now + timedelta(minutes=15), config=self.config, provider=self.provider)
         self.assertEqual(later["ready"], 2)
-        self.assertEqual(self.provider.call_count, 6)
+        self.assertEqual(self.provider.call_count, 10)
 
     def test_cached_projection_is_read_only_and_evidence_change_invalidates_it(self):
         self.run_worker(limit=1)
@@ -76,11 +76,11 @@ class NewsEnrichmentTests(unittest.TestCase):
         self.assertEqual(self.provider.call_count, 1)
 
     def test_old_future_missing_dates_never_create_paid_backfill(self):
-        self.items[0]["published_at"] = (self.now - timedelta(days=2)).isoformat()
+        self.items[0]["published_at"] = (self.now - timedelta(days=3)).isoformat()
         self.items[1]["published_at"] = (self.now + timedelta(hours=1)).isoformat()
         self.items[2]["published_at_status"] = "missing"
         result = self.run_worker()
-        self.assertEqual(result["attempted"], 3)
+        self.assertEqual(result["attempted"], 7)
 
     def test_provider_failure_stops_batch_and_redacts_details(self):
         self.provider.side_effect = llm_enrichment.EnrichmentError("authentication", retry_after_seconds=3600)
@@ -124,11 +124,11 @@ class NewsEnrichmentTests(unittest.TestCase):
     def test_peak_offpeak_and_noon_transition(self):
         peak = datetime(2026, 10, 13, 3, 55, tzinfo=timezone.utc)
         state = {"configured": 1, "last_run_at": (peak - timedelta(minutes=25)).isoformat()}
-        self.assertEqual(subject._schedule(state, peak)["interval_minutes"], 60)
+        self.assertEqual(subject._schedule(state, peak)["interval_minutes"], 30)
         self.assertEqual(subject._schedule(state, peak)["next_check_at"], "2026-10-13T04:00:00+00:00")
         self.assertTrue(subject._schedule(state, peak + timedelta(minutes=5))["due"])
         holiday = datetime(2026, 10, 1, 3, 0, tzinfo=timezone.utc)
-        self.assertEqual(subject._schedule(None, holiday)["interval_minutes"], 15)
+        self.assertEqual(subject._schedule(None, holiday)["interval_minutes"], 5)
 
     def test_max_attempts_stop_invalid_output_loop(self):
         self.provider.side_effect = ValueError("raw secret must not be stored")
@@ -153,6 +153,63 @@ class NewsEnrichmentTests(unittest.TestCase):
         subject.run(db_path=self.path, now=self.now + timedelta(minutes=15), config=self.config, provider=self.provider, limit=1)
         public = subject.decorate_snapshot({"items": self.items}, db_path=self.path, now=self.now)
         self.assertEqual(public["items"][0]["analysis"]["status"], "error")
+
+    def test_peak_caps_batch_even_if_requested_higher(self):
+        self.now = datetime(2026, 10, 13, 3, 0, tzinfo=timezone.utc)
+        for item in self.items:
+            item["published_at"] = (self.now - timedelta(minutes=10)).isoformat()
+        result = self.run_worker(limit=100)
+        self.assertEqual(result["attempted"], 4)
+
+    def test_batch_stops_before_paid_call_after_beijing_midnight(self):
+        before = datetime(2026, 10, 13, 15, 59, 59, tzinfo=timezone.utc)
+        after = before + timedelta(seconds=2)
+        current = [before]
+        for item in self.items:
+            item["published_at"] = (before - timedelta(minutes=10)).isoformat()
+        def respond_and_cross_midnight(**kwargs):
+            response = self.respond(**kwargs)
+            current[0] = after
+            return response
+        self.provider.side_effect = respond_and_cross_midnight
+        with patch.object(subject, "_now", side_effect=lambda: current[0]):
+            result = subject.run(db_path=self.path, config=self.config, provider=self.provider)
+        self.assertEqual(result["status"], "day_changed")
+        self.assertEqual(result["attempted"], 1)
+        with subject._connect(self.path) as connection:
+            row = connection.execute("SELECT budget_day,daily_attempts FROM news_analysis_state").fetchone()
+        self.assertEqual(tuple(row), ("2026-10-13", 1))
+
+    def test_daily_budget_counts_errors_and_survives_worker_restart(self):
+        self.run_worker(limit=1)
+        with subject._connect(self.path) as connection:
+            connection.execute("UPDATE news_analysis_state SET daily_attempts=399")
+        self.provider.side_effect = ValueError("bad output")
+        result = subject.run(db_path=self.path, now=self.now + timedelta(minutes=5), config=self.config, provider=self.provider)
+        self.assertEqual(result["attempted"], 1)
+        later = self.now + timedelta(minutes=10)
+        self.assertEqual(subject.run(db_path=self.path, now=later, config=self.config, provider=self.provider)["status"], "daily_budget_exhausted")
+        snapshot = subject.decorate_snapshot({"items": self.items}, db_path=self.path, now=later)
+        self.assertEqual(snapshot["analysis_schedule"]["daily_remaining"], 0)
+        self.assertEqual(snapshot["analysis_schedule"]["next_check_at"], "2026-10-13T16:00:00+00:00")
+        self.provider.side_effect = self.respond
+        result = subject.run(db_path=self.path, now=self.now + timedelta(days=1), config=self.config, provider=self.provider, limit=1)
+        self.assertEqual(result["attempted"], 1)
+
+    def test_oldest_pending_article_gets_a_slot_amid_new_articles(self):
+        self.items[-1]["id"] = "old"
+        self.items[-1]["published_at"] = (self.now - timedelta(hours=30)).isoformat()
+        self.items[-1]["commodity_tags"] = []
+        self.run_worker(limit=2)
+        called = [json.loads(call.kwargs["user_prompt"])["id"] for call in self.provider.call_args_list]
+        self.assertIn("old", called)
+
+    def test_unprocessable_evidence_does_not_claim_it_is_queued(self):
+        self.run_worker(limit=1)
+        self.items[-1]["published_at"] = (self.now - timedelta(days=3)).isoformat()
+        view = subject.decorate_snapshot({"items": self.items}, db_path=self.path, now=self.now)
+        self.assertEqual(view["items"][-1]["analysis"]["status"], "not_scheduled")
+        self.assertEqual(view["items"][0]["analysis"]["status"], "ready")
 
 
 if __name__ == "__main__":

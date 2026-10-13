@@ -300,10 +300,10 @@ class FrontendContractTests(unittest.TestCase):
             assessment_contract,
         )
 
-    def test_daily_assets_share_the_v41_cachebuster(self) -> None:
-        self.assertIn('static/app.js?v=41', self.html)
-        self.assertIn('static/style.css?v=41', self.html)
-        self.assertEqual(self.html.count("?v=41"), 2)
+    def test_daily_assets_share_the_v42_cachebuster(self) -> None:
+        self.assertIn('static/app.js?v=42', self.html)
+        self.assertIn('static/style.css?v=42', self.html)
+        self.assertEqual(self.html.count("?v=42"), 2)
         self.assertNotIn("?v=39", self.html)
         self.assertNotIn("?v=38", self.html)
         self.assertNotIn("?v=37", self.html)
@@ -1367,8 +1367,8 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn('stale ? "数据延迟" : ""', self.javascript)
         self.assertIn('"高收益债利差"', self.javascript)
         self.assertIn("cs.hy_oas", self.javascript)
-        self.assertIn('static/app.js?v=41', self.html)
-        self.assertIn('static/style.css?v=41', self.html)
+        self.assertIn('static/app.js?v=42', self.html)
+        self.assertIn('static/style.css?v=42', self.html)
         self.assertNotIn('?v=39', self.html)
         self.assertNotIn('?v=38', self.html)
         self.assertIn(".metric.is-stale", self.css)

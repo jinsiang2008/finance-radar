@@ -287,6 +287,77 @@ class StorageTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.snapshot(**filters)
 
+    def test_shared_metadata_filters_and_catalog_count_all_recent_evidence(self):
+        self.store(feed({"title": "SpaceX launches Starship", "snippet": "Satellite deployment"},
+                        {"title": "Copper rallies", "snippet": "Supply tightens", "url": "https://wsj.com/copper"},
+                        {"title": "Blue Origin rocket launch", "snippet": "", "url": "https://wsj.com/blue"}))
+        direct = self.snapshot(instrument="US:SPCX")
+        self.assertEqual(direct["total"], 1)
+        self.assertEqual(direct["items"][0]["instrument_keys"], ["US:SPCX"])
+        self.assertIn("space", direct["items"][0]["topic_tags"])
+        self.assertEqual(self.snapshot(asset="us:spcx")["items"], direct["items"])
+        self.assertEqual(self.snapshot(asset="US:SPCX", include_related=True)["total"], 2)
+        self.assertEqual(self.snapshot(topic="space", commodity="copper")["total"], 0)
+        catalog = direct["catalog"]
+        self.assertEqual(next(topic["count"] for topic in catalog["topics"] if topic["key"] == "space"), 2)
+        self.assertEqual(next(topic["count"] for topic in catalog["topics"] if topic["key"] == "commodities"), 1)
+        spacex = next(asset for asset in catalog["instruments"] if asset["key"] == "US:SPCX")
+        self.assertEqual((spacex["direct_count"], spacex["related_count"]), (1, 1))
+        with self.assertRaisesRegex(ValueError, "conflicting"):
+            self.snapshot(asset="US:SPCX", instrument="US:NVDA")
+        for kwargs in ({"topic": "bad"}, {"instrument": "US:FAKE"}, {"include_related": "false"}):
+            with self.assertRaises(ValueError):
+                self.snapshot(**kwargs)
+
+    def test_context_uses_same_ids_and_metadata_without_network_or_database_writes(self):
+        self.store(feed({"title": "SpaceX satellites", "snippet": ""},
+                        {"title": "Rocket Lab satellite launch", "url": "https://wsj.com/rklb", "snippet": ""}))
+        before = news.database_path(self.path).read_bytes()
+        with patch.object(news, "fetch_feed", side_effect=AssertionError("Public context must not fetch")):
+            context = news.get_news_context(limit=1, topic="space", db_path=self.path, now=NOW)
+        self.assertEqual(context["context_kind"], "shared_publisher_news")
+        self.assertFalse(context["is_complete"])
+        self.assertEqual(context["items"], self.snapshot(limit=1, topic="space")["items"])
+        self.assertEqual(news.database_path(self.path).read_bytes(), before)
+        with self.assertRaises(ValueError):
+            news.get_news_context(limit=21, db_path=self.path, now=NOW)
+
+    def test_filters_apply_before_public_limit_and_worker_can_reach_older_candidates(self):
+        rows = [{"title": "Equity update", "snippet": "Markets", "url": f"https://wsj.com/market-{i}"} for i in range(220)]
+        rows.append({"title": "SpaceX schedules Starship launch", "snippet": "", "url": "https://wsj.com/spacex-old",
+                     "date": format_datetime(NOW - timedelta(hours=1))})
+        rows.extend([{"title": "Unknown time", "url": "https://wsj.com/missing", "date": None},
+                     {"title": "Future time", "url": "https://wsj.com/future", "date": format_datetime(NOW + timedelta(hours=1))}])
+        body = feed(*rows)
+        self.store(body)
+        self.store(body, now=NOW + timedelta(minutes=1))
+        self.assertEqual(len(self.snapshot(limit=200)["items"]), 200)
+        self.assertEqual(self.snapshot(limit=1, instrument="US:SPCX")["items"][0]["url"], "https://wsj.com/spacex-old")
+        candidates = news.get_enrichment_candidates(db_path=self.path, now=NOW + timedelta(minutes=1))
+        self.assertEqual(len(candidates), 221)
+        self.assertTrue(all(item["published_at_status"] == "provided" for item in candidates))
+        self.assertTrue(any(item["url"] == "https://wsj.com/spacex-old" and "space" in item["topic_tags"] for item in candidates))
+        self.assertEqual(news.get_enrichment_candidates(db_path=self.path, now=NOW + timedelta(hours=49)), [])
+        with self.assertRaises(ValueError):
+            news.get_enrichment_candidates(db_path=self.path, now=NOW, limit=1001)
+
+    def test_new_catalog_and_worker_readers_do_not_initialize_missing_storage(self):
+        self.assertEqual(news.get_enrichment_candidates(db_path=self.path, now=NOW), [])
+        result = news.get_news_context(db_path=self.path, now=NOW, topic="space")
+        self.assertFalse(news.database_path(self.path).exists())
+        self.assertEqual(result["items"], [])
+        self.assertTrue(any(item["key"] == "US:SPCX" for item in result["catalog"]["instruments"]))
+        self.assertTrue(all(item["direct_count"] == 0 for item in result["catalog"]["instruments"]))
+
+    def test_technology_feeds_share_the_same_storage_and_deduplication(self):
+        source = news.SOURCE_BY_ID["wsj_technology"]
+        self.store(feed({"title": "SpaceX Starship launch", "url": "https://www.wsj.com/spacex?mod=business"}))
+        self.store(feed({"title": "SpaceX Starship launch", "url": "https://www.wsj.com/spacex?mod=tech"}), source=source)
+        payload = self.snapshot(topic="space")
+        self.assertEqual(payload["total"], 1)
+        self.assertEqual(payload["items"][0]["source_ids"], ["wsj_markets", "wsj_technology"])
+        self.assertEqual({row["id"] for row in payload["sources"]}, set(news.SOURCE_BY_ID))
+
     def test_changed_evidence_resets_analysis_marker_but_not_first_seen(self):
         self.store()
         with sqlite3.connect(self.path) as con:
@@ -303,7 +374,7 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(news.prune_news(db_path=self.path, now=NOW + timedelta(days=15)), 1)
         with sqlite3.connect(self.path) as con:
             self.assertEqual(con.execute("SELECT COUNT(*) FROM news_item_sources").fetchone()[0], 0)
-            self.assertEqual(con.execute("SELECT COUNT(*) FROM news_sources").fetchone()[0], 3)
+            self.assertEqual(con.execute("SELECT COUNT(*) FROM news_sources").fetchone()[0], len(news.SOURCES))
 
 
 class FetchTests(unittest.TestCase):

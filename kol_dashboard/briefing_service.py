@@ -130,6 +130,7 @@ _EVIDENCE_RANK = {
 _REVISION_PROVENANCE_RANK = {
     "kol_event": 1,
     "macro_event": 1,
+    "publisher_news": 1,
     "imported_event": 0,
 }
 _TIER_LABELS = {
@@ -968,12 +969,15 @@ def _canonical_identity_url(value: Any) -> str:
         parsed = urlsplit(raw)
     except (TypeError, ValueError):
         return ""
+    publisher_url = (parsed.hostname or "").lower().removeprefix("www.") in {"bloomberg.com", "wsj.com"}
+    publisher_tracking = {"mod", "reflink", "srnd", "cmpid", "sref", "leadsource", "siteid", "tesla", "embedded-checkout"} if publisher_url else set()
     query = urlencode(
         sorted(
             (key, value)
             for key, value in parse_qsl(parsed.query, keep_blank_values=True)
             if not key.lower().startswith("utm_")
             and key.lower() not in _TRACKING_QUERY_KEYS
+            and key.lower() not in publisher_tracking
         ),
         doseq=True,
     )
@@ -981,6 +985,8 @@ def _canonical_identity_url(value: Any) -> str:
     if path != "/":
         path = path.rstrip("/")
     host = (parsed.hostname or "").lower().rstrip(".")
+    if publisher_url:
+        host = host.removeprefix("www.")
     port = parsed.port
     netloc = host if port in {None, 80, 443} else f"{host}:{port}"
     return urlunsplit((parsed.scheme.lower(), netloc, path, query, ""))
@@ -1839,6 +1845,116 @@ def _event_highlight(source: Mapping[str, Any]) -> dict[str, Any] | None:
     return item
 
 
+_PUBLISHER_DOMAINS = {"Bloomberg": "bloomberg.com", "WSJ": "wsj.com"}
+_PUBLISHER_FEEDS = frozenset({
+    "bloomberg_markets", "bloomberg_technology", "wsj_markets",
+    "wsj_business", "wsj_technology",
+})
+_PUBLISHER_STALE_SECONDS = 20 * 60
+
+
+def _publisher_highlight(source: Mapping[str, Any], *, now: datetime) -> dict[str, Any] | None:
+    """Adapt persisted media evidence without creating a KOL identity or score."""
+    publisher = _text(source.get("publisher"), 40)
+    source_url = _public_url(source.get("url"))
+    domain = _PUBLISHER_DOMAINS.get(publisher)
+    published = _datetime(source.get("published_at"))
+    title = _text(source.get("title"), 500)
+    item_id = _text(source.get("id"), 80)
+    if (not domain or _host(source_url).removeprefix("www.") != domain
+            or not source_url.startswith("https://") or not title or not item_id
+            or source.get("published_at_status") != "provided"
+            or published is None or not now - timedelta(hours=EVENT_LOOKBACK_HOURS) <= published <= now):
+        return None
+    snippet = _text(source.get("snippet"), 1600)
+    basis = "title_and_snippet" if snippet and source.get("evidence_scope") != "title_only" else "title_only"
+    if basis == "title_only":
+        snippet = ""
+    raw_analysis = source.get("analysis")
+    analysis = raw_analysis if isinstance(raw_analysis, Mapping) else {}
+    evidence_ids = analysis.get("evidence_ids")
+    ready = bool(
+        analysis.get("status") == "ready" and analysis.get("evidence_scope") == basis
+        and isinstance(evidence_ids, list) and evidence_ids == [item_id]
+        and all(isinstance(analysis.get(key), str) and analysis[key].strip()
+                for key in ("headline_zh", "summary_zh", "why_it_matters_zh"))
+    )
+    item = {
+        "id": "publisher:" + item_id, "kind": "publisher_news",
+        "title": _text(analysis.get("headline_zh"), 180) if ready else title[:180],
+        "summary": _text(analysis.get("summary_zh"), 420) if ready else snippet[:420] or title[:420],
+        "impact": "unknown", "impact_basis": "not_declared",
+        "source_tier": "reporting", "source_label": publisher, "source_url": source_url,
+        "time_status": "verified", "published_at": _iso(published),
+        "last_updated_at": _iso(published), "source_count": 1, "related_records": 1,
+        "ai_status": "ready" if ready else "pending", "ai_summary_used": ready,
+        "evidence_basis": basis, "_trusted_evidence_basis": basis,
+        "_raw_title": title, "_canonical_url": _canonical_identity_url(source_url),
+        "_stable_external_id": "publisher_news:" + item_id,
+    }
+    observed = _datetime(source.get("first_seen_at"))
+    if observed is not None and observed <= now:
+        item["fetched_at"] = _iso(observed)
+    if ready:
+        item["why_it_matters"] = _text(analysis.get("why_it_matters_zh"), 320)
+    _set_rank_reason(item)
+    return item
+
+
+def _publisher_candidates(snapshot: Mapping[str, Any] | None, *, now: datetime) -> list[dict[str, Any]]:
+    if not isinstance(snapshot, Mapping) or not isinstance(snapshot.get("items"), list):
+        return []
+    output = []
+    seen = set()
+    for source in snapshot["items"][:200]:
+        if not isinstance(source, Mapping):
+            continue
+        item = _publisher_highlight(source, now=now)
+        if item is None:
+            continue
+        identity = (item["_canonical_url"], item["published_at"])
+        if identity not in seen:
+            seen.add(identity)
+            output.append(item)
+    return output
+
+
+def _publisher_coverage(snapshot: Mapping[str, Any], *, now: datetime) -> dict[str, Any]:
+    """Publisher polling health never claims the hourly Daily import succeeded."""
+    rows = snapshot.get("sources")
+    sources = []
+    successful = []
+    seen = set()
+    for raw in rows[:12] if isinstance(rows, list) else []:
+        if not isinstance(raw, Mapping):
+            continue
+        source_id = _text(raw.get("id"), 64)
+        if source_id not in _PUBLISHER_FEEDS or source_id in seen:
+            continue
+        seen.add(source_id)
+        success = _datetime(raw.get("last_success_at"))
+        checked = _datetime(raw.get("last_checked_at"))
+        success = success if success is not None and success <= now else None
+        checked = checked if checked is not None and checked <= now else None
+        stale = success is None or (now - success).total_seconds() > _PUBLISHER_STALE_SECONDS
+        healthy = raw.get("status") == "ok" and not stale
+        sources.append({
+            "id": source_id, "publisher": "Bloomberg" if source_id.startswith("bloomberg_") else "WSJ",
+            "status": "ok" if healthy else "error" if raw.get("status") == "error" else "stale" if success else "not_checked",
+            "stale": stale, "last_checked_at": _iso(checked) if checked else None,
+            "last_success_at": _iso(success) if success else None,
+        })
+        if success is not None:
+            successful.append(success)
+    complete = _PUBLISHER_FEEDS <= seen and all(row["status"] == "ok" for row in sources)
+    coverage = min(successful) if _PUBLISHER_FEEDS <= seen and len(successful) == len(sources) else None
+    return {
+        "publisher_source_coverage_as_of": _iso(coverage) if coverage else None,
+        "publisher_source_coverage_stale": not complete,
+        "publisher_sources": sources,
+    }
+
+
 def _macro_highlight(source: Mapping[str, Any], macro: Mapping[str, Any]) -> dict[str, Any] | None:
     original_title = _text(source.get("title"), 180)
     if not original_title:
@@ -2584,6 +2700,10 @@ def _merge_duplicate_group(
         )
         base["source_count"] = source_count
         base["related_records"] = source_count
+        if any(item.get("kind") == "publisher_news" for item in group):
+            publishers = {_host(item.get("_canonical_url")).removeprefix("www.") for item in group}
+            publishers.discard("")
+            base["source_count"] = max(1, len(publishers))
 
     for field in ("disclosed_at", "effective_at"):
         if field in base:
@@ -2891,6 +3011,16 @@ def _section_payloads(
     for key in SECTION_KEYS:
         ranked = sorted(grouped[key], key=lambda item: _section_rank(item, now=now))
         selected[key] = ranked[:MAX_SECTION_ITEMS]
+        diversity = None
+        publisher = next((item for item in ranked if item.get("kind") == "publisher_news"), None)
+        if publisher is not None and not any(item.get("kind") == "publisher_news" for item in selected[key]):
+            replaceable = next((index for index in range(len(selected[key]) - 1, -1, -1)
+                                if _impact(selected[key][index].get("impact")) not in {"critical", "high"}
+                                and selected[key][index].get("source_tier") not in {"official", "first_party"}), None)
+            if replaceable is not None:
+                selected[key][replaceable] = publisher
+                diversity = {"policy": "one_direct_publisher", "publisher": publisher["source_label"],
+                             "preserves_major_and_primary_evidence": True}
         observed = [
             value
             for item in selected[key]
@@ -2915,6 +3045,7 @@ def _section_payloads(
                 ),
                 "total_count": len(ranked),
                 "items": [_public_item(item) for item in selected[key]],
+                **({"selection_source_diversity": diversity} if diversity else {}),
             }
         )
     return sections, selected
@@ -3178,6 +3309,7 @@ def build_latest_briefing(
     public_macro: Mapping[str, Any] | None,
     decision_record: Mapping[str, Any] | None,
     imported_snapshot: Mapping[str, Any] | None = None,
+    publisher_news: Mapping[str, Any] | None = None,
     refresh_schedule: str = "",
     now: Any = None,
 ) -> dict[str, Any]:
@@ -3212,6 +3344,7 @@ def build_latest_briefing(
             if (item := _macro_highlight(source, macro)) is not None
         )
     candidates.extend(_imported_candidates(imported_snapshot, now=current))
+    candidates.extend(_publisher_candidates(publisher_news, now=current))
     ranked, dedup_stats = _deduplicate_with_stats(candidates)
     sections, selected_by_section = _section_payloads(ranked, now=current)
     major_items = sorted(
@@ -3321,6 +3454,7 @@ def build_latest_briefing(
         "watchpoints": watchpoints,
         "sections": sections,
         "disclaimer": DISCLAIMER,
+        **(_publisher_coverage(publisher_news, now=current) if isinstance(publisher_news, Mapping) else {}),
     }
 
 

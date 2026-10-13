@@ -23,7 +23,7 @@ def collect_news(*, db_path=None, now=None, fetcher=None) -> dict:
     states = {source.id: news_service.source_state(source.id, db_path) for source in news_service.SOURCES}
     results = []
     # Network requests are independent; SQLite commits stay serialized here.
-    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="publisher-news") as pool:
+    with ThreadPoolExecutor(max_workers=min(5, len(news_service.SOURCES)), thread_name_prefix="publisher-news") as pool:
         pending = {pool.submit(fetcher, source, etag=states[source.id].get("etag"),
                                last_modified=states[source.id].get("last_modified")): source
                    for source in news_service.SOURCES}

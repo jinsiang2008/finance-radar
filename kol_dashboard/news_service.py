@@ -27,6 +27,10 @@ try:
     import db
 except ModuleNotFoundError:  # Source-tree package invocation.
     from kol_dashboard import db
+try:
+    import news_catalog
+except ModuleNotFoundError:
+    from kol_dashboard import news_catalog
 
 POLLING_INTERVAL_SECONDS = 300
 SOURCE_STALE_SECONDS = 20 * 60
@@ -59,6 +63,12 @@ SOURCES = (
                ("wsj.com", "www.wsj.com")),
     NewsSource("wsj_business", "WSJ · Business", "WSJ",
                "https://feeds.content.dowjones.io/public/rss/WSJcomUSBusiness",
+               ("wsj.com", "www.wsj.com")),
+    NewsSource("bloomberg_technology", "Bloomberg · Technology", "Bloomberg",
+               "https://www.bloomberg.com/feeds/technology/news.rss",
+               ("bloomberg.com", "www.bloomberg.com")),
+    NewsSource("wsj_technology", "WSJ · Technology", "WSJ",
+               "https://feeds.content.dowjones.io/public/rss/RSSWSJD",
                ("wsj.com", "www.wsj.com")),
 )
 SOURCE_BY_ID = {source.id: source for source in SOURCES}
@@ -447,7 +457,23 @@ def _public_source(source: NewsSource, row: dict, count: int, current: datetime)
             "evidence_scope": EVIDENCE_SCOPE}
 
 
-def get_news_snapshot(*, limit=40, commodity=None, publisher=None, db_path=None, now=None) -> dict:
+def _project_item(con, row) -> dict:
+    source_ids = [entry[0] for entry in con.execute("SELECT source_id FROM news_item_sources WHERE item_id=? ORDER BY source_id", (row["id"],))]
+    delay = None
+    if row["published_at"] and row["published_at_status"] == "provided":
+        delta = (utc_datetime(row["first_seen_at"]) - utc_datetime(row["published_at"])).total_seconds()
+        if delta >= 0:
+            delay = int(delta)
+    item = {key: row[key] for key in ("id", "title", "snippet", "url", "publisher", "published_at",
+        "published_at_status", "reported_published_at", "first_seen_at", "last_seen_at", "evidence_scope", "analysis_status")}
+    item.update(source_ids=source_ids, commodity_tags=json.loads(row["commodity_tags_json"]),
+                discovery_delay_seconds=delay, initial_import=bool(row["initial_import"]))
+    item.update(news_catalog.classify(item["title"], item["snippet"]))
+    return item
+
+
+def get_news_snapshot(*, limit=40, commodity=None, publisher=None, topic=None,
+                      instrument=None, asset=None, include_related=False, db_path=None, now=None) -> dict:
     """Read a public, bounded projection. Missing collector state is explicit."""
     current = utc_datetime(now)
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 200:
@@ -458,38 +484,80 @@ def get_news_snapshot(*, limit=40, commodity=None, publisher=None, db_path=None,
     publisher = str(publisher or "").strip().lower() or None
     if publisher and publisher not in {"bloomberg", "wsj"}:
         raise ValueError("unsupported publisher")
+    topic = str(topic or "").strip().lower() or None
+    if topic and topic not in news_catalog.TOPIC_BY_KEY:
+        raise ValueError("unsupported topic")
+    instrument = news_catalog.normalize_instrument(instrument)
+    asset = news_catalog.normalize_instrument(asset)
+    if instrument and asset and instrument != asset:
+        raise ValueError("conflicting instrument filters")
+    instrument = instrument or asset
+    if not isinstance(include_related, bool):
+        raise ValueError("include_related must be a boolean")
     states, counts, items, total = {}, {}, [], 0
+    catalog = news_catalog.catalog()
     path = database_path(db_path)
     if path.is_file():
         with _connection(db_path, readonly=True) as con:
             tables = {row[0] for row in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             if {"news_items", "news_sources", "news_item_sources"} <= tables:
+                con.create_function("news_topic_matches", 3, lambda title, snippet, key: int(news_catalog.matches_topic(title, snippet, key)))
+                con.create_function("news_asset_matches", 3, lambda title, snippet, key: int(news_catalog.matches_instrument(title, snippet, key, include_related)))
                 states = {row["id"]: dict(row) for row in con.execute("SELECT * FROM news_sources")}
                 counts = {row[0]: row[1] for row in con.execute("SELECT source_id,COUNT(*) FROM news_item_sources GROUP BY source_id")}
                 clauses, params = ["COALESCE(published_at,first_seen_at)>=?"], [timestamp(current - timedelta(days=DISPLAY_WINDOW_DAYS))]
+                catalog = news_catalog.catalog(con.execute("SELECT title,snippet FROM news_items WHERE " + clauses[0], params))
                 if commodity:
                     clauses.append("commodity_tags_json LIKE ?")
                     params.append('%"' + commodity + '"%')
                 if publisher:
                     clauses.append("LOWER(publisher)=?")
                     params.append(publisher)
+                if topic:
+                    clauses.append("news_topic_matches(title,snippet,?)=1")
+                    params.append(topic)
+                if instrument:
+                    clauses.append("news_asset_matches(title,snippet,?)=1")
+                    params.append(instrument)
                 where = " AND ".join(clauses)
                 total = con.execute("SELECT COUNT(*) FROM news_items WHERE " + where, params).fetchone()[0]
                 rows = con.execute("SELECT * FROM news_items WHERE " + where + " ORDER BY COALESCE(published_at,first_seen_at) DESC,first_seen_at DESC,id LIMIT ?", [*params, limit]).fetchall()
-                for row in rows:
-                    source_ids = [entry[0] for entry in con.execute("SELECT source_id FROM news_item_sources WHERE item_id=? ORDER BY source_id", (row["id"],))]
-                    delay = None
-                    if row["published_at"] and row["published_at_status"] == "provided":
-                        delta = (utc_datetime(row["first_seen_at"]) - utc_datetime(row["published_at"])).total_seconds()
-                        if delta >= 0:
-                            delay = int(delta)
-                    item = {key: row[key] for key in ("id", "title", "snippet", "url", "publisher", "published_at",
-                        "published_at_status", "reported_published_at", "first_seen_at", "last_seen_at", "evidence_scope", "analysis_status")}
-                    item.update(source_ids=source_ids, commodity_tags=json.loads(row["commodity_tags_json"]),
-                                discovery_delay_seconds=delay, initial_import=bool(row["initial_import"]))
-                    items.append(item)
+                items = [_project_item(con, row) for row in rows]
     return {"schema_version": 1, "generated_at": timestamp(current),
             "polling_interval_seconds": POLLING_INTERVAL_SECONDS, "evidence_scope": EVIDENCE_SCOPE,
             "sources": [_public_source(source, states.get(source.id, {}), counts.get(source.id, 0), current) for source in SOURCES],
-            "items": items, "total": total, "filters": {"commodity": commodity, "publisher": publisher},
+            "items": items, "total": total, "catalog": catalog,
+            "filters": {"commodity": commodity, "publisher": publisher, "topic": topic,
+                        "instrument": instrument, "include_related": include_related},
             "notice": "官方 RSS 标题与简介；不代表全文或实时通讯社服务。每 5 分钟检查，实际到达速度取决于上游。"}
+
+
+def get_news_context(*, limit=8, commodity=None, publisher=None, topic=None,
+                     instrument=None, asset=None, include_related=False, db_path=None, now=None) -> dict:
+    """Shared page context with the same evidence IDs, filters and source health."""
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 20:
+        raise ValueError("context limit must be between 1 and 20")
+    snapshot = get_news_snapshot(limit=limit, commodity=commodity, publisher=publisher, topic=topic,
+                                 instrument=instrument, asset=asset, include_related=include_related,
+                                 db_path=db_path, now=now)
+    return {**snapshot, "context_kind": "shared_publisher_news",
+            "is_complete": snapshot["total"] <= len(snapshot["items"])}
+
+
+def get_enrichment_candidates(*, db_path=None, now=None, limit=1000) -> list[dict]:
+    """Worker-only candidate window, separate from the public 200-item ceiling."""
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
+        raise ValueError("candidate limit must be between 1 and 1000")
+    current = utc_datetime(now)
+    path = database_path(db_path)
+    if not path.is_file():
+        return []
+    with _connection(db_path, readonly=True) as con:
+        tables = {row[0] for row in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if not {"news_items", "news_sources", "news_item_sources"} <= tables:
+            return []
+        rows = con.execute("""SELECT * FROM news_items WHERE published_at_status='provided'
+            AND published_at>=? AND published_at<=?
+            ORDER BY published_at DESC,first_seen_at DESC,id LIMIT ?""",
+            (timestamp(current - timedelta(hours=48)), timestamp(current), limit)).fetchall()
+        return [_project_item(con, row) for row in rows]

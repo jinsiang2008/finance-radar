@@ -21,16 +21,27 @@ class FrontendNewsRuntimeTests(unittest.TestCase):
             let source = fs.readFileSync(process.argv[1], "utf8");
             source = source.replace(/\n\}\)\(\);\s*$/, `
               globalThis.__newsTest = { state, newsItemHTML, newsSourceHTML,
-                newsContentSignature, loadNews, renderNews };
+                newsContentSignature, loadNews, renderNews, loadNewsContext,
+                clearAssetNewsContext, newsSummaryStatus, renderNewsCatalog };
             })();`);
             const node = () => ({
               innerHTML: "", textContent: "", hidden: false, value: "", dataset: {}, attrs: {},
               setAttribute(name, value) { this.attrs[name] = value; },
-              remove() {},
+              remove() {}, focus() {},
+              querySelector(selector) {
+                if (!this.innerHTML.includes("shared-news-items")) return null;
+                if (selector === ".shared-news-items") return {};
+                if (selector === ".shared-news-status") {
+                  this.banner ||= { innerHTML: "", hidden: false }; return this.banner;
+                }
+                return null;
+              },
             });
             const nodes = new Map();
             for (const id of ["news-items", "news-count", "news-source-list", "news-cadence",
-                              "news-publisher", "news-live-status", "news-update-banner"]) {
+                              "news-publisher", "news-live-status", "news-update-banner", "news-topic-filters", "news-instrument",
+                              "news-instrument-focus", "news-context-home", "news-context-daily", "news-context-macro",
+                              "news-context-asset", "news-context-kol"]) {
               nodes.set(`#${id}`, node());
             }
             const wrap = { querySelector() { return null; }, prepend() {} };
@@ -129,6 +140,68 @@ class FrontendNewsRuntimeTests(unittest.TestCase):
               await initialFailure;
               assert.ok(nodes.get("#news-items").innerHTML.includes("暂时无法读取市场快讯"));
               assert.equal(nodes.get("#news-count").textContent, "读取失败");
+
+              // Shared reports contain summaries in the current page, independently of decision snapshots.
+              const oldAssetRequest = api.loadNewsContext("asset", { asset: "US:NVDA" });
+              const newAssetRequest = api.loadNewsContext("asset", { asset: "US:SPCX" });
+              assert.ok(responses[6].url.includes("view=asset&limit=4&asset=US%3ASPCX"));
+              succeed(6, payload([{ ...gold, analysis: { ...analysis, evidence_ids: [9] } }]));
+              assert.equal(await newAssetRequest, true);
+              succeed(5, payload());
+              assert.equal(await oldAssetRequest, false);
+              assert.equal(api.state.newsContexts.asset.asset, "US:SPCX");
+              assert.ok(nodes.get("#news-context-asset").innerHTML.includes("仍需核验的供应变化"));
+              assert.ok(nodes.get("#news-context-asset").innerHTML.includes("影响与核验"));
+              assert.ok(nodes.get("#news-context-asset").innerHTML.includes("原文证据"));
+              const privateAssetRequest = api.loadNewsContext("asset", { asset: "US:NVDA" });
+              api.clearAssetNewsContext();
+              succeed(7, payload());
+              assert.equal(await privateAssetRequest, false);
+              assert.equal(api.state.newsContexts.asset, undefined, "logout removes asset-selection context");
+              assert.equal(nodes.get("#news-context-asset").innerHTML, "");
+
+              // KOL filter changes never relabel an older person's publisher stories as the new selection.
+              api.state.selectedKols = new Set(["musk"]);
+              const oldKolContext = api.loadNewsContext("kol");
+              assert.ok(responses[8].url.includes("view=kol&limit=3&kols=musk"));
+              api.state.selectedKols = new Set(["altman"]);
+              const newKolContext = api.loadNewsContext("kol");
+              const media = { ...gold, kol_mentions: [{ name: "Sam Altman", key: "altman", attribution_basis: "company_mention" }] };
+              succeed(9, payload([media]));
+              assert.equal(await newKolContext, true);
+              succeed(8, payload());
+              assert.equal(await oldKolContext, false);
+              const kolVisible = nodes.get("#news-context-kol").innerHTML;
+              assert.ok(kolVisible.includes("关联公司报道：Sam Altman"));
+              assert.ok(kolVisible.includes("不等同于本人表态"));
+              const kolRefresh = api.loadNewsContext("kol", { force: true, background: true });
+              succeed(10, payload([{ ...media, title: "Revised company report" }]));
+              assert.equal(await kolRefresh, true);
+              assert.equal(nodes.get("#news-context-kol").innerHTML, kolVisible);
+              assert.ok(api.state.newsContexts.kol.pending);
+              const kolFailure = api.loadNewsContext("kol", { force: true, background: true });
+              responses[11].reject(new Error("Failed to fetch"));
+              assert.equal(await kolFailure, false);
+              assert.equal(nodes.get("#news-context-kol").innerHTML, kolVisible);
+              assert.equal(api.state.newsContexts.kol.pending, null);
+              assert.ok(nodes.get("#news-context-kol").banner.innerHTML.includes("保留上次结果"));
+
+              assert.equal(api.newsSummaryStatus({ published_at_status: "provided", analysis: { status: "not_scheduled" } }),
+                "未自动解读 · 超出近期处理范围");
+              assert.equal(api.newsSummaryStatus({ published_at_status: "missing", analysis: { status: "not_scheduled" } }),
+                "未自动解读 · 发布时间待核实");
+              api.state.newsInstrument = "US:SPCX";
+              api.renderNewsCatalog({ catalog: { topics: [{ key: "space", label: "商业航天", count: 2 }], instruments: [
+                { key: "US:SPCX", label: "SpaceX", ticker: "SPCX", market: "NASDAQ", type: "stock", direct_count: 2 }
+              ] }});
+              assert.ok(nodes.get("#news-topic-filters").innerHTML.includes("商业航天"));
+              assert.ok(nodes.get("#news-instrument").innerHTML.includes("SpaceX · SPCX"));
+              assert.ok(nodes.get("#news-instrument-focus").innerHTML.includes("只显示标题或简介直接提及"));
+              const association = api.newsItemHTML({ ...article, assets: [
+                { asset_key: "US:COPX", name: "Copper miners ETF", relation: "topic_related" }
+              ] });
+              assert.ok(association.includes("主题相关，原文未直接提及"));
+              assert.ok(!association.includes('data-news-instrument="US:COPX"'));
               console.log("news runtime safety and lifecycle checks passed");
             })().catch((error) => { console.error(error); process.exitCode = 1; });
             """
