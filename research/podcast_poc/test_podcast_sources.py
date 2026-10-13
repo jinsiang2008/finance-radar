@@ -141,6 +141,18 @@ class PodcastSourceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             poc.summarize(episode["id"])
 
+    def test_publisher_negative_zero_utc_dates_sort_and_display_without_guessing_missing_zones(self):
+        material = rss(item("older", published="Thu, 08 Oct 2026 17:00:00 -0000"),
+                       item("newer", published="Mon, 12 Oct 2026 05:00:00 -0000"))
+        with patch.object(poc, "fetch", return_value=material):
+            poc.discover(["jre"], limit=1)
+        self.assertEqual(poc.payload()["episodes"][0]["guid"], "newer")
+        self.assertEqual(self.source("jre")["latest_published_at"], "Mon, 12 Oct 2026 05:00:00 -0000")
+        self.assertEqual(poc.published_timestamp("Mon, 12 Oct 2026 05:00:00 -0000"),
+                         poc.published_timestamp("2026-10-12T05:00:00+00:00"))
+        self.assertIsNone(poc.published_timestamp("Mon, 12 Oct 2026 05:00:00"))
+        self.assertIsNone(poc.published_timestamp("2026-10-12T05:00:00"))
+
     def test_primary_feed_skips_trailers_before_applying_episode_limit(self):
         material = rss(item("trailer-kind", title="Meet our next guest", kind="trailer"),
                        item("trailer-title", title="Official TRAILER: a new conversation"),

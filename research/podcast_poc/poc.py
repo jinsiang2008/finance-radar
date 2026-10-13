@@ -222,6 +222,10 @@ def published_timestamp(value):
             stamp = parsedate_to_datetime(value)
         except (ValueError, TypeError, OverflowError):
             return None
+        # RFC 5322 -0000 is a UTC timestamp with unknown originating zone.
+        # email.utils intentionally returns it naive; it is not a missing zone.
+        if stamp.tzinfo is None and re.search(r"\s-0000\s*$", value):
+            stamp = stamp.replace(tzinfo=timezone.utc)
     if stamp.tzinfo is None:
         return None
     return stamp.timestamp()
