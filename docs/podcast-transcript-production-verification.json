@@ -1,0 +1,514 @@
+{
+  "verified_at": "2026-10-13T16:49:34.984780+00:00",
+  "application_commit": "549af10efa8c9e9c7a7103dbe90e36cdb87e8e26",
+  "release": "/opt/kol-dashboard/releases/20261013T163030Z-42229-fa4309b5",
+  "runtime_files_verified": 55,
+  "reading_asset_version": 44,
+  "preserved_existing_texts": 4,
+  "episodes": [
+    {
+      "id": "diary-471e3a03f8f2",
+      "source": "diary",
+      "title": "AI Extinction Risk Expert: If Your Job Is Repetitive, AI Will Do It Better Than You! | Eric Weinstein",
+      "status": "summarized",
+      "acquisition": {
+        "state": "ready",
+        "checked_at": "2026-10-13T16:47:15.529030+00:00"
+      },
+      "segments": 1521,
+      "processed": 1521,
+      "summary_points": 8,
+      "chinese_summary_points": 8,
+      "evidence_references": 24,
+      "source_kind": "official_transcript",
+      "transcript_source_url": "https://rss.flightcast.com/transcripts/01M426P4R3YTEDTPVFX13Q6DPJ.vtt",
+      "model": "deepseek-v4-flash",
+      "chunks_processed": 9,
+      "chunks_total": 9,
+      "usage": {
+        "prompt_tokens": 58531,
+        "completion_tokens": 3431,
+        "total_tokens": 61962
+      },
+      "paid_api_calls": 10,
+      "job": {
+        "state": "completed",
+        "error": null
+      }
+    },
+    {
+      "id": "dwarkesh-df8d7f12bc40",
+      "source": "dwarkesh",
+      "title": "Si Sheppard – How did a few hundred Spanish soldiers topple two empires?",
+      "status": "summarized",
+      "acquisition": {
+        "state": "ready",
+        "checked_at": "2026-10-13T16:46:58.234058+00:00"
+      },
+      "segments": 59,
+      "processed": 59,
+      "summary_points": 8,
+      "chinese_summary_points": 8,
+      "evidence_references": 9,
+      "source_kind": "official_edited_transcript",
+      "transcript_source_url": "https://www.dwarkesh.com/p/si-sheppard",
+      "model": "deepseek-v4-flash",
+      "chunks_processed": 11,
+      "chunks_total": 11,
+      "usage": {
+        "prompt_tokens": 28020,
+        "completion_tokens": 3525,
+        "total_tokens": 31545
+      },
+      "paid_api_calls": 12,
+      "job": {
+        "state": "completed",
+        "error": null
+      }
+    },
+    {
+      "id": "lex-3b2c67e29bd1",
+      "source": "lex",
+      "title": "#502 – Psychiatry, Insane Asylums, Mental Illness, ECT, Lobotomies, Freud & Jung",
+      "status": "summarized",
+      "acquisition": {
+        "state": "ready",
+        "checked_at": "2026-10-13T16:47:13.341457+00:00"
+      },
+      "segments": 431,
+      "processed": 431,
+      "summary_points": 8,
+      "chinese_summary_points": 8,
+      "evidence_references": 19,
+      "source_kind": "official_edited_transcript",
+      "transcript_source_url": "https://lexfridman.com/andrew-scull-transcript/",
+      "model": "deepseek-v4-flash",
+      "chunks_processed": 16,
+      "chunks_total": 16,
+      "usage": {
+        "prompt_tokens": 54896,
+        "completion_tokens": 5578,
+        "total_tokens": 60474
+      },
+      "paid_api_calls": 17,
+      "job": {
+        "state": "completed",
+        "error": null
+      }
+    }
+  ],
+  "active_jobs": [],
+  "source_health": [
+    {
+      "id": "dwarkesh",
+      "status": "failed",
+      "last_checked_at": "2026-10-13T16:37:47.050565+00:00",
+      "error": "HTTP Error 502: Bad Gateway"
+    },
+    {
+      "id": "lex",
+      "status": "ok",
+      "last_checked_at": "2026-10-13T16:38:14.152729+00:00",
+      "error": null
+    },
+    {
+      "id": "allin",
+      "status": "ok",
+      "last_checked_at": "2026-10-13T16:39:00.968061+00:00",
+      "error": null
+    },
+    {
+      "id": "nikhil_people",
+      "status": "ok",
+      "last_checked_at": "2026-10-13T16:39:03.294578+00:00",
+      "error": null
+    },
+    {
+      "id": "nikhil_wtf",
+      "status": "ok",
+      "last_checked_at": "2026-10-13T16:39:10.335045+00:00",
+      "error": null
+    },
+    {
+      "id": "jre",
+      "status": "ok",
+      "last_checked_at": "2026-10-13T16:40:13.224151+00:00",
+      "error": null
+    },
+    {
+      "id": "diary",
+      "status": "ok",
+      "last_checked_at": "2026-10-13T16:41:11.249268+00:00",
+      "error": null
+    },
+    {
+      "id": "sv101",
+      "status": "ok",
+      "last_checked_at": "2026-10-13T16:41:45.243654+00:00",
+      "error": null
+    },
+    {
+      "id": "latepost",
+      "status": "failed",
+      "last_checked_at": "2026-10-13T16:41:45.825331+00:00",
+      "error": "HTTP Error 302: Found"
+    },
+    {
+      "id": "luanfanshu",
+      "status": "ok",
+      "last_checked_at": "2026-10-13T16:42:11.048985+00:00",
+      "error": null
+    },
+    {
+      "id": "xiaojun",
+      "status": "ok",
+      "last_checked_at": "2026-10-13T16:42:25.725386+00:00",
+      "error": null
+    },
+    {
+      "id": "latent",
+      "status": "ok",
+      "last_checked_at": "2026-10-13T16:44:54.725168+00:00",
+      "error": null
+    },
+    {
+      "id": "acquired",
+      "status": "ok",
+      "last_checked_at": "2026-10-13T16:45:25.443614+00:00",
+      "error": null
+    },
+    {
+      "id": "iltb",
+      "status": "ok",
+      "last_checked_at": "2026-10-13T16:46:47.174109+00:00",
+      "error": null
+    }
+  ],
+  "unavailable_sources": [
+    "acquired",
+    "allin",
+    "iltb",
+    "jre",
+    "latent",
+    "latepost",
+    "luanfanshu",
+    "nikhil_people",
+    "nikhil_wtf",
+    "sv101",
+    "xiaojun"
+  ],
+  "schedule": {
+    "worker_alive": true,
+    "enabled": true,
+    "off_peak_only": true,
+    "period": "off_peak",
+    "off_peak_minutes": 60,
+    "next_check_at": "2026-10-13T17:37:00+00:00",
+    "transcript_policy": "official_latest_only",
+    "automatic_transcript_sources": [
+      "dwarkesh",
+      "lex",
+      "diary"
+    ],
+    "podcast_daily_limit": 3,
+    "automatic_audio_transcription": false,
+    "provider_blocked": null,
+    "counts": {
+      "completed": 221
+    },
+    "last_refresh_state": "completed",
+    "podcast_last_check_at": "2026-10-13T16:46:47.186124+00:00"
+  },
+  "units": {
+    "kol-dashboard.service": "active",
+    "kol-reading-worker.service": "active",
+    "nginx.service": "active",
+    "kol-collect-kol.timer": "active",
+    "kol-collect-news.timer": "active",
+    "kol-enrich-news.timer": "active"
+  },
+  "private_endpoints": {
+    "/api/private/reading/podcasts": {
+      "status": 401,
+      "cache_control": "no-store"
+    },
+    "/api/private/reading/wechat": {
+      "status": 401,
+      "cache_control": "no-store"
+    },
+    "/api/private/reading/status": {
+      "status": 401,
+      "cache_control": "no-store"
+    }
+  },
+  "runtime_sha256": {
+    "app.py": "07dd8c93a3a4263ae232ae03b064c3b2a756d222ee82e91933d7393066bfefe4",
+    "auth.py": "f193f831096565f0db069658a44e68ba9c3bf2f4022ffdec30d93d9e25b676c2",
+    "briefing_collect.py": "ea0139a2a156e9a3134c57ce0e4bf7637ddd155d713092a69c05ac79cdfd5f4a",
+    "briefing_import.py": "0cc8bd7c927a917d108695f2c9d44db8f2068be28edbadc602895b18bbcb37b0",
+    "briefing_service.py": "0a96ea58d4783a9786e95e9d43df1b18c189f8a9dfc784c6578ae837672c9981",
+    "briefing_topics.py": "bcebeac451ab4179c8045729d5e320a1f7e2d092f2786df990a787d8046b09b8",
+    "daily_enrichment.py": "279f46a23c964d6601a3e40bbe2f8f6da9f25a7468bc8df92f37e98178a4d9d7",
+    "content_quality.py": "09ec119f65db4efe022fbb31b24c31373cbb76158a22c6892bd14dc3ca9489c1",
+    "event_relevance.py": "7515a6644aded97735b5a2f690039f50d285841f692d7007c7065b3dda4ed290",
+    "db.py": "c2cd21be96230b3cff319fd79a8152d72218542bb17322c25f3b9a568af74cb0",
+    "decision_collect.py": "b37731ab526bd2662d245374a2a7f60b2a2f19008b6164f61f22e4759c173f92",
+    "decision_service.py": "e9bc7896bf4fa5daeef806867548fe4cd78e2080c725a3706f1a7ea9589131e3",
+    "decision_snapshot.py": "51b219dd6f2039af871491b66d08fae0e2b9e78ac707d90d7b141e0b840304f6",
+    "market_data.py": "fc5328d51eda5408b0abb3dc450a1deca0daccc71959ed29a26c099f97ac392a",
+    "portfolio.py": "8120a8be33d925c80a20a9d7863cc01373cbb5007ba573d8fcff9f71ff62ce60",
+    "relation_engine.py": "8a52a9794cd4a4ed41e7e122b9840690ebca77312affd2c59679da43e5c82692",
+    "macro_alert_service.py": "ee9ad871b753eaa268b004a8a7a55638579860b1984fb0ebbb491fbcbb2e2be5",
+    "macro_collect.py": "821d20bfd14b26966b7688554e8b57fa7bef386c1a84948d0ac4ebc217b8b26e",
+    "llm_enrichment.py": "fe0b28dd108d6aa0fc802549a4483799512b4e29cb2d3e3f4ab64f8a7c2be108",
+    "enrichment_collect.py": "c705766053ef7f948e131dc044843162aff447655dc1aec6ca5998b3b5b97ed0",
+    "options_capacity.py": "23ca00e407c3c8d9c5bcb1ae4c1f6cd35bf93533e9c3382b4ffb6371d7e46fe0",
+    "options_policy.py": "7ad105195a8b91d69ae44027054ddfa8dd0020f13347508dba2c4994d1f539cf",
+    "options_research_service.py": "5a0e200e07470717e05330edf5b9436e055077358911e43fc00ac1bf26a9e7e9",
+    "options_strategy.py": "d8e686b1d7b6e84b3f412ac76bc0c23b32d44fdff8d68c7bd4f18fcaa51683a6",
+    "reading_service.py": "33946714e736919ea6685d3b5e67551acab53d04b66455ec46821a76c0a3b220",
+    "reading_worker.py": "dbc1f343ea6e4d27b3460f73d33c70230f7401518f8e3717fa50d889f5f997a5",
+    "reading_import.py": "ade783c46b60513781b1fc137b105bc1b123866e9c229be7c6fada74910f6920",
+    "news_service.py": "1ca7b6df0a2a3be3e0ebec1c2ced02bb0a09c28b5808a0debb1017d93c73e5f3",
+    "news_collect.py": "62988623edd40e0f3bed17fba0c74c389fe91302e733be636e33f874b369b1bb",
+    "news_enrichment.py": "9d1de75ced37f0cace6818b3bca887ffb8fee12c010b63cf4dc28efc84d9d143",
+    "collect.sh": "eaecfcb89f68c8051e9f169a41ae9260dab498a5d7e8d04fcac96d4ee453f127",
+    "templates/index.html": "c64b159222f37070b6cb936d7dd02648b976f6591073893a08f514842de07417",
+    "static/style.css": "c47982f45c1eaebadd35f3db641951e3f38620278fce94732e86bb848970e9b5",
+    "static/app.js": "3af1b0db3ff786f3df5e5463cb835a7e0a59bdbcb45e39136c0fe745e75210fa",
+    "static/img/donate-qrcode.png": "458b1626cec6579301a6b8aa6ea48545b39a9f444b02c102df25aad53a441c98",
+    "lib/kol_tracker.py": "1395cfe85cb5b17eaf9751f9c73e7f5c52b1e2fb81e03e804ef96c873af045a7",
+    "lib/macro_fetcher.py": "28b199c3be490ef88fbebfcd0e0a008cf03761619f04d9d00e6476492e5016a7",
+    "lib/risk_radar.py": "3ce479c423cf6b79e8b87cdb4e9550b8d18a489768456d9185eb262c72dfea24",
+    "lib/serenity_tracker.py": "8494c1070144448d5c4b4392f8314982f2c35c4a94eb2dee2c7d13ffac88dfd5",
+    "research/podcast_poc/poc.py": "5046133dbf2ca6fc49f31fccb7c20e9cab2865bf84aca20709201fcdc9dfe71b",
+    "research/podcast_poc/wechat.py": "3d7b43641eeb8fa5bf405c7e434f13386ced6362b0059d2462e505e463169740",
+    "research/podcast_poc/reading_jobs.py": "142d4f482249e60af6fdfd5116b1c65f37ef0a0c488b9821e8c97446e5191d0e",
+    "research/podcast_poc/schedule_policy.py": "31a7f84d0845e639319da318829e09df2e277cd9bfa691dcf0f7554c56a2219c",
+    "research/podcast_poc/inference.py": "5bc1b3fd38bbf8c95c1dffe70ae011e8afd2c26bd1a96d7e054118c18375517e",
+    "research/podcast_poc/wechat_sources.json": "ca5d0a5199f849f02c9513b0a7d5f3ba75301c9a04b3d843d32c3ac2b82f5573",
+    "research/podcast_poc/web/index.html": "eb1b109d6531a929309672a33a5e659f6cceeb97b53d0c52fb04ceaa3b37072a",
+    "research/podcast_poc/web/app.js": "fe7ea30beae151b610bb2f7798ae8a7138751bc61b0e9a3c998f100a4ec78b2b",
+    "research/podcast_poc/web/style.css": "288ba9bb4279759fe8dc402720caea68c565719ab1e2946adae370f9e7d2edb1",
+    "research/podcast_poc/web/wechat.html": "3bd73f4be5a367e5cd9ce4c532876233422176905a37180ab53fb193912018f0",
+    "research/podcast_poc/web/wechat.js": "59a761e539134edb99aefb4c33d2134be2e685a50ef53fdf0a9a3bee6a0a13f9",
+    "research/podcast_poc/web/wechat.css": "1e95fd637ad5666dfdb1438735930f6e4c265f189483182d2fc1416d4d1732e2",
+    "research/podcast_poc/web/reader-auth.js": "aa7610f3164580552d7ba1e2a9f1fd021f009a8420b7fae6bb44600451f366f1",
+    "research/podcast_poc/web/reader-auth.css": "9b919d3f78431d1e6f1b22bb215a5cb22e2089bd020584d470145266fe1ff424",
+    "news_catalog.py": "661d4aecbb55e7cdc14f9cafd006d7ea174aca9246d16ea7cc82e8393771e555",
+    "research/podcast_poc/official_transcripts.py": "382eab4eca1eb0f4635f910a8cebba54e042cbdfbfb9e90290bab84f74ec008c"
+  },
+  "official_source_probe": {
+    "verified_at": "2026-10-13T16:02:08.751941+00:00",
+    "results": [
+      {
+        "source": "dwarkesh",
+        "success": true,
+        "segments": 59,
+        "chars": 94961,
+        "end_seconds": 5622,
+        "source_kind": "official_edited_transcript",
+        "coverage_note": "完整处理所获取的公开官方整理稿；未独立核对整段音频，不保证与音频逐字一致。部分时间点仅为官方章节锚点，同章发言共用时间，不能精确定位每句话。"
+      },
+      {
+        "source": "lex",
+        "success": true,
+        "segments": 431,
+        "chars": 168279,
+        "end_seconds": 12977,
+        "source_kind": "official_edited_transcript",
+        "coverage_note": "完整处理所获取的公开官方整理稿；时间点沿用官方文字稿，未独立核对整段音频，不保证与音频逐字一致。"
+      },
+      {
+        "source": "diary",
+        "success": true,
+        "segments": 1521,
+        "chars": 94986,
+        "end_seconds": 6766.11,
+        "source_kind": "official_transcript",
+        "coverage_note": "完整处理所获取的官方字幕文件；字幕时间点沿用原文件，未独立听校，不保证字幕覆盖整段音频或与音频逐字一致。"
+      }
+    ],
+    "diary_rss_fields": [
+      {
+        "tag": "{https://podcastindex.org/namespace/1.0}transcript",
+        "type": "text/vtt",
+        "language": "en"
+      }
+    ]
+  },
+  "verification": {
+    "dashboard_python_tests": 1011,
+    "reading_python_tests": 138,
+    "repository_contract_tests": 3,
+    "frontend_fixture": {
+      "passed": true,
+      "private_gets": 35,
+      "mock_summary_posts": 3,
+      "widths": [
+        390,
+        320
+      ],
+      "checks": [
+        "six acquisition states and summary precedence",
+        "peak-to-valley refresh preserves transcript DOM",
+        "retry time is not a completion promise",
+        "official provenance URL safety",
+        "5 second running and 30 second deferred polling"
+      ]
+    },
+    "release_gates": [
+      "nginx configuration",
+      "five Bloomberg and WSJ feeds",
+      "home/daily/macro/asset contexts",
+      "Daily root feeds and API",
+      "service and reading worker heartbeat",
+      "public health and APIs"
+    ],
+    "initial_release_failure": {
+      "release": "20261013T160920Z-38547-b8b8031c",
+      "gate": "Daily AI Brief root request deadline",
+      "automatic_rollback_verified": true,
+      "restored_release": "20261013T153016Z-30479-1624964b"
+    },
+    "daily_rss_fix": {
+      "root_request_seconds": 12,
+      "other_request_seconds": 4,
+      "whole_budget_seconds": 40,
+      "retries": 1,
+      "retry_only": "request wall-clock deadline exceeded",
+      "live_collect_feed_probe": {
+        "both_roots_success": true,
+        "elapsed_seconds": 3.91,
+        "paid_calls": 0
+      }
+    },
+    "public_browser": {
+      "startedAt": "2026-10-13T16:39:23.583Z",
+      "reading": {
+        "htmlStatus": 200,
+        "assetURL": "/kol/reading-assets/app.js?v=44",
+        "scriptSha256": "fe7ea30beae151b610bb2f7798ae8a7138751bc61b0e9a3c998f100a4ec78b2b",
+        "matchesLocalScript": true,
+        "newAcquisitionUI": true,
+        "anonymousPrivateContentHidden": true,
+        "privateBrowserRequests": 0,
+        "layouts": [
+          {
+            "width": 1440,
+            "noHorizontalOverflow": true,
+            "unlockButtonHeight": 44
+          },
+          {
+            "width": 390,
+            "noHorizontalOverflow": true,
+            "unlockButtonHeight": 44
+          }
+        ],
+        "privateAPIs": [
+          {
+            "name": "podcasts",
+            "status": 401,
+            "detail": "private_mode_required"
+          },
+          {
+            "name": "wechat",
+            "status": 401,
+            "detail": "private_mode_required"
+          }
+        ],
+        "passed": true
+      },
+      "kol": {
+        "directAPI": [
+          {
+            "path": "/kol/api/kols",
+            "status": 200,
+            "ms": 4542,
+            "count": 19,
+            "hasJustinSun": true,
+            "topLevelKeys": [
+              "array"
+            ]
+          },
+          {
+            "path": "/kol/api/news/context?view=kol&kols=justinsun",
+            "status": 200,
+            "ms": 441
+          }
+        ],
+        "uiAttempts": [
+          {
+            "attempt": 1,
+            "visible": true,
+            "text": "孙宇晨2",
+            "ms": 2726
+          }
+        ]
+      },
+      "errors": [],
+      "requests": [
+        {
+          "path": "/kol/api/auth/status",
+          "status": 200,
+          "ms": 52
+        },
+        {
+          "path": "/kol/api/auth/status",
+          "status": 200,
+          "ms": 56
+        },
+        {
+          "path": "/kol/api/stats",
+          "status": 200,
+          "ms": 689
+        },
+        {
+          "path": "/kol/api/kols",
+          "status": 200,
+          "ms": 1472
+        }
+      ],
+      "finishedAt": "2026-10-13T16:39:36.039Z",
+      "passed": true
+    },
+    "initial_browser_timeout": {
+      "step": "KOL Justin Sun chip",
+      "retry_passed": true,
+      "cause": "Not isolated: initial requests aborted by existing frontend timeout; fresh context succeeded."
+    }
+  },
+  "policy": {
+    "automatic_sources": [
+      "dwarkesh",
+      "lex",
+      "diary"
+    ],
+    "scope": "latest dated non-future episode per supported source",
+    "daily_limit": 3,
+    "limit_unit": "distinct transcript acquisition reservations per Beijing date; failures count",
+    "off_peak_check_minutes": 60,
+    "failed_acquisition_retry_hours": 24,
+    "automatic_audio_asr": false,
+    "historical_backfill": false,
+    "paid_summary_retry_on_fetch_failure": false
+  },
+  "limitations": [
+    "Official transcripts and captions have not been independently checked against audio.",
+    "Automatic summaries are unreviewed drafts; valid segment references do not certify semantic accuracy.",
+    "All-In, JRE and Nikhil currently have metadata discovery only unless a transcript is separately supplied.",
+    "No guarantee of one-hour source-to-summary latency or three completed summaries per day.",
+    "Feed and transcript availability can change; unavailable sources preserve existing data."
+  ],
+  "end_to_end": {
+    "result": "passed",
+    "completed_episodes": 3,
+    "all_summary_points_chinese": true,
+    "all_evidence_references_resolve": true,
+    "independent_audio_review": false,
+    "human_summary_review": false,
+    "total_summary_points": 24,
+    "total_model_calls": 39,
+    "total_tokens": 153981
+  }
+}

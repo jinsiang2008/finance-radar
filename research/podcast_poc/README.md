@@ -1,6 +1,6 @@
 # 播客与公众号阅读：本地 POC 与 KOL 集成
 
-阅读器已集成到线上 KOL（2026-10-09 文档更新），入口为 `/kol/podcasts` 和 `/kol/wechat`。阅读正文、摘要、任务状态与已归档音频均使用现有 KOL 私人会话鉴权。远端后台复用服务器已有 DeepSeek 环境配置，将取得的文字发送到固定官方 API，按实际 tokens 计费；不读取本地 POC 的凭据文件，也不在服务器运行 MLX。
+阅读器已集成到线上 KOL（2026-10-14 文档更新），入口为 `/kol/podcasts` 和 `/kol/wechat`。阅读正文、摘要、任务状态与已归档音频均使用现有 KOL 私人会话鉴权。远端后台复用服务器已有 DeepSeek 环境配置，将取得的文字发送到固定官方 API，按实际 tokens 计费；不读取本地 POC 的凭据文件，也不在服务器运行 MLX。
 
 远端自动检查公众号 RSS，并发现 14 个固定播客源每源最新最多 3 集的元数据。公众号符合增量条件的新正文自动排队摘要；播客已有文字稿可手动生成中文摘要。Dwarkesh、Lex、Diary 的最新一集可自动获取官方文字稿/字幕并排队摘要，后台返回 `official_latest_only`；每日最多为 3 个节目安排取稿，历史不自动回填。**整集音频转写尚未启用**，`automatic_audio_transcription=false`。
 
@@ -102,7 +102,7 @@ ffmpeg 需可执行，当前 POC 使用 `/opt/homebrew/bin/ffmpeg`。两套模�
 
 显式复核可使用 `apply-review <episode-id> <review.json>`。review JSON 包含匹配当前稿件的 `summary_signature`、修订后的 `summary` 及字符串数组 `issues`。版本不匹配会拒绝；原模型草稿保留，网页显示“文字已复核”及保存的复核日期。自动执行 `summarize` 不会产生复核标记。
 
-CLI 仅供本机可信用户；本地 HTTP 只监听回环地址，写操作核对 Host、Origin、进程 token、JSON 内容和固定文章 ID。线上通过 KOL 私人会话授权读取数据和提交任务，写操作检查同源、动作头及有限 JSON 参数；worker 只请求配置中的 HTTPS RSS，不接受任意抓取 URL，也不跟随 RSS 重定向。线上数据保存在 `KOL_READING_DATA_DIR` 指定的持久化目录，凭据由服务器环境单独提供。此版尚无整集中文音频质量验证、自动说话人身份识别、跨节目日报去重或总金额硬预算。
+CLI 仅供本机可信用户；本地 HTTP 只监听回环地址，写操作核对 Host、Origin、进程 token、JSON 内容和固定文章 ID。线上通过 KOL 私人会话授权读取数据和提交任务，写操作检查同源、动作头及有限 JSON 参数；worker 只请求配置中的 HTTPS RSS 及三个支持来源的固定官方文字稿/字幕地址，不接受任意抓取 URL，也不跟随重定向。线上数据保存在 `KOL_READING_DATA_DIR` 指定的持久化目录，凭据由服务器环境单独提供。此版尚无整集中文音频质量验证、自动说话人身份识别、跨节目日报去重或总金额硬预算。
 
 ## 线上分时检查与后台任务
 
