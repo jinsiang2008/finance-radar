@@ -1,0 +1,329 @@
+{
+  "application_commit": "10765a3b68fc0b690d4f406b3ad7a6e17d54e91c",
+  "production_url": "https://zlstreet.xyz/kol/",
+  "production": {
+    "verified_at": "2026-10-13T13:42:08.710011+00:00",
+    "release": "/opt/kol-dashboard/releases/20261013T133530Z-6208-8ef9b5eb",
+    "runtime_files_verified": 54,
+    "source_health": [
+      {
+        "id": "bloomberg_markets",
+        "name": "Bloomberg · Markets",
+        "publisher": "Bloomberg",
+        "feed_url": "https://www.bloomberg.com/feeds/markets/news.rss",
+        "status": "ok",
+        "last_checked_at": "2026-10-13T13:40:41+00:00",
+        "last_success_at": "2026-10-13T13:40:41+00:00",
+        "last_error": null,
+        "latest_published_at": "2026-10-13T13:35:01+00:00",
+        "item_count": 165,
+        "last_feed_item_count": 20,
+        "consecutive_failures": 0,
+        "stale": false,
+        "check_age_seconds": 80,
+        "evidence_scope": "title_and_snippet"
+      },
+      {
+        "id": "wsj_markets",
+        "name": "WSJ · Markets",
+        "publisher": "WSJ",
+        "feed_url": "https://feeds.content.dowjones.io/public/rss/RSSMarketsMain",
+        "status": "ok",
+        "last_checked_at": "2026-10-13T13:40:42+00:00",
+        "last_success_at": "2026-10-13T13:40:42+00:00",
+        "last_error": null,
+        "latest_published_at": "2026-10-13T13:15:00+00:00",
+        "item_count": 50,
+        "last_feed_item_count": 59,
+        "consecutive_failures": 0,
+        "stale": false,
+        "check_age_seconds": 79,
+        "evidence_scope": "title_and_snippet"
+      },
+      {
+        "id": "wsj_business",
+        "name": "WSJ · Business",
+        "publisher": "WSJ",
+        "feed_url": "https://feeds.content.dowjones.io/public/rss/WSJcomUSBusiness",
+        "status": "ok",
+        "last_checked_at": "2026-10-13T13:40:42+00:00",
+        "last_success_at": "2026-10-13T13:40:42+00:00",
+        "last_error": null,
+        "latest_published_at": "2026-10-13T13:14:00+00:00",
+        "item_count": 68,
+        "last_feed_item_count": 80,
+        "consecutive_failures": 0,
+        "stale": false,
+        "check_age_seconds": 79,
+        "evidence_scope": "title_and_snippet"
+      },
+      {
+        "id": "bloomberg_technology",
+        "name": "Bloomberg · Technology",
+        "publisher": "Bloomberg",
+        "feed_url": "https://www.bloomberg.com/feeds/technology/news.rss",
+        "status": "ok",
+        "last_checked_at": "2026-10-13T13:40:41+00:00",
+        "last_success_at": "2026-10-13T13:40:41+00:00",
+        "last_error": null,
+        "latest_published_at": "2026-10-13T13:23:02+00:00",
+        "item_count": 20,
+        "last_feed_item_count": 20,
+        "consecutive_failures": 0,
+        "stale": false,
+        "check_age_seconds": 80,
+        "evidence_scope": "title_and_snippet"
+      },
+      {
+        "id": "wsj_technology",
+        "name": "WSJ · Technology",
+        "publisher": "WSJ",
+        "feed_url": "https://feeds.content.dowjones.io/public/rss/RSSWSJD",
+        "status": "ok",
+        "last_checked_at": "2026-10-13T13:40:43+00:00",
+        "last_success_at": "2026-10-13T13:40:43+00:00",
+        "last_error": null,
+        "latest_published_at": "2026-10-13T13:29:00+00:00",
+        "item_count": 11,
+        "last_feed_item_count": 35,
+        "consecutive_failures": 0,
+        "stale": false,
+        "check_age_seconds": 78,
+        "evidence_scope": "title_and_snippet"
+      }
+    ],
+    "items_total": 295,
+    "recent_200_analysis": {
+      "pending": 94,
+      "ready": 106
+    },
+    "analysis_schedule": {
+      "period": "off_peak",
+      "interval_minutes": 5,
+      "batch_limit": 8,
+      "daily_attempt_limit": 400,
+      "daily_attempts": 178,
+      "daily_remaining": 222,
+      "configured": true,
+      "last_run_at": "2026-10-13T13:40:40.697746+00:00",
+      "next_check_at": "2026-10-13T13:46:00+00:00",
+      "due": false,
+      "calendar_status": "verified"
+    },
+    "contexts": {
+      "home": {
+        "count": 6,
+        "ready": 0,
+        "total": 295
+      },
+      "daily": {
+        "count": 6,
+        "ready": 0,
+        "total": 295
+      },
+      "macro": {
+        "count": 6,
+        "ready": 2,
+        "total": 37
+      },
+      "kol": {
+        "count": 6,
+        "ready": 4,
+        "total": 10
+      },
+      "asset": {
+        "count": 1,
+        "ready": 0,
+        "total": 1
+      }
+    },
+    "daily_publisher_items": {
+      "macro": 1,
+      "world": 3,
+      "finance": 1,
+      "technology": 1,
+      "ai": 1,
+      "investors": 0
+    },
+    "daily_publisher_source_coverage_stale": false,
+    "units": {
+      "kol-dashboard.service": "active",
+      "kol-reading-worker.service": "active",
+      "nginx.service": "active",
+      "kol-collect-news.timer": "active",
+      "kol-enrich-news.timer": "active"
+    }
+  },
+  "browser": {
+    "status": "passed",
+    "sourceCount": 5,
+    "widths": [
+      1440,
+      390,
+      320
+    ],
+    "contexts": [
+      "home",
+      "daily",
+      "macro",
+      "kol"
+    ],
+    "errors": []
+  },
+  "isolated_remote_preflight": {
+    "collection": {
+      "status": "ok",
+      "checked_sources": 5,
+      "successful_sources": 5,
+      "inserted": 125,
+      "updated": 0,
+      "pruned": 0,
+      "sources": [
+        {
+          "id": "bloomberg_markets",
+          "status": "ok",
+          "inserted": 20,
+          "updated": 0,
+          "initial_import": true,
+          "feed_items": 20
+        },
+        {
+          "id": "bloomberg_technology",
+          "status": "ok",
+          "inserted": 20,
+          "updated": 0,
+          "initial_import": true,
+          "feed_items": 20
+        },
+        {
+          "id": "wsj_business",
+          "status": "ok",
+          "inserted": 50,
+          "updated": 0,
+          "initial_import": true,
+          "feed_items": 80
+        },
+        {
+          "id": "wsj_markets",
+          "status": "ok",
+          "inserted": 24,
+          "updated": 0,
+          "initial_import": true,
+          "feed_items": 59
+        },
+        {
+          "id": "wsj_technology",
+          "status": "ok",
+          "inserted": 11,
+          "updated": 0,
+          "initial_import": true,
+          "feed_items": 35
+        }
+      ]
+    },
+    "model_result": {
+      "status": "ok",
+      "attempted": 1,
+      "ready": 1,
+      "failed": 0
+    },
+    "ready_count": 1,
+    "models": [
+      "deepseek-v4-flash"
+    ],
+    "evidence_match": true,
+    "chinese_fields_present": true
+  },
+  "production_enrichment": {
+    "attempted": 8,
+    "ready": 7,
+    "failed": 1,
+    "following_wakeup": {
+      "status": "not_due",
+      "attempted": 0
+    },
+    "verification": "post-deploy systemd journal; failed item retained for bounded retry"
+  },
+  "tests": {
+    "dashboard": 968,
+    "reading": 86,
+    "clean_export_repository": 3,
+    "total": 1057,
+    "python_compile": true,
+    "javascript_syntax": true,
+    "shell_syntax": true,
+    "diff_check": true
+  },
+  "runtime_sha256": {
+    "app.py": "88226029a1668e67a36ef58595ae1731ec6aa69dc6646cd91a444fc5388e1ca2",
+    "auth.py": "f193f831096565f0db069658a44e68ba9c3bf2f4022ffdec30d93d9e25b676c2",
+    "briefing_collect.py": "77e952d27a85f8b90657c73c721a58c55b0c2dc018a25a66a2276b8936dafe3c",
+    "briefing_import.py": "0cc8bd7c927a917d108695f2c9d44db8f2068be28edbadc602895b18bbcb37b0",
+    "briefing_service.py": "0a96ea58d4783a9786e95e9d43df1b18c189f8a9dfc784c6578ae837672c9981",
+    "briefing_topics.py": "bcebeac451ab4179c8045729d5e320a1f7e2d092f2786df990a787d8046b09b8",
+    "daily_enrichment.py": "279f46a23c964d6601a3e40bbe2f8f6da9f25a7468bc8df92f37e98178a4d9d7",
+    "content_quality.py": "09ec119f65db4efe022fbb31b24c31373cbb76158a22c6892bd14dc3ca9489c1",
+    "event_relevance.py": "290405929094e8cae00b3cda0c75f1737a8cac29f428a4ac7c6d569c999cdbd6",
+    "db.py": "c2cd21be96230b3cff319fd79a8152d72218542bb17322c25f3b9a568af74cb0",
+    "decision_collect.py": "b37731ab526bd2662d245374a2a7f60b2a2f19008b6164f61f22e4759c173f92",
+    "decision_service.py": "e9bc7896bf4fa5daeef806867548fe4cd78e2080c725a3706f1a7ea9589131e3",
+    "decision_snapshot.py": "51b219dd6f2039af871491b66d08fae0e2b9e78ac707d90d7b141e0b840304f6",
+    "market_data.py": "fc5328d51eda5408b0abb3dc450a1deca0daccc71959ed29a26c099f97ac392a",
+    "portfolio.py": "8120a8be33d925c80a20a9d7863cc01373cbb5007ba573d8fcff9f71ff62ce60",
+    "relation_engine.py": "8a52a9794cd4a4ed41e7e122b9840690ebca77312affd2c59679da43e5c82692",
+    "macro_alert_service.py": "ee9ad871b753eaa268b004a8a7a55638579860b1984fb0ebbb491fbcbb2e2be5",
+    "macro_collect.py": "821d20bfd14b26966b7688554e8b57fa7bef386c1a84948d0ac4ebc217b8b26e",
+    "llm_enrichment.py": "fe0b28dd108d6aa0fc802549a4483799512b4e29cb2d3e3f4ab64f8a7c2be108",
+    "enrichment_collect.py": "c705766053ef7f948e131dc044843162aff447655dc1aec6ca5998b3b5b97ed0",
+    "options_capacity.py": "23ca00e407c3c8d9c5bcb1ae4c1f6cd35bf93533e9c3382b4ffb6371d7e46fe0",
+    "options_policy.py": "7ad105195a8b91d69ae44027054ddfa8dd0020f13347508dba2c4994d1f539cf",
+    "options_research_service.py": "5a0e200e07470717e05330edf5b9436e055077358911e43fc00ac1bf26a9e7e9",
+    "options_strategy.py": "d8e686b1d7b6e84b3f412ac76bc0c23b32d44fdff8d68c7bd4f18fcaa51683a6",
+    "reading_service.py": "df3c2e4fc754d66c520a58e6893a93f6c51cbddd7276b39243b83ba49d6101d3",
+    "reading_worker.py": "3ef7da60b74b6561d3e0135ae33739ac12796b37a930d758e58040717119a1a5",
+    "reading_import.py": "ade783c46b60513781b1fc137b105bc1b123866e9c229be7c6fada74910f6920",
+    "news_service.py": "1ca7b6df0a2a3be3e0ebec1c2ced02bb0a09c28b5808a0debb1017d93c73e5f3",
+    "news_collect.py": "62988623edd40e0f3bed17fba0c74c389fe91302e733be636e33f874b369b1bb",
+    "news_enrichment.py": "9d1de75ced37f0cace6818b3bca887ffb8fee12c010b63cf4dc28efc84d9d143",
+    "collect.sh": "eaecfcb89f68c8051e9f169a41ae9260dab498a5d7e8d04fcac96d4ee453f127",
+    "templates/index.html": "c64b159222f37070b6cb936d7dd02648b976f6591073893a08f514842de07417",
+    "static/style.css": "c47982f45c1eaebadd35f3db641951e3f38620278fce94732e86bb848970e9b5",
+    "static/app.js": "3af1b0db3ff786f3df5e5463cb835a7e0a59bdbcb45e39136c0fe745e75210fa",
+    "static/img/donate-qrcode.png": "458b1626cec6579301a6b8aa6ea48545b39a9f444b02c102df25aad53a441c98",
+    "lib/kol_tracker.py": "1f41cae19b22096bdd51053ed0af109756a086f2cac6ac4077fd4231cb4fe1c5",
+    "lib/macro_fetcher.py": "28b199c3be490ef88fbebfcd0e0a008cf03761619f04d9d00e6476492e5016a7",
+    "lib/risk_radar.py": "3ce479c423cf6b79e8b87cdb4e9550b8d18a489768456d9185eb262c72dfea24",
+    "lib/serenity_tracker.py": "8494c1070144448d5c4b4392f8314982f2c35c4a94eb2dee2c7d13ffac88dfd5",
+    "research/podcast_poc/poc.py": "d7834cf174fb6da043299c7de606d510d2680805d7bee22664ea6a51e1bc6c49",
+    "research/podcast_poc/wechat.py": "1de37985fa106c6caf98a9fdb694086ea5e003d7bc72ed8bb6e933f075f0fbc2",
+    "research/podcast_poc/reading_jobs.py": "fb1ba613008ef5bf42faf4f8f41605b30411caa76c7b6864b7059e609e537914",
+    "research/podcast_poc/schedule_policy.py": "50efb2de970fef8904df59bfe20eb507af790ba1511e8a4cc642c32710f99d20",
+    "research/podcast_poc/inference.py": "5bc1b3fd38bbf8c95c1dffe70ae011e8afd2c26bd1a96d7e054118c18375517e",
+    "research/podcast_poc/wechat_sources.json": "ca5d0a5199f849f02c9513b0a7d5f3ba75301c9a04b3d843d32c3ac2b82f5573",
+    "research/podcast_poc/web/index.html": "4810b3a5e57937d9b27332e630d7ac1ed5138b49c646185310e4838a26963d0b",
+    "research/podcast_poc/web/app.js": "aee2b0c0975712cf09a1f1301d07a69f91602b47bdd6e3b893b4765343b09b22",
+    "research/podcast_poc/web/style.css": "4f4e06d62e0de67d9afe6459a9b4cac54ce2e75786750863a6fec3febdb02f5b",
+    "research/podcast_poc/web/wechat.html": "3bd73f4be5a367e5cd9ce4c532876233422176905a37180ab53fb193912018f0",
+    "research/podcast_poc/web/wechat.js": "49f6cc62f70a2c7b9c6b56d44f35057efa8b27310a92f7553bdb1500f1713a8d",
+    "research/podcast_poc/web/wechat.css": "1e95fd637ad5666dfdb1438735930f6e4c265f189483182d2fc1416d4d1732e2",
+    "research/podcast_poc/web/reader-auth.js": "aa7610f3164580552d7ba1e2a9f1fd021f009a8420b7fae6bb44600451f366f1",
+    "research/podcast_poc/web/reader-auth.css": "9b919d3f78431d1e6f1b22bb215a5cb22e2089bd020584d470145266fe1ff424",
+    "news_catalog.py": "661d4aecbb55e7cdc14f9cafd006d7ea174aca9246d16ea7cc82e8393771e555"
+  },
+  "scope": [
+    "five official RSS feeds",
+    "seven topics",
+    "28 stock/ETF news identities",
+    "home, daily, macro, KOL and asset media context",
+    "daily section merging",
+    "5/30 minute off-peak/peak summary policy; 8/4 items; 400 attempts per Beijing day"
+  ],
+  "limits": [
+    "RSS title and description, not paywalled full text",
+    "source polling does not guarantee upstream latency",
+    "topic-related assets are not direct mentions or confirmed beneficiaries",
+    "news context does not change decision scores or trading gates",
+    "pending and failed summaries remain explicit; no assertion of complete summary coverage",
+    "CLS, intraday price breakout alerts and mobile push remain outside this release"
+  ]
+}

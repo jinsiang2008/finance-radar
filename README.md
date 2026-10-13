@@ -110,9 +110,11 @@ Daily 六栏也合并过去 24 小时的媒体报道，并独立公开媒体源�
 来源状态表示采集可用性，不能证明上游消息实时；发布时间、首次发现时间和初次导入标记
 分别保留，不能把历史首次导入的差值算作持续运行延迟。
 
-发布脚本将两个新 worker/timer 纳入停写、数据库备份和回滚。首次发布必须实际采集并验证三个
+发布脚本将两个新 worker/timer 纳入停写、数据库备份和回滚。首次发布必须实际采集并验证五个
 来源全部成功后才提交发布事务，默认不覆盖线上数据库或认证。新闻异常可先在来源状态查看，
 再检查 `kol-collect-news.service`、`kol-enrich-news.service`，无需将采集与 AI 故障混为一谈。
+本次跨页接入的生产验收、真实模型批次和运行文件指纹见
+[`shared-news-production-verification.json`](docs/shared-news-production-verification.json)。
 
 宏观采集还会并发读取 SPY、沪深 300、VIX、USD/CNY 的 6 个月完成日线，
 计算并保存有限的派生趋势数据；原始日线不会写入宏观快照。若任一核心输入
