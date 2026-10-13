@@ -1,0 +1,557 @@
+{
+  "verified_at": "2026-10-13T15:36:23.007166+00:00",
+  "application_commit": "bc8f0471fb090d73466c18161fa3bf76730bcf08",
+  "release": "/opt/kol-dashboard/releases/20261013T153016Z-30479-1624964b",
+  "runtime_files_verified": 54,
+  "reading_asset_version": 43,
+  "total_episodes": 53,
+  "sources": [
+    {
+      "id": "dwarkesh",
+      "name": "Dwarkesh Podcast",
+      "language": "en",
+      "feed_url": "https://apple.dwarkesh-podcast.workers.dev/feed.rss",
+      "priority": "primary",
+      "group": "dwarkesh",
+      "homepage_url": "https://www.dwarkesh.com/",
+      "focus": "AI、前沿技术与深度访谈",
+      "status": "ok",
+      "last_checked_at": "2026-10-13T15:10:02.463027+00:00",
+      "last_success_at": "2026-10-13T15:10:02.463027+00:00",
+      "latest_published_at": "Thu, 01 Oct 2026 15:28:28 GMT",
+      "error": null,
+      "discovered_count": 4,
+      "transcript_count": 1,
+      "summary_count": 1
+    },
+    {
+      "id": "lex",
+      "name": "Lex Fridman Podcast",
+      "language": "en",
+      "feed_url": "https://lexfridman.com/feed/podcast/",
+      "priority": "primary",
+      "group": "lex",
+      "homepage_url": "https://lexfridman.com/podcast/",
+      "focus": "AI、科技与长篇人物访谈",
+      "status": "ok",
+      "last_checked_at": "2026-10-13T15:10:05.870139+00:00",
+      "last_success_at": "2026-10-13T15:10:05.870139+00:00",
+      "latest_published_at": "Thu, 17 Sep 2026 00:40:49 +0000",
+      "error": null,
+      "discovered_count": 3,
+      "transcript_count": 0,
+      "summary_count": 0
+    },
+    {
+      "id": "allin",
+      "name": "All-In Podcast",
+      "language": "en",
+      "feed_url": "https://rss.libsyn.com/shows/254861/destinations/1928300.xml",
+      "priority": "primary",
+      "group": "allin",
+      "homepage_url": "https://allin.com/",
+      "focus": "科技商业、投资与宏观",
+      "status": "ok",
+      "last_checked_at": "2026-10-13T15:12:09.062731+00:00",
+      "last_success_at": "2026-10-13T15:12:09.062731+00:00",
+      "latest_published_at": "Mon, 12 Oct 2026 15:49:00 +0000",
+      "error": null,
+      "discovered_count": 3,
+      "transcript_count": 0,
+      "summary_count": 0
+    },
+    {
+      "id": "nikhil_people",
+      "name": "People by WTF — Nikhil Kamath",
+      "language": "en",
+      "feed_url": "https://feeds.hubhopper.com/db41907e6c28518ffe336b392c715ef1.rss",
+      "priority": "primary",
+      "group": "nikhil",
+      "homepage_url": "https://www.youtube.com/@nikhil.kamath",
+      "focus": "全球企业家与投资人；部分节目英印混合",
+      "status": "ok",
+      "last_checked_at": "2026-10-13T15:12:09.239814+00:00",
+      "last_success_at": "2026-10-13T15:12:09.239814+00:00",
+      "latest_published_at": "Thu, 16 Jul 2026 17:55:35 +0000",
+      "error": null,
+      "discovered_count": 3,
+      "transcript_count": 0,
+      "summary_count": 0
+    },
+    {
+      "id": "nikhil_wtf",
+      "name": "WTF is with Nikhil Kamath",
+      "language": "en",
+      "feed_url": "https://feeds.hubhopper.com/664690fdea0d7a6f61a052da119934d3.rss",
+      "priority": "primary",
+      "group": "nikhil",
+      "homepage_url": "https://www.youtube.com/@nikhil.kamath",
+      "focus": "行业圆桌、商业与投资；部分节目英印混合",
+      "status": "ok",
+      "last_checked_at": "2026-10-13T15:12:09.363051+00:00",
+      "last_success_at": "2026-10-13T15:12:09.363051+00:00",
+      "latest_published_at": "Fri, 11 Sep 2026 05:46:49 +0000",
+      "error": null,
+      "discovered_count": 3,
+      "transcript_count": 0,
+      "summary_count": 0
+    },
+    {
+      "id": "jre",
+      "name": "The Joe Rogan Experience",
+      "language": "en",
+      "feed_url": "https://feeds.megaphone.fm/GLT1412515089",
+      "priority": "primary",
+      "group": "jre",
+      "homepage_url": "https://www.joerogan.com/",
+      "focus": "人物长访谈，含科技，也含文化与体育",
+      "status": "ok",
+      "last_checked_at": "2026-10-13T15:12:09.905324+00:00",
+      "last_success_at": "2026-10-13T15:12:09.905324+00:00",
+      "latest_published_at": "Thu, 08 Oct 2026 17:00:00 -0000",
+      "error": null,
+      "discovered_count": 3,
+      "transcript_count": 0,
+      "summary_count": 0
+    },
+    {
+      "id": "diary",
+      "name": "The Diary Of A CEO",
+      "language": "en",
+      "feed_url": "https://rss2.flightcast.com/xmsftuzjjykcmqwolaqn6mdn",
+      "priority": "primary",
+      "group": "diary",
+      "homepage_url": "https://stevenbartlett.com/doac",
+      "focus": "企业家、商业与人生访谈，也含健康话题",
+      "status": "ok",
+      "last_checked_at": "2026-10-13T15:12:17.150881+00:00",
+      "last_success_at": "2026-10-13T15:12:17.150881+00:00",
+      "latest_published_at": "Mon, 12 Oct 2026 05:00:00 -0000",
+      "error": null,
+      "discovered_count": 3,
+      "transcript_count": 0,
+      "summary_count": 0
+    },
+    {
+      "id": "sv101",
+      "name": "硅谷101",
+      "language": "zh",
+      "feed_url": "https://feeds.fireside.fm/sv101/rss",
+      "priority": "standard",
+      "group": "sv101",
+      "homepage_url": null,
+      "focus": "",
+      "status": "ok",
+      "last_checked_at": "2026-10-13T15:12:17.316117+00:00",
+      "last_success_at": "2026-10-13T15:12:17.316117+00:00",
+      "latest_published_at": "Thu, 08 Oct 2026 16:00:00 -0700",
+      "error": null,
+      "discovered_count": 10,
+      "transcript_count": 1,
+      "summary_count": 1
+    },
+    {
+      "id": "latepost",
+      "name": "晚点聊",
+      "language": "zh",
+      "feed_url": "https://podcast.latepost.com/rss",
+      "priority": "standard",
+      "group": "latepost",
+      "homepage_url": null,
+      "focus": "",
+      "status": "failed",
+      "last_checked_at": "2026-10-13T15:12:17.826206+00:00",
+      "last_success_at": null,
+      "latest_published_at": "Fri, 02 Oct 2026 09:00:00 +0800",
+      "error": "HTTP Error 302: Found",
+      "discovered_count": 1,
+      "transcript_count": 0,
+      "summary_count": 0
+    },
+    {
+      "id": "luanfanshu",
+      "name": "乱翻书",
+      "language": "zh",
+      "feed_url": "https://feed.xyzfm.space/yxuruh3f9mc4",
+      "priority": "standard",
+      "group": "luanfanshu",
+      "homepage_url": null,
+      "focus": "",
+      "status": "ok",
+      "last_checked_at": "2026-10-13T15:12:18.127241+00:00",
+      "last_success_at": "2026-10-13T15:12:18.127241+00:00",
+      "latest_published_at": "Thu, 24 Sep 2026 05:46:12 GMT",
+      "error": null,
+      "discovered_count": 3,
+      "transcript_count": 0,
+      "summary_count": 0
+    },
+    {
+      "id": "xiaojun",
+      "name": "张小珺商业访谈录",
+      "language": "zh",
+      "feed_url": "https://feed.xyzfm.space/dk4yh3pkpjp3",
+      "priority": "standard",
+      "group": "xiaojun",
+      "homepage_url": null,
+      "focus": "",
+      "status": "ok",
+      "last_checked_at": "2026-10-13T15:12:18.315013+00:00",
+      "last_success_at": "2026-10-13T15:12:18.315013+00:00",
+      "latest_published_at": "Thu, 03 Sep 2026 00:00:00 GMT",
+      "error": null,
+      "discovered_count": 3,
+      "transcript_count": 0,
+      "summary_count": 0
+    },
+    {
+      "id": "latent",
+      "name": "Latent Space",
+      "language": "en",
+      "feed_url": "https://api.substack.com/feed/podcast/1084089.rss",
+      "priority": "standard",
+      "group": "latent",
+      "homepage_url": null,
+      "focus": "",
+      "status": "ok",
+      "last_checked_at": "2026-10-13T15:12:18.714953+00:00",
+      "last_success_at": "2026-10-13T15:12:18.714953+00:00",
+      "latest_published_at": "Sat, 10 Oct 2026 00:31:26 GMT",
+      "error": null,
+      "discovered_count": 6,
+      "transcript_count": 1,
+      "summary_count": 0
+    },
+    {
+      "id": "acquired",
+      "name": "Acquired",
+      "language": "en",
+      "feed_url": "https://feeds.transistor.fm/acquired",
+      "priority": "standard",
+      "group": "acquired",
+      "homepage_url": null,
+      "focus": "",
+      "status": "ok",
+      "last_checked_at": "2026-10-13T15:12:18.901025+00:00",
+      "last_success_at": "2026-10-13T15:12:18.901025+00:00",
+      "latest_published_at": "Sun, 13 Sep 2026 20:35:03 -0700",
+      "error": null,
+      "discovered_count": 3,
+      "transcript_count": 0,
+      "summary_count": 0
+    },
+    {
+      "id": "iltb",
+      "name": "Invest Like the Best",
+      "language": "en",
+      "feed_url": "https://feeds.megaphone.fm/CLS2859450455",
+      "priority": "standard",
+      "group": "iltb",
+      "homepage_url": null,
+      "focus": "",
+      "status": "ok",
+      "last_checked_at": "2026-10-13T15:12:19.357173+00:00",
+      "last_success_at": "2026-10-13T15:12:19.357173+00:00",
+      "latest_published_at": "Tue, 13 Oct 2026 08:00:00 -0000",
+      "error": null,
+      "discovered_count": 4,
+      "transcript_count": 0,
+      "summary_count": 0
+    }
+  ],
+  "discovery": {
+    "scope": "metadata_only",
+    "automatic_transcript_fetch": false,
+    "automatic_audio_transcription": false,
+    "primary_group_count": 6
+  },
+  "reading_schedule": {
+    "enabled": true,
+    "model": "deepseek-v4-flash",
+    "worker_alive": true,
+    "period": "off_peak",
+    "off_peak_only": true,
+    "off_peak_minutes": 60,
+    "execution_allowed": true,
+    "next_check_at": "2026-10-13T16:03:00+00:00",
+    "manual_execution_policy": "off_peak_only",
+    "automatic_audio_transcription": false
+  },
+  "protected_endpoints": {
+    "/api/private/reading/podcasts": {
+      "anonymous_status": 401,
+      "cache_control": "no-store"
+    },
+    "/api/private/reading/wechat": {
+      "anonymous_status": 401,
+      "cache_control": "no-store"
+    },
+    "/api/private/reading/status": {
+      "anonymous_status": 401,
+      "cache_control": "no-store"
+    }
+  },
+  "units": {
+    "kol-dashboard.service": "active",
+    "kol-reading-worker.service": "active",
+    "nginx.service": "active",
+    "kol-collect-kol.timer": "active",
+    "kol-collect-news.timer": "active",
+    "kol-enrich-news.timer": "active"
+  },
+  "verification_scope": "read_only_runtime_after_final_deployment",
+  "episode_files_observed": 53,
+  "initial_discovery": {
+    "verified_at": "2026-10-13T15:12:19.721975+00:00",
+    "application_commit": "1f306ed6e6b470931b0e02b8b0b2688fd70d58e0",
+    "release": "/opt/kol-dashboard/releases/20261013T150220Z-26036-53adada8",
+    "total_episodes": 53,
+    "existing_episodes_preserved": 35,
+    "new_metadata_episodes": 18,
+    "inference_calls_for_discovery": 0,
+    "primary_sources_successful": 7
+  },
+  "tests": {
+    "dashboard": 982,
+    "reading": 122,
+    "repository": 3
+  },
+  "browser": {
+    "passed": true,
+    "kol": "justinsun",
+    "readingAssetVersion": 43,
+    "anonymousPrivateContentHidden": true,
+    "widths": [
+      1440,
+      390
+    ],
+    "errors": []
+  },
+  "release_recovery": {
+    "failed_release": "20261013T151552Z-28133-a7139fa5",
+    "failed_gate": "Daily collector upstream root RSS fetch/parse failure",
+    "rollback_report": "ROLLBACK INCOMPLETE",
+    "manual_recovery_verification": [
+      {
+        "units": [
+          {
+            "unit": "kol-collect-daily.timer",
+            "before": [
+              "enabled",
+              "active"
+            ],
+            "now": [
+              "enabled",
+              "active"
+            ]
+          },
+          {
+            "unit": "kol-collect-decision.timer",
+            "before": [
+              "enabled",
+              "active"
+            ],
+            "now": [
+              "enabled",
+              "active"
+            ]
+          },
+          {
+            "unit": "kol-collect-enrich.timer",
+            "before": [
+              "enabled",
+              "active"
+            ],
+            "now": [
+              "enabled",
+              "active"
+            ]
+          },
+          {
+            "unit": "kol-collect-kol.timer",
+            "before": [
+              "enabled",
+              "active"
+            ],
+            "now": [
+              "enabled",
+              "active"
+            ]
+          },
+          {
+            "unit": "kol-collect-macro.timer",
+            "before": [
+              "enabled",
+              "active"
+            ],
+            "now": [
+              "enabled",
+              "active"
+            ]
+          },
+          {
+            "unit": "kol-collect-news.timer",
+            "before": [
+              "enabled",
+              "active"
+            ],
+            "now": [
+              "enabled",
+              "active"
+            ]
+          },
+          {
+            "unit": "kol-dashboard.service",
+            "before": [
+              "enabled",
+              "active"
+            ],
+            "now": [
+              "enabled",
+              "active"
+            ]
+          },
+          {
+            "unit": "kol-enrich-news.timer",
+            "before": [
+              "enabled",
+              "active"
+            ],
+            "now": [
+              "enabled",
+              "active"
+            ]
+          },
+          {
+            "unit": "kol-enrich-wakeup.path",
+            "before": [
+              "enabled",
+              "active"
+            ],
+            "now": [
+              "enabled",
+              "active"
+            ]
+          },
+          {
+            "unit": "kol-reading-worker.service",
+            "before": [
+              "enabled",
+              "active"
+            ],
+            "now": [
+              "enabled",
+              "active"
+            ]
+          }
+        ],
+        "configuration_checks": [
+          {
+            "name": "aidao.locations.conf",
+            "restored": true
+          },
+          {
+            "name": "kol-collect-daily.service",
+            "restored": true
+          },
+          {
+            "name": "kol-collect-daily.timer",
+            "restored": true
+          },
+          {
+            "name": "kol-collect-decision.service",
+            "restored": true
+          },
+          {
+            "name": "kol-collect-decision.timer",
+            "restored": true
+          },
+          {
+            "name": "kol-collect-enrich.service",
+            "restored": true
+          },
+          {
+            "name": "kol-collect-enrich.timer",
+            "restored": true
+          },
+          {
+            "name": "kol-collect-kol.service",
+            "restored": true
+          },
+          {
+            "name": "kol-collect-kol.timer",
+            "restored": true
+          },
+          {
+            "name": "kol-collect-macro.service",
+            "restored": true
+          },
+          {
+            "name": "kol-collect-macro.timer",
+            "restored": true
+          },
+          {
+            "name": "kol-collect-news.service",
+            "restored": true
+          },
+          {
+            "name": "kol-collect-news.timer",
+            "restored": true
+          },
+          {
+            "name": "kol-dashboard.conf",
+            "restored": true
+          },
+          {
+            "name": "kol-dashboard.env",
+            "restored": true
+          },
+          {
+            "name": "kol-dashboard.service",
+            "restored": true
+          },
+          {
+            "name": "kol-enrich-news.service",
+            "restored": true
+          },
+          {
+            "name": "kol-enrich-news.timer",
+            "restored": true
+          },
+          {
+            "name": "kol-enrich-wakeup.path",
+            "restored": true
+          },
+          {
+            "name": "kol-reading-worker.service",
+            "restored": true
+          }
+        ],
+        "rollback_files": [
+          "reading-queue.before-release",
+          "database.before-release",
+          "config",
+          "database.before-release-shm",
+          "database.before-release-wal"
+        ]
+      },
+      [
+        {
+          "file": "/opt/kol-dashboard/data/kol_dashboard.db",
+          "integrity": "ok",
+          "owner_matches_worker": true
+        },
+        {
+          "file": "/opt/kol-dashboard/private/reading/runtime/reading-jobs.sqlite3",
+          "integrity": "ok",
+          "owner_matches_worker": true
+        }
+      ]
+    ],
+    "daily_retry_result": "success",
+    "daily_retry_exit_status": 0,
+    "health_after_retry": "ok",
+    "preserved_stage": "/opt/kol-dashboard/.staging/20261013T151552Z-28133-a7139fa5",
+    "retention": "Preserve original rollback materials; no files removed."
+  }
+}
