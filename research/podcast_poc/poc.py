@@ -129,6 +129,8 @@ def summary_config():
 
 def summary_prompt_version(episode):
     version = "wechat-source-evidence-v1" if episode.get("content_kind") == "wechat_article" else PROMPT_VERSION + ("-asr-scope2" if episode["source_kind"] == "local_asr_sample" else "")
+    if episode["source_kind"] == "third_party_transcript":
+        version += "-third-party-partial-v1"
     # The chunk boundaries are part of the cache identity, including JSON
     # overhead. Never mix older per-index chunks with the bounded prompt layout.
     return version + ("-deepseek-v2-bounded" if summary_config()["provider"] == "deepseek" else "")
@@ -220,6 +222,8 @@ def discover(names, limit):
                 if found >= limit:
                     break
             result.append({"feed": key, "success": True, "items": found})
+        except local_module("schedule_policy").OffPeakDeferred:
+            raise
         except Exception as exc:
             result.append({"feed": key, "success": False, "error": str(exc)})
         print(json.dumps(result[-1], ensure_ascii=False), flush=True)
@@ -539,7 +543,8 @@ def summarize(eid):
                     prompt + "\n上次输出的JSON格式或引用无效。请重新生成更简短的严格JSON，所有引用必须来自原资料。"}]
 
     def chunk_prompt(chunk):
-        material = [{"segment_id": s["id"], "speaker": s.get("speaker", ""), "text": s["text"]} for s in chunk]
+        material = [{"segment_id": s["id"], "speaker": s.get("speaker", ""), "text": s["text"],
+                     **({"source_notes": s["source_notes"]} if s.get("source_notes") else {})} for s in chunk]
         prompt = "总结这段访谈：overview不超过100个汉字，提取3至5条主要观点，每条不超过70个汉字。资料：\n" + json.dumps(material, ensure_ascii=False)
         if is_article:
             prompt = (f"公众号：{episode['account']}；标题：{episode['title']}。只据以下正文片段生成不超过120字的overview和1至5个短要点，短文不凑数，"
@@ -548,6 +553,11 @@ def summarize(eid):
             prompt = ("以下资料是有识别错误的自动转写。只总结商业机制和观点，不列举人名、公司名，不猜测或改正专名。"
                       "只挑选原文明说且范围清楚的3至4个要点。不要把某一细分行业或某些公司的状态推断为整个行业，"
                       "不得自行添加盈利前景、长期收益或因果关系。范围不清的内容舍弃。" + prompt)
+        if episode["source_kind"] == "third_party_transcript":
+            prompt = ("以下是第三方自动转写，未经逐句音频核验，可能有识别错误、重复、错配说话人或遗漏。"
+                      "source_notes是转录限制，不是访谈内容；对标注冲突或不可靠的内容不要作确定引文。"
+                      "只概括证据清楚的观点，不推断说话人，不把嘉宾预测或个人经验当成事实或投资建议。"
+                      "只覆盖当前提供的文字，不声称覆盖整期音频。" + prompt)
         return prompt
 
     chunks = (bounded_summary_chunks(episode["segments"], chunk_prompt) if client
@@ -575,6 +585,9 @@ def summarize(eid):
                   "引用保留原始segment_ids。不可把嘉宾预测说成已发生事实。\n" + json.dumps(items, ensure_ascii=False))
         if is_article:
             prompt = prompt.replace("嘉宾预测", "作者观点或预测").replace("6至8", "4至6")
+        if episode["source_kind"] == "third_party_transcript":
+            prompt = ("第三方转录未经逐句听校且存在缺失，仅合并提供的文字观点；"
+                      "不声称覆盖整期，不推断说话人，不补充预测为事实。" + prompt)
         return prompt
 
     while len(summaries) > 1:
@@ -587,7 +600,17 @@ def summarize(eid):
                 merged.append(group[0])
                 continue
             ids = {ref for s in group for p in s["points"] for ref in p["segment_ids"]}
-            merged.append(infer(merge_prompt(group), ids, 1700))
+            prompt = merge_prompt(group)
+            # A window boundary can pause a long transcript during merging too.
+            # Key each completed merge by its actual input so resuming does not
+            # pay for work already completed at an earlier level of the tree.
+            path = cache / ("merge-" + hashlib.sha256(prompt.encode()).hexdigest() + ".json")
+            if path.exists():
+                summary = validate_summary(json.loads(path.read_text()), ids)
+            else:
+                summary = infer(prompt, ids, 1700)
+                write_json(path, summary)
+            merged.append(summary)
         summaries = merged
     summary = summaries[0]
     episode.update({"status": "summarized", "summary": summary, "summary_signature": signature, "summarized_at": now()})

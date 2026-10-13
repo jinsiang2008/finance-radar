@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "adapter": "timestamped_interview_markdown_v1",
+  "id": "alan-justinsun-20261010",
+  "show": "邵艾伦 Alan 对谈",
+  "title": "对话孙宇晨：年轻人如何抓住AI时代的机会？",
+  "language": "zh",
+  "source_url": "https://www.youtube.com/watch?v=0Z-vhBvBmUY",
+  "published_at": null,
+  "announcement_release_date": "2026-10-10",
+  "announcement_source_url": "https://www.bilibili.com/video/BV176pp69Eom/",
+  "published_at_note": "作者B站预告为10月10日中午12点；YouTube原站本次只核实标题和作者，未核实精确发布日期，不把预告时间当作实际发布时间。",
+  "duration_seconds": 15749,
+  "duration_basis": "第三方转录声明及57个连续转录块的首尾时间；未从原视频播放器独立核验。",
+  "transcript_provider": "wousp112",
+  "transcript_commit": "db8ddd2c2578837a3c900901b24a3108a290d1ea",
+  "transcript_url": "https://github.com/wousp112/justin-sun-alan-shao-ai-notes/blob/db8ddd2c2578837a3c900901b24a3108a290d1ea/%E5%85%A8%E6%96%87.md",
+  "transcript_raw_url": "https://raw.githubusercontent.com/wousp112/justin-sun-alan-shao-ai-notes/db8ddd2c2578837a3c900901b24a3108a290d1ea/%E5%85%A8%E6%96%87.md",
+  "transcript_sha256": "31a119ca7d9ae5a722f5e1dcf8c9ba7d6026e72ffbf2136aa9706d4200d36744",
+  "transcription_method": "据转录作者说明：Gemini 3.8 Flash按5分钟音轨分段转录，邻段重叠20秒；部分失败段重新短切转录；仅首、中、尾各30秒抽样比对，未逐句人工听校；说话人按分段发言量推定。",
+  "license_url": "https://github.com/wousp112/justin-sun-alan-shao-ai-notes/blob/db8ddd2c2578837a3c900901b24a3108a290d1ea/LICENSE",
+  "rights_notice": "来源LICENSE明确：访谈内容及全文.md版权归孙宇晨、邵艾伦；仓库CC BY 4.0只适用于精华、教程与AGENT.md，不适用于逐字稿。全文仅作为私有阅读资料，不能随代码公开发布。",
+  "expected_structure": {
+    "turns": 1743,
+    "blocks": 57,
+    "continuations": 1,
+    "timestamp_backtracks": 52,
+    "last_timestamp_seconds": 15736
+  },
+  "excluded_blocks": [
+    {
+      "start_seconds": 1680,
+      "reason": "转录作者标注本块与上一块的重叠内容对不上，其中一段可能不是录音原文；本块不进入阅读证据或模型摘要。排除按源转录块而非精确音频删节，邻块仍存在重叠。"
+    }
+  ],
+  "warnings": [
+    "第三方自动转录，未逐句对照原音频；不能当作已核验的官方字幕。",
+    "已排除00:28–00:33源转录块；并非完整无缺的逐字稿。",
+    "原稿有52次分段重叠导致的时间回退，剩余发言按原稿顺序保留，不擅自去重或改写。",
+    "00:32:40源块两位说话人的发言未分开，其他说话人标签也可能误判；引用前需回听。",
+    "末条有时间戳的发言在04:22:16，距离来源声明的总时长还剩13秒，未为这13秒补造内容。"
+  ],
+  "coverage_note": "第三方自动转写，未经原音频逐句核验。原稿1743条发言已排除作者标注疑似不符原音频的00:28–00:33转录块，其余重叠和说话人不确定保留；这是部分可用转录，不能视为已核验完整字幕。原始视频和转录来源均可回查。"
+}

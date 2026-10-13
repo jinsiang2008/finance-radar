@@ -199,6 +199,16 @@ KOLS = {
         "impact": "medium",
         "category": "growth",
     },
+    "justinsun": {
+        "name": "Justin Sun",
+        "name_cn": "孙宇晨",
+        "search_terms": ["Justin Sun", "孙宇晨"],
+        "impact": "medium",
+        "category": "investor",
+        # Official account linked by https://linktr.ee/tron_dao, verified
+        # 2026-10-13. Retain news discovery when the public X reader is down.
+        "x_handle": "justinsuntron",
+    },
     # ─── X / 社交源 ───
     "serenity": {
         "name": "Serenity",
@@ -227,6 +237,7 @@ HOT_KOL_KEYS = (
     "pangongsheng",
     "dimon",
     "serenity",
+    "justinsun",
 )
 _UNKNOWN_HOT_KOL_KEYS = set(HOT_KOL_KEYS) - set(KOLS)
 if _UNKNOWN_HOT_KOL_KEYS:
@@ -762,6 +773,10 @@ def search_x(handle: str, max_results: int = 10) -> list[dict[str, Any]]:
             if callable(fetch_tweets):
                 tweets = fetch_tweets(handle)
             else:
+                if handle.casefold() != "aleabitoreddit":
+                    # The legacy reader has no account argument and always
+                    # reads Serenity. Never relabel those posts as another KOL.
+                    raise XSourceError("source_handle_unsupported")
                 tweets = st.parse_tweets(st.fetch_page())
             if not isinstance(tweets, list):
                 raise XSourceError("source_bad_payload")
@@ -871,6 +886,15 @@ def scan_kol(kol_key: str, max_results: int = 5) -> list[dict[str, Any]]:
     # Own-platform posts come first: they are the primary source for anything
     # the news feeds will only report on later. They take at most half the
     # budget so news coverage is never crowded out entirely.
+    x_handle = kol.get("x_handle")
+    if x_handle:
+        for item in search_x(x_handle, max(1, max_results // 2)):
+            if item["url"] not in seen:
+                seen.add(item["url"])
+                annotated = annotate(item)
+                if annotated is not None:
+                    results.append(annotated)
+
     truth_handle = kol.get("truth_handle")
     if truth_handle:
         for item in search_truth_social(

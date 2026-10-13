@@ -184,6 +184,10 @@ def refresh(per_source=2, fixture_dir=None):
             raw_path.write_bytes(body)
             state = ingest_feed(source, body, per_source)
             state["retrieval_mode"] = "fixture" if fixture_dir else "live_public_rss"
+        except poc.local_module("schedule_policy").OffPeakDeferred:
+            # Preserve the last source state and stop the batch. A cost-window
+            # pause is neither a broken RSS source nor a completed refresh.
+            raise
         except Exception as exc:
             state = {**previous.get(source["id"], {}), **source, "status": "failed", "last_checked_at": poc.now(), "error": str(exc)}
         states.append(state)
@@ -217,6 +221,8 @@ def summarize_batch(max_articles=6):
         try:
             completed = poc.summarize(article["id"])
             result.append({"id": article["id"], "status": completed["status"]})
+        except poc.local_module("schedule_policy").OffPeakDeferred:
+            raise
         except Exception as exc:
             failed = poc.load_episode(article["id"])
             failed.update({"status": "failed", "error": str(exc)})

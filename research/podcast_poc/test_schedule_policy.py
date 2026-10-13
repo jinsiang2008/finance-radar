@@ -35,3 +35,27 @@ class ScheduleTests(unittest.TestCase):
         self.assertTrue(policy.snapshot(dt("2026-10-07T18:00").isoformat(), at=dt("2026-10-08T09:00"))["due"])
         with self.assertRaises(ValueError):
             policy.period_at(datetime(2026, 10, 8))
+
+    def test_off_peak_only_never_starts_overdue_or_manual_work_in_peak(self):
+        for at, boundary in (("2026-10-13T09:00", "2026-10-13T12:00"),
+                             ("2026-10-13T14:00", "2026-10-13T18:00")):
+            result = policy.snapshot("2026-10-10T00:00:00+08:00", at=dt(at), off_peak_only=True)
+            self.assertFalse(result["due"])
+            self.assertFalse(result["execution_allowed"])
+            self.assertEqual(result["manual_execution_policy"], "off_peak_only")
+            self.assertEqual(result["deferred_reason"], "off_peak_only")
+            self.assertEqual(datetime.fromisoformat(result["next_check_at"]), dt(boundary))
+            self.assertEqual(datetime.fromisoformat(result["next_run_at"]), dt(boundary))
+
+    def test_first_run_in_peak_waits_and_weekends_holidays_remain_eligible(self):
+        result = policy.snapshot(at=dt("2026-10-13T10:17"), off_peak_only=True)
+        self.assertFalse(result["due"])
+        self.assertEqual(datetime.fromisoformat(result["next_run_at"]), dt("2026-10-13T12:00"))
+        for stamp in ("2026-10-13T12:00", "2026-10-13T18:00", "2026-10-10T10:00", "2026-10-01T10:00"):
+            self.assertTrue(policy.snapshot(at=dt(stamp), off_peak_only=True)["due"])
+
+    def test_paid_call_guard_exposes_next_window_without_provider_error(self):
+        policy.require_off_peak(at=dt("2026-10-13T08:59"))
+        with self.assertRaises(policy.OffPeakDeferred) as caught:
+            policy.require_off_peak(at=dt("2026-10-13T09:00"))
+        self.assertEqual(datetime.fromisoformat(caught.exception.not_before), dt("2026-10-13T12:00"))

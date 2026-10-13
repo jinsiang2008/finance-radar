@@ -38,8 +38,9 @@ class _NoRedirect(HTTPRedirectHandler):
 
 
 class ReadingRuntime:
-    def __init__(self, data_dir, *, client_factory=None):
+    def __init__(self, data_dir, *, client_factory=None, clock=None):
         self.data = Path(data_dir)
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
         if not self.data.is_absolute():
             raise ReadingUnavailable("KOL_READING_DATA_DIR must be an absolute directory")
         # Separate function globals preserve local POC callers and isolated tests.
@@ -54,12 +55,13 @@ class ReadingRuntime:
         self.poc.ALLOW_PODCAST_JOBS = True
         self.poc.refresh_podcasts = self.refresh_podcasts
         self.engine = reading_jobs.Engine(self.poc)
+        self.poc.reading_schedule = self.schedule_status
         self.allowed_feeds = {value[2] for value in self.poc.FEEDS.values()}
         self.allowed_feeds.update(source["feed_url"] for source in self.poc.wechat_module().source_config())
 
     def settings(self):
         fallback = {"enabled": False, "provider": "unconfigured", "model": "unconfigured",
-                    "peak_minutes": 240, "off_peak_minutes": 60}
+                    "peak_minutes": 240, "off_peak_minutes": 60, "off_peak_only": True}
         try:
             value = json.loads((self.data / "runtime" / "production-config.json").read_text())
         except (OSError, ValueError):
@@ -69,7 +71,7 @@ class ReadingRuntime:
                 or value.get("configured") is not True):
             return fallback
         return {"enabled": value.get("enabled") is True, "provider": "deepseek", "model": value["model"],
-                "peak_minutes": 240, "off_peak_minutes": 60}
+                "peak_minutes": 240, "off_peak_minutes": 60, "off_peak_only": True}
 
     def publish_configuration(self, *, model, enabled):
         if model not in SUPPORTED_MODELS:
@@ -77,6 +79,7 @@ class ReadingRuntime:
         self.poc.write_json(self.data / "runtime" / "production-config.json",
                             {"provider": "deepseek", "model": model, "configured": True,
                              "enabled": bool(enabled), "peak_minutes": 240, "off_peak_minutes": 60,
+                             "off_peak_only": True,
                              "updated_at": self.poc.now()})
 
     def fetch_feed(self, url, *, limit):
@@ -84,6 +87,7 @@ class ReadingRuntime:
         # fetches a supplied article/audio URL or follows a feed's arbitrary redirect.
         if url not in self.allowed_feeds or not url.startswith("https://"):
             raise ValueError("Only configured HTTPS reading feeds may be fetched")
+        schedule_policy.require_off_peak(at=self.clock())
         opener = build_opener(ProxyHandler({}), _NoRedirect())
         request = Request(url, headers={"User-Agent": "KOLReading/1", "Accept": "application/rss+xml, application/xml"})
         with opener.open(request, timeout=25) as response:
@@ -93,20 +97,27 @@ class ReadingRuntime:
         return body
 
     def refresh_podcasts(self):
+        schedule_policy.require_off_peak(at=self.clock())
         results = self.poc.discover(list(self.poc.FEEDS), limit=3)
         self.engine._runtime_update(podcast_last_check_at=self.poc.now(),
                                     podcast_successful_sources=sum(bool(row.get("success")) for row in results),
                                     podcast_source_count=len(results))
 
+    def schedule_status(self):
+        runtime = self.engine.runtime_snapshot()
+        return schedule_policy.snapshot(runtime.get("last_check_at"), at=self.clock(),
+                                        peak_minutes=240, off_peak_minutes=60, off_peak_only=True)
+
     def status(self):
         settings, runtime = self.settings(), self.engine.runtime_snapshot()
-        state = schedule_policy.snapshot(runtime.get("last_check_at"), peak_minutes=240, off_peak_minutes=60)
+        state = self.schedule_status()
         state.update(runtime)
         state.update(settings)
         if state.get("provider_blocked"):
             state["automatic_paused_reason"] = reading_jobs.PROVIDER_ERRORS.get(state["provider_blocked"], reading_jobs.PUBLIC_FAILURE)
         state.update(worker_alive=False, scheduler="systemd_worker", jobs=self.engine.snapshot(),
-                     transcript_policy="existing_transcripts_only", automatic_audio_transcription=False)
+                     transcript_policy="existing_transcripts_only", automatic_audio_transcription=False,
+                     deepseek_audio_transcription=False, paid_call_boundary="before_each_request")
         try:
             heartbeat = json.loads((self.data / "runtime" / "worker-heartbeat.json").read_text())
             stamp = datetime.fromisoformat(heartbeat["updated_at"])

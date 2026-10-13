@@ -672,6 +672,61 @@ class PublishedAtParsingTests(unittest.TestCase):
         )
 
 
+class JustinSunCollectorTests(unittest.TestCase):
+    def tearDown(self):
+        kol_tracker.X_SOURCE_WARNINGS.pop("justinsuntron", None)
+
+    @staticmethod
+    def news(index=0):
+        return {"title": f"Justin Sun discusses stablecoin settlement growth {index}",
+                "snippet": "The founder discussed digital finance and stablecoin payments.",
+                "url": f"https://example.com/justin-sun/{index}", "source": "Bing News"}
+
+    def test_new_kol_has_hot_cadence_and_full_name_discovery(self):
+        profile = kol_tracker.KOLS["justinsun"]
+        self.assertEqual(profile["name_cn"], "孙宇晨")
+        self.assertEqual(profile["search_terms"], ["Justin Sun", "孙宇晨"])
+        self.assertEqual(profile["x_handle"], "justinsuntron")
+        self.assertIn("justinsun", kol_tracker.HOT_KOL_KEYS)
+        self.assertNotIn("justinsun", kol_tracker.REGULAR_KOL_KEYS)
+
+    def test_official_posts_reserve_room_for_news(self):
+        posts = [{"title": "Stablecoin settlement demand continues to grow",
+                  "snippet": "Stablecoin settlement demand continues to grow across the network.",
+                  "url": f"https://x.com/justinsuntron/status/{i}",
+                  "source": "X @justinsuntron"} for i in range(6)]
+        with mock.patch.object(kol_tracker, "search_x", side_effect=lambda handle, limit: posts[:limit]) as direct, \
+             mock.patch.object(kol_tracker, "search_kol", return_value=[self.news(i) for i in range(6)]) as search:
+            result = kol_tracker.scan_kol("justinsun", max_results=6)
+        direct.assert_called_once_with("justinsuntron", 3)
+        self.assertTrue(search.called)
+        self.assertEqual(len(result), 6)
+        self.assertEqual([item["attribution_basis"] for item in result],
+                         ["direct_source"] * 3 + ["person_mention"] * 3)
+
+    def test_x_failure_keeps_news_and_explicit_source_warning(self):
+        def unavailable(handle, limit):
+            kol_tracker._set_x_source_warning(handle, "source_unavailable")
+            return []
+        with mock.patch.object(kol_tracker, "search_x", side_effect=unavailable), \
+             mock.patch.object(kol_tracker, "search_kol", return_value=[self.news()]) as search:
+            result = kol_tracker.scan_kol("justinsun", max_results=5)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["attribution_basis"], "person_mention")
+        self.assertEqual([call.args[1] for call in search.call_args_list], ["Justin Sun", "孙宇晨"])
+        self.assertEqual(kol_tracker.X_SOURCE_WARNINGS["justinsuntron"]["code"], "source_unavailable")
+
+    def test_legacy_serenity_only_reader_cannot_relabel_posts_as_justin_sun(self):
+        legacy = types.SimpleNamespace(fetch_page=mock.Mock(), parse_tweets=mock.Mock())
+        with mock.patch.dict(sys.modules, {"serenity_tracker": legacy}), \
+             mock.patch.object(kol_tracker.time, "sleep"), redirect_stderr(StringIO()):
+            result = kol_tracker.search_x("justinsuntron")
+        self.assertEqual(result, [])
+        legacy.fetch_page.assert_not_called()
+        legacy.parse_tweets.assert_not_called()
+        self.assertEqual(kol_tracker.X_SOURCE_WARNINGS["justinsuntron"]["code"], "source_handle_unsupported")
+
+
 class CollectorFailureTests(unittest.TestCase):
     def test_required_database_write_failure_propagates(self) -> None:
         fake_db = types.SimpleNamespace(

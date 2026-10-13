@@ -1,5 +1,6 @@
 """Offline concurrency and recovery tests; never invoke inference or RSS services."""
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 import fcntl
 import hashlib
 import json
@@ -12,6 +13,7 @@ import unittest
 import uuid
 
 from research.podcast_poc.reading_jobs import Engine, PUBLIC_FAILURE, MAX_INTERRUPTION_RECOVERIES
+from research.podcast_poc import schedule_policy
 
 
 class FakePoc:
@@ -99,6 +101,18 @@ class ReadingJobTests(unittest.TestCase):
         self.assertEqual(len({job["id"] for job in results}), 1)
         self.assertEqual(len(self.engine.snapshot()), 1)
         self.assertEqual(self.poc.calls, [])
+
+    def test_legacy_queue_migration_is_concurrent_and_preserves_pending_job(self):
+        queued = self.engine.enqueue("wx-example")
+        with self.engine._connection() as connection:
+            connection.execute("ALTER TABLE jobs DROP COLUMN not_before")
+            connection.execute("ALTER TABLE jobs DROP COLUMN deferred_reason")
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            list(executor.map(lambda _index: Engine(self.poc), range(5)))
+        result = self.job(queued["id"])
+        self.assertEqual(result["state"], "queued")
+        self.assertIsNone(result["not_before"])
+        self.assertIsNone(result["deferred_reason"])
 
     def test_concurrent_process_requests_share_one_job(self):
         context = multiprocessing.get_context("spawn")
@@ -279,6 +293,46 @@ class ReadingJobTests(unittest.TestCase):
         self.assertTrue(self.engine.run_one(allow_automatic=False))
         self.assertEqual(self.job(refresh["id"])["state"], "queued")
         self.assertEqual(self.job(automatic["id"])["state"], "completed")
+
+    def test_peak_policy_defers_manual_and_automatic_work_without_attempt(self):
+        clock = [datetime.fromisoformat("2026-10-13T10:00:00+08:00")]
+        self.poc.reading_schedule = lambda: schedule_policy.snapshot(at=clock[0], off_peak_only=True)
+        summary_job = self.engine.enqueue("wx-example", manual=True)
+        refresh_job = self.engine.enqueue_refresh(manual=True)
+        self.assertEqual(summary_job["deferred_reason"], "off_peak_only")
+        self.assertEqual(refresh_job["deferred_reason"], "off_peak_only")
+        self.assertFalse(self.engine.run_one(allow_automatic=False))
+        self.assertEqual(self.poc.calls, [])
+        self.assertEqual(self.poc.refresh_calls, [])
+        self.assertTrue(all(job["attempts"] == 0 and job["state"] == "queued" for job in self.engine.snapshot()))
+        clock[0] = datetime.fromisoformat("2026-10-13T12:00:00+08:00")
+        self.assertTrue(self.engine.run_one(allow_automatic=False))
+        self.assertEqual(self.job(refresh_job["id"])["state"], "completed")
+        self.assertTrue(self.engine.run_one(allow_automatic=False))
+        self.assertEqual(self.job(summary_job["id"])["state"], "completed")
+        self.assertIsNone(self.job(summary_job["id"])["not_before"])
+
+    def test_mid_job_peak_boundary_requeues_without_failure_or_interruption(self):
+        clock = [datetime.fromisoformat("2026-10-13T08:59:59+08:00")]
+        self.poc.reading_schedule = lambda: schedule_policy.snapshot(at=clock[0], off_peak_only=True)
+        def boundary():
+            clock[0] = datetime.fromisoformat("2026-10-13T09:00:00+08:00")
+            raise schedule_policy.OffPeakDeferred(clock[0])
+        self.poc.before_summary = boundary
+        job = self.engine.enqueue("wx-example", manual=True)
+        self.assertFalse(self.engine.run_one())
+        deferred = self.job(job["id"])
+        self.assertEqual(deferred["state"], "queued")
+        self.assertIsNone(deferred["error"])
+        self.assertEqual(deferred["deferred_reason"], "off_peak_only")
+        self.assertEqual(self.poc.load_episode("wx-example")["status"], "body_ready")
+        self.assertFalse((self.engine.runtime / "reading-errors.jsonl").exists())
+        self.assertFalse(self.engine.run_one())
+        self.assertEqual(self.job(job["id"])["attempts"], 1)
+        self.poc.before_summary = None
+        clock[0] = datetime.fromisoformat("2026-10-13T12:00:00+08:00")
+        self.assertTrue(self.engine.run_one())
+        self.assertEqual(self.job(job["id"])["state"], "completed")
 
     def test_manual_refresh_and_its_summaries_can_run_while_automatic_work_is_paused(self):
         first = self.engine.enqueue_refresh()

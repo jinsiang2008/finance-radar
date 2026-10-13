@@ -30,6 +30,8 @@ function reviewed(a) { return hasBody(a) && a.status === 'summarized' && a.quali
 function summaryReady(a) { return hasBody(a) && a.status === 'summarized' && Boolean(a.summary?.overview || array(a.summary?.points).length); }
 function jobFor(a) { return array(automation?.jobs).find(job=>job?.article_id === a.id); }
 function jobState(a) { return submitting.has(a.id) ? 'submitting' : jobFor(a)?.state || (a.status === 'summarizing' ? 'running' : a.status === 'failed' && hasBody(a) ? 'failed' : ''); }
+function deferred(job) { return job?.state === 'queued' && (job.deferred_reason === 'off_peak_only' || automation?.off_peak_only === true && automation?.execution_allowed === false); }
+function deferredNote(job) { return `等待谷时处理，预计最早 ${beijingDate(job?.not_before || automation?.next_run_at)}（北京时间）。可以先阅读正文，后台恢复后依次处理。`; }
 function modelLabel() { return automation?.provider === 'local_mlx' ? '本地免费模型' : automation?.provider === 'deepseek' ? 'DeepSeek' : '摘要服务'; }
 function recordedModelLabel(a) {
   const inference = a.processing?.inference, model = a.processing?.summary_model;
@@ -41,6 +43,7 @@ function status(a) {
   if (!hasBody(a)) return a.status === 'failed' ? ['正文未取得','failed'] : ['仅简介','pending'];
   if (reviewed(a)) return ['文字已复核','done'];
   if (!summaryReady(a)) {
+    if (deferred(jobFor(a))) return ['等待谷时','pending'];
     const current = ({submitting:['正在提交','pending'],queued:['摘要已排队','pending'],running:['摘要处理中','pending'],completed:['摘要已完成','done'],failed:['摘要生成失败','failed']})[jobState(a)];
     if (current) return current;
   }
@@ -124,22 +127,24 @@ function showAutomation() {
   if (!automation) { label.textContent='状态未提供'; box.append(el('p','','后台尚未提供自动检查状态。')); return; }
   const pausedReason = typeof automation.automatic_paused_reason === 'string' ? automation.automatic_paused_reason.trim() : '';
   const paused = Boolean(automation.provider_blocked || pausedReason);
-  label.textContent = paused ? '自动处理已暂停' : automation.enabled === true ? automation.worker_alive === true ? '已开启' : '已开启 · 后台未运行' : '未开启';
-  box.append(el('p','automation-policy',`配置频率（北京时间）：空闲每 ${intervalLabel(automation.off_peak_minutes)}，高峰每 ${intervalLabel(automation.peak_minutes)} 检查一次。`));
+  const waiting = automation.off_peak_only === true && automation.execution_allowed === false;
+  label.textContent = paused ? '自动处理已暂停' : automation.enabled === true ? automation.worker_alive === true ? waiting ? '已开启 · 等待谷时' : '已开启' : '已开启 · 后台未运行' : '未开启';
+  box.append(el('p','automation-policy',automation.off_peak_only ? `配置频率（北京时间）：谷时每 ${Number.isFinite(automation.off_peak_minutes)?automation.off_peak_minutes:60} 分钟检查；高峰只排队，抓取和摘要等待谷时。` : `配置频率（北京时间）：空闲每 ${intervalLabel(automation.off_peak_minutes)}，高峰每 ${intervalLabel(automation.peak_minutes)} 检查一次。`));
   const period = automation.period === 'peak' ? '高峰' : automation.period === 'off_peak' ? '空闲' : '时段待确认';
   box.append(el('p','',`当前：${period}。分时检查采用 DeepSeek 峰谷规则。`),el('p','automation-provider',`实际摘要服务：${modelLabel()}${typeof automation.model === 'string' && automation.model ? `（${automation.model}）` : ''}。`));
   box.append(el('p','',paused ? '已暂停安排新的自动检查与摘要任务。已有内容仍可阅读。' : automation.enabled === true ? '发现新文章后，由后台安排检查与摘要任务。' : '定时检查未开启；有正文的文章可以手动生成摘要。'));
+  if(waiting&&!paused)box.append(el('p','automation-deferred',`高峰期间仍可阅读已有内容、安排摘要；最早 ${beijingDate(automation.next_run_at)}（北京时间）恢复处理。`));
   if (paused) box.append(el('p','automation-warning automation-paused-reason',pausedReason || '摘要服务暂不可用，自动任务等待服务恢复。'));
   box.append(el('p','automation-worker',`后台进程：${automation.worker_alive === true ? '运行中' : automation.worker_alive === false ? '未运行' : '状态未提供'}`));
-  box.append(el('p','',`最近检查：${beijingDate(automation.last_check_at)}`),el('p','',`最近成功：${beijingDate(automation.last_success_at)}`),el('p','automation-next-check',`下次检查：${paused ? '暂停中，当前不安排自动检查' : automation.enabled === true ? beijingDate(automation.next_check_at) : '未安排'}`));
-  if (automation.calendar_status === 'unknown_year') box.append(el('p','automation-warning','节假日表待更新；工作日白天暂按高峰频率检查。'));
+  box.append(el('p','',`最近检查：${beijingDate(automation.last_check_at)}`),el('p','',`最近成功：${beijingDate(automation.last_success_at)}`),el('p','automation-next-check',`下次检查：${paused ? '暂停中，当前不安排自动检查' : automation.enabled === true ? `${beijingDate(automation.next_check_at || automation.next_run_at)}（北京时间）` : '未安排'}`));
+  if (automation.calendar_status === 'unknown_year') box.append(el('p','automation-warning',automation.off_peak_only?'节假日表待更新；工作日高峰暂只排队。':'节假日表待更新；工作日白天暂按高峰频率检查。'));
   if (automation.credentials_status === 'authentication_failed' && !paused) box.append(el('p','automation-warning',session.isKol?'DeepSeek 服务验证失败，自动处理尚未开启；请稍后重试。':'DeepSeek 密钥验证失败，定时处理尚未开启；请先在本机终端更新密钥。'));
   if (automation.worker_alive !== true) box.append(el('p','automation-warning','后台当前未运行，已排队任务需等待服务恢复。'));
 }
 function schedulePoll() {
   clearTimeout(pollTimer);
   if (!session.authenticated()) return;
-  const busy = array(automation?.jobs).some(job=>['queued','running'].includes(job?.state));
+  const busy = array(automation?.jobs).some(job=>job?.state==='running'||job?.state==='queued'&&!deferred(job));
   pollTimer = setTimeout(()=>load({background:true}),busy ? 5000 : 30000);
 }
 function updateJobUI() {
@@ -148,14 +153,14 @@ function updateJobUI() {
   if (badge) { setText(badge,label); badge.className=`status ${kind}`; }
   const controls = active.generation;
   if (!controls) return;
-  const current = jobState(a), job = jobFor(a), busy = ['submitting','queued','running'].includes(current), complete = current === 'completed';
+  const current = jobState(a), job = jobFor(a), waiting=deferred(job), busy = ['submitting','queued','running'].includes(current), complete = current === 'completed';
   const errors = requestErrors.get(a.id) || (current === 'failed' ? job?.error || a.error || '摘要任务未能完成，可以稍后重试。' : '');
-  setText(controls.title,({submitting:'正在提交摘要请求',queued:'摘要已排队',running:'正在生成摘要',completed:'摘要已完成',failed:'摘要生成失败'})[current] || '这篇文章还没有摘要');
-  setText(controls.note,({submitting:'正在向后台提交，请稍候。',queued:'后台会依次处理。你可以继续阅读正文，完成后此处自动更新。',running:'正在整理正文与出处，完成后此处自动更新。',completed:'后台已完成任务，正在等待最新摘要内容。',failed:'已获取的正文仍可阅读；重试只会提交这篇文章。'})[current] || '可以按需生成要点与出处，也可以直接阅读已获取正文。');
+  setText(controls.title,waiting?'等待谷时处理':({submitting:'正在提交摘要请求',queued:'摘要已排队',running:'正在生成摘要',completed:'摘要已完成',failed:'摘要生成失败'})[current] || '这篇文章还没有摘要');
+  setText(controls.note,waiting?deferredNote(job):({submitting:'正在向后台提交，请稍候。',queued:'后台会依次处理。你可以继续阅读正文，完成后此处自动更新。',running:'正在整理正文与出处，完成后此处自动更新。',completed:'后台已完成任务，正在等待最新摘要内容。',failed:'已获取的正文仍可阅读；重试只会提交这篇文章。'})[current] || `可以按需安排要点与出处，也可以直接阅读已获取正文。${automation?.off_peak_only?'高峰提交后等待谷时执行。':''}`);
   setText(controls.error,typeof errors === 'string' ? errors : '摘要请求失败，请稍后重试。'); controls.error.hidden = !errors;
   controls.generate.hidden = complete;
   controls.generate.disabled = busy || (!session.isKol && !csrfToken);
-  setText(controls.generate,({submitting:'正在提交…',queued:'已排队',running:'正在生成…'})[current] || (current === 'failed' || errors ? '重试生成摘要' : '立即生成摘要'));
+  setText(controls.generate,waiting?'等待谷时':({submitting:'正在提交…',queued:'已排队',running:'正在生成…'})[current] || (current === 'failed' || errors ? '重新安排摘要' : '安排摘要'));
   setText(controls.provider,`${modelLabel()}${automation?.model ? ` · ${automation.model}` : ''}${!session.isKol && !csrfToken && !busy ? ' · 服务暂不可提交，请刷新列表后重试' : ''}`);
   controls.root.dataset.state = current || 'ready'; controls.root.setAttribute('aria-busy',String(busy));
 }
@@ -361,7 +366,7 @@ function select(a,{focus=false,mobileOpen=false,preserve=false}={}) {
       empty.id='summary-generation';
       const title=el('h3'), note=el('p','summary-job-note'), error=el('p','error-box'), provider=el('p','generation-provider');
       title.id='summary-job-status'; title.setAttribute('role','status'); error.id='summary-job-error'; error.setAttribute('role','alert'); error.hidden=true;
-      const actions=el('div','generation-actions'), generate=button('立即生成摘要','generate-summary',()=>generateSummary(a.id)); generate.id='generate-summary';
+      const actions=el('div','generation-actions'), generate=button('安排摘要','generate-summary',()=>generateSummary(a.id)); generate.id='generate-summary';
       actions.append(generate,button('阅读正文','read-original-button',()=>setView('original'))); empty.append(title,note,error,actions,provider);
       active.generation={root:empty,title,note,error,generate,provider};
     } else {

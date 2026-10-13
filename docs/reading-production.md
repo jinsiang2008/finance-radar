@@ -16,7 +16,7 @@ KOL_DASHBOARD_DB=/opt/kol-dashboard/data/kol_dashboard.db
 
 worker 从现有 `/etc/kol-dashboard/deepseek.env` 获取凭据；该文件必须是 `root:root 0600` 的普通文件。发布脚本只检查文件属性，不读取、复制、改写或创建凭据。Web 不加载此环境文件。原 Daily/enrichment 后台单元继续按原契约使用它。worker 禁止 core dump，日志为 `/var/log/kol-dashboard/reading.log`、`reading.err.log`，权限 `0600`。
 
-worker 消费持久队列并在内部判断是否到期，默认空闲 60 分钟、高峰 240 分钟；不新增 systemd timer 或 Codex 自动化。机器上的运行状态与代码中的默认值应分别核验。公网代理、五个既有采集 timer 和 enrichment 唤醒 path 沿用现有流程。
+worker 消费持久队列并在内部判断是否到期：线上仅谷时抓取与摘要，谷时每 60 分钟检查新内容，高峰仅排队；手动摘要同样等待谷时。每次 RSS 请求和每个 DeepSeek 分块、重试、合并前重新判断时段，正在进行的请求允许结束。已完成分块及合并缓存，暂停不计失败，不增加付费调用计数。状态提供 `off_peak_only`、`execution_allowed`、`next_run_at` 以及任务的 `not_before`、`deferred_reason`；不新增 systemd timer 或 Codex 自动化。机器上的运行状态与代码中的默认值应分别核验。公网代理、五个既有采集 timer 和 enrichment 唤醒 path 沿用现有流程。
 
 系统 `/usr/bin/python3` 需要既有 FastAPI/Uvicorn，以及 `beautifulsoup4>=4.12,<5`。Ubuntu 的兼容 `python3-bs4` 包可满足此范围。发布在停止旧服务之前执行 `import bs4, reading_service`；缺依赖直接失败，脚本不会隐式运行 pip、apt 或系统升级。
 
@@ -87,3 +87,12 @@ bash -n kol_dashboard/deploy.sh
 - 验证共 870 项 KOL 测试、86 项 POC 测试、3 项源代码仓库契约，以及真实／模拟浏览器检查。第二次发布实际使用了阅读队列备份和恢复材料保留流程，队列和内容未被清空。
 
 边界：公众号文字来自外部 RSS，未与微信原页及图片逐项核对；模型输出仍是待复核初稿。引用编号完整性不等于语义正确性，正文片段导出语义抽查被自动审批拒绝，未进行该导出。播客目前自动发现节目、手动总结已有真实文字稿；尚无服务器自动获取文字稿或整集 ASR，也不提供逐段全文翻译。
+
+## 2026-10-13 谷时阅读与孙宇晨
+
+- 使用官方北京时间规则：工作日（法定假期除外）09:00–12:00、14:00–18:00 为高峰；其他时间为谷时。2026 假期表显式维护，未知年份的工作日白天保守不处理。模型 token 的输入和输出谷价为峰价一半，RSS 和本地语音识别本身不消耗 DeepSeek token；实时新闻现有采集与解读频率不变。
+- `justinsun` 进入 KOL 热点组，随现有 15 分钟采集批次扫描。官方 X `@justinsuntron` 和媒体搜索并行覆盖，X 失败保留告警、继续新闻。人物提及和 TRON 关联报道分别分类，不把公司消息归为本人说法。
+- 已确认的邵艾伦 × 孙宇晨访谈使用原始 YouTube 节目链接；本次取得的是公开第三方转录，非官方字幕。来源 commit/checksum 与版权归属保存在 `research/podcast_poc/sources/alan-justinsun-20261010.json`，完整文字只进入私人阅读目录，不进入 Git。
+- 适配器排除了来源自行标注疑似不符原音频的 00:28–00:33 转录块；其他重叠和说话人不确定性保留，`source_kind=third_party_transcript`、`coverage.scope=partial`。不补齐缺失音频、说话人或发布日期。自动摘要是待复核初稿，每条观点仍须有已收录段落 ID。
+- 该单集通过受控发布的 `KOL_READING_SEED_ARCHIVE` 导入，只创建不存在的记录，不覆盖已有阅读数据。`import_public_interview.py` 仅在本地校验固定来源并制作私有临时归档，不是自动追踪该 YouTube 频道的订阅器。
+- 完成后的实际发布、测试和摘要元数据见 `offpeak-reading-production-verification.json`。上述配置不代表已自动下载或转写其他播客整集音频。

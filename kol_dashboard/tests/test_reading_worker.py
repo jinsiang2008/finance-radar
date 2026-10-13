@@ -1,10 +1,12 @@
 import fcntl
+from datetime import datetime
 import json
 import tempfile
 import unittest
 from unittest.mock import patch
 
 from kol_dashboard import llm_enrichment, reading_service, reading_worker
+from kol_dashboard.tests.test_reading_service import podcast
 
 
 class ReadingWorkerTests(unittest.TestCase):
@@ -12,11 +14,12 @@ class ReadingWorkerTests(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.config = llm_enrichment.DeepSeekConfig(api_key="test-key-never-sent")
-        self.worker = reading_worker.Worker(self.directory.name, config=self.config)
+        self.clock = lambda: datetime.fromisoformat("2026-10-13T20:00:00+08:00")
+        self.worker = reading_worker.Worker(self.directory.name, config=self.config, clock=self.clock)
         self.worker.runtime.publish_configuration(model=self.config.model, enabled=True)
 
     def test_shared_client_uses_existing_transport_and_preserves_usage(self):
-        client = reading_worker.SharedDeepSeekClient(self.config)
+        client = reading_worker.SharedDeepSeekClient(self.config, clock=self.clock)
         response = llm_enrichment.EnrichmentResponse(result={"overview": "摘要"}, usage=llm_enrichment.ProviderUsage(prompt_tokens=12, completion_tokens=5, total_tokens=17))
         with patch.object(llm_enrichment, "complete_json_with_usage", return_value=response) as complete:
             value = client.generate([{"role": "system", "content": "Output JSON"}, {"role": "user", "content": "Evidence text"}], 1100)
@@ -28,7 +31,7 @@ class ReadingWorkerTests(unittest.TestCase):
         self.assertNotIn(self.config.api_key, json.dumps(client.stats()))
 
     def test_failed_provider_usage_remains_unknown_without_reported_tokens(self):
-        client = reading_worker.SharedDeepSeekClient(self.config)
+        client = reading_worker.SharedDeepSeekClient(self.config, clock=self.clock)
         failure = llm_enrichment.EnrichmentError("network", retry_after_seconds=60)
         with patch.object(llm_enrichment, "complete_json_with_usage", side_effect=failure):
             with self.assertRaises(llm_enrichment.EnrichmentError):
@@ -37,7 +40,7 @@ class ReadingWorkerTests(unittest.TestCase):
         self.assertEqual(client.stats()["usage_unreported_calls"], 1)
 
     def test_local_prompt_rejection_does_not_count_a_paid_api_attempt(self):
-        client = reading_worker.SharedDeepSeekClient(self.config)
+        client = reading_worker.SharedDeepSeekClient(self.config, clock=self.clock)
         with patch.object(llm_enrichment, "_default_transport", side_effect=AssertionError("No network")):
             with self.assertRaises(llm_enrichment.EnrichmentError) as caught:
                 client.generate([{"role": "system", "content": "JSON"},
@@ -45,6 +48,52 @@ class ReadingWorkerTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "invalid_request")
         self.assertEqual(client.stats()["paid_api_calls"], 0)
         self.assertEqual(client.stats()["usage_unreported_calls"], 0)
+
+    def test_peak_paid_call_is_blocked_before_transport_or_usage_counter(self):
+        client = reading_worker.SharedDeepSeekClient(self.config,
+            clock=lambda: datetime.fromisoformat("2026-10-13T09:00:00+08:00"))
+        with patch.object(llm_enrichment, "complete_json_with_usage") as complete:
+            with self.assertRaises(reading_worker.schedule_policy.OffPeakDeferred):
+                client.generate([{"role": "system", "content": "JSON"}, {"role": "user", "content": "Text"}], 1100)
+        complete.assert_not_called()
+        self.assertEqual(client.stats()["paid_api_calls"], 0)
+        self.assertEqual(client.stats()["usage_unreported_calls"], 0)
+
+    def test_chunk_boundary_defers_and_next_window_reuses_paid_chunk(self):
+        clock = [datetime.fromisoformat("2026-10-13T08:59:59+08:00")]
+        worker = reading_worker.Worker(self.directory.name, config=self.config, clock=lambda: clock[0])
+        value = podcast("podcast-boundary")
+        value["segments"].append({"id": "s0002", "text": "A second distinct topic in the interview.", "start_seconds": 20, "end_seconds": 40})
+        worker.runtime.poc.save_episode(value)
+        job = worker.runtime.enqueue_summary(value["id"])
+        calls = []
+        def respond(**kwargs):
+            refs = (["s0001"], ["s0002"], ["s0001", "s0002"])[len(calls)]
+            calls.append(kwargs["user_prompt"])
+            if len(calls) == 1:
+                clock[0] = datetime.fromisoformat("2026-10-13T09:00:00+08:00")
+            return llm_enrichment.EnrichmentResponse(
+                result={"overview": "访谈中的观点。", "points": [{"text": "原文支持这一观点。", "segment_ids": refs}]},
+                usage=llm_enrichment.ProviderUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15))
+        chunks = [[value["segments"][0]], [value["segments"][1]]]
+        with patch.object(worker.runtime.poc, "bounded_summary_chunks", return_value=chunks), \
+             patch.object(llm_enrichment, "complete_json_with_usage", side_effect=respond):
+            self.assertFalse(worker.runtime.engine.run_one())
+            deferred = next(row for row in worker.runtime.engine.snapshot() if row["id"] == job["id"])
+            self.assertEqual(deferred["state"], "queued")
+            self.assertEqual(deferred["deferred_reason"], "off_peak_only")
+            self.assertEqual(len(calls), 1)
+            saved = worker.runtime.poc.load_episode(value["id"])
+            self.assertEqual(saved["processing"]["paid_api_calls"], 1)
+            self.assertEqual(saved["coverage"]["chunks_processed"], 1)
+            self.assertFalse(worker.runtime.engine.run_one())
+            self.assertEqual(len(calls), 1)
+            clock[0] = datetime.fromisoformat("2026-10-13T12:00:00+08:00")
+            self.assertTrue(worker.runtime.engine.run_one())
+        result = worker.runtime.poc.load_episode(value["id"])
+        self.assertEqual(result["status"], "summarized")
+        self.assertEqual(len(calls), 3)  # first chunk, second chunk, merge; no repeated first chunk
+        self.assertEqual(result["processing"]["paid_api_calls"], 3)
 
     def test_due_check_is_bounded_and_resume_enqueues_only_one_refresh(self):
         with patch.object(self.worker.runtime, "status", return_value={"due": True}), \

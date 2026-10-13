@@ -50,6 +50,7 @@ KOL_DIRECTORY: dict[str, dict[str, str]] = {
     "burry": {"name": "Michael Burry", "name_cn": "迈克尔·伯里", "category": "risk"},
     "howardmarks": {"name": "Howard Marks", "name_cn": "霍华德·马克斯", "category": "risk"},
     "cathiewood": {"name": "Cathie Wood", "name_cn": "木头姐", "category": "growth"},
+    "justinsun": {"name": "Justin Sun", "name_cn": "孙宇晨", "category": "investor"},
     "serenity": {"name": "Serenity", "name_cn": "Serenity", "category": "trader"},
 }
 
@@ -83,6 +84,7 @@ _PERSON_ALIASES: dict[str, tuple[str, ...]] = {
     "burry": ("Michael Burry", "迈克尔·伯里"),
     "howardmarks": ("Howard Marks", "霍华德·马克斯"),
     "cathiewood": ("Cathie Wood", "木头姐"),
+    "justinsun": ("Justin Sun", "孙宇晨", "孫宇晨", "justinsuntron"),
     "serenity": ("Serenity", "aleabitoreddit", "@aleabitoreddit"),
 }
 
@@ -106,11 +108,19 @@ _AFFILIATED_COMPANIES: dict[str, tuple[str, ...]] = {
     "burry": ("Scion Asset Management", "Scion"),
     "howardmarks": ("Oaktree Capital", "Oaktree", "橡树资本"),
     "cathiewood": ("ARK Invest", "ARK Investment", "方舟投资"),
+    # Explicit organization/network names avoid confusing Disney's Tron films
+    # with the blockchain; affiliations never imply a statement by Sun.
+    "justinsun": (
+        "TRON DAO", "TRON network", "TRON blockchain", "TRON Foundation",
+        "Tron Inc", "Tron Incorporated", "波场", "波場",
+    ),
 }
 
 _DIRECT_HANDLES = {
     "trump": frozenset({"realdonaldtrump"}),
     "musk": frozenset({"elonmusk"}),
+    # Verified 2026-10-13 via https://linktr.ee/tron_dao.
+    "justinsun": frozenset({"justinsuntron"}),
     "serenity": frozenset({"aleabitoreddit"}),
 }
 
@@ -257,7 +267,12 @@ def _is_owned_direct_source(event: Mapping[str, Any]) -> bool:
     configured = str(event.get("handle") or "").strip().lstrip("@").casefold()
     if configured:
         expected.add(configured)
-    return bool(expected) and _direct_handle(source, url) in expected
+    source_handle = _direct_handle(source, url)
+    # A trusted-looking source label alone cannot authenticate a different
+    # account's permalink. Both identities must name the owned account.
+    return bool(expected) and source_handle in expected and (
+        _direct_handle("", url) == source_handle
+    )
 
 
 def is_owned_direct_source(event: Mapping[str, Any]) -> bool:
@@ -273,10 +288,10 @@ _FINANCE_RE = re.compile(
     r"capex|capital expenditure|cash flow|fiscal|monetary|GDP|econom(?:y|ic)|"
     r"recession|inflation|deflation|interest rates?|rate cut|rate hike|"
     r"central bank|tariffs?|trade war|export controls?|sanctions?|"
-    r"commodit(?:y|ies)|bitcoin|ethereum|crypto|forex|currency|"
+    r"commodit(?:y|ies)|bitcoin|ethereum|crypto|stablecoins?|forex|currency|"
     r"AI spending|AI investment|supply chain)\b|"
     r"A股|港股|美股|股票|股份|股价|市场|债券|国债|收益率|基金|投资|"
-    r"大宗商品|比特币|加密货币|营收|利润|业绩|指引|"
+    r"大宗商品|比特币|加密货币|稳定币|穩定幣|营收|利润|业绩|指引|"
     r"估值|分红|回购|资本开支|经济|财政|货币政策|央行|美联储|国内生产总值|"
     r"衰退|通胀|通缩|降息|加息|利率|关税|贸易战|出口管制|制裁|"
     r"供应链"

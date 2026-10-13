@@ -450,5 +450,58 @@ class EventRelevanceTests(unittest.TestCase):
         self.assertNotEqual(impostor["attribution_basis"], "direct_source")
 
 
+class JustinSunRelevanceTests(unittest.TestCase):
+    @staticmethod
+    def assess(title, **kwargs):
+        return assess_event_relevance(event(
+            title, kol_key="justinsun", kol_name="Justin Sun",
+            kol_name_cn="孙宇晨", **kwargs,
+        ))
+
+    def test_full_person_aliases_include_chinese_and_official_username(self):
+        for name in ("Justin Sun", "孙宇晨", "孫宇晨", "@justinsuntron"):
+            with self.subTest(name=name):
+                result = self.assess(f"{name} discusses stablecoin settlement growth")
+                self.assertTrue(result["intelligence_eligible"])
+                self.assertEqual(result["attribution_basis"], "person_mention")
+
+    def test_affiliated_network_and_company_never_become_personal_statements(self):
+        for name in ("TRON DAO", "TRON network", "TRON blockchain", "Tron Inc.", "波场"):
+            with self.subTest(name=name):
+                result = self.assess(f"{name} reports stablecoin settlement growth")
+                self.assertTrue(result["intelligence_eligible"])
+                self.assertEqual(result["attribution_basis"], "company_mention")
+
+    def test_ambiguous_sun_tron_movie_and_generic_crypto_do_not_match(self):
+        for title in ("Sun rises over global markets", "Justin Bieber invests in stocks",
+                      "Tron film earns record revenue", "Bitcoin rallies as crypto investment grows"):
+            with self.subTest(title=title):
+                result = self.assess(title)
+                self.assertFalse(result["entity_match"])
+                self.assertFalse(result["intelligence_eligible"])
+
+    def test_verified_account_is_direct_but_impostor_or_mismatched_link_is_not(self):
+        title = "Stablecoin settlement volume continues to grow across the network"
+        owned = self.assess(title, source="X @justinsuntron",
+                            url="https://x.com/justinsuntron/status/123")
+        self.assertTrue(owned["intelligence_eligible"])
+        self.assertEqual(owned["attribution_basis"], "direct_source")
+        for source, url in (
+            ("X @justinsuntronn", "https://x.com/justinsuntronn/status/123"),
+            ("X @justinsuntron", "https://x.com/impostor/status/123"),
+            ("X @trondao", "https://x.com/trondao/status/123"),
+        ):
+            with self.subTest(source=source, url=url):
+                result = self.assess(title, source=source, url=url)
+                self.assertFalse(result["intelligence_eligible"])
+                self.assertNotEqual(result["attribution_basis"], "direct_source")
+
+    def test_personal_lifestyle_does_not_inherit_financial_impact(self):
+        result = self.assess("Justin Sun shares photos from a holiday dinner")
+        self.assertTrue(result["entity_match"])
+        self.assertFalse(result["intelligence_eligible"])
+        self.assertEqual(result["rule_impact"], "low")
+
+
 if __name__ == "__main__":
     unittest.main()

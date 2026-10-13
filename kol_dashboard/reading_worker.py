@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime, timezone
 import fcntl
 import json
 import os
@@ -9,6 +10,8 @@ from pathlib import Path
 import signal
 import threading
 import time
+
+from research.podcast_poc import schedule_policy
 
 try:
     from kol_dashboard import llm_enrichment, reading_service
@@ -19,10 +22,11 @@ except ModuleNotFoundError:  # Flat production release.
 
 class SharedDeepSeekClient:
     """Adapts the reading prompts to the existing server's fixed HTTPS boundary."""
-    def __init__(self, config):
+    def __init__(self, config, *, clock=None):
         if config is None:
             raise reading_service.ReadingUnavailable("Reading worker requires the existing DeepSeek configuration")
         self.config = config
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.calls = 0
         self.unknown = 0
         self.usage = {key: 0 for key in ("prompt_tokens", "completion_tokens", "total_tokens")}
@@ -54,6 +58,9 @@ class SharedDeepSeekClient:
                 or len(system_prompt) > 32_000 or not user_prompt.strip()
                 or len(user_prompt) > 32_000):
             raise llm_enrichment.EnrichmentError("invalid_request", retry_after_seconds=None)
+        # Each chunk, retry and merge passes this boundary independently. An
+        # already in-flight call may finish, but no new paid call starts in peak.
+        schedule_policy.require_off_peak(at=self.clock())
         self.calls += 1
         self.unknown += 1
         try:
@@ -73,11 +80,13 @@ class SharedDeepSeekClient:
 
 
 class Worker:
-    def __init__(self, data_dir, *, config, enabled=True):
+    def __init__(self, data_dir, *, config, enabled=True, clock=None):
         if config is None or not llm_enrichment.is_supported_model(config.model):
             raise reading_service.ReadingUnavailable("Existing DeepSeek configuration is required")
         self.config, self.enabled = config, bool(enabled)
-        self.runtime = reading_service.ReadingRuntime(data_dir, client_factory=lambda: SharedDeepSeekClient(config))
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self.runtime = reading_service.ReadingRuntime(data_dir,
+            client_factory=lambda: SharedDeepSeekClient(config, clock=self.clock), clock=self.clock)
         self.stop = threading.Event()
         self.last_check_monotonic = None
 

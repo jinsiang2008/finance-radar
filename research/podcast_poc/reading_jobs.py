@@ -16,6 +16,11 @@ import sqlite3
 import traceback
 import uuid
 
+try:
+    from research.podcast_poc import schedule_policy
+except ModuleNotFoundError:
+    import schedule_policy
+
 
 PUBLIC_FAILURE = "处理失败，可以稍后重试。详细诊断已保存在本机。"
 INTERRUPTED_FAILURE = "任务多次中断，已停止自动重试；可以手动重试。"
@@ -69,7 +74,9 @@ class Engine:
                     updated_at TEXT NOT NULL,
                     started_at TEXT,
                     completed_at TEXT,
-                    reused INTEGER NOT NULL DEFAULT 0
+                    reused INTEGER NOT NULL DEFAULT 0,
+                    not_before TEXT,
+                    deferred_reason TEXT
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS summary_input
                     ON jobs(article_id, input_version) WHERE type = 'summary';
@@ -77,6 +84,32 @@ class Engine:
                     ON jobs(type) WHERE type = 'refresh' AND state IN ('queued', 'running');
                 CREATE TABLE IF NOT EXISTS runtime (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             """)
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                columns = {row[1] for row in connection.execute("PRAGMA table_info(jobs)")}
+                for column in ("not_before", "deferred_reason"):
+                    if column not in columns:
+                        connection.execute("ALTER TABLE jobs ADD COLUMN " + column + " TEXT")
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+
+    def _schedule(self):
+        policy = getattr(self.poc, "reading_schedule", None)
+        return policy() if callable(policy) else {"execution_allowed": True}
+
+    @staticmethod
+    def _deferral_values(policy):
+        if policy.get("execution_allowed", True):
+            return None, None
+        value = datetime.fromisoformat(policy["next_run_at"]).astimezone(timezone.utc).isoformat()
+        return value, "off_peak_only"
+
+    def _apply_queue_schedule(self, connection, job_id, policy):
+        not_before, reason = self._deferral_values(policy)
+        connection.execute("UPDATE jobs SET not_before=?,deferred_reason=? WHERE id=? AND state='queued'",
+                           (not_before, reason, job_id))
 
     @contextmanager
     def _connection(self):
@@ -127,8 +160,10 @@ class Engine:
         if not getattr(self.poc, "ALLOW_PODCAST_JOBS", False):
             return False
         segments, coverage = article.get("segments"), article.get("coverage")
-        return (isinstance(coverage, dict) and coverage.get("scope") in {"full", "sample"}
-                and article.get("source_kind") in {"provided_transcript", "official_transcript", "official_edited_transcript", "local_asr_sample"}
+        accepted_scope = (isinstance(coverage, dict) and (coverage.get("scope") in {"full", "sample"}
+                          or (coverage.get("scope") == "partial" and article.get("source_kind") == "third_party_transcript")))
+        return (accepted_scope
+                and article.get("source_kind") in {"provided_transcript", "official_transcript", "official_edited_transcript", "third_party_transcript", "local_asr_sample"}
                 and isinstance(segments, list) and bool(segments)
                 and all(isinstance(segment, dict) and isinstance(segment.get("id"), str) and segment["id"]
                         and isinstance(segment.get("text"), str) and segment["text"].strip() for segment in segments))
@@ -167,9 +202,10 @@ class Engine:
         if not self._has_input(article):
             raise ValueError("尚未取得可用正文，不能生成摘要。")
         version, ready, moment = self._version(article), self._summary_ready(article), _now()
+        policy = self._schedule()
         with self._transaction() as connection:
             # An old queued input must never overwrite a newer body or reviewed result.
-            connection.execute("""UPDATE jobs SET state='superseded', updated_at=?, completed_at=?
+            connection.execute("""UPDATE jobs SET state='superseded', updated_at=?, completed_at=?,not_before=NULL,deferred_reason=NULL
                 WHERE type='summary' AND article_id=? AND input_version<>? AND state='queued'""",
                 (moment, moment, article_id, version))
             row = connection.execute("SELECT * FROM jobs WHERE type='summary' AND article_id=? AND input_version=?",
@@ -184,7 +220,7 @@ class Engine:
             else:
                 job_id = row["id"]
                 if ready and row["state"] != "running":
-                    connection.execute("""UPDATE jobs SET state='completed', error=NULL, reused=1,
+                    connection.execute("""UPDATE jobs SET state='completed', error=NULL, reused=1,not_before=NULL,deferred_reason=NULL,
                         completed_at=?, updated_at=? WHERE id=?""", (moment, moment, job_id))
                 elif not ready and (row["state"] in {"completed", "superseded"} or (manual and row["state"] == "failed")):
                     connection.execute("""UPDATE jobs SET state='queued', error=NULL, reused=0, manual=?,
@@ -199,20 +235,24 @@ class Engine:
             tracked[article_id] = article.get("body_hash")
             connection.execute("INSERT OR REPLACE INTO runtime (key,value) VALUES ('tracked_article_bodies',?)",
                                (json.dumps(tracked),))
+            self._apply_queue_schedule(connection, job_id, policy)
             return self._public(connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone())
 
     def enqueue_refresh(self, manual=False):
         """Deduplicate refreshes while one is queued or running."""
+        policy = self._schedule()
         with self._transaction() as connection:
             row = connection.execute("SELECT * FROM jobs WHERE type='refresh' AND state IN ('queued','running')").fetchone()
             if row:
                 if manual and row["state"] == "queued" and not row["manual"]:
                     connection.execute("UPDATE jobs SET manual=1, updated_at=? WHERE id=?", (_now(), row["id"]))
-                    row = connection.execute("SELECT * FROM jobs WHERE id=?", (row["id"],)).fetchone()
+                self._apply_queue_schedule(connection, row["id"], policy)
+                row = connection.execute("SELECT * FROM jobs WHERE id=?", (row["id"],)).fetchone()
                 return self._public(row)
             job_id, moment = uuid.uuid4().hex, _now()
             connection.execute("INSERT INTO jobs (id,type,state,manual,created_at,updated_at) VALUES (?, 'refresh', 'queued', ?, ?, ?)",
                                (job_id, int(manual), moment, moment))
+            self._apply_queue_schedule(connection, job_id, policy)
             return self._public(connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone())
 
     def snapshot(self):
@@ -243,8 +283,22 @@ class Engine:
     def _finish(self, job_id, state, *, error=None, reused=False):
         moment = _now()
         with self._transaction() as connection:
-            connection.execute("UPDATE jobs SET state=?, error=?, reused=?, updated_at=?, completed_at=? WHERE id=?",
+            connection.execute("UPDATE jobs SET state=?, error=?, reused=?, updated_at=?, completed_at=?,not_before=NULL,deferred_reason=NULL WHERE id=?",
                                (state, error, int(reused), moment, moment, job_id))
+
+    def _defer(self, job, exception):
+        with self._transaction() as connection:
+            connection.execute("""UPDATE jobs SET state='queued',error=NULL,not_before=?,deferred_reason='off_peak_only',
+                started_at=NULL,completed_at=NULL,updated_at=? WHERE id=?""", (exception.not_before, _now(), job["id"]))
+        if job["type"] == "summary":
+            article = self.poc.load_episode(job["article_id"])
+            if self._version(article) == job["input_version"] and not self._summary_ready(article):
+                article["status"] = "body_ready" if article.get("content_kind") == "wechat_article" else "transcribed"
+                article.pop("error", None)
+                self.poc.save_episode(article)
+        else:
+            # A partial refresh must be eligible as soon as the next window opens.
+            self._runtime_update(last_refresh_state="queued", last_error=None)
 
     def _article_failure(self, job, message):
         try:
@@ -373,7 +427,7 @@ class Engine:
             raise RuntimeError(REFRESH_FAILURE)
 
     def run_one(self, allow_automatic=True):
-        """Run at most one job; a paused schedule still permits explicit manual work."""
+        """Run one job; manual priority never bypasses a reading cost window."""
         with self.lock_path.open("a") as worker_lock:
             try:
                 fcntl.flock(worker_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -381,7 +435,15 @@ class Engine:
                 return False
             try:
                 self._recover()
+                policy = self._schedule()
+                if not policy.get("execution_allowed", True):
+                    not_before, reason = self._deferral_values(policy)
+                    with self._transaction() as connection:
+                        connection.execute("""UPDATE jobs SET not_before=?,deferred_reason=? WHERE state='queued'
+                            AND (not_before IS NOT ? OR deferred_reason IS NOT ?)""", (not_before, reason, not_before, reason))
+                    return False
                 with self._transaction() as connection:
+                    connection.execute("UPDATE jobs SET not_before=NULL,deferred_reason=NULL WHERE state='queued' AND deferred_reason='off_peak_only'")
                     row = connection.execute("""SELECT * FROM jobs WHERE state='queued'
                         AND (? OR manual=1)
                         ORDER BY manual DESC, CASE type WHEN 'refresh' THEN 0 ELSE 1 END, created_at, id LIMIT 1""",
@@ -391,7 +453,7 @@ class Engine:
                     job = dict(row)
                     moment = _now()
                     connection.execute("""UPDATE jobs SET state='running', attempts=attempts+1,
-                        started_at=?, updated_at=?, error=NULL WHERE id=?""", (moment, moment, job["id"]))
+                        started_at=?, updated_at=?, error=NULL,not_before=NULL,deferred_reason=NULL WHERE id=?""", (moment, moment, job["id"]))
                 try:
                     if job["type"] == "refresh":
                         self._refresh(manual=bool(job["manual"]))
@@ -416,6 +478,9 @@ class Engine:
                             raise ValueError("Summary generation did not persist a complete result")
                         self._runtime_update(provider_blocked=None, provider_blocked_at=None)
                     self._finish(job["id"], "completed")
+                except schedule_policy.OffPeakDeferred as exc:
+                    self._defer(job, exc)
+                    return False
                 except Exception as exc:
                     self._diagnostic(job, exc)
                     message = REFRESH_FAILURE if job["type"] == "refresh" else PUBLIC_FAILURE

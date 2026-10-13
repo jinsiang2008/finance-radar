@@ -6,7 +6,7 @@ const refresh = document.querySelector('#refresh');
 const session = window.ReaderSession;
 const states = { summarized: ['模型初稿 · 待复核', 'pending'], summarizing: ['正在生成摘要', 'pending'], transcribed: ['文字稿就绪 · 待摘要', 'pending'], audio_ready: ['音频就绪 · 待转写', 'pending'], discovered: ['仅节目信息', ''], failed: ['处理失败', 'failed'] };
 let episodes = [];
-let selectedId = null;
+let selectedId = new URL(location.href).searchParams.get('episode');
 let automation=null, csrfToken='', pollTimer=null, inFlight=null, selectedSignature='', currentEpisode=null, listSignature='';
 const readingStates=new Map(), submitting=new Set(), requestErrors=new Map();
 
@@ -17,18 +17,24 @@ function el(tag, className, text) {
   return node;
 }
 function array(value) { return Array.isArray(value) ? value : []; }
-function hasTranscript(ep) { return ['full','sample'].includes(ep.coverage?.scope) && array(ep.segments).some(s=>s&&typeof s.text==='string'&&s.text.trim()); }
+function hasTranscript(ep) { return ['full','sample','partial'].includes(ep.coverage?.scope) && array(ep.segments).some(s=>s&&typeof s.text==='string'&&s.text.trim()); }
+function thirdParty(ep) { return ep.source_kind === 'third_party_transcript'; }
 function summaryReady(ep) { return hasTranscript(ep)&&ep.status==='summarized'&&Boolean(ep.summary?.overview||array(ep.summary?.points).length); }
 function jobFor(ep) { return array(automation?.jobs).find(j=>j.article_id===ep.id); }
 function jobState(ep) { return submitting.has(ep.id)?'submitting':jobFor(ep)?.state||(ep.status==='summarizing'?'running':ep.status==='failed'?'failed':''); }
 function isReviewed(ep) { return summaryReady(ep) && ep.quality_review?.status === 'assistant_reviewed'; }
-function status(ep) { if(!hasTranscript(ep))return states[ep.status==='audio_ready'?'audio_ready':ep.status==='failed'?'failed':'discovered'];return isReviewed(ep) ? ['文字已复核', 'done'] : !summaryReady(ep)&&({queued:['摘要已排队','pending'],running:['正在生成摘要','pending'],failed:['摘要失败 · 可重试','failed'],completed:['摘要已完成','done']})[jobState(ep)] || states[ep.status] || ['状态待确认', 'pending']; }
-function schedulePoll() { clearTimeout(pollTimer);if(session.authenticated())pollTimer=setTimeout(load,array(automation?.jobs).some(j=>['queued','running'].includes(j.state))?5000:30000); }
+function beijingDate(value) { const parsed = value && new Date(value);return parsed && !Number.isNaN(parsed.getTime()) ? parsed.toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}) : '时间待确认'; }
+function deferred(job) { return job?.state === 'queued' && (job.deferred_reason === 'off_peak_only' || automation?.off_peak_only === true && automation?.execution_allowed === false); }
+function deferredNote(job) { return `等待谷时处理，预计最早 ${beijingDate(job?.not_before || automation?.next_run_at)}（北京时间）。可以先阅读文字稿，后台恢复后依次处理。`; }
+function status(ep) { if(!hasTranscript(ep))return states[ep.status==='audio_ready'?'audio_ready':ep.status==='failed'?'failed':'discovered'];return isReviewed(ep) ? [thirdParty(ep)?'摘要已对照转写复核':'文字已复核', 'done'] : !summaryReady(ep)&&(deferred(jobFor(ep))?['等待谷时','pending']:({queued:['摘要已排队','pending'],running:['正在生成摘要','pending'],failed:['摘要失败 · 可重试','failed'],completed:['摘要已完成','done']})[jobState(ep)]) || states[ep.status] || ['状态待确认', 'pending']; }
+function schedulePoll() { clearTimeout(pollTimer);if(session.authenticated())pollTimer=setTimeout(load,array(automation?.jobs).some(j=>j.state==='running'||j.state==='queued'&&!deferred(j))?5000:30000); }
+function updateSchedule() { const node=document.querySelector('#podcast-schedule');if(node)node.textContent=automation?.off_peak_only ? `阅读任务仅在谷时执行；谷时每 ${Number.isFinite(automation.off_peak_minutes)?automation.off_peak_minutes:60} 分钟检查，高峰先排队。${automation.execution_allowed===false?` 最早 ${beijingDate(automation.next_run_at)}（北京时间）恢复。`:''}` : '摘要按后台队列安排；音频仅在点击后加载。'; }
 function updateGeneration() {
   const ep=currentEpisode,box=reader.querySelector('#podcast-generation');if(!ep||!box)return;
-  const state=jobState(ep),busy=['submitting','queued','running'].includes(state),button=box.querySelector('button'),note=box.querySelector('.podcast-job-state'),error=box.querySelector('.error-box');
-  note.textContent=({submitting:'正在提交请求…',queued:'摘要已排队，可继续阅读文字稿。',running:'正在整理文字稿与出处，完成后自动更新。',completed:'摘要已完成，正在等待最新结果。',failed:'摘要未能完成，可重试。'})[state]||'只总结当前取得的文字稿，不会自动下载音频或开始转写。';
-  button.textContent=({submitting:'正在提交…',queued:'已排队',running:'正在生成…'})[state]||(state==='failed'||requestErrors.has(ep.id)?'重试生成摘要':'立即生成摘要');button.disabled=busy||(!session.isKol&&!csrfToken);button.hidden=state==='completed';
+  const state=jobState(ep),job=jobFor(ep),waiting=deferred(job),busy=['submitting','queued','running'].includes(state),button=box.querySelector('button'),note=box.querySelector('.podcast-job-state'),error=box.querySelector('.error-box');
+  const badge=reader.querySelector('.reader-meta .status'),[label,kind]=status(ep);if(badge){badge.textContent=label;badge.className=`status ${kind}`;}
+  note.textContent=waiting?deferredNote(job):({submitting:'正在提交请求…',queued:'摘要已排队，可继续阅读文字稿。',running:'正在整理文字稿与出处，完成后自动更新。',completed:'摘要已完成，正在等待最新结果。',failed:'摘要未能完成，可重试。'})[state]||`只总结当前取得的文字稿，不会自动下载音频或开始转写。${automation?.off_peak_only?'高峰提交后等待谷时执行。':''}`;
+  button.textContent=waiting?'等待谷时':({submitting:'正在提交…',queued:'已排队',running:'正在生成…'})[state]||(state==='failed'||requestErrors.has(ep.id)?'重新安排摘要':'安排摘要');button.disabled=busy||(!session.isKol&&!csrfToken);button.hidden=state==='completed';
   error.textContent=requestErrors.get(ep.id)||(state==='failed'?jobFor(ep)?.error||ep.error||'':'');error.hidden=!error.textContent;
 }
 async function generateSummary(id) {
@@ -40,7 +46,7 @@ async function generateSummary(id) {
   finally{submitting.delete(id);if(session.valid(generation)){updateGeneration();schedulePoll();}}
 }
 function collectionStatus(items) {
-  return `${items.length} 集节目；已生成初稿 ${items.filter(summaryReady).length} 集，文字已复核 ${items.filter(isReviewed).length} 集`;
+  return `${items.length} 集节目；已生成初稿 ${items.filter(summaryReady).length} 集，摘要已复核 ${items.filter(isReviewed).length} 集`;
 }
 function mediaTime(absoluteTime, offset = 0) {
   if (!Number.isFinite(absoluteTime) || absoluteTime < 0) return 0;
@@ -92,7 +98,7 @@ function showList() {
     button.append(el('span', 'episode-show', ep.show || '未命名节目'), el('span', 'episode-title', ep.title || '未命名单集'));
     const meta = el('span', 'episode-meta');
     const [label, kind] = status(ep);
-    meta.append(el('span', '', date(ep.published_at)), el('span', `status ${kind}`, ep.coverage?.scope === 'sample' ? `${label} / 节选` : label));
+    meta.append(el('span', '', date(ep.published_at)), el('span', `status ${kind}`, ep.coverage?.scope === 'sample' ? `${label} / 节选` : ep.coverage?.scope === 'partial' ? `${label} / 部分转写` : label));
     button.append(meta);
     button.addEventListener('click', () => select(episodes.find(item=>item.id===ep.id)||ep));
     list.append(button);
@@ -114,28 +120,42 @@ function select(ep,{preserve=false}={}) {
   const previous = reader.querySelector('audio');
   if (previous) { previous.pause(); previous.removeAttribute('src'); previous.load(); }
   selectedId = ep.id;
+  const selectedURL=new URL(location.href);selectedURL.searchParams.set('episode',ep.id);history.replaceState(null,'',selectedURL.pathname+selectedURL.search+selectedURL.hash);
   currentEpisode=ep;selectedSignature=JSON.stringify(ep);
   showList(); reader.replaceChildren();
   const heading = el('header', 'reader-heading');
   heading.append(el('p', 'reader-show', ep.show || '播客'), el('h2', '', ep.title || '未命名单集'));
   const metadata = el('div', 'reader-meta');
   metadata.append(el('span', '', date(ep.published_at)), el('span', '', ep.language === 'en' ? '英语原文' : ep.language?.startsWith('zh') ? '中文原文' : '语言待确认'));
-  if (time(ep.duration_seconds)) metadata.append(el('span', '', `节目时长 ${time(ep.duration_seconds)}`));
+  if (time(ep.duration_seconds)) metadata.append(el('span', '', `${thirdParty(ep)?'来源标注时长':'节目时长'} ${time(ep.duration_seconds)}`));
   const source = externalLink(ep.source_url, '打开原节目');
   if (source) metadata.append(source);
   const [stateText, stateClass] = status(ep);
   metadata.append(el('span', `status ${stateClass}`, stateText));
+  if(thirdParty(ep))metadata.append(el('span','transcript-source-kind','第三方自动转写'));
   heading.append(metadata); reader.append(heading);
 
   const coverage = ep.coverage || {};
-  const box = el('div', `coverage ${coverage.scope === 'sample' ? 'sample' : ''} ${ep.status === 'failed' ? 'failed' : ''}`);
+  const box = el('div', `coverage ${['sample','partial'].includes(coverage.scope) ? 'sample' : ''} ${ep.status === 'failed' ? 'failed' : ''}`);
   const start = time(coverage.start_seconds), end = time(coverage.end_seconds);
   const officialTranscript = typeof ep.source_kind === 'string' && ep.source_kind.startsWith('official_');
-  let scopeText = coverage.scope === 'sample' ? '仅节选内容' : coverage.scope === 'full' ? officialTranscript ? '已取得官方文字稿' : '已取得文字稿' : '目前只有节目信息';
+  let scopeText = thirdParty(ep) ? `第三方自动转写${coverage.scope==='partial'?' · 部分覆盖':''} · 未逐句音频核验` : coverage.scope === 'partial' ? '已取得部分文字稿' : coverage.scope === 'sample' ? '仅节选内容' : coverage.scope === 'full' ? officialTranscript ? '已取得官方文字稿' : '已取得文字稿' : '目前只有节目信息';
   if (coverage.scope === 'sample' && start && end) scopeText += `：${start}–${end}`;
   box.append(el('strong', '', scopeText));
+  if(thirdParty(ep)){
+    box.append(el('p','transcript-boundary','非官方稿，摘要只覆盖已取得的文字；重要信息请回听原节目。'));
+    const provenance=ep.transcript_provenance||{};
+    const transcriptSource=externalLink(ep.transcript_source_url||provenance.source_url,'查看第三方转写来源');if(transcriptSource){transcriptSource.classList.add('transcript-provenance-link');box.append(transcriptSource);}
+    if(array(provenance.excluded_regions).length)box.append(el('p','transcript-exclusions','已排除来源作者标为不可靠的片段；其余内容仍可能存在遗漏或重叠。'));
+    const details=el('details','transcript-provenance-details');details.append(el('summary','','转写来源与覆盖说明'));
+    if(typeof ep.duration_basis==='string'&&ep.duration_basis)details.append(el('p','transcript-duration-basis',`时长依据：${ep.duration_basis}`));
+    if(typeof ep.published_at_note==='string'&&ep.published_at_note)details.append(el('p','transcript-publication-note',ep.published_at_note));
+    if(coverage.note)details.append(el('p','',coverage.note));
+    for(const warning of array(provenance.warnings).filter(value=>typeof value==='string').slice(0,8))details.append(el('p','transcript-warning',warning));
+    box.append(details);
+  }
   if (coverage.scope === 'full') box.append(el('p', '', '文字稿已获取；摘要处理进度见下方。文字稿不一定涵盖音频的每一秒。'));
-  if (coverage.note) box.append(el('p', '', coverage.note));
+  if (coverage.note && !thirdParty(ep)) box.append(el('p', '', coverage.note));
   if (Number.isFinite(coverage.chunks_total) && Number.isFinite(coverage.chunks_processed)) box.append(el('p', '', `摘要进度：已处理 ${coverage.chunks_processed} / ${coverage.chunks_total} 块${ep.status === 'summarizing' ? '，整集摘要尚未完成' : ''}`));
   if (Number.isFinite(coverage.segments_total) && coverage.segments_total > 0 && Number.isFinite(coverage.segments_processed) && (!Number.isFinite(coverage.chunks_total) || ep.status === 'summarized')) box.append(el('p', '', `摘要段落进度：${coverage.segments_processed} / ${coverage.segments_total} 段`));
   if (ep.status === 'failed') box.append(el('p', 'error-box', typeof ep.error === 'string' ? ep.error : '此集处理失败，请查看处理记录。'));
@@ -185,13 +205,14 @@ function select(ep,{preserve=false}={}) {
     } else meta.append(el('span', '', stamp || '未提供时间戳'));
     if (seg.speaker) meta.append(el('span', '', seg.speaker));
     node.append(meta, el('p', 'segment-text', seg.text || '此段没有正文。'));
+    for(const note of (Array.isArray(seg.source_notes)?seg.source_notes:typeof seg.source_notes==='string'?[seg.source_notes]:[]).filter(value=>typeof value==='string'))node.append(el('p','review-meta',`来源说明：${note}`));
     return node;
   }
   const summarySection = section('中文摘要', '保留关键观点与原文出处');
   if (summaryReady(ep)) {
     const reviewed = isReviewed(ep);
     const reviewNote = el('div', `review-note ${reviewed ? 'reviewed' : ''}`);
-    reviewNote.append(el('strong', '', reviewed ? '文字已复核' : '模型初稿 · 待复核'));
+    reviewNote.append(el('strong', '', reviewed ? thirdParty(ep)?'摘要已对照转写复核':'文字已复核' : '模型初稿 · 待复核'));
     reviewNote.append(el('p', '', reviewed ? `助手于 ${date(ep.quality_review.reviewed_at)} 对照文字稿修订；未逐秒核对音频，也不代表内容已独立证实。` : `以下是${ep.processing?.inference==='deepseek'?' DeepSeek ':ep.processing?.inference==='local_mlx'?'本地 MLX 模型':'模型'}自动生成的初稿，尚未对照文字稿复核，可能误读语义。请展开引用核对。`));
     summarySection.append(reviewNote);
     if (ep.summary?.overview) summarySection.append(el('p', 'overview', ep.summary.overview));
@@ -231,7 +252,7 @@ function select(ep,{preserve=false}={}) {
     }
   } else {
     summarySection.append(el('p','empty',summaryPlaceholder(ep)));
-    if(hasTranscript(ep)){const generation=el('div','podcast-generation');generation.id='podcast-generation';const state=el('p','podcast-job-state');state.setAttribute('role','status');const error=el('p','error-box');error.setAttribute('role','alert');const button=el('button','','立即生成摘要');button.id='generate-podcast-summary';button.type='button';button.addEventListener('click',()=>generateSummary(ep.id));generation.append(state,error,button);summarySection.append(generation);}
+    if(hasTranscript(ep)){const generation=el('div','podcast-generation');generation.id='podcast-generation';const state=el('p','podcast-job-state');state.setAttribute('role','status');const error=el('p','error-box');error.setAttribute('role','alert');const button=el('button','','安排摘要');button.id='generate-podcast-summary';button.type='button';button.addEventListener('click',()=>generateSummary(ep.id));generation.append(state,error,button);summarySection.append(generation);}
   }
   reader.append(summarySection);
 
@@ -259,7 +280,7 @@ function select(ep,{preserve=false}={}) {
   const processing = ep.processing || {};
   const record = el('details', 'processing'); record.append(el('summary', '', '查看处理记录'));
   const dl = el('dl');
-  const originLabels = { official_transcript: '官方文字稿', official_edited_transcript: '官方整理稿', local_asr: '本地语音转写', local_asr_sample: '本地语音转写节选', rss: 'RSS 节目元信息' };
+  const originLabels = { official_transcript: '官方文字稿', official_edited_transcript: '官方整理稿', third_party_transcript: '第三方自动转写（未逐句音频核验）', local_asr: '本地语音转写', local_asr_sample: '本地语音转写节选', rss: 'RSS 节目元信息' };
   const fields = [['文字来源', originLabels[ep.source_kind] || ep.source_kind || '未提供'], ['摘要模型', processing.summary_model || '尚未生成'], ['转写模型', processing.asr_model || '未使用 / 未提供'], ['处理用时', Number.isFinite(processing.elapsed_seconds) ? `${processing.elapsed_seconds.toFixed(1)} 秒` : '未提供'], ['API请求', Number.isFinite(processing.paid_api_calls) ? `${processing.paid_api_calls} 次` : '未提供']];
   fields.forEach(([key, value]) => dl.append(el('dt', '', key), el('dd', '', value))); record.append(dl); reader.append(record);
   reader.querySelectorAll('details').forEach((n,i)=>{n.open=Boolean(saved.details?.[i]);});updateGeneration();
@@ -276,6 +297,7 @@ async function fetchEpisodes() {
     if (!Array.isArray(data.episodes)) throw new Error('接口缺少节目列表');
     episodes = data.episodes.filter(ep => ep && typeof ep === 'object' && typeof ep.id === 'string');
     automation=data.automation||null;csrfToken=!session.isKol&&typeof data.csrf_token==='string'?data.csrf_token:'';
+    updateSchedule();if(!selectedId)selectedId=new URL(location.href).searchParams.get('episode');
     document.querySelector('#collection-status').textContent = collectionStatus(episodes);
     const selected = episodes.find(ep => ep.id === selectedId) || episodes.find(isReviewed) || episodes.find(ep => ep.status === 'summarized') || episodes[0];
     if (selected) {if(selected.id!==selectedId||selectedSignature!==JSON.stringify(selected))select(selected,{preserve:selected.id===selectedId});else{currentEpisode=selected;updateGeneration();showList();}}
@@ -292,4 +314,5 @@ async function fetchEpisodes() {
 function load(){if(!session.authenticated())return Promise.resolve();if(inFlight)return inFlight;clearTimeout(pollTimer);const pending=fetchEpisodes().finally(()=>{if(inFlight===pending){inFlight=null;schedulePoll();}});inFlight=pending;return pending;}
 refresh.addEventListener('click',()=>load());
 session.on('lock',()=>{clearTimeout(pollTimer);inFlight=null;pollTimer=null;const audio=reader.querySelector('audio');if(audio){audio.pause();audio.removeAttribute('src');audio.load();}episodes=[];selectedId=null;currentEpisode=null;selectedSignature='';listSignature='';automation=null;csrfToken='';readingStates.clear();requestErrors.clear();submitting.clear();reader.replaceChildren();list.replaceChildren();document.querySelector('#episode-count').textContent='—';document.querySelector('#collection-status').textContent='请先解锁阅读';refresh.disabled=false;});
+session.on('lock',()=>{document.querySelector('#podcast-schedule').textContent='';});
 session.on('unlock',()=>load());session.init().then(ready=>{if(ready)load();});

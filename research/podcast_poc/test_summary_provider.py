@@ -9,6 +9,59 @@ from research.podcast_poc.test_wechat import SOURCE, make_item
 
 
 class SummaryProviderTests(unittest.TestCase):
+    def test_resume_reuses_completed_merges_as_well_as_chunks(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(poc, "DATA", Path(directory)):
+            poc.write_json(poc.DATA / "runtime/automation.json", {"provider": "deepseek"})
+            article = wechat.article_from_item(make_item(), SOURCE)
+            article["segments"] = [{"id": f"p{i:04d}", "text": "证" * 11_000} for i in range(5)]
+            poc.save_episode(article)
+            successful, attempted = [], []
+            pause = True
+            def answer(messages, max_tokens):
+                nonlocal pause
+                prompt = messages[1]["content"]
+                attempted.append(prompt)
+                refs = re.findall(r'"segment_id": "(p[0-9]+)"', prompt)
+                if refs:
+                    successful.append(prompt)
+                    return json.dumps({"overview": "摘" * 5000, "points": [{"text": "要" * 5000, "segment_ids": refs}]})
+                if pause and len(successful) == 6:
+                    pause = False
+                    raise RuntimeError("pause before the second merge")
+                successful.append(prompt)
+                refs = sorted(set(re.findall(r'"(p[0-9]+)"', prompt)))
+                return json.dumps({"overview": "合并摘要", "points": [{"text": "跨段证据", "segment_ids": refs}]})
+            with patch.object(inference, "Client") as client:
+                client.return_value.generate.side_effect = answer
+                client.return_value.stats.return_value = {"paid_api_calls": 0}
+                with self.assertRaisesRegex(RuntimeError, "pause"):
+                    poc.summarize(article["id"])
+                already_completed = list(successful)
+                result = poc.summarize(article["id"])
+            self.assertEqual(len(already_completed), 6)
+            for prompt in already_completed:
+                self.assertEqual(attempted.count(prompt), 1)
+            self.assertEqual(result["summary"]["points"][0]["segment_ids"], [f"p{i:04d}" for i in range(5)])
+
+    def test_third_party_transcription_constraints_reach_model(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(poc, "DATA", Path(directory)):
+            poc.write_json(poc.DATA / "runtime/automation.json", {"provider": "deepseek"})
+            article = wechat.article_from_item(make_item(), SOURCE)
+            article.update(content_kind="podcast", source_kind="third_party_transcript")
+            article["coverage"]["scope"] = "partial"
+            article["segments"][0]["source_notes"] = ["说话人标签待核验"]
+            poc.save_episode(article)
+            def answer(messages, max_tokens):
+                self.assertIn("第三方自动转写", messages[1]["content"])
+                self.assertIn("说话人标签待核验", messages[1]["content"])
+                return json.dumps({"overview": "第三方稿摘要", "points": [{"text": "保留出处", "segment_ids": [article["segments"][0]["id"]]}]})
+            with patch.object(inference, "Client") as client:
+                client.return_value.generate.side_effect = answer
+                client.return_value.stats.return_value = {"paid_api_calls": 0}
+                result = poc.summarize(article["id"])
+            self.assertEqual(result["coverage"]["scope"], "partial")
+            self.assertIn("third-party-partial", result["processing"]["prompt_version"])
+
     def test_short_paragraph_overhead_is_split_before_the_shared_provider_limit(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(poc, "DATA", Path(directory)):
             poc.write_json(poc.DATA / "runtime/automation.json", {"provider": "deepseek"})

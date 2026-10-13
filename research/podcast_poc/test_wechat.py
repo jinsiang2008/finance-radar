@@ -1,5 +1,6 @@
 """Offline coverage and data-retention checks for third-party article feeds."""
 import contextlib
+from datetime import datetime
 import io
 import json
 from pathlib import Path
@@ -9,7 +10,7 @@ import unittest
 from unittest.mock import patch
 import xml.etree.ElementTree as ET
 
-from research.podcast_poc import poc, wechat
+from research.podcast_poc import poc, schedule_policy, wechat
 
 
 SOURCE = {
@@ -161,6 +162,24 @@ class WechatCoverageTests(unittest.TestCase):
         self.assertEqual(states[0]["last_success_at"], last_success)
         self.assertEqual(poc.episode_path(article["id"]).read_bytes(), before)
         self.assertEqual(len(wechat.payload()["articles"]), 1)
+
+    def test_off_peak_pause_propagates_without_overwriting_source_health(self):
+        previous = {"sources": [{**SOURCE, "status": "ok", "last_success_at": "2026-10-13T00:00:00+00:00"}]}
+        state = poc.DATA / "wechat-sources.json"
+        poc.write_json(state, previous)
+        before = state.read_bytes()
+        pause = schedule_policy.OffPeakDeferred(datetime.fromisoformat("2026-10-13T09:00:00+08:00"))
+        with patch.object(wechat, "source_config", return_value=[SOURCE]), patch.object(poc, "fetch", side_effect=pause):
+            with self.assertRaises(schedule_policy.OffPeakDeferred):
+                wechat.refresh()
+        self.assertEqual(state.read_bytes(), before)
+
+    def test_podcast_discovery_uses_same_pause_exception_and_stops_remaining_sources(self):
+        pause = schedule_policy.OffPeakDeferred(datetime.fromisoformat("2026-10-13T09:00:00+08:00"))
+        with patch.object(poc, "fetch", side_effect=pause) as fetch:
+            with self.assertRaises(schedule_policy.OffPeakDeferred):
+                poc.discover(["sv101", "latepost"], limit=1)
+        self.assertEqual(fetch.call_count, 1)
 
     def test_missing_invalid_or_timezone_free_dates_never_become_fetch_time(self):
         for published in (None, "not a date", "2026-10-03T09:00:00"):
