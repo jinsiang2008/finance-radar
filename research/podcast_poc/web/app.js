@@ -11,6 +11,7 @@ let automation=null, csrfToken='', pollTimer=null, inFlight=null, selectedSignat
 let sources=[], discovery=null, groupFilter='primary', sourceFilter='all', filtersInitialized=false, filterSignature='', sourceSignature='';
 const readingStates=new Map(), submitting=new Set(), requestErrors=new Map();
 const groupLabels={all:'全部',primary:'英文重点',chinese:'中文',additional:'英文补充'};
+const sourceBoundary='订阅更新会发现新节目。读取节目列表不代表已有全文或摘要；取得文字稿后才能整理中文要点。';
 
 function el(tag, className, text) {
   const node = document.createElement(tag);
@@ -28,13 +29,44 @@ function isReviewed(ep) { return summaryReady(ep) && ep.quality_review?.status =
 function beijingDate(value) { const parsed = value && new Date(value);return parsed && !Number.isNaN(parsed.getTime()) ? parsed.toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}) : '时间待确认'; }
 function deferred(job) { return job?.state === 'queued' && (job.deferred_reason === 'off_peak_only' || automation?.off_peak_only === true && automation?.execution_allowed === false); }
 function deferredNote(job) { return `等待谷时处理，预计最早 ${beijingDate(job?.not_before || automation?.next_run_at)}（北京时间）。可以先阅读文字稿，后台恢复后依次处理。`; }
-function status(ep) { if(!hasTranscript(ep))return states[ep.status==='audio_ready'?'audio_ready':ep.status==='failed'?'failed':'discovered'];return isReviewed(ep) ? [thirdParty(ep)?'摘要已对照转写复核':'文字已复核', 'done'] : !summaryReady(ep)&&(deferred(jobFor(ep))?['等待谷时','pending']:({queued:['摘要已排队','pending'],running:['正在生成摘要','pending'],failed:['摘要失败 · 可重试','failed'],completed:['摘要已完成','done']})[jobState(ep)]) || states[ep.status] || ['状态待确认', 'pending']; }
-function schedulePoll() { clearTimeout(pollTimer);if(session.authenticated())pollTimer=setTimeout(load,array(automation?.jobs).some(j=>j.state==='running'||j.state==='queued'&&!deferred(j))?5000:30000); }
-function updateSchedule() { const node=document.querySelector('#podcast-schedule');if(node)node.textContent=automation?.off_peak_only ? `阅读任务仅在谷时执行；谷时每 ${Number.isFinite(automation.off_peak_minutes)?automation.off_peak_minutes:60} 分钟检查，高峰先排队。${automation.execution_allowed===false?` 最早 ${beijingDate(automation.next_run_at)}（北京时间）恢复。`:''}` : '摘要按后台队列安排；音频仅在点击后加载。'; }
+function acquisitionInfo(ep) {
+  if(hasTranscript(ep))return null;
+  const acquisition=ep.transcript_acquisition,waiting=automation?.off_peak_only===true&&automation?.execution_allowed===false;
+  if(!acquisition||typeof acquisition!=='object')return null;
+  const retry=acquisition.next_retry_at?`最早 ${beijingDate(acquisition.next_retry_at)}（北京时间）再次尝试；这不是摘要完成时间。`:'等待后续检查，暂时没有确定的重试时间。';
+  const pending=waiting?`高峰暂不取稿。${automation.next_run_at?`最早 ${beijingDate(automation.next_run_at)}（北京时间）恢复检查；这不是摘要完成时间。`:''}`:'等待下一轮官方文字稿或字幕检查。';
+  return ({
+    pending:{label:waiting?'等待谷时取稿':'待取官方文字稿',kind:'pending',note:`${pending}取得正文后才会安排中文要点和段落证据，仍需复核。`},
+    fetching:{label:'正在读取文字稿',kind:'pending',note:'正在读取官方文字稿或字幕。取得正文后才会安排中文要点与段落证据；尚未开始内容分析。'},
+    unavailable:{label:'文字稿暂不可读',kind:'pending',note:`本次未能取得可读的官方文字稿或字幕。${retry}`},
+    unsupported:{label:'待接入转写',kind:'pending',note:'这集暂无可自动读取的官方文字稿，整集音频转写尚未启用，当前不会自动生成摘要。可打开原节目收听。'},
+    archive:{label:'历史节目 · 未自动处理',kind:'',note:'这集属于历史节目。当前只自动处理支持来源的最新一集，历史内容不自动回填。可打开原节目收听。'},
+    ready:{label:'文字稿待就绪',kind:'pending',note:'来源已返回文字稿状态，当前还没有可读取的正文。请稍后刷新查看，尚不能生成内容摘要。'}
+  })[acquisition.state]||null;
+}
+function status(ep) { if(!hasTranscript(ep)){const acquisition=acquisitionInfo(ep);return acquisition?[acquisition.label,acquisition.kind]:states[ep.status==='audio_ready'?'audio_ready':ep.status==='failed'?'failed':'discovered'];}return isReviewed(ep) ? [thirdParty(ep)?'摘要已对照转写复核':'文字已复核', 'done'] : !summaryReady(ep)&&(deferred(jobFor(ep))?['等待谷时','pending']:({queued:['摘要已排队','pending'],running:['正在生成摘要','pending'],failed:['摘要失败 · 可重试','failed'],completed:['摘要已完成','done']})[jobState(ep)]) || states[ep.status] || ['状态待确认', 'pending']; }
+function schedulePoll() { clearTimeout(pollTimer);if(session.authenticated())pollTimer=setTimeout(load,array(automation?.jobs).some(j=>j.state==='running'||j.state==='queued'&&!deferred(j))||episodes.some(ep=>!hasTranscript(ep)&&ep.transcript_acquisition?.state==='fetching')?5000:30000); }
+function updateSchedule() {
+  const node=document.querySelector('#podcast-schedule'),boundary=document.querySelector('.podcast-source-boundary');
+  if(automation?.transcript_policy==='official_latest_only'){
+    const names={dwarkesh:'Dwarkesh',lex:'Lex Fridman',diary:'The Diary Of A CEO'},supported=array(automation.automatic_transcript_sources).map(id=>names[id]).filter(Boolean).join('、')||'已接入官方文字稿的来源';
+    const minutes=Number.isFinite(automation.off_peak_minutes)?automation.off_peak_minutes:60,limit=Number.isFinite(automation.podcast_daily_limit)?automation.podcast_daily_limit:3;
+    const pause=automation.enabled===false?'自动处理未开启。':automation.provider_blocked?'自动分析暂停中。':automation.worker_alive===false?'后台暂未运行。':'';
+    const policy=`自动取稿仅覆盖 ${supported}：谷时每 ${minutes} 分钟检查，每个来源只处理最新 1 集，每天最多新增 ${limit} 集；历史节目不自动回填。取得正文后，由 DeepSeek 生成中文要点与段落证据，仍需复核。其他来源暂未接入自动取稿，整集音频转写尚未启用。`;
+    if(node)node.textContent=`${pause}自动取稿：${supported}。谷时每 ${minutes} 分钟检查，每源最新 1 集，每天最多新增 ${limit} 集；其他来源及历史节目暂不自动取稿。${automation.execution_allowed===false?' 高峰先排队，具体取稿状态见各集。':''}`;
+    if(boundary)boundary.textContent=`${sourceBoundary}${pause}${policy}`;
+    return;
+  }
+  if(boundary)boundary.textContent=sourceBoundary;
+  if(node)node.textContent=automation?.off_peak_only ? `阅读任务仅在谷时执行；谷时每 ${Number.isFinite(automation.off_peak_minutes)?automation.off_peak_minutes:60} 分钟检查，高峰先排队。${automation.execution_allowed===false?` 最早 ${beijingDate(automation.next_run_at)}（北京时间）恢复。`:''}` : '摘要按后台队列安排；音频仅在点击后加载。';
+}
 function updateGeneration() {
-  const ep=currentEpisode,box=reader.querySelector('#podcast-generation');if(!ep||!box)return;
-  const state=jobState(ep),job=jobFor(ep),waiting=deferred(job),busy=['submitting','queued','running'].includes(state),button=box.querySelector('button'),note=box.querySelector('.podcast-job-state'),error=box.querySelector('.error-box');
+  const ep=currentEpisode;if(!ep)return;
   const badge=reader.querySelector('.reader-meta .status'),[label,kind]=status(ep);if(badge){badge.textContent=label;badge.className=`status ${kind}`;}
+  const acquisition=acquisitionInfo(ep),coverageState=reader.querySelector('.transcript-acquisition-status'),acquisitionNote=reader.querySelector('.transcript-acquisition-note');
+  if(acquisition){if(coverageState)coverageState.textContent=acquisition.label;if(acquisitionNote)acquisitionNote.textContent=acquisition.note;}
+  const box=reader.querySelector('#podcast-generation');if(!box)return;
+  const state=jobState(ep),job=jobFor(ep),waiting=deferred(job),busy=['submitting','queued','running'].includes(state),button=box.querySelector('button'),note=box.querySelector('.podcast-job-state'),error=box.querySelector('.error-box');
   note.textContent=waiting?deferredNote(job):({submitting:'正在提交请求…',queued:'摘要已排队，可继续阅读文字稿。',running:'正在整理文字稿与出处，完成后自动更新。',completed:'摘要已完成，正在等待最新结果。',failed:'摘要未能完成，可重试。'})[state]||`只总结当前取得的文字稿，不会自动下载音频或开始转写。${automation?.off_peak_only?'高峰提交后等待谷时执行。':''}`;
   button.textContent=waiting?'等待谷时':({submitting:'正在提交…',queued:'已排队',running:'正在生成…'})[state]||(state==='failed'||requestErrors.has(ep.id)?'重新安排摘要':'安排摘要');button.disabled=busy||(!session.isKol&&!csrfToken);button.hidden=state==='completed';
   error.textContent=requestErrors.get(ep.id)||(state==='failed'?jobFor(ep)?.error||ep.error||'':'');error.hidden=!error.textContent;
@@ -56,6 +88,7 @@ function mediaTime(absoluteTime, offset = 0) {
   return Math.max(0, absoluteTime - origin);
 }
 function summaryPlaceholder(ep) {
+  const acquisition=acquisitionInfo(ep);if(acquisition)return acquisition.note;
   if (ep.status === 'summarizing') return '正在逐块处理文字稿，中文摘要尚未完成。你可以先阅读下方原文，稍后刷新查看进度。';
   if (ep.status === 'transcribed') return '文字稿已准备好，中文摘要尚未生成。你可以先阅读下方原文。';
   if (ep.status === 'audio_ready') return '音频样本已准备好，尚未取得文字稿。此页面不会自动开始转写。';
@@ -195,9 +228,12 @@ function select(ep,{preserve=false}={}) {
   const box = el('div', `coverage ${['sample','partial'].includes(coverage.scope) ? 'sample' : ''} ${ep.status === 'failed' ? 'failed' : ''}`);
   const start = time(coverage.start_seconds), end = time(coverage.end_seconds);
   const officialTranscript = typeof ep.source_kind === 'string' && ep.source_kind.startsWith('official_');
+  const acquisition=acquisitionInfo(ep);
   let scopeText = thirdParty(ep) ? `第三方自动转写${coverage.scope==='partial'?' · 部分覆盖':''} · 未逐句音频核验` : coverage.scope === 'partial' ? '已取得部分文字稿' : coverage.scope === 'sample' ? '仅节选内容' : coverage.scope === 'full' ? officialTranscript ? '已取得官方文字稿' : '已取得文字稿' : '目前只有节目信息';
+  if(acquisition)scopeText=acquisition.label;
   if (coverage.scope === 'sample' && start && end) scopeText += `：${start}–${end}`;
-  box.append(el('strong', '', scopeText));
+  box.append(el('strong', acquisition?'transcript-acquisition-status':'', scopeText));
+  if(officialTranscript&&hasTranscript(ep)){const officialSource=externalLink(ep.transcript_source_url,'官方文字稿 / 字幕');if(officialSource){officialSource.classList.add('official-transcript-link');box.append(officialSource);}}
   if(thirdParty(ep)){
     box.append(el('p','transcript-boundary','非官方稿，摘要只覆盖已取得的文字；重要信息请回听原节目。'));
     const provenance=ep.transcript_provenance||{};
@@ -307,7 +343,7 @@ function select(ep,{preserve=false}={}) {
       summarySection.append(audit);
     }
   } else {
-    summarySection.append(el('p','empty',summaryPlaceholder(ep)));
+    summarySection.append(el('p',`empty${acquisition?' transcript-acquisition-note':''}`,summaryPlaceholder(ep)));
     if(hasTranscript(ep)){const generation=el('div','podcast-generation');generation.id='podcast-generation';const state=el('p','podcast-job-state');state.setAttribute('role','status');const error=el('p','error-box');error.setAttribute('role','alert');const button=el('button','','安排摘要');button.id='generate-podcast-summary';button.type='button';button.addEventListener('click',()=>generateSummary(ep.id));generation.append(state,error,button);summarySection.append(generation);}
   }
   reader.append(summarySection);
@@ -371,6 +407,6 @@ function load(){if(!session.authenticated())return Promise.resolve();if(inFlight
 refresh.addEventListener('click',()=>load());
 document.querySelector('#podcast-source').addEventListener('change',event=>{sourceFilter=event.target.value;selectedId=null;renderCollection();});
 session.on('lock',()=>{clearTimeout(pollTimer);inFlight=null;pollTimer=null;const audio=reader.querySelector('audio');if(audio){audio.pause();audio.removeAttribute('src');audio.load();}episodes=[];selectedId=null;currentEpisode=null;selectedSignature='';listSignature='';automation=null;csrfToken='';readingStates.clear();requestErrors.clear();submitting.clear();reader.replaceChildren();list.replaceChildren();document.querySelector('#episode-count').textContent='—';document.querySelector('#collection-status').textContent='请先解锁阅读';refresh.disabled=false;});
-session.on('lock',()=>{document.querySelector('#podcast-schedule').textContent='';});
+session.on('lock',()=>{document.querySelector('#podcast-schedule').textContent='';document.querySelector('.podcast-source-boundary').textContent=sourceBoundary;});
 session.on('lock',()=>{sources=[];discovery=null;groupFilter='primary';sourceFilter='all';filtersInitialized=false;filterSignature='';sourceSignature='';document.querySelector('#podcast-filters').hidden=true;document.querySelector('#podcast-groups').replaceChildren();document.querySelector('#podcast-source').replaceChildren();const panel=document.querySelector('#podcast-sources');panel.hidden=true;panel.open=false;document.querySelector('#podcast-source-list').replaceChildren();document.querySelector('#podcast-sources-heading').textContent='订阅来源与更新';});
 session.on('unlock',()=>load());session.init().then(ready=>{if(ready)load();});

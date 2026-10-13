@@ -5,21 +5,26 @@ KOL_READING_DATA_DIR; there is no fallback to a developer's POC data or keys.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import sys
 import threading
+import time
 import uuid
+from urllib.parse import urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
-from research.podcast_poc import poc as poc_template, reading_jobs, schedule_policy
+from research.podcast_poc import poc as poc_template, reading_jobs, schedule_policy, official_transcripts
 
 
 SUPPORTED_MODELS = {"deepseek-v4-flash", "deepseek-v4-pro"}
+TRANSCRIPT_SOURCES = ("dwarkesh", "lex", "diary")
+PODCAST_DAILY_LIMIT = 3
 _runtime = None
 _runtime_lock = threading.Lock()
 
@@ -102,6 +107,127 @@ class ReadingRuntime:
         self.engine._runtime_update(podcast_last_check_at=self.poc.now(),
                                     podcast_successful_sources=sum(bool(row.get("success")) for row in results),
                                     podcast_source_count=len(results))
+        self.acquire_podcast_transcripts()
+
+    @staticmethod
+    def _official_url(source_id, url, *, transcript=False):
+        if not isinstance(url, str):
+            raise ValueError("Missing official transcript URL")
+        parsed = urlsplit(url)
+        hosts = {"dwarkesh": "www.dwarkesh.com", "lex": "lexfridman.com", "diary": "rss.flightcast.com"}
+        paths = {"dwarkesh": r"/p/[a-zA-Z0-9_-]+/?", "lex": r"/[a-zA-Z0-9-]+/?",
+                 "diary": r"/transcripts/[a-zA-Z0-9_-]+\.vtt"}
+        if (source_id not in hosts or parsed.scheme != "https" or parsed.netloc != hosts[source_id]
+                or not re.fullmatch(paths[source_id], parsed.path)):
+            raise ValueError("Only supported official transcript pages may be fetched")
+        clean = urlunsplit(("https", parsed.netloc, parsed.path, "", ""))
+        if transcript:
+            official_transcripts.validate_transcript_url(source_id, clean)
+        return clean
+
+    def fetch_official_transcript(self, source_id, url, *, transcript=False):
+        url = self._official_url(source_id, url, transcript=transcript)
+        schedule_policy.require_off_peak(at=self.clock())
+        opener = build_opener(ProxyHandler({}), _NoRedirect())
+        request = Request(url, headers={"User-Agent": "KOLReading/1", "Accept": "text/html, text/vtt"})
+        chunks, size, deadline = [], 0, time.monotonic() + 40
+        with opener.open(request, timeout=20) as response:
+            while True:
+                if time.monotonic() > deadline:
+                    raise TimeoutError("Official transcript fetch timed out")
+                chunk = response.read1(65536)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > 4_000_000:
+                    raise ValueError("Official transcript exceeds the size limit")
+                chunks.append(chunk)
+        return b"".join(chunks).decode("utf-8-sig")
+
+    def _latest_podcasts(self, episodes):
+        # Only the newest dated episode per supported source is automatic. This
+        # never drains the historical archive on subsequent refreshes/restarts.
+        latest = {}
+        for episode in episodes:
+            key = episode.get("source_id")
+            stamp = self.poc.published_timestamp(episode.get("published_at"))
+            if key not in TRANSCRIPT_SOURCES or stamp is None or stamp > self.clock().timestamp():
+                continue
+            if key not in latest or stamp > self.poc.published_timestamp(latest[key]["published_at"]):
+                latest[key] = episode
+        return latest
+
+    def acquire_podcast_transcripts(self):
+        """Called under the existing worker lock; at most three new inputs/day."""
+        if not self.settings()["enabled"] or self.engine.runtime_snapshot().get("provider_blocked"):
+            return
+        episodes = self.poc.payload()["episodes"]
+        # Recover every saved automatic input, even when a newer RSS episode
+        # appeared after a crash between saving the text and enqueueing it.
+        for episode in episodes:
+            if episode.get("segments") and episode.get("transcript_acquisition", {}).get("state") == "ready":
+                self.engine.enqueue(episode["id"], manual=False)
+        latest = self._latest_podcasts(episodes)
+        for key in TRANSCRIPT_SOURCES:
+            candidate = latest.get(key)
+            if candidate is None:
+                continue
+            episode = self.poc.load_episode(candidate["id"])
+            acquisition = episode.get("transcript_acquisition", {})
+            if episode.get("segments"):
+                continue
+            retry = acquisition.get("next_retry_at")
+            if retry and datetime.fromisoformat(retry) > self.clock():
+                continue
+            # A slow source may cross midnight; do not charge later fetches to
+            # yesterday and accidentally grant them a second allowance.
+            today = self.clock().astimezone(schedule_policy.BEIJING).date().isoformat()
+            ledger = self.engine._runtime_value("podcast_daily_reservations", {})
+            reserved = ledger.get("ids", []) if ledger.get("date") == today else []
+            if episode["id"] not in reserved and len(reserved) >= PODCAST_DAILY_LIMIT:
+                continue
+            schedule_policy.require_off_peak(at=self.clock())
+            if episode["id"] not in reserved:
+                reserved.append(episode["id"])
+                self.engine._runtime_update(podcast_daily_reservations={"date": today, "ids": reserved})
+            episode["transcript_acquisition"] = {"state": "fetching", "checked_at": self.poc.now()}
+            self.poc.save_episode(episode)
+            try:
+                if key == "diary":
+                    url = self._official_url(key, episode.get("official_transcript_url"), transcript=True)
+                    body = self.fetch_official_transcript(key, url, transcript=True)
+                    parsed = official_transcripts.parse_webvtt(body, source_url=url)
+                else:
+                    url = self._official_url(key, episode.get("source_url"))
+                    body = self.fetch_official_transcript(key, url)
+                    target = official_transcripts.find_transcript_url(key, url, body)
+                    target = self._official_url(key, target, transcript=True)
+                    if target != url:
+                        body = self.fetch_official_transcript(key, target, transcript=True)
+                    parsed = official_transcripts.parse_transcript(key, body, source_url=target)
+                    url = target
+                episode.update(segments=parsed["segments"], coverage=parsed["coverage"],
+                               source_kind=parsed["source_kind"], status="transcribed",
+                               transcript_source_url=url, fetched_at=self.poc.now(),
+                               transcript_sha256=hashlib.sha256(body.encode("utf-8")).hexdigest(),
+                               transcript_adapter="official-v1",
+                               transcript_acquisition={"state": "ready", "checked_at": self.poc.now()})
+                self.poc.save_episode(episode)
+            except schedule_policy.OffPeakDeferred:
+                episode["transcript_acquisition"] = {"state": "pending"}
+                self.poc.save_episode(episode)
+                raise
+            except Exception as exc:
+                # Do not expose fetched HTML, raw exceptions, or treat failure as
+                # a summary. Retrying a public fetch never retries a paid summary.
+                episode["transcript_acquisition"] = {"state": "unavailable", "checked_at": self.poc.now(),
+                    "error_code": type(exc).__name__,
+                    "next_retry_at": (self.clock() + timedelta(hours=24)).isoformat()}
+                self.poc.save_episode(episode)
+                continue
+            # A queue write failure must remain recoverable with the saved text;
+            # it is not a failure to acquire the transcript.
+            self.engine.enqueue(episode["id"], manual=False)
 
     def schedule_status(self):
         runtime = self.engine.runtime_snapshot()
@@ -116,7 +242,8 @@ class ReadingRuntime:
         if state.get("provider_blocked"):
             state["automatic_paused_reason"] = reading_jobs.PROVIDER_ERRORS.get(state["provider_blocked"], reading_jobs.PUBLIC_FAILURE)
         state.update(worker_alive=False, scheduler="systemd_worker", jobs=self.engine.snapshot(),
-                     transcript_policy="existing_transcripts_only", automatic_audio_transcription=False,
+                     transcript_policy="official_latest_only", automatic_transcript_sources=list(TRANSCRIPT_SOURCES),
+                     podcast_daily_limit=PODCAST_DAILY_LIMIT, automatic_audio_transcription=False,
                      deepseek_audio_transcription=False, paid_call_boundary="before_each_request")
         try:
             heartbeat = json.loads((self.data / "runtime" / "worker-heartbeat.json").read_text())
@@ -141,6 +268,19 @@ class ReadingRuntime:
     def podcast_payload(self):
         result = self.poc.payload()
         result.update(mode="server_deepseek", automation=self.status())
+        latest_ids = {ep["id"] for ep in self._latest_podcasts(result["episodes"]).values()}
+        for episode in result["episodes"]:
+            if episode.get("segments"):
+                continue
+            if episode.get("source_id") not in TRANSCRIPT_SOURCES:
+                episode["transcript_acquisition"] = {"state": "unsupported"}
+            elif episode["id"] not in latest_ids:
+                episode["transcript_acquisition"] = {"state": "archive"}
+            else:
+                episode.setdefault("transcript_acquisition", {"state": "pending"})
+        result["discovery"].update(automatic_transcript_fetch=True,
+                                   automatic_transcript_sources=list(TRANSCRIPT_SOURCES),
+                                   automatic_scope="latest_one_per_source", podcast_daily_limit=PODCAST_DAILY_LIMIT)
         return result
 
     def enqueue_summary(self, content_id):

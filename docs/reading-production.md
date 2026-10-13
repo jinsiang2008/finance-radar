@@ -24,7 +24,7 @@ worker 消费持久队列并在内部判断是否到期：线上仅谷时抓取�
 
 平铺应用包增加 `reading_service.py`、`reading_worker.py`、`reading_import.py`。共享代码保留 Python namespace 路径 `research/podcast_poc`，只复制：
 
-- 运行文件：`poc.py`、`wechat.py`、`reading_jobs.py`、`schedule_policy.py`、`inference.py`、`wechat_sources.json`。
+- 运行文件：`poc.py`、`wechat.py`、`reading_jobs.py`、`schedule_policy.py`、`inference.py`、`official_transcripts.py`、`wechat_sources.json`。
 - 八个界面文件：`index.html`、`wechat.html`、`app.js`、`wechat.js`、`style.css`、`wechat.css`、`reader-auth.js`、`reader-auth.css`。
 
 不复制 tests、private、runtime、模型、虚拟环境、`configure_deepseek.py` 或本地服务控制脚本。文章、音频、队列与凭据都不进入代码 release。
@@ -113,3 +113,12 @@ bash -n kol_dashboard/deploy.sh
 最终生产验收：2026-10-13 23:36 CST，应用提交 `bc8f0471fb090d73466c18161fa3bf76730bcf08`、release `20261013T153016Z-30479-1624964b`；54 个运行文件指纹匹配，阅读资源 v43。首次发现新增18集元数据并逐字节保留原35条，最终库内53集；7/7重点RSS成功、日期均可显示，全部14源中原“晚点聊”因302仍失败且保留旧数据。982主站、122阅读、3仓库测试及公网浏览器验收通过；私人接口保持401/no-store。
 
 第二次发布在Daily上游RSS间歇故障时被既有门禁拒绝，回滚曾报告未完成。之后逐项核验10个unit状态、20个配置文件、两个数据库完整性/权限、Nginx和HTTP健康均恢复；正式Daily重试成功，再执行正常发布，全部门禁通过。该次恢复材料仍保留在生产 `.staging/20261013T151552Z-28133-a7139fa5`，未删除或绕过检查。上游间歇性不因本次成功而消失，后续可单独评估有界RSS重试；本次未扩大Daily代码范围。
+
+## 官方文字稿自动处理（2026-10-14 代码契约）
+
+- 同一 worker 锁内，RSS 更新完成后处理 Dwarkesh、Lex、Diary 各自最新且不晚于当前时间的已收录节目；每个北京时间自然日最多给 3 个不同节目安排取稿，预约额度持久化，重启不重置。不会逐小时回填每源历史 3 集。已有文字稿和复核稿不覆盖。
+- Dwarkesh 从显式 Transcript 区域提取；Lex 跟随节目页内真实同域文字稿链接；Diary 只接受 RSS 明确声明的官方 VTT。URL 限定 HTTPS、精确主机和路径，无凭据/端口/重定向；单页 4 MB 上限，每次网络请求前重新检查谷时。
+- 官方稿原子合并到原节目，保留 GUID、音频、发布日期等 RSS 身份，并记录独立文字稿 URL、SHA256、adapter 版本。章节级时间码明确注明精度；字幕保留实际起止时间。官方稿/字幕并不等于已逐字听校。全文只进私人阅读目录。
+- 成功保存正文后使用既有版本去重队列生成中文要点和段落证据；保存与排队间中断可恢复。取稿失败保持元数据、最早 24 小时后免费重试；不会因此循环重试付费摘要。字幕地址更新可重新尝试。
+- 页面区分等待取稿、谷时等待、正在读取、来源暂不可读、历史未自动处理、待接入转写。All-In、JRE、Nikhil 及其他未支持源仍只自动发现新集，尚无服务器整集 ASR；不能承诺到谷时就生成摘要。
+- 本节是实现契约；真实发布与端到端结果见 `podcast-transcript-production-verification.json`。

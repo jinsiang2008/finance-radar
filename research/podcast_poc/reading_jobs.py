@@ -26,7 +26,7 @@ PUBLIC_FAILURE = "处理失败，可以稍后重试。详细诊断已保存在�
 INTERRUPTED_FAILURE = "任务多次中断，已停止自动重试；可以手动重试。"
 REFRESH_FAILURE = "本次未能取得订阅源，已保留已有文章。"
 MAX_INTERRUPTION_RECOVERIES = 3
-PRIVATE_RUNTIME_KEYS = {"automatic_source_baselines", "automatic_baselines_initialized", "tracked_article_bodies"}
+PRIVATE_RUNTIME_KEYS = {"automatic_source_baselines", "automatic_baselines_initialized", "tracked_article_bodies", "podcast_daily_reservations"}
 PROVIDER_ERRORS = {
     "authentication": "DeepSeek 认证失败，请检查本机配置的密钥后重试。",
     "balance": "DeepSeek 账户余额不足，请补充余额后重试。",

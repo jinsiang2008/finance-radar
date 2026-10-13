@@ -299,6 +299,20 @@ def discover(names, limit):
                         "coverage": {"scope": "metadata_only", "segments_total": 0,
                                      "segments_processed": 0, "note": "仅发现新集，尚未取得正文或转写。"},
                         "processing": {"paid_api_calls": 0}, "discovered_at": now()})
+                # Podcasting 2.0 captions are a separate full-text candidate, not
+                # the description. Upgrade metadata only; never rewrite a read episode.
+                if key == "diary":
+                    transcript = next((node.get("url") for node in item.findall("{https://podcastindex.org/namespace/1.0}transcript")
+                        if node.get("type") == "text/vtt" and re.fullmatch(
+                            r"https://rss\.flightcast\.com/transcripts/[a-zA-Z0-9_-]+\.vtt", node.get("url", ""))), None)
+                    if transcript:
+                        existing = load_episode(eid)
+                        if (existing.get("source_kind") == "rss_metadata"
+                                and existing.get("coverage", {}).get("scope") == "metadata_only"
+                                and not existing.get("segments") and existing.get("official_transcript_url") != transcript):
+                            existing["official_transcript_url"] = transcript
+                            existing.pop("transcript_acquisition", None)
+                            save_episode(existing)
                 found += 1
                 if found >= limit:
                     break
