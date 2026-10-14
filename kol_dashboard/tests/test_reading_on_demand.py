@@ -12,6 +12,20 @@ from kol_dashboard.tests.test_reading_service import podcast
 from research.podcast_poc import reading_jobs, schedule_policy
 
 
+def merge_wire_response(prompt):
+    """Provider wire for merge only; every input point stays assigned."""
+    material = json.loads(prompt.rsplit("\n", 1)[-1])
+    assert material["wire_version"] == "merge-slots-v1"
+    inputs = material["input_points"]
+    refs = list(dict.fromkeys(ref for point in inputs.values() for ref in point["segment_ids"]))[:8]
+    themes = {f"theme_{index:02d}": None for index in range(1, 9)}
+    themes["theme_01"] = {"title": "访谈中的主要观点", "text": "原文支持这一观点，但尚不能推导一般结论。",
+                          **{f"evidence_{index:02d}": refs[index - 1] if index <= len(refs) else None
+                             for index in range(1, 9)}}
+    return {"overview": "访谈中的观点。", "themes": themes,
+            "assignments": {identity: "theme_01" for identity in inputs}}
+
+
 class OnDemandTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -32,11 +46,12 @@ class OnDemandTests(unittest.TestCase):
         self.calls.append(prompt)
         if self.after_call:
             self.after_call()
-        decoded = json.loads(prompt)[0]["content"]
-        refs = list(dict.fromkeys(re.findall(r'"(s[0-9]+)"', decoded))) or ["s0001"]
-        return llm_enrichment.EnrichmentResponse(result={
-            "schema_version": "detailed-v1", "scope": "仅有提供的短片段，缺乏进一步影响依据。", "impacts": [],
-            "overview": "访谈中的观点。", "points": [{"text": "原文支持这一观点，但尚不能推导一般结论。", "segment_ids": refs}]},
+        refs = list(dict.fromkeys(re.findall(r'"(s[0-9]+)"', prompt))) or ["s0001"]
+        result = {"schema_version": "detailed-v1", "scope": "仅有提供的短片段，缺乏进一步影响依据。", "impacts": [],
+                  "overview": "访谈中的观点。", "points": [{"text": "原文支持这一观点，但尚不能推导一般结论。", "segment_ids": refs}]}
+        if "当前阶段：综合合并" in kwargs["system_prompt"]:
+            result = merge_wire_response(prompt)
+        return llm_enrichment.EnrichmentResponse(result=result,
             usage=llm_enrichment.ProviderUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15))
 
     def save(self, identity="podcast-demand"):
@@ -57,6 +72,22 @@ class OnDemandTests(unittest.TestCase):
         self.assertEqual(self.job(job["id"])["state"], "completed")
         self.assertEqual(len(self.calls), 2)
         self.assertFalse(schedule_policy.summary_is_on_demand())
+        self.assertFalse(schedule_policy.summary_context_active())
+
+    def test_peak_explicit_multichunk_runs_merge_wire_and_retains_usage(self):
+        value = self.save()
+        value["segments"].append({"id": "s0002", "text": "A second distinct topic in the interview.",
+                                  "start_seconds": 20, "end_seconds": 40})
+        self.runtime.poc.save_episode(value)
+        selected = self.runtime.enqueue_summary(value["id"])
+        with patch.object(self.runtime.poc, "bounded_summary_chunks", return_value=[[segment] for segment in value["segments"]]):
+            self.assertTrue(self.runtime.engine.run_one())
+        self.assertEqual(self.job(selected["id"])["state"], "completed")
+        self.assertEqual(len(self.calls), 4)  # two chunks, one merge, one final; no paid repair
+        result = self.runtime.poc.load_episode(value["id"])
+        self.assertEqual(result["processing"]["paid_api_calls"], 4)
+        self.assertEqual(result["processing"]["usage"]["total_tokens"], 60)
+        self.assertEqual(set(result["summary"]["points"][0]["segment_ids"]), {"s0001", "s0002"})
         self.assertFalse(schedule_policy.summary_context_active())
 
     def test_peak_auto_and_legacy_manual_and_manual_refresh_never_start(self):

@@ -53,9 +53,14 @@ class SharedDeepSeekClient:
         # Match the shared provider's local request bounds before counting an
         # attempted API call. A rejected local prompt cannot have incurred usage.
         system_prompt = messages[0]["content"]
-        user_prompt = json.dumps(messages[1:], ensure_ascii=False)
+        # Preserve the normal system/user boundary. Wrapping the sole user
+        # instruction in a JSON message envelope makes it look like source data.
+        user_prompt = (messages[1]["content"] if len(messages) == 2
+                       and messages[0].get("role") == "system"
+                       and messages[1].get("role") == "user"
+                       else json.dumps(messages[1:], ensure_ascii=False))
         if (not isinstance(system_prompt, str) or not system_prompt.strip()
-                or len(system_prompt) > 32_000 or not user_prompt.strip()
+                or len(system_prompt) > 32_000 or not isinstance(user_prompt, str) or not user_prompt.strip()
                 or len(user_prompt) > 32_000):
             raise llm_enrichment.EnrichmentError("invalid_request", retry_after_seconds=None)
         # Each chunk, retry and merge passes this boundary independently. An

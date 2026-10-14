@@ -9,6 +9,20 @@ from kol_dashboard import llm_enrichment, reading_service, reading_worker
 from kol_dashboard.tests.test_reading_service import podcast
 
 
+def merge_wire_response(prompt):
+    """Provider wire for merge only; every input point stays assigned."""
+    material = json.loads(prompt.rsplit("\n", 1)[-1])
+    assert material["wire_version"] == "merge-slots-v1"
+    inputs = material["input_points"]
+    refs = list(dict.fromkeys(ref for point in inputs.values() for ref in point["segment_ids"]))[:8]
+    themes = {f"theme_{index:02d}": None for index in range(1, 9)}
+    themes["theme_01"] = {"title": "访谈中的主要观点", "text": "原文支持这一观点，但尚不能推导一般结论。",
+                          **{f"evidence_{index:02d}": refs[index - 1] if index <= len(refs) else None
+                             for index in range(1, 9)}}
+    return {"overview": "访谈中的观点。", "themes": themes,
+            "assignments": {identity: "theme_01" for identity in inputs}}
+
+
 class ReadingWorkerTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -26,6 +40,8 @@ class ReadingWorkerTests(unittest.TestCase):
         self.assertEqual(json.loads(value), response.result)
         self.assertEqual(complete.call_args.kwargs["config"].max_output_tokens, 1100)
         self.assertEqual(complete.call_args.kwargs["user_id"], "kol-reading-summary")
+        self.assertEqual(complete.call_args.kwargs["system_prompt"], "Output JSON")
+        self.assertEqual(complete.call_args.kwargs["user_prompt"], "Evidence text")
         self.assertEqual(client.stats()["usage"]["total_tokens"], 17)
         self.assertEqual(client.stats()["usage_unreported_calls"], 0)
         self.assertNotIn(self.config.api_key, json.dumps(client.stats()))
@@ -44,7 +60,7 @@ class ReadingWorkerTests(unittest.TestCase):
         with patch.object(llm_enrichment, "_default_transport", side_effect=AssertionError("No network")):
             with self.assertRaises(llm_enrichment.EnrichmentError) as caught:
                 client.generate([{"role": "system", "content": "JSON"},
-                                 {"role": "user", "content": "x" * 32_000}], 1100)
+                                 {"role": "user", "content": "x" * 32_001}], 1100)
         self.assertEqual(caught.exception.code, "invalid_request")
         self.assertEqual(client.stats()["paid_api_calls"], 0)
         self.assertEqual(client.stats()["usage_unreported_calls"], 0)
@@ -72,8 +88,11 @@ class ReadingWorkerTests(unittest.TestCase):
             calls.append(kwargs["user_prompt"])
             if len(calls) == 1:
                 clock[0] = datetime.fromisoformat("2026-10-13T09:00:00+08:00")
+            result = {"schema_version": "detailed-v1", "scope": "仅据取得文字。", "impacts": [], "overview": "访谈中的观点。", "points": [{"text": "原文支持这一观点。", "segment_ids": refs}]}
+            if "当前阶段：综合合并" in kwargs["system_prompt"]:
+                result = merge_wire_response(kwargs["user_prompt"])
             return llm_enrichment.EnrichmentResponse(
-                result={"schema_version": "detailed-v1", "scope": "仅据取得文字。", "impacts": [], "overview": "访谈中的观点。", "points": [{"text": "原文支持这一观点。", "segment_ids": refs}]},
+                result=result,
                 usage=llm_enrichment.ProviderUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15))
         chunks = [[value["segments"][0]], [value["segments"][1]]]
         with patch.object(worker.runtime.poc, "bounded_summary_chunks", return_value=chunks), \
