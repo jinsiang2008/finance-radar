@@ -59,12 +59,12 @@ def stage_system(stage, *, long_form=False, short_form=False):
             "每个非null主题精确包含title、text、evidence_01至evidence_08，不允许其他字段。"
             "每个evidence槽只填一个原始segment_id字符串或null；同主题至少1个非null引用且不能重复。"
             "assignments必须是覆盖input_points每一个编号的完整对象，每个编号恰好出现一次，值为一个非null主题槽名称。"
-            "每个非null主题至少分配一个输入要点，每条引用必须来自分配给该主题的输入要点之segment_ids。"
+            "每个非null主题至少分配一个输入要点。assignments仅是覆盖账本，不划分引用所有权；同一原文段可以支持多个主题。每条引用须来自当前合并组任一input_points的真实segment_ids，并直接支持本主题观点。"
             "即便把重复要点合并，也必须在assignments逐一保留其归属；最后一份笔记同样不能漏掉。"
             "归属表只记录分组，不替代论证；主题正文仍应实质涵盖该组重要观点、不同意见和条件。"
             "overview与所有主题正文总计约1500–2400中文字符，简短资料按实际内容缩减。"
             "每主题用多句说明论点、代表案例和条件，不能只留短标题。此阶段不输出impacts或投资建议。"
-            "以下只示范结构，实际assignments须列全输入编号，evidence须从本主题所属输入选择真实ID："
+            "以下只示范结构，实际assignments须列全输入编号，evidence须从当前合并组选择支持本主题的真实ID，允许跨主题共享证据："
             + json.dumps(skeleton, ensure_ascii=False))
     size = ("长访谈：points总数8–14，overview约200–350字；全文目标1800–3000中文字符。"
             "每点多个完整句子说明论据案例与条件，事实概述和要点至少1200中文字符。" if long_form else
@@ -122,7 +122,9 @@ def decode_merge_output(raw, material):
             raise ValueError("Merge assignment must name an active theme")
         grouped[theme].append(point_id)
     decoded = {"overview": raw["overview"], "points": []}
-    all_allowed = set()
+    # Assignment is a coverage ledger, not exclusive ownership of evidence.
+    # A source passage may directly support more than one theme in this group.
+    all_allowed = {ref for point in inputs.values() for ref in point["segment_ids"]}
     for name in MERGE_THEMES:
         theme = themes[name]
         if theme is None:
@@ -131,15 +133,13 @@ def decode_merge_output(raw, material):
             raise ValueError("Merge theme fields invalid")
         if not grouped[name]:
             raise ValueError("Merge active theme has no assigned input points")
-        allowed = {ref for point_id in grouped[name] for ref in inputs[point_id]["segment_ids"]}
-        all_allowed.update(allowed)
         refs = []
         for key in MERGE_EVIDENCE:
             ref = theme[key]
             if ref is None:
                 continue
-            if not isinstance(ref, str) or ref not in allowed:
-                raise ValueError("Merge citation does not belong to this theme assigned inputs")
+            if not isinstance(ref, str) or ref not in all_allowed:
+                raise ValueError("Merge citation does not belong to the current merge group")
             if ref in refs:
                 raise ValueError("Merge evidence slots must not repeat an ID")
             refs.append(ref)
@@ -164,6 +164,25 @@ def stage_cache_key(stage, prompt, *, long_form=False, short_form=False):
     return hashlib.sha256((system + "\n" + prompt).encode()).hexdigest()
 
 
+def merge_cache_keys(prompt):
+    """Reuse only the immediately preceding, stricter evidence-ownership policy.
+
+    Its successful decoded notes already satisfy the relaxed group-wide rule;
+    callers still validate them against this group's current evidence IDs.
+    All other stage text remains in the hash, so unrelated prompt changes miss.
+    """
+    system = stage_system("merge")
+    previous = system.replace(
+        "每个非null主题至少分配一个输入要点。assignments仅是覆盖账本，不划分引用所有权；"
+        "同一原文段可以支持多个主题。每条引用须来自当前合并组任一input_points的真实segment_ids，并直接支持本主题观点。",
+        "每个非null主题至少分配一个输入要点，每条引用必须来自分配给该主题的输入要点之segment_ids。"
+    ).replace(
+        "以下只示范结构，实际assignments须列全输入编号，evidence须从当前合并组选择支持本主题的真实ID，允许跨主题共享证据：",
+        "以下只示范结构，实际assignments须列全输入编号，evidence须从本主题所属输入选择真实ID：")
+    return tuple(dict.fromkeys((stage_cache_key("merge", prompt),
+                               hashlib.sha256((previous + "\n" + prompt).encode()).hexdigest())))
+
+
 def validation_feedback(error, value, *, stage, long_form=False, short_form=False):
     """Only local reason codes and counts enter repair instructions, never prose."""
     points = value.get("points") if isinstance(value, dict) else None
@@ -176,7 +195,7 @@ def validation_feedback(error, value, *, stage, long_form=False, short_form=Fals
         "Merge assignment must name an active theme": "每个assignments值必须是一个非null的theme_01至theme_08槽位。",
         "Merge theme fields invalid": "非null主题只能含title、text和evidence_01至evidence_08这8个引用槽，引用槽不能省略。",
         "Merge active theme has no assigned input points": "存在未分配任何输入要点的主题；每个非null主题必须有原始输入归属。",
-        "Merge citation does not belong to this theme assigned inputs": "引用必须来自assignments分配给本主题的输入要点，不能借用其他主题的引用或填写列表。",
+        "Merge citation does not belong to the current merge group": "引用必须来自当前合并组input_points的真实segment_ids并直接支持观点；可以共享证据，不能引用组外ID或填写列表。",
         "Merge evidence slots must not repeat an ID": "同主题的8个引用槽不能重复ID；不用的槽填null。",
         "Merge active theme requires at least one evidence ID": "每个非null主题至少需要1个真实原始ID，其余不用的引用槽填null。",
     }
@@ -431,10 +450,12 @@ def summarize(poc, eid):
                 continue
             prompt = merge_prompt(group)
             ids = {ref for note in group for point in note["points"] for ref in point["segment_ids"]}
-            path = cache / ("detail-merge-" + stage_cache_key("merge", prompt) + ".json")
-            note = validate_stage(json.loads(path.read_text()), ids, stage="merge") if path.exists() else infer(prompt, ids, stage="merge", merge_input=merge_material(group))
-            if not path.exists():
-                poc.write_json(path, note)
+            paths = [cache / ("detail-merge-" + key + ".json") for key in merge_cache_keys(prompt)]
+            path = next((candidate for candidate in paths if candidate.exists()), None)
+            note = (validate_stage(json.loads(path.read_text()), ids, stage="merge") if path else
+                    infer(prompt, ids, stage="merge", merge_input=merge_material(group)))
+            if not paths[0].exists():
+                poc.write_json(paths[0], note)
             merged.append(note)
         notes = merged
     # This stage always runs, including a single short article/chunk. Its references

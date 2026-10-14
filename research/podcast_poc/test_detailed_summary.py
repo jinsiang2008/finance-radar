@@ -347,6 +347,58 @@ class DetailedTests(unittest.TestCase):
         self.assertEqual(result["processing"]["paid_api_calls"], 6)
         self.assertEqual(result["summary_signature"], version)
 
+    def test_previous_stricter_merge_cache_is_reused_after_policy_change(self):
+        value = self.save()
+        value["segments"] = [{"id": f"s{i:04d}", "text": "Long evidence and caveats. "*400} for i in range(3)]
+        self.poc.save_episode(value)
+        version = self.poc.detailed_summary_signature(value)
+        cache = self.poc.DATA / "chunks" / value["id"] / version
+        for index, segment in enumerate(value["segments"]):
+            self.poc.write_json(cache / f"detail-{index:03d}.json", answer([segment["id"]]))
+        self.client_options["long"] = True
+        factory = self.poc._RUNTIME["client_factory"]
+        def fail_after_merge():
+            client = factory()
+            if len(self.clients) == 1:
+                client.fail_on = 2
+            return client
+        self.poc._RUNTIME["client_factory"] = fail_after_merge
+        job = self.engine.enqueue(value["id"])
+        self.engine.run_one()
+        prompt = self.clients[0].calls[0]
+        current, previous = detail.merge_cache_keys(prompt)
+        self.assertNotEqual(current, previous)
+        current_path = cache / ("detail-merge-" + current + ".json")
+        previous_path = cache / ("detail-merge-" + previous + ".json")
+        current_path.rename(previous_path)
+        original_bytes = previous_path.read_bytes()
+        restarted = reading_jobs.Engine(self.poc)
+        self.assertEqual(restarted.enqueue(value["id"])["id"], job["id"])
+        self.assertTrue(restarted.run_one())
+        self.assertEqual(len(self.clients[1].calls), 1)  # only final; chunks and merge reused
+        self.assertNotIn(prompt, self.clients[1].calls)
+        self.assertEqual(previous_path.read_bytes(), original_bytes)
+        self.assertEqual(json.loads(current_path.read_text()), json.loads(previous_path.read_text()))
+        result = self.poc.load_episode(value["id"])
+        self.assertEqual(result["status"], "summarized")
+        self.assertEqual(result["processing"]["paid_api_calls"], 3)
+
+    def test_previous_cache_key_is_exact_and_does_not_mask_other_system_changes(self):
+        prompt = "same source notes"
+        current, previous = detail.merge_cache_keys(prompt)
+        # Released exclusive-evidence system identity before this relaxation.
+        self.assertEqual(previous, "03df7f95e8731aee137aeeb677864ecf7c160e60cf77e13249584f33c8405045")
+        self.assertEqual(current, detail.stage_cache_key("merge", prompt))
+        original = detail.stage_system
+        with patch.object(detail, "stage_system", side_effect=lambda *a, **kw: original(*a, **kw) + "新的独立限制"):
+            changed = detail.merge_cache_keys(prompt)
+        self.assertNotIn(current, changed)
+        self.assertNotIn(previous, changed)
+        system = detail.stage_system("merge")
+        self.assertIn("仅是覆盖账本", system)
+        self.assertIn("允许跨主题共享证据", system)
+        self.assertNotIn("来自分配给该主题的输入要点", system)
+
     def test_merge_system_has_trusted_schema_and_repairs_actual_24_point_error(self):
         value = self.save()
         value["segments"] = [{"id": f"s{i:04d}", "text": "Long evidence and caveats. "*400} for i in range(3)]
@@ -625,10 +677,18 @@ class MergeWireTests(unittest.TestCase):
             with self.subTest(edit=index), self.assertRaises(ValueError):
                 self.decode(raw)
 
-    def test_decoder_rejects_wrong_theme_citation_even_when_globally_real(self):
+    def test_decoder_allows_shared_evidence_across_themes_in_same_group(self):
         self.raw["themes"]["theme_01"]["evidence_01"] = "s0001"
         self.assertIn("s0001", self.material["input_points"]["N1P2"]["segment_ids"])
-        with self.assertRaisesRegex(ValueError, "this theme assigned inputs"):
+        self.assertEqual(self.raw["assignments"]["N1P2"], "theme_02")
+        decoded = self.decode()
+        self.assertIn("s0001", decoded["points"][0]["segment_ids"])
+        self.assertIn("s0001", decoded["points"][1]["segment_ids"])
+        self.assertEqual(set(self.raw["assignments"]), set(self.material["input_points"]))
+
+    def test_decoder_rejects_evidence_outside_current_merge_group(self):
+        self.raw["themes"]["theme_01"]["evidence_01"] = "s9999"
+        with self.assertRaisesRegex(ValueError, "current merge group"):
             self.decode()
 
     def test_decoder_rejects_non_scalar_unknown_duplicate_and_missing_evidence(self):
@@ -669,7 +729,7 @@ class MergeWireTests(unittest.TestCase):
         with self.assertRaises(ValueError) as raised:
             self.decode()
         feedback = detail.validation_feedback(raised.exception, self.raw, stage="merge")
-        self.assertIn("分配给本主题的输入要点", feedback)
+        self.assertIn("当前合并组input_points", feedback)
         self.assertNotIn("PRIVATE_MODEL_MATERIAL", feedback)
         self.assertIn("禁止简单拼接或删除后半部分要点", feedback)
 
