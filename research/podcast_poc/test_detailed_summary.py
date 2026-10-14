@@ -253,6 +253,68 @@ class DetailedTests(unittest.TestCase):
         self.assertIn("s0006", {ref for p in result["summary"]["points"] for ref in p["segment_ids"]})
         self.assertGreater(len(list((self.poc.DATA / "chunks" / value["id"]).glob("*/detail-merge-*.json"))), 2)
 
+    def test_small_notes_still_merge_at_most_three_at_each_level(self):
+        value = self.save()
+        value["segments"] = [{"id": f"s{i:04d}", "text": "Long evidence and caveats. "*400} for i in range(9)]
+        self.poc.save_episode(value)
+        self.client_options["long"] = True
+        self.engine.enqueue(value["id"])
+        self.assertTrue(self.engine.run_one())
+        result = self.poc.load_episode(value["id"])
+        self.assertEqual(result["status"], "summarized")
+        merges = [prompt for prompt in self.clients[0].calls
+                  if '"segment_id"' not in prompt and '"schema_version":"detailed-v1"' not in prompt]
+        # Nine tiny notes fit within the character cap but must form 3 + 1 merges.
+        self.assertEqual(len(merges), 4)
+        for prompt in merges:
+            group = json.loads(prompt.rsplit("\n", 1)[-1])
+            self.assertGreaterEqual(len(group), 2)
+            self.assertLessEqual(len(group), 3)
+            self.assertLessEqual(self.poc.serialized_prompt_chars(prompt), 28000)
+            self.assertIn("每点最多引用8个", prompt)
+            self.assertIn("不要逐份拼接", prompt)
+        final_prompt = self.clients[0].calls[-1]
+        self.assertIn("每条主题和影响最多引用8个", final_prompt)
+        self.assertIn("1800–3000", final_prompt)
+        all_refs = {ref for point in result["summary"]["points"] + result["summary"]["impacts"] for ref in point["segment_ids"]}
+        self.assertIn("s0008", all_refs)
+
+    def test_new_merge_tree_reuses_existing_chunk_files_and_completed_subtree(self):
+        value = self.save()
+        value["segments"] = [{"id": f"s{i:04d}", "text": "Long evidence and caveats. "*400} for i in range(9)]
+        self.poc.save_episode(value)
+        version = self.poc.detailed_summary_signature(value)
+        cache = self.poc.DATA / "chunks" / value["id"] / version
+        # This matches persisted production chunks: the merge-only repair must
+        # reuse their original filenames and validated contents without inference.
+        for index, segment in enumerate(value["segments"]):
+            self.poc.write_json(cache / f"detail-{index:03d}.json", answer([segment["id"]]))
+        original_chunks = {path.name: path.read_bytes() for path in cache.glob("detail-???.json")}
+        self.client_options["long"] = True
+        original_factory = self.poc._RUNTIME["client_factory"]
+        def factory():
+            client = original_factory()
+            if len(self.clients) == 1:
+                client.fail_on = 2
+            return client
+        self.poc._RUNTIME["client_factory"] = factory
+        job = self.engine.enqueue(value["id"])
+        self.assertTrue(self.engine.run_one())
+        self.assertEqual(next(j for j in self.engine.snapshot() if j["id"] == job["id"])["state"], "failed")
+        completed_merge = self.clients[0].calls[0]
+        self.assertEqual(len(list(cache.glob("detail-merge-*.json"))), 1)
+        restarted = reading_jobs.Engine(self.poc)
+        self.assertEqual(restarted.enqueue(value["id"])["id"], job["id"])
+        self.assertTrue(restarted.run_one())
+        self.assertEqual(len(self.clients[1].calls), 4)  # remaining 3 merges + final
+        self.assertNotIn(completed_merge, self.clients[1].calls)
+        self.assertFalse(any('"segment_id"' in prompt for client in self.clients for prompt in client.calls))
+        self.assertEqual({path.name: path.read_bytes() for path in cache.glob("detail-???.json")}, original_chunks)
+        result = self.poc.load_episode(value["id"])
+        self.assertEqual(result["status"], "summarized")
+        self.assertEqual(result["processing"]["paid_api_calls"], 6)
+        self.assertEqual(result["summary_signature"], version)
+
     def test_old_publication_date_and_time_scope_reach_every_stage(self):
         value = self.save()
         value["published_at"] = "2025-11-26T00:00:00Z"

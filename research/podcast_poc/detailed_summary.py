@@ -13,6 +13,7 @@ import time
 
 SCHEMA = "detailed-v1"
 PROMPT_VERSION = "detailed-reading-v1"
+MAX_MERGE_INPUTS = 3
 SCOPE = ("仅依据当前取得的文字资料；原文观点与下方 AI 影响分析分开呈现。"
          "未查询实时行情、用户持仓或企业最新经营数据，影响分析属于有条件的推断，不能视为已验证的投资机会。")
 SYSTEM = (
@@ -214,9 +215,12 @@ def summarize(poc, eid):
                 + json.dumps(material, ensure_ascii=False))
 
     def merge_prompt(items):
-        return (prefix + "这是有原始出处的分段证据笔记。合并去重，保留主要论点、案例数字、条件和不同意见，"
-                "仍输出overview和points（title,text,segment_ids），8–14个主题约1500–2400中文字符；"
-                "简短材料按实际内容缩减。不可增加资料以外的事实，不能删成8个短句。\n"
+        return (prefix + "这是有原始出处的分段证据笔记。请综合重组并去重，不要逐份拼接或复制所有输入要点。"
+                "保留主要论点、代表案例数字、条件和不同意见，仍输出overview和points（title,text,segment_ids）。"
+                "整份合并结果只有8–14个主题，overview与要点正文总计约1500–2400中文字符；"
+                "每点用多个完整句子说明，不是8个短句；简短材料按实际内容缩减。"
+                "每点最多引用8个直接支持论点的代表原始ID，不罗列全部邻近字幕或复制全部输入引用。"
+                "引用必须来自这次输入且实际支持相应主张；不能为凑数保留不相关引用。不可增加资料以外的事实。\n"
                 + json.dumps(items, ensure_ascii=False))
 
     total_chars = sum(len(item["text"]) for item in episode["segments"])
@@ -237,7 +241,12 @@ def summarize(poc, eid):
         progress["chunks_processed"] = index + 1
         persist()
     while len(notes) > 1:
-        groups = poc.bounded_summary_groups(notes, merge_prompt, maximum=27000)
+        # Bound both request bytes and semantic fan-in. Even many short notes
+        # can provoke an oversized concatenated output if merged all at once.
+        # Chunk identity is unchanged; only merge/final prompt hashes vary.
+        groups = [group for offset in range(0, len(notes), MAX_MERGE_INPUTS)
+                  for group in poc.bounded_summary_groups(notes[offset:offset + MAX_MERGE_INPUTS],
+                                                         merge_prompt, maximum=27000)]
         if len(groups) == len(notes):
             raise ValueError("Detailed notes cannot be merged within request limits")
         merged = []
@@ -257,6 +266,8 @@ def summarize(poc, eid):
     # can only cite evidence actually retained by the preceding evidence notes.
     ids = {ref for point in notes[0]["points"] for ref in point["segment_ids"]}
     final_prompt = (prefix + "根据详细证据笔记写最终中文阅读报告，事实摘要与AI推断严格分开。"
+        "综合取舍并去重，不要复制所有输入要点、逐段拼接或重复展开同一个论据。"
+        "每条主题和影响最多引用8个最直接支持的代表原始ID，不复制全部输入引用，不罗列全部邻近字幕。"
         + ("长访谈目标正文约1800–3000字，overview约200–350字，8–14个主题，每点多个完整句子展开论据、案例、前提和反例。" if long_form else
            ("本文不足800字符，只提取1–3个主题，概述和要点正文合计最多600字符，通常0–2条实质影响；保留全部有用日程和数字，不扩充猜测。" if short_form else
             "按文章或片段实际内容写详细报告，概述和1–8个主题要点，不要为了长度凑数；较短文本不强求投资相关性。"))
