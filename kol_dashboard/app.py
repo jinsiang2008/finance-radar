@@ -85,7 +85,7 @@ _AI_ACTION_HEADER = "X-Finance-Radar-Action"
 _AI_ACTION_VALUE = "request-ai-enrichment"
 _OPTIONS_POLICY_ACTION_VALUE = "update-options-policy"
 _OPTIONS_POLICY_MAX_BODY_BYTES = 16 * 1024
-_READING_ASSET_VERSION = "44"
+_READING_ASSET_VERSION = "45"
 _READING_ASSETS = frozenset({"app.js", "style.css", "wechat.js", "wechat.css", "reader-auth.js", "reader-auth.css"})
 _READING_WEB = BASE.parent / "research" / "podcast_poc" / "web"
 # The atomic release flattens kol_dashboard alongside the shared research package.
@@ -1363,13 +1363,15 @@ async def request_reading_summary(request: Request,
         raw.extend(chunk)
     try:
         value = json.loads(raw, object_pairs_hook=_strict_json_object)
-        if (not isinstance(value, dict) or set(value) != {"id"} or not isinstance(value["id"], str)
+        if (not isinstance(value, dict) or set(value) not in ({"id"}, {"id", "upgrade"}) or not isinstance(value["id"], str)
+                or ("upgrade" in value and type(value["upgrade"]) is not bool)
                 or not re.fullmatch(r"[a-zA-Z0-9_-]{1,100}", value["id"])):
             raise ValueError("Invalid reading identity")
     except (ValueError, UnicodeDecodeError):
         _ai_request_error(422, "invalid_reading_request")
     try:
-        job = reading_service.enqueue_summary(value["id"])
+        job = (reading_service.enqueue_summary(value["id"], upgrade=value["upgrade"]) if "upgrade" in value
+               else reading_service.enqueue_summary(value["id"]))
     except FileNotFoundError:
         _ai_request_error(404, "reading_item_not_found")
     except ValueError:

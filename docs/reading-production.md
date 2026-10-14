@@ -24,7 +24,7 @@ worker 消费持久队列并在内部判断是否到期：线上仅谷时抓取�
 
 平铺应用包增加 `reading_service.py`、`reading_worker.py`、`reading_import.py`。共享代码保留 Python namespace 路径 `research/podcast_poc`，只复制：
 
-- 运行文件：`poc.py`、`wechat.py`、`reading_jobs.py`、`schedule_policy.py`、`inference.py`、`official_transcripts.py`、`wechat_sources.json`。
+- 运行文件：`poc.py`、`wechat.py`、`reading_jobs.py`、`schedule_policy.py`、`inference.py`、`official_transcripts.py`、`detailed_summary.py`、`wechat_sources.json`。
 - 八个界面文件：`index.html`、`wechat.html`、`app.js`、`wechat.js`、`style.css`、`wechat.css`、`reader-auth.js`、`reader-auth.css`。
 
 不复制 tests、private、runtime、模型、虚拟环境、`configure_deepseek.py` 或本地服务控制脚本。文章、音频、队列与凭据都不进入代码 release。
@@ -136,3 +136,13 @@ bash -n kol_dashboard/deploy.sh
 上线后已通过既有去重队列启动一次真实刷新。最新正文获取、摘要状态、模型用量和证据引用计数以 `podcast-transcript-production-verification.json` 中带时间戳的结果为准。每小时检查不是摘要完成时限：RSS 串行读取、上游故障与长节目分块都会延后处理；每日 3 集是不同节目的取稿预约额度，失败也占用额度，不能解释为每日保证完成 3 份摘要。
 
 首轮端到端验收于 2026-10-14 00:49 CST 完成：Dwarkesh 的 Si Sheppard 一期、Lex 的 Andrew Scull 一期、Diary 的 Eric Weinstein 一期都成功取得官方稿并生成中文初稿，分别处理 59/431/1521 个原文段落、11/16/9 个分块，各有 8 条中文要点，9/19/24 个引用均对应已存段落。队列无运行或等待任务，自动摘要仍待人工语义复核，未独立核验音频。Dwarkesh 本轮 RSS 曾返回 502，但保留的最新节目身份及独立官方正文读取成功；不能把一次端到端通过解释为所有上游持续可用。
+
+## 详细阅读与影响分析（2026-10-14 实现契约）
+
+长访谈按内容量生成约 1800–3000 字中文详解，分块时保留论据、案例、数字、条件、反例及观点差异；短文章不按固定条数填充。`detailed-v1` 保留 `overview` 和有原始段落引用的 `points`，新增独立 `impacts`，包括投资、工作或行业的影响机制、不确定性和可验证观察项。界面固定标注 AI 推断，引用只表明推断的原文起点，不能冒充嘉宾原话或已证实结论。未查询用户持仓、实时行情或企业最新经营数据，不生成个性化买卖指令。
+
+生产 worker 对尚无摘要的新任务使用详细格式，普通刷新仍复用旧完成稿；旧稿须显式提交 `{"id":"已有内容ID","upgrade":true}` 升级，同一版本重复请求复用任务。升级意图保存在 SQLite，排队与取稿/模型调用均沿用谷时限制，不通过升级绕过峰谷。
+
+升级期间继续显示原摘要和原复核记录，进度独立保存。只有新稿完整生成并通过引用与格式校验后才切换，旧摘要、复核和可确认对应的原文进入私人历史记录；新稿重新标为待复核。无法确认旧证据版本时仍保留旧摘要，但不把当前正文误当历史证据。失败或谷时暂停不丢原稿，已完成分块和合并继续复用缓存。
+
+原文与历史正文只存私人阅读目录；Git 仅保存代码、说明和不含私有正文的验收元数据。具体发布、真实生成篇幅、模型用量与抽查结论待本轮验收后记录。

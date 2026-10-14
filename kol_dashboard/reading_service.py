@@ -58,6 +58,7 @@ class ReadingRuntime:
                                    client_factory=client_factory or _web_inference_disabled,
                                    fetcher=self.fetch_feed)
         self.poc.ALLOW_PODCAST_JOBS = True
+        self.poc.DETAILED_SUMMARIES = True
         self.poc.refresh_podcasts = self.refresh_podcasts
         self.engine = reading_jobs.Engine(self.poc)
         self.poc.reading_schedule = self.schedule_status
@@ -283,10 +284,10 @@ class ReadingRuntime:
                                    automatic_scope="latest_one_per_source", podcast_daily_limit=PODCAST_DAILY_LIMIT)
         return result
 
-    def enqueue_summary(self, content_id):
+    def enqueue_summary(self, content_id, *, upgrade=False):
         if self.settings()["provider"] != "deepseek":
             raise ReadingUnavailable("阅读后台尚未配置完成，请稍后重试。")
-        return self.engine.enqueue(content_id, manual=True)
+        return self.engine.enqueue(content_id, manual=True, upgrade=upgrade)
 
     def enqueue_check(self, manual=True):
         if self.settings()["provider"] != "deepseek":
@@ -326,8 +327,8 @@ def runtime_status():
     return get_runtime().status()
 
 
-def enqueue_summary(content_id):
-    return get_runtime().enqueue_summary(content_id)
+def enqueue_summary(content_id, *, upgrade=False):
+    return get_runtime().enqueue_summary(content_id, upgrade=upgrade)
 
 
 def enqueue_check(manual=True):

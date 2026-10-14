@@ -557,6 +557,15 @@ def validate_summary(value, allowed_ids):
     return {"overview": value["overview"], "points": [{"text": p["text"], "segment_ids": list(dict.fromkeys(p["segment_ids"]))} for p in points]}
 
 
+def strict_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Duplicate JSON key")
+        result[key] = value
+    return result
+
+
 def parse_json(text):
     text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip())
     value, end = json.JSONDecoder().raw_decode(text)
@@ -565,6 +574,14 @@ def parse_json(text):
     if text[end:].strip() not in {"", '"'}:
         raise ValueError("Unexpected material after JSON object")
     return value
+
+
+def detailed_summary_signature(episode):
+    return local_module("detailed_summary").signature(__import__("sys").modules[__name__], episode)
+
+
+def summarize_detailed(eid):
+    return local_module("detailed_summary").summarize(__import__("sys").modules[__name__], eid)
 
 
 def summarize(eid):
@@ -737,7 +754,10 @@ def apply_review(eid, review_path):
         raise ValueError("Only a completed draft may be reviewed")
     if review.get("summary_signature") != episode["summary_signature"]:
         raise ValueError("Review belongs to a different input/model/prompt version")
-    summary = validate_summary(review["summary"], {s["id"] for s in episode["segments"]})
+    ids = {s["id"] for s in episode["segments"]}
+    summary = (local_module("detailed_summary").validate(review["summary"], ids, final=True)
+               if episode.get("summary", {}).get("schema_version") == "detailed-v1"
+               else validate_summary(review["summary"], ids))
     if not isinstance(review.get("issues"), list) or not all(isinstance(s, str) for s in review["issues"]):
         raise ValueError("Review issues must be a list of strings")
     episode["model_draft_summary"] = episode.get("model_draft_summary", episode["summary"])
@@ -842,14 +862,15 @@ def serve(port, *, return_server=False, start_worker=True):
                 length = int(self.headers.get("Content-Length", "0"))
                 if not 0 < length <= 1024:
                     raise ValueError("Invalid body size")
-                value = json.loads(self.rfile.read(length))
+                value = json.loads(self.rfile.read(length), object_pairs_hook=strict_json_object)
                 if not isinstance(value, dict):
                     raise ValueError("Invalid body")
                 path = urlparse(self.path).path
                 if path == "/api/wechat/summarize":
-                    if set(value) != {"id"} or not isinstance(value["id"], str):
+                    if (set(value) not in ({"id"}, {"id", "upgrade"}) or not isinstance(value["id"], str)
+                            or ("upgrade" in value and type(value["upgrade"]) is not bool)):
                         raise ValueError("Invalid article request")
-                    job = engine.enqueue(value["id"], manual=True)
+                    job = engine.enqueue(value["id"], manual=True, upgrade=value.get("upgrade", False))
                 elif path == "/api/wechat/check":
                     if set(value) - {"force"} or not isinstance(value.get("force", False), bool):
                         raise ValueError("Invalid check request")

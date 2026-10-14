@@ -64,6 +64,13 @@ class ReaderAPITests(unittest.TestCase):
         self.assertEqual(self.post(value={"id": "wx-missing"})[0], 404)
         self.assertEqual(self.post(headers={"Content-Type": "text/plain"})[0], 415)
 
+    def test_upgrade_requires_boolean_and_supported_provider(self):
+        for upgrade in (1, 0, "true", None, {}, []):
+            self.assertEqual(self.post(value={"id": self.article["id"], "upgrade": upgrade})[0], 400)
+        self.assertEqual(self.post(value={"id": self.article["id"], "upgrade": True})[0], 400)
+        poc.write_json(poc.DATA / "runtime/automation.json", {"provider": "deepseek"})
+        self.assertEqual(self.post(value={"id": self.article["id"], "upgrade": True})[0], 202)
+
     def test_disabled_schedule_does_not_check_but_manual_still_works(self):
         code, result = self.post(path="/api/wechat/check", value={})
         self.assertEqual(code, 200)

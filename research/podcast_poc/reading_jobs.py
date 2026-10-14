@@ -90,6 +90,8 @@ class Engine:
                 for column in ("not_before", "deferred_reason"):
                     if column not in columns:
                         connection.execute("ALTER TABLE jobs ADD COLUMN " + column + " TEXT")
+                if "upgrade" not in columns:
+                    connection.execute("ALTER TABLE jobs ADD COLUMN upgrade INTEGER NOT NULL DEFAULT 0")
                 connection.commit()
             except BaseException:
                 connection.rollback()
@@ -137,6 +139,7 @@ class Engine:
         result = dict(row)
         result["manual"] = bool(result["manual"])
         result["reused"] = bool(result["reused"])
+        result["upgrade"] = bool(result.get("upgrade", False))
         result.pop("interruptions", None)
         return result
 
@@ -183,16 +186,29 @@ class Engine:
             for point in points
         )
 
-    def _version(self, article):
-        signature = getattr(self.poc, "summary_signature", None)
+    def _version(self, article, upgrade=False):
+        detailed = upgrade or getattr(self.poc, "DETAILED_SUMMARIES", False)
+        signature = getattr(self.poc, "detailed_summary_signature" if detailed else "summary_signature", None)
         if signature is not None:
             return signature(article)
         identity = [article["segments"], self.poc.MODEL, "wechat-source-evidence-v1",
                     article.get("body_hash"), article.get("title"), article.get("account")]
         return hashlib.sha256(json.dumps(identity, ensure_ascii=False).encode()).hexdigest()
 
-    def enqueue(self, article_id, manual=True):
+    def _ready_for_job(self, article, job):
+        if not self._summary_ready(article):
+            return False
+        return (not job.get("upgrade") or (article.get("summary", {}).get("schema_version") == "detailed-v1"
+                and article.get("summary_signature") == self._version(article, True)))
+
+    def enqueue(self, article_id, manual=True, upgrade=False):
         """Queue a validated body once; only an explicit manual request retries failure."""
+        if type(upgrade) is not bool:
+            raise ValueError("升级选项必须是布尔值。")
+        if upgrade and not callable(getattr(self.poc, "summarize_detailed", None)):
+            raise ValueError("当前环境不支持详细摘要。")
+        if upgrade and callable(getattr(self.poc, "summary_config", None)) and self.poc.summary_config().get("provider") != "deepseek":
+            raise ValueError("详细摘要需要先配置 DeepSeek。")
         pattern = r"[a-zA-Z0-9_-]{1,100}" if getattr(self.poc, "ALLOW_PODCAST_JOBS", False) else r"wx-[a-zA-Z0-9_-]{1,97}"
         if not isinstance(article_id, str) or not re.fullmatch(pattern, article_id):
             raise ValueError("仅支持已有的文章或节目。")
@@ -201,24 +217,39 @@ class Engine:
             raise ValueError("文章记录与请求不一致。")
         if not self._has_input(article):
             raise ValueError("尚未取得可用正文，不能生成摘要。")
-        version, ready, moment = self._version(article), self._summary_ready(article), _now()
+        version, ready, moment = self._version(article, upgrade), self._ready_for_job(article, {"upgrade": upgrade}), _now()
         policy = self._schedule()
         with self._transaction() as connection:
+            # A local legacy reader may poll/queue while its explicit detailed
+            # upgrade is pending. Preserve that intent rather than superseding
+            # the newer job merely because the default prompt still is legacy.
+            if not upgrade and not getattr(self.poc, "DETAILED_SUMMARIES", False) and callable(getattr(self.poc, "detailed_summary_signature", None)):
+                detailed_version = self._version(article, True)
+                pending_upgrade = connection.execute("SELECT id FROM jobs WHERE type='summary' AND article_id=? AND input_version=? AND upgrade=1",
+                                                     (article_id, detailed_version)).fetchone()
+                if pending_upgrade:
+                    upgrade, version = True, detailed_version
+                    ready = self._ready_for_job(article, {"upgrade": True})
             # An old queued input must never overwrite a newer body or reviewed result.
             connection.execute("""UPDATE jobs SET state='superseded', updated_at=?, completed_at=?,not_before=NULL,deferred_reason=NULL
                 WHERE type='summary' AND article_id=? AND input_version<>? AND state='queued'""",
                 (moment, moment, article_id, version))
             row = connection.execute("SELECT * FROM jobs WHERE type='summary' AND article_id=? AND input_version=?",
                                      (article_id, version)).fetchone()
+            if row is not None and row["upgrade"]:
+                upgrade = True
+                ready = self._ready_for_job(article, {"upgrade": True})
             if row is None:
                 job_id = uuid.uuid4().hex
                 connection.execute("""INSERT INTO jobs
-                    (id,type,article_id,input_version,state,manual,created_at,updated_at,completed_at,reused)
-                    VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    (id,type,article_id,input_version,state,manual,created_at,updated_at,completed_at,reused,upgrade)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                     (job_id, "summary", article_id, version, "completed" if ready else "queued", int(manual),
-                     moment, moment, moment if ready else None, int(ready)))
+                     moment, moment, moment if ready else None, int(ready), int(upgrade)))
             else:
                 job_id = row["id"]
+                if upgrade and not row["upgrade"]:
+                    connection.execute("UPDATE jobs SET upgrade=1 WHERE id=?", (job_id,))
                 if ready and row["state"] != "running":
                     connection.execute("""UPDATE jobs SET state='completed', error=NULL, reused=1,not_before=NULL,deferred_reason=NULL,
                         completed_at=?, updated_at=? WHERE id=?""", (moment, moment, job_id))
@@ -292,9 +323,13 @@ class Engine:
                 started_at=NULL,completed_at=NULL,updated_at=? WHERE id=?""", (exception.not_before, _now(), job["id"]))
         if job["type"] == "summary":
             article = self.poc.load_episode(job["article_id"])
-            if self._version(article) == job["input_version"] and not self._summary_ready(article):
-                article["status"] = "body_ready" if article.get("content_kind") == "wechat_article" else "transcribed"
-                article.pop("error", None)
+            if self._version(article, bool(job.get("upgrade"))) == job["input_version"] and not self._ready_for_job(article, job):
+                if article.get("detail_generation"):
+                    article["detail_generation"].update(state="queued", not_before=exception.not_before)
+                    article["detail_generation"].pop("error", None)
+                if not article.get("summary"):
+                    article["status"] = "body_ready" if article.get("content_kind") == "wechat_article" else "transcribed"
+                    article.pop("error", None)
                 self.poc.save_episode(article)
         else:
             # A partial refresh must be eligible as soon as the next window opens.
@@ -303,8 +338,11 @@ class Engine:
     def _article_failure(self, job, message):
         try:
             article = self.poc.load_episode(job["article_id"])
-            if self._version(article) == job["input_version"] and not self._summary_ready(article):
-                article.update(status="failed", error=message)
+            if self._version(article, bool(job.get("upgrade"))) == job["input_version"] and not self._ready_for_job(article, job):
+                if article.get("detail_generation"):
+                    article["detail_generation"].update(state="failed", error=message)
+                if not article.get("summary"):
+                    article.update(status="failed", error=message)
                 self.poc.save_episode(article)
         except (OSError, ValueError, KeyError, TypeError):
             pass
@@ -459,22 +497,24 @@ class Engine:
                         self._refresh(manual=bool(job["manual"]))
                     else:
                         article = self.poc.load_episode(job["article_id"])
-                        if not self._has_input(article) or self._version(article) != job["input_version"]:
+                        if not self._has_input(article) or self._version(article, bool(job.get("upgrade"))) != job["input_version"]:
                             self._finish(job["id"], "superseded")
                             if self._has_input(article):
-                                self.enqueue(article["id"], manual=bool(job["manual"]))
+                                self.enqueue(article["id"], manual=bool(job["manual"]), upgrade=bool(job.get("upgrade")))
                             return True
-                        if self._summary_ready(article):
+                        if self._ready_for_job(article, job):
                             self._finish(job["id"], "completed", reused=True)
                             return True
-                        self.poc.summarize(job["article_id"])
+                        summarize = (self.poc.summarize_detailed if job.get("upgrade") or getattr(self.poc, "DETAILED_SUMMARIES", False)
+                                     else self.poc.summarize)
+                        summarize(job["article_id"])
                         completed = self.poc.load_episode(job["article_id"])
-                        if self._version(completed) != job["input_version"]:
+                        if self._version(completed, bool(job.get("upgrade"))) != job["input_version"]:
                             self._finish(job["id"], "superseded")
                             if self._has_input(completed):
-                                self.enqueue(completed["id"], manual=bool(job["manual"]))
+                                self.enqueue(completed["id"], manual=bool(job["manual"]), upgrade=bool(job.get("upgrade")))
                             return True
-                        if not self._summary_ready(completed):
+                        if not self._ready_for_job(completed, job):
                             raise ValueError("Summary generation did not persist a complete result")
                         self._runtime_update(provider_blocked=None, provider_blocked_at=None)
                     self._finish(job["id"], "completed")

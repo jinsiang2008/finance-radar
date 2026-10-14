@@ -27,7 +27,7 @@ def podcast(content_id="podcast-test", *, source_kind="official_transcript", sco
 
 class FakeClient:
     def generate(self, messages, max_tokens):
-        return json.dumps({"overview": "根据提供的文字稿总结。", "points": [{"text": "说话人表达了这个观点。", "segment_ids": ["s0001"]}]})
+        return json.dumps({"schema_version": "detailed-v1", "scope": "仅据提供的文字，没有充分行业影响依据。", "impacts": [], "overview": "根据提供的文字稿总结。", "points": [{"text": "说话人表达了这个观点。", "segment_ids": ["s0001"]}]})
 
     def stats(self):
         return {"paid_api_calls": 0, "usage_unreported_calls": 0, "usage": {}}

@@ -88,6 +88,27 @@ class ReadingApiTests(unittest.IsolatedAsyncioTestCase):
                 enqueue.assert_called_once_with("podcast-demo")
                 self.assertEqual(response.json()["job"]["state"], state)
 
+    async def test_explicit_upgrade_is_strict_boolean_and_uses_existing_auth_boundary(self):
+        await self.login()
+        headers = {"X-Finance-Radar-Action": "request-reading-summary", "Origin": "http://testserver"}
+        for upgrade in (True, False):
+            with patch.object(dashboard.reading_service, "enqueue_summary", return_value={"id": "upgrade", "state": "queued", "upgrade": upgrade}) as enqueue:
+                response = await self.client.post("/api/private/reading/summary", headers=headers, json={"id": "podcast-demo", "upgrade": upgrade})
+                self.assertEqual(response.status_code, 202)
+                enqueue.assert_called_once_with("podcast-demo", upgrade=upgrade)
+        for upgrade in (1, 0, "true", None, {}, []):
+            with patch.object(dashboard.reading_service, "enqueue_summary") as enqueue:
+                response = await self.client.post("/api/private/reading/summary", headers=headers, json={"id": "podcast-demo", "upgrade": upgrade})
+                self.assertEqual(response.status_code, 422)
+                enqueue.assert_not_called()
+        with patch.object(dashboard.reading_service, "enqueue_summary") as enqueue:
+            response = await self.client.post("/api/private/reading/summary", headers={**headers, "Content-Type": "application/json"},
+                content='{"id":"podcast-demo","upgrade":true,"upgrade":false}')
+            self.assertEqual(response.status_code, 422)
+            response = await self.client.post("/api/private/reading/summary", headers={**headers, "Origin": "https://evil.invalid"}, json={"id": "podcast-demo", "upgrade": True})
+            self.assertEqual(response.status_code, 403)
+            enqueue.assert_not_called()
+
     async def test_errors_never_expose_provider_details(self):
         await self.login()
         for failure, code in ((FileNotFoundError("PRIVATE_PATH"), 404), (ValueError("PRIVATE_BODY"), 422), (RuntimeError("PRIVATE_KEY"), 503)):
@@ -119,8 +140,8 @@ class ReadingApiTests(unittest.IsolatedAsyncioTestCase):
             response = await self.client.get("/wechat")
         self.assertEqual(response.status_code, 200)
         self.assertIn('data-kol-base="/kol"', response.text)
-        self.assertIn('/kol/reading-assets/wechat.js?v=44', response.text)
+        self.assertIn('/kol/reading-assets/wechat.js?v=45', response.text)
         self.assertNotIn('src="/wechat.js"', response.text)
         self.assertIn("frame-ancestors 'none'", response.headers["content-security-policy"])
-        self.assertEqual((await self.client.get("/reading-assets/wechat.js?v=44")).status_code, 200)
+        self.assertEqual((await self.client.get("/reading-assets/wechat.js?v=45")).status_code, 200)
         self.assertEqual((await self.client.get("/reading-assets/poc.py")).status_code, 404)

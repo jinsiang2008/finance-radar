@@ -127,6 +127,12 @@ def upsert_article(article):
                 old[key] = article.get(key)
             old.pop("source_body_note", None)
             article = old
+        else:
+            # Snapshot before replacing the old body. Historical citations must
+            # remain bound to their own text, never to reused new paragraph IDs.
+            poc.local_module("detailed_summary")._archive_previous(poc, old)
+            if old.get("summary_history"):
+                article["summary_history"] = old["summary_history"]
     poc.save_episode(article)
     return article
 

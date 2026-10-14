@@ -68,12 +68,12 @@ class ReadingWorkerTests(unittest.TestCase):
         job = worker.runtime.enqueue_summary(value["id"])
         calls = []
         def respond(**kwargs):
-            refs = (["s0001"], ["s0002"], ["s0001", "s0002"])[len(calls)]
+            refs = (["s0001"], ["s0002"], ["s0001", "s0002"], ["s0001", "s0002"])[len(calls)]
             calls.append(kwargs["user_prompt"])
             if len(calls) == 1:
                 clock[0] = datetime.fromisoformat("2026-10-13T09:00:00+08:00")
             return llm_enrichment.EnrichmentResponse(
-                result={"overview": "访谈中的观点。", "points": [{"text": "原文支持这一观点。", "segment_ids": refs}]},
+                result={"schema_version": "detailed-v1", "scope": "仅据取得文字。", "impacts": [], "overview": "访谈中的观点。", "points": [{"text": "原文支持这一观点。", "segment_ids": refs}]},
                 usage=llm_enrichment.ProviderUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15))
         chunks = [[value["segments"][0]], [value["segments"][1]]]
         with patch.object(worker.runtime.poc, "bounded_summary_chunks", return_value=chunks), \
@@ -92,8 +92,8 @@ class ReadingWorkerTests(unittest.TestCase):
             self.assertTrue(worker.runtime.engine.run_one())
         result = worker.runtime.poc.load_episode(value["id"])
         self.assertEqual(result["status"], "summarized")
-        self.assertEqual(len(calls), 3)  # first chunk, second chunk, merge; no repeated first chunk
-        self.assertEqual(result["processing"]["paid_api_calls"], 3)
+        self.assertEqual(len(calls), 4)  # two cached evidence chunks, merge, final impact stage
+        self.assertEqual(result["processing"]["paid_api_calls"], 4)
 
     def test_due_check_is_bounded_and_resume_enqueues_only_one_refresh(self):
         with patch.object(self.worker.runtime, "status", return_value={"due": True}), \

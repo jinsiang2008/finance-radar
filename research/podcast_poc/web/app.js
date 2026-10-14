@@ -23,7 +23,8 @@ function array(value) { return Array.isArray(value) ? value : []; }
 function hasTranscript(ep) { return ['full','sample','partial'].includes(ep.coverage?.scope) && array(ep.segments).some(s=>s&&typeof s.text==='string'&&s.text.trim()); }
 function thirdParty(ep) { return ep.source_kind === 'third_party_transcript'; }
 function summaryReady(ep) { return hasTranscript(ep)&&ep.status==='summarized'&&Boolean(ep.summary?.overview||array(ep.summary?.points).length); }
-function jobFor(ep) { return array(automation?.jobs).find(j=>j.article_id===ep.id); }
+function detailedSummary(ep) { return summaryReady(ep) && ep.summary?.schema_version==='detailed-v1'; }
+function jobFor(ep) { return array(automation?.jobs).find(j=>j.article_id===ep.id&&(!summaryReady(ep)||j.upgrade===true)) || (summaryReady(ep)?ep.detail_generation:null); }
 function jobState(ep) { return submitting.has(ep.id)?'submitting':jobFor(ep)?.state||(ep.status==='summarizing'?'running':ep.status==='failed'?'failed':''); }
 function isReviewed(ep) { return summaryReady(ep) && ep.quality_review?.status === 'assistant_reviewed'; }
 function beijingDate(value) { const parsed = value && new Date(value);return parsed && !Number.isNaN(parsed.getTime()) ? parsed.toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}) : '时间待确认'; }
@@ -45,7 +46,7 @@ function acquisitionInfo(ep) {
   })[acquisition.state]||null;
 }
 function status(ep) { if(!hasTranscript(ep)){const acquisition=acquisitionInfo(ep);return acquisition?[acquisition.label,acquisition.kind]:states[ep.status==='audio_ready'?'audio_ready':ep.status==='failed'?'failed':'discovered'];}return isReviewed(ep) ? [thirdParty(ep)?'摘要已对照转写复核':'文字已复核', 'done'] : !summaryReady(ep)&&(deferred(jobFor(ep))?['等待谷时','pending']:({queued:['摘要已排队','pending'],running:['正在生成摘要','pending'],failed:['摘要失败 · 可重试','failed'],completed:['摘要已完成','done']})[jobState(ep)]) || states[ep.status] || ['状态待确认', 'pending']; }
-function schedulePoll() { clearTimeout(pollTimer);if(session.authenticated())pollTimer=setTimeout(load,array(automation?.jobs).some(j=>j.state==='running'||j.state==='queued'&&!deferred(j))||episodes.some(ep=>!hasTranscript(ep)&&ep.transcript_acquisition?.state==='fetching')?5000:30000); }
+function schedulePoll() { clearTimeout(pollTimer);if(session.authenticated())pollTimer=setTimeout(load,array(automation?.jobs).some(j=>j.state==='running'||j.state==='queued'&&!deferred(j))||episodes.some(ep=>(!hasTranscript(ep)&&ep.transcript_acquisition?.state==='fetching')||ep.detail_generation?.state==='running')?5000:30000); }
 function updateSchedule() {
   const node=document.querySelector('#podcast-schedule'),boundary=document.querySelector('.podcast-source-boundary');
   if(automation?.transcript_policy==='official_latest_only'){
@@ -66,19 +67,24 @@ function updateGeneration() {
   const acquisition=acquisitionInfo(ep),coverageState=reader.querySelector('.transcript-acquisition-status'),acquisitionNote=reader.querySelector('.transcript-acquisition-note');
   if(acquisition){if(coverageState)coverageState.textContent=acquisition.label;if(acquisitionNote)acquisitionNote.textContent=acquisition.note;}
   const box=reader.querySelector('#podcast-generation');if(!box)return;
-  const state=jobState(ep),job=jobFor(ep),waiting=deferred(job),busy=['submitting','queued','running'].includes(state),button=box.querySelector('button'),note=box.querySelector('.podcast-job-state'),error=box.querySelector('.error-box');
-  note.textContent=waiting?deferredNote(job):({submitting:'正在提交请求…',queued:'摘要已排队，可继续阅读文字稿。',running:'正在整理文字稿与出处，完成后自动更新。',completed:'摘要已完成，正在等待最新结果。',failed:'摘要未能完成，可重试。'})[state]||`只总结当前取得的文字稿，不会自动下载音频或开始转写。${automation?.off_peak_only?'高峰提交后等待谷时执行。':''}`;
-  button.textContent=waiting?'等待谷时':({submitting:'正在提交…',queued:'已排队',running:'正在生成…'})[state]||(state==='failed'||requestErrors.has(ep.id)?'重新安排摘要':'安排摘要');button.disabled=busy||(!session.isKol&&!csrfToken);button.hidden=state==='completed';
-  error.textContent=requestErrors.get(ep.id)||(state==='failed'?jobFor(ep)?.error||ep.error||'':'');error.hidden=!error.textContent;
+  const upgrade=summaryReady(ep),state=jobState(ep),job=jobFor(ep),waiting=deferred(job),busy=['submitting','queued','running'].includes(state),button=box.querySelector('button'),note=box.querySelector('.podcast-job-state'),error=box.querySelector('.error-box');
+  const progress=ep.detail_generation;
+  const chunks=progress&&Number.isFinite(progress.chunks_processed)&&Number.isFinite(progress.chunks_total)?`已整理 ${progress.chunks_processed} / ${progress.chunks_total} 块。`:'';
+  note.textContent=waiting?`${deferredNote(job)}${upgrade?'现有摘要继续保留，详细稿完成后再更新。':''}`:({submitting:'正在提交请求…',queued:upgrade?'详细解读已排队，现有摘要仍可阅读。':'摘要已排队，可继续阅读文字稿。',running:`正在整理${upgrade?'详细解读':'文字稿'}与出处。${chunks}${upgrade?'现有摘要仍可阅读。':'完成后自动更新。'}`,completed:'摘要已完成，正在等待最新结果。',failed:upgrade?'详细解读未能完成，现有摘要和复核记录仍然保留。':'摘要未能完成，可重试。'})[state]||(upgrade?`当前为此前的简版摘要。可生成分主题详解和 AI 影响分析，原摘要会保留在历史记录中。${automation?.off_peak_only?'高峰提交后等待谷时执行。':''}`:`只总结当前取得的文字稿，不会自动下载音频或开始转写。${automation?.off_peak_only?'高峰提交后等待谷时执行。':''}`);
+  button.textContent=waiting?'等待谷时':({submitting:'正在提交…',queued:'已排队',running:'正在生成…'})[state]||(state==='failed'||requestErrors.has(ep.id)?upgrade?'重试详细解读':'重新安排摘要':upgrade?'生成详细解读':'安排摘要');button.disabled=busy||(!session.isKol&&!csrfToken)||(upgrade&&automation?.provider!=='deepseek');button.hidden=state==='completed';
+  if(upgrade&&automation?.provider!=='deepseek'){note.textContent='当前摘要服务尚未接入 DeepSeek；详细解读需切换至 DeepSeek 后生成。现有摘要与出处仍可阅读。';button.textContent='详细解读需 DeepSeek';}
+  box.setAttribute('aria-busy',String(busy));
+  error.textContent=requestErrors.get(ep.id)||(state==='failed'?job?.error||ep.detail_generation?.error||ep.error||'':'');error.hidden=!error.textContent;
 }
-async function generateSummary(id) {
+async function generateSummary(id,upgrade=false) {
   const generation=session.revision(),ep=episodes.find(e=>e.id===id);
-  if(!session.valid(generation)||!ep||!hasTranscript(ep)||summaryReady(ep)||['submitting','queued','running','completed'].includes(jobState(ep)))return;
+  if(!session.valid(generation)||!ep||!hasTranscript(ep)||detailedSummary(ep)||summaryReady(ep)!==upgrade||(upgrade&&automation?.provider!=='deepseek')||['submitting','queued','running','completed'].includes(jobState(ep)))return;
   submitting.add(id);requestErrors.delete(id);updateGeneration();
-  try {const response=await session.request(session.api('summary'),{method:'POST',headers:session.summaryHeaders(csrfToken),body:JSON.stringify({id})});const result=await response.json();if(!session.valid(generation))return;if(!response.ok)throw new Error(session.errorMessage(result,response.status));if(result.job?.article_id===id)automation={...automation,jobs:[...array(automation?.jobs).filter(j=>j.article_id!==id),result.job]};if(inFlight)await inFlight;await load();}
+  try {const response=await session.request(session.api('summary'),{method:'POST',headers:session.summaryHeaders(csrfToken),body:JSON.stringify(upgrade?{id,upgrade:true}:{id})});const result=await response.json();if(!session.valid(generation))return;if(!response.ok)throw new Error(session.errorMessage(result,response.status));if(result.job?.article_id===id)automation={...automation,jobs:[...array(automation?.jobs).filter(j=>j.article_id!==id),result.job]};if(inFlight)await inFlight;await load();}
   catch(error){if(session.valid(generation)&&!error.authExpired)requestErrors.set(id,error.message||'请求失败，请稍后重试。');}
   finally{submitting.delete(id);if(session.valid(generation)){updateGeneration();schedulePoll();}}
 }
+
 function collectionStatus(items) {
   return `${items.length} 集节目；已生成初稿 ${items.filter(summaryReady).length} 集，摘要已复核 ${items.filter(isReviewed).length} 集`;
 }
@@ -204,7 +210,7 @@ function section(title, meta) {
   return result;
 }
 function select(ep,{preserve=false}={}) {
-  if(currentEpisode){const old=readingStates.get(currentEpisode.id)||{};old.scroll=window.scrollY;old.details=[...reader.querySelectorAll('details')].map(n=>n.open);old.search=reader.querySelector('#segment-search')?.value||'';readingStates.set(currentEpisode.id,old);}
+  if(currentEpisode){const old=readingStates.get(currentEpisode.id)||{};old.scroll=window.scrollY;old.details=Object.fromEntries([...reader.querySelectorAll('details')].map((n,i)=>[n.dataset.stateKey||n.id||`layout:${i}`,n.open]));old.search=reader.querySelector('#segment-search')?.value||'';readingStates.set(currentEpisode.id,old);}
   const saved=readingStates.get(ep.id)||{};
   const previous = reader.querySelector('audio');
   if (previous) { previous.pause(); previous.removeAttribute('src'); previous.load(); }
@@ -287,20 +293,36 @@ function select(ep,{preserve=false}={}) {
 
   const segments = hasTranscript(ep)?array(ep.segments):[];
   const segmentMap = new Map(segments.map(s => [String(s.id), s]));
-  function segmentNode(seg, evidence = false) {
+  function segmentNode(seg, evidence = false, historical = false) {
     const node = el(evidence ? 'blockquote' : 'div', evidence ? 'evidence' : 'transcript-segment');
     const meta = el('div', 'segment-heading');
     const stamp = time(seg.start_seconds);
-    if (stamp && mediaURL) {
-      const seek = el('button', 'time-button', `▶ ${stamp}`); seek.type = 'button'; seek.setAttribute('aria-label', `从 ${stamp} 播放`);
+    if (stamp && mediaURL && !historical) {
+      const approximate=seg.timestamp_precision==='chapter';
+      const seek = el('button', 'time-button', `▶ ${stamp}${approximate?' · 章节':''}`); seek.type = 'button'; seek.setAttribute('aria-label', `从${approximate?'章节起点 ':''}${stamp} 播放`);
       seek.addEventListener('click', () => loadAudio(seg.start_seconds, true)); meta.append(seek);
     } else meta.append(el('span', '', stamp || '未提供时间戳'));
     if (seg.speaker) meta.append(el('span', '', seg.speaker));
-    node.append(meta, el('p', 'segment-text', seg.text || '此段没有正文。'));
+    if(evidence&&!historical){const locate=el('button','jump-to-transcript','定位文字稿');locate.type='button';locate.addEventListener('click',()=>{const search=reader.querySelector('#segment-search');if(!search)return;search.dispatchEvent(new CustomEvent('locate-segment',{detail:String(seg.id)}));const target=[...reader.querySelectorAll('.transcript-segment')].find(node=>node.dataset.segmentId===String(seg.id));if(target){target.tabIndex=-1;target.focus({preventScroll:true});target.scrollIntoView({block:'center',behavior:'auto'});}});meta.append(locate);}
+    node.dataset.segmentId=String(seg.id);node.append(meta, el('p', 'segment-text', seg.text || '此段没有正文。'));
     for(const note of (Array.isArray(seg.source_notes)?seg.source_notes:typeof seg.source_notes==='string'?[seg.source_notes]:[]).filter(value=>typeof value==='string'))node.append(el('p','review-meta',`来源说明：${note}`));
     return node;
   }
-  const summarySection = section('中文摘要', '保留关键观点与原文出处');
+  function evidenceNode(point,map=segmentMap,historical=false,key='') {
+    const details=el('details','point-evidence'),cited=[...new Set(array(point.segment_ids).map(String))].map(id=>map.get(id)).filter(Boolean);
+    details.dataset.stateKey=`evidence:${key}`;details.append(el('summary','',cited.length?`查看 ${cited.length} 处${historical?'历史':''}原文依据`:historical?'历史原文未保存或引用不可用':'暂无可核对的原文引用'));
+    if(cited.length)cited.forEach(seg=>details.append(segmentNode(seg,true,historical)));else details.append(el('p','empty','未关联可用原文，请结合原节目核对。'));
+    return details;
+  }
+  function detailedPoint(point,index,map=segmentMap,historical=false,key='current') {
+    const item=el('section','detailed-point');item.append(el('h4','',point.title||`主题 ${index+1}`),el('p','detailed-point-text',point.text||'未提供观点文字'),evidenceNode(point,map,historical,`${key}:point:${index}`));return item;
+  }
+  function impactNode(impact,map=segmentMap,historical=false,key='current') {
+    const item=el('section','impact-item');item.append(el('p','impact-domain',({investment:'投资视角',work:'工作视角',industry:'行业与社会影响'})[impact.domain]||'影响分析'),el('h4','',impact.title||'可能的影响'),el('p','impact-mechanism',impact.text||'未提供影响机制'));
+    if(array(impact.watch_items).length){item.append(el('h5','','值得跟踪'));const watch=el('ul','impact-watch');array(impact.watch_items).filter(value=>typeof value==='string').forEach(value=>watch.append(el('li','',value)));item.append(watch);}
+    if(impact.uncertainty)item.append(el('p','impact-uncertainty',`不确定性与边界：${impact.uncertainty}`));item.append(evidenceNode(impact,map,historical,`${key}:impact:${impact.domain}:${impact.title}`));return item;
+  }
+  const summarySection = section(detailedSummary(ep)?'中文详细解读':'中文摘要', '保留关键观点与原文出处');
   if (summaryReady(ep)) {
     const reviewed = isReviewed(ep);
     const reviewNote = el('div', `review-note ${reviewed ? 'reviewed' : ''}`);
@@ -308,16 +330,21 @@ function select(ep,{preserve=false}={}) {
     reviewNote.append(el('p', '', reviewed ? `助手于 ${date(ep.quality_review.reviewed_at)} 对照文字稿修订；未逐秒核对音频，也不代表内容已独立证实。` : `以下是${ep.processing?.inference==='deepseek'?' DeepSeek ':ep.processing?.inference==='local_mlx'?'本地 MLX 模型':'模型'}自动生成的初稿，尚未对照文字稿复核，可能误读语义。请展开引用核对。`));
     summarySection.append(reviewNote);
     if (ep.summary?.overview) summarySection.append(el('p', 'overview', ep.summary.overview));
-    const points = array(ep.summary?.points);
-    for (const point of points) {
-      const details = el('details', 'point');
+    if(detailedSummary(ep)&&ep.summary.scope){const scope=el('details','summary-scope');scope.dataset.stateKey='summary-scope';scope.append(el('summary','','解读范围'),el('p','',ep.summary.scope));summarySection.append(scope);}
+    const points = array(ep.summary?.points).filter(point=>point&&typeof point==='object');
+    if(detailedSummary(ep)){
+      summarySection.append(el('h3','detail-section-title','分主题详解'));
+      points.forEach((point,index)=>summarySection.append(detailedPoint(point,index)));
+      const impacts=el('section','impact-analysis');impacts.append(el('h3','detail-section-title','AI 影响分析'),el('p','impact-boundary','以下为 AI 推断，原文依据不等于嘉宾原话。关注 AI、科技与商业、股票与 ETF，以及 AI 产品和技术研发；未结合你的持仓或实时行情。'));
+      const items=array(ep.summary.impacts).filter(item=>item&&typeof item==='object');items.forEach(item=>impacts.append(impactNode(item)));
+      if(!items.length)impacts.append(el('p','empty','当前内容不足以支持具体影响判断，暂不延伸推断。'));
+      summarySection.append(impacts);
+    }else for (const [index,point] of points.entries()) {
+      const details = el('details', 'point');details.dataset.stateKey=`legacy-point:${index}`;
       const cited = array(point.segment_ids).map(id => segmentMap.get(String(id))).filter(Boolean);
       const summary = el('summary', '', point.text || '未提供观点文字');
-      summary.append(el('span', 'point-note', cited.length ? `查看 ${cited.length} 处原文` : '暂无可核对的原文引用'));
-      details.append(summary);
-      if (cited.length) cited.forEach(seg => details.append(segmentNode(seg, true)));
-      else details.append(el('p', 'empty', '这条观点未关联可用原文，请结合原节目核对。'));
-      summarySection.append(details);
+      summary.append(el('span', 'point-note', cited.length ? `查看 ${cited.length} 处原文` : '暂无可核对的原文引用'));details.append(summary);
+      if (cited.length) cited.forEach(seg => details.append(segmentNode(seg, true)));else details.append(el('p', 'empty', '这条观点未关联可用原文，请结合原节目核对。'));summarySection.append(details);
     }
     if (!ep.summary?.overview && !points.length) summarySection.append(el('p', 'empty', '处理状态为已生成，但没有收到摘要正文。请查看处理记录。'));
     if (reviewed) {
@@ -344,7 +371,22 @@ function select(ep,{preserve=false}={}) {
     }
   } else {
     summarySection.append(el('p',`empty${acquisition?' transcript-acquisition-note':''}`,summaryPlaceholder(ep)));
-    if(hasTranscript(ep)){const generation=el('div','podcast-generation');generation.id='podcast-generation';const state=el('p','podcast-job-state');state.setAttribute('role','status');const error=el('p','error-box');error.setAttribute('role','alert');const button=el('button','','安排摘要');button.id='generate-podcast-summary';button.type='button';button.addEventListener('click',()=>generateSummary(ep.id));generation.append(state,error,button);summarySection.append(generation);}
+
+  }
+  if(hasTranscript(ep)&&!detailedSummary(ep)){
+    const upgrade=summaryReady(ep),generation=el('div',`podcast-generation${upgrade?' detail-upgrade':''}`);generation.id='podcast-generation';const state=el('p','podcast-job-state');state.setAttribute('role','status');const error=el('p','error-box');error.setAttribute('role','alert');const button=el('button','',upgrade?'生成详细解读':'安排摘要');button.id=upgrade?'upgrade-podcast-summary':'generate-podcast-summary';button.type='button';button.addEventListener('click',()=>generateSummary(ep.id,upgrade));generation.append(state,error,button);summarySection.append(generation);
+  }
+  if(array(ep.summary_history).length){
+    const history=el('details','summary-history');history.id='summary-history';history.append(el('summary','','查看此前摘要 / 复核稿'));
+    array(ep.summary_history).filter(item=>item&&typeof item==='object').forEach((record,index)=>{
+      const item=el('section','history-entry'),oldMap=new Map(array(record.segments).filter(seg=>seg&&typeof seg==='object').map(seg=>[String(seg.id),seg]));item.append(el('h4','',`此前版本 ${index+1} · ${date(record.archived_at||record.summarized_at)}`),el('p','history-status',record.quality_review?.status==='assistant_reviewed'?'此历史稿曾对照文字复核；复核状态仅属于该版本。':'历史模型初稿 · 未复核'));
+      if(record.summary?.overview)item.append(el('p','overview',record.summary.overview));array(record.summary?.points).filter(point=>point&&typeof point==='object').forEach((point,i)=>item.append(detailedPoint(point,i,oldMap,true,record.archive_id||`history:${index}`)));
+      if(array(record.summary?.impacts).length){item.append(el('p','impact-boundary','以下为历史版本的 AI 推断，原文依据不等于嘉宾原话。'));array(record.summary.impacts).filter(impact=>impact&&typeof impact==='object').forEach(impact=>item.append(impactNode(impact,oldMap,true,record.archive_id||`history:${index}`)));}
+      if(array(record.quality_review?.issues).length){const issues=el('ul','review-issues');record.quality_review.issues.forEach(issue=>issues.append(el('li','',typeof issue==='string'?issue:issue?.description||'未提供问题说明')));item.append(issues);}
+      if(record.quality_review?.note)item.append(el('p','review-meta',record.quality_review.note));
+      if(record.model_draft_summary){const draft=el('details','history-model-draft');draft.dataset.stateKey=`history-draft:${record.archive_id||index}`;draft.append(el('summary','','此前复核前的模型草稿'));if(record.model_draft_summary.overview)draft.append(el('p','draft-overview',record.model_draft_summary.overview));array(record.model_draft_summary.points).filter(point=>point&&typeof point==='object').forEach(point=>draft.append(el('p','detailed-point-text',point.text)));item.append(draft);}
+      history.append(item);
+    });summarySection.append(history);
   }
   reader.append(summarySection);
 
@@ -364,6 +406,7 @@ function select(ep,{preserve=false}={}) {
       if (!matches.length) results.append(el('p', 'empty', '没有找到匹配内容，试试其他关键词。'));
       more.classList.toggle('hidden', limit >= matches.length);
     }
+    search.addEventListener('locate-segment',event=>{const index=segments.findIndex(seg=>String(seg.id)===event.detail);if(index<0)return;search.value='';limit=Math.max(30,index+1);readingStates.set(ep.id,{...readingStates.get(ep.id),limit});renderSegments();});
     search.addEventListener('input', () => { limit = 30;readingStates.set(ep.id,{...readingStates.get(ep.id),limit}); renderSegments(); });
     more.addEventListener('click', () => { limit += 50;readingStates.set(ep.id,{...readingStates.get(ep.id),limit}); renderSegments(); });
     transcript.append(label, search, count, results, more); renderSegments();
@@ -375,7 +418,7 @@ function select(ep,{preserve=false}={}) {
   const originLabels = { official_transcript: '官方文字稿', official_edited_transcript: '官方整理稿', third_party_transcript: '第三方自动转写（未逐句音频核验）', local_asr: '本地语音转写', local_asr_sample: '本地语音转写节选', rss: 'RSS 节目元信息' };
   const fields = [['文字来源', originLabels[ep.source_kind] || ep.source_kind || '未提供'], ['摘要模型', processing.summary_model || '尚未生成'], ['转写模型', processing.asr_model || '未使用 / 未提供'], ['处理用时', Number.isFinite(processing.elapsed_seconds) ? `${processing.elapsed_seconds.toFixed(1)} 秒` : '未提供'], ['API请求', Number.isFinite(processing.paid_api_calls) ? `${processing.paid_api_calls} 次` : '未提供']];
   fields.forEach(([key, value]) => dl.append(el('dt', '', key), el('dd', '', value))); record.append(dl); reader.append(record);
-  reader.querySelectorAll('details').forEach((n,i)=>{n.open=Boolean(saved.details?.[i]);});updateGeneration();
+  reader.querySelectorAll('details').forEach((n,i)=>{n.open=Boolean(saved.details?.[n.dataset.stateKey||n.id||`layout:${i}`]);});updateGeneration();
   if(preserve)requestAnimationFrame(()=>{if(currentEpisode?.id===ep.id&&session.authenticated())window.scrollTo({top:saved.scroll||0,behavior:'instant'});});
 }
 async function fetchEpisodes() {

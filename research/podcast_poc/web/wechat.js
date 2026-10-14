@@ -28,7 +28,8 @@ function categoryName(value) { return ({finance:'财经',ai:'AI',tech:'技术'})
 function hasBody(a) { return a.coverage?.scope === 'source_text' && a.source_kind === 'external_rss_body' && array(a.segments).some(s=>s && typeof s.text === 'string' && s.text.trim()); }
 function reviewed(a) { return hasBody(a) && a.status === 'summarized' && a.quality_review?.status === 'assistant_reviewed'; }
 function summaryReady(a) { return hasBody(a) && a.status === 'summarized' && Boolean(a.summary?.overview || array(a.summary?.points).length); }
-function jobFor(a) { return array(automation?.jobs).find(job=>job?.article_id === a.id); }
+function detailedSummary(a) { return summaryReady(a) && a.summary?.schema_version==='detailed-v1'; }
+function jobFor(a) { return array(automation?.jobs).find(job=>job?.article_id === a.id&&(!summaryReady(a)||job.upgrade===true)) || (summaryReady(a)?a.detail_generation:null); }
 function jobState(a) { return submitting.has(a.id) ? 'submitting' : jobFor(a)?.state || (a.status === 'summarizing' ? 'running' : a.status === 'failed' && hasBody(a) ? 'failed' : ''); }
 function deferred(job) { return job?.state === 'queued' && (job.deferred_reason === 'off_peak_only' || automation?.off_peak_only === true && automation?.execution_allowed === false); }
 function deferredNote(job) { return `等待谷时处理，预计最早 ${beijingDate(job?.not_before || automation?.next_run_at)}（北京时间）。可以先阅读正文，后台恢复后依次处理。`; }
@@ -144,7 +145,7 @@ function showAutomation() {
 function schedulePoll() {
   clearTimeout(pollTimer);
   if (!session.authenticated()) return;
-  const busy = array(automation?.jobs).some(job=>job?.state==='running'||job?.state==='queued'&&!deferred(job));
+  const busy = array(automation?.jobs).some(job=>job?.state==='running'||job?.state==='queued'&&!deferred(job))||articles.some(a=>a.detail_generation?.state==='running');
   pollTimer = setTimeout(()=>load({background:true}),busy ? 5000 : 30000);
 }
 function updateJobUI() {
@@ -153,27 +154,29 @@ function updateJobUI() {
   if (badge) { setText(badge,label); badge.className=`status ${kind}`; }
   const controls = active.generation;
   if (!controls) return;
-  const current = jobState(a), job = jobFor(a), waiting=deferred(job), busy = ['submitting','queued','running'].includes(current), complete = current === 'completed';
-  const errors = requestErrors.get(a.id) || (current === 'failed' ? job?.error || a.error || '摘要任务未能完成，可以稍后重试。' : '');
-  setText(controls.title,waiting?'等待谷时处理':({submitting:'正在提交摘要请求',queued:'摘要已排队',running:'正在生成摘要',completed:'摘要已完成',failed:'摘要生成失败'})[current] || '这篇文章还没有摘要');
-  setText(controls.note,waiting?deferredNote(job):({submitting:'正在向后台提交，请稍候。',queued:'后台会依次处理。你可以继续阅读正文，完成后此处自动更新。',running:'正在整理正文与出处，完成后此处自动更新。',completed:'后台已完成任务，正在等待最新摘要内容。',failed:'已获取的正文仍可阅读；重试只会提交这篇文章。'})[current] || `可以按需安排要点与出处，也可以直接阅读已获取正文。${automation?.off_peak_only?'高峰提交后等待谷时执行。':''}`);
+  const upgrade=summaryReady(a),current = jobState(a), job = jobFor(a), waiting=deferred(job), busy = ['submitting','queued','running'].includes(current), complete = current === 'completed';
+  const errors = requestErrors.get(a.id) || (current === 'failed' ? job?.error || a.detail_generation?.error || a.error || '摘要任务未能完成，可以稍后重试。' : '');
+  const progress=a.detail_generation, chunks=progress&&Number.isFinite(progress.chunks_processed)&&Number.isFinite(progress.chunks_total)?`已整理 ${progress.chunks_processed} / ${progress.chunks_total} 块。`:'';
+  setText(controls.title,waiting?'等待谷时处理':({submitting:'正在提交摘要请求',queued:upgrade?'详细解读已排队':'摘要已排队',running:upgrade?'正在生成详细解读':'正在生成摘要',completed:'摘要已完成',failed:upgrade?'详细解读未能完成':'摘要生成失败'})[current] || (upgrade?'还可以读得更深入':'这篇文章还没有摘要'));
+  setText(controls.note,waiting?`${deferredNote(job)}${upgrade?'现有摘要继续保留，详细稿完成后再更新。':''}`:({submitting:'正在向后台提交，请稍候。',queued:upgrade?'现有摘要和复核记录继续保留，详细解读完成后自动更新。':'后台会依次处理。你可以继续阅读正文，完成后此处自动更新。',running:`正在整理正文与出处。${chunks}${upgrade?'现有摘要仍可阅读。':'完成后此处自动更新。'}`,completed:'后台已完成任务，正在等待最新摘要内容。',failed:upgrade?'现有摘要和复核记录仍然保留；可以重试详细解读。':'已获取的正文仍可阅读；重试只会提交这篇文章。'})[current] || (upgrade?`当前为此前的简版摘要。可生成分主题详解和 AI 影响分析，原摘要会保留在历史记录中。${automation?.off_peak_only?'高峰提交后等待谷时执行。':''}`:`可以按需安排要点与出处，也可以直接阅读已获取正文。${automation?.off_peak_only?'高峰提交后等待谷时执行。':''}`));
   setText(controls.error,typeof errors === 'string' ? errors : '摘要请求失败，请稍后重试。'); controls.error.hidden = !errors;
   controls.generate.hidden = complete;
-  controls.generate.disabled = busy || (!session.isKol && !csrfToken);
-  setText(controls.generate,waiting?'等待谷时':({submitting:'正在提交…',queued:'已排队',running:'正在生成…'})[current] || (current === 'failed' || errors ? '重新安排摘要' : '安排摘要'));
+  controls.generate.disabled = busy || (!session.isKol && !csrfToken) || (upgrade&&automation?.provider!=='deepseek');
+  setText(controls.generate,waiting?'等待谷时':({submitting:'正在提交…',queued:'已排队',running:'正在生成…'})[current] || (current === 'failed' || errors ? upgrade?'重试详细解读':'重新安排摘要' : upgrade?'生成详细解读':'安排摘要'));
+  if(upgrade&&automation?.provider!=='deepseek'){setText(controls.note,'当前摘要服务尚未接入 DeepSeek；详细解读需切换至 DeepSeek 后生成。现有摘要与出处仍可阅读。');setText(controls.generate,'详细解读需 DeepSeek');}
   setText(controls.provider,`${modelLabel()}${automation?.model ? ` · ${automation.model}` : ''}${!session.isKol && !csrfToken && !busy ? ' · 服务暂不可提交，请刷新列表后重试' : ''}`);
   controls.root.dataset.state = current || 'ready'; controls.root.setAttribute('aria-busy',String(busy));
 }
-async function generateSummary(articleId) {
+async function generateSummary(articleId,upgrade=false) {
   const generation=session.revision();
   if (!session.valid(generation)) return;
   const a = articles.find(item=>item.id === articleId);
-  if (!a || !hasBody(a) || summaryReady(a) || ['submitting','queued','running','completed'].includes(jobState(a))) return;
+  if (!a || !hasBody(a) || detailedSummary(a) || summaryReady(a)!==upgrade || (upgrade&&automation?.provider!=='deepseek') || ['submitting','queued','running','completed'].includes(jobState(a))) return;
   if (!session.isKol && !csrfToken) { requestErrors.set(articleId,'缺少本机请求凭据，请刷新列表后重试。'); updateJobUI(); return; }
   submitting.add(articleId); requestErrors.delete(articleId); updateJobUI(); showList();
   const controller = new AbortController(), timeout = setTimeout(()=>controller.abort(),20000);
   try {
-    const response = await session.request(session.api('summary'),{method:'POST',headers:{...session.summaryHeaders(csrfToken),Accept:'application/json'},body:JSON.stringify({id:articleId}),signal:controller.signal});
+    const response = await session.request(session.api('summary'),{method:'POST',headers:{...session.summaryHeaders(csrfToken),Accept:'application/json'},body:JSON.stringify(upgrade?{id:articleId,upgrade:true}:{id:articleId}),signal:controller.signal});
     let result; try { result = await response.json(); } catch { throw new Error(`服务未返回可读结果（HTTP ${response.status}）`); }
     if (!session.valid(generation)) return;
     if (!response.ok) throw new Error(session.errorMessage(result,response.status));
@@ -327,7 +330,7 @@ function select(a,{focus=false,mobileOpen=false,preserve=false}={}) {
   const toolbar = el('div','reading-modebar'); toolbar.append(button('文章列表','list-toggle',openList)); toolbar.firstChild.id = 'back-to-list';
   const modes = el('div','reading-modes'); modes.setAttribute('role','group'); modes.setAttribute('aria-label','阅读方式');
   const modeButtons = [];
-  for (const [view,text] of [['summary','要点速读'],['original',body ? '阅读原文' : '来源简介'],['compare','对照阅读']]) {
+  for (const [view,text] of [['summary',detailedSummary(a)?'详细解读':'要点速读'],['original',body ? '阅读原文' : '来源简介'],['compare','对照阅读']]) {
     const b = button(text,'',()=>setView(view)); b.dataset.view = view; b.setAttribute('aria-pressed','false'); b.disabled = view === 'summary' && !body || view === 'compare' && !summaryReady(a); modes.append(b); modeButtons.push(b);
   }
   toolbar.append(modes); const returnButton = button('回到刚才的要点','return-to-point',returnToPoint); returnButton.id = 'return-to-point'; returnButton.hidden = true; toolbar.append(returnButton); reader.append(toolbar);
@@ -337,11 +340,14 @@ function select(a,{focus=false,mobileOpen=false,preserve=false}={}) {
   const pointNodes = new Map(), paragraphNodes = new Map();
   active = {article:a,signature:JSON.stringify(a),state,summaryPane,originalPane,modeButtons,returnButton,pointNodes,paragraphNodes,toolbar,content,generation:null};
   if (summaryReady(a)) {
-    summaryPane.append(el('h3','','核心摘要')); if (a.summary.overview) summaryPane.append(el('p','summary-overview',a.summary.overview));
-    const points = array(a.summary.points).filter(p=>p && typeof p === 'object'); if (points.length) summaryPane.append(el('h3','points-heading',`${points.length} 条要点，可查看出处与上下文`));
-    points.forEach((p,i)=>{
-      const point = el('section','insight'); point.tabIndex = -1; point.dataset.pointIndex = String(i); point.id = `insight-${i}`; pointNodes.set(i,point);
-      const header = el('div','insight-header'); header.append(el('span','insight-number',String(i+1).padStart(2,'0')),el('h4','',p.text || '未提供观点文字')); point.append(header);
+    summaryPane.append(el('h3','',detailedSummary(a)?'核心概览':'核心摘要')); if (a.summary.overview) summaryPane.append(el('p','summary-overview',a.summary.overview));if(detailedSummary(a)&&a.summary.scope){const scope=el('details','summary-scope');scope.dataset.stateKey='summary-scope';scope.append(el('summary','','解读范围'),el('p','',a.summary.scope));summaryPane.append(scope);}
+    const points = array(a.summary.points).filter(p=>p && typeof p === 'object'); if (points.length) summaryPane.append(el('h3','points-heading',detailedSummary(a)?`分主题详解 · ${points.length} 个主题`:`${points.length} 条要点，可查看出处与上下文`));
+    function appendInsight(p,i,impact=false){
+      const point = el('section',`insight${impact?' impact-item':detailedSummary(a)?' detailed-insight':''}`); point.tabIndex = -1; point.dataset.pointIndex = String(i); point.id = `insight-${i}`; pointNodes.set(i,point);
+      if(impact)point.append(el('p','impact-domain',({investment:'投资视角',work:'工作视角',industry:'行业与社会影响'})[p.domain]||'影响分析'));
+      const header = el('div','insight-header');if(!detailedSummary(a)&&!impact)header.append(el('span','insight-number',String(i+1).padStart(2,'0')));header.append(el('h4','',detailedSummary(a)||impact?p.title||`主题 ${i+1}`:p.text||'未提供观点文字'));point.append(header);
+      if(detailedSummary(a)||impact)point.append(el('p',impact?'impact-mechanism':'detailed-point-text',p.text||'未提供观点文字'));
+      if(impact){if(array(p.watch_items).length){point.append(el('h5','','值得跟踪'));const watch=el('ul','impact-watch');array(p.watch_items).filter(value=>typeof value==='string').forEach(value=>watch.append(el('li','',value)));point.append(watch);}if(p.uncertainty)point.append(el('p','impact-uncertainty',`不确定性与边界：${p.uncertainty}`));}
       const refs = [...new Set(array(p.segment_ids).filter(id=>typeof id === 'string' || typeof id === 'number').map(String))]; const valid = refs.filter(id=>segmentMap.has(id)), missing = refs.length-valid.length;
       const actions = el('div','insight-actions'), panel = el('div','evidence-panel'); panel.id = `evidence-${i}`; panel.hidden = !state.openPoints.has(i);
       const toggle = button(valid.length ? `查看 ${valid.length} 处出处` : '无可用出处','evidence-toggle',()=>{state.lastPoint=i;panel.hidden=!panel.hidden;toggle.setAttribute('aria-expanded',String(!panel.hidden));if (panel.hidden) state.openPoints.delete(i);else state.openPoints.add(i);});
@@ -358,22 +364,39 @@ function select(a,{focus=false,mobileOpen=false,preserve=false}={}) {
         citation.append(context); panel.append(citation);
       });
       point.append(panel); summaryPane.append(point);
-    });
+    }
+    points.forEach((p,i)=>appendInsight(p,i));
+    if(detailedSummary(a)){
+      const impacts=array(a.summary.impacts).filter(item=>item&&typeof item==='object');summaryPane.append(el('h3','detail-section-title','AI 影响分析'),el('p','impact-boundary','以下为 AI 推断，原文依据不等于作者原话。关注 AI、科技与商业、股票与 ETF，以及 AI 产品和技术研发；未结合你的持仓或实时行情。'));
+      impacts.forEach((impact,index)=>appendInsight(impact,points.length+index,true));if(!impacts.length)summaryPane.append(el('p','empty','当前内容不足以支持具体影响判断，暂不延伸推断。'));
+    }
     summaryPane.append(buildReview(a));
   } else {
     const empty = el('div','reading-empty');
-    if (body) {
-      empty.id='summary-generation';
-      const title=el('h3'), note=el('p','summary-job-note'), error=el('p','error-box'), provider=el('p','generation-provider');
-      title.id='summary-job-status'; title.setAttribute('role','status'); error.id='summary-job-error'; error.setAttribute('role','alert'); error.hidden=true;
-      const actions=el('div','generation-actions'), generate=button('安排摘要','generate-summary',()=>generateSummary(a.id)); generate.id='generate-summary';
-      actions.append(generate,button('阅读正文','read-original-button',()=>setView('original'))); empty.append(title,note,error,actions,provider);
-      active.generation={root:empty,title,note,error,generate,provider};
-    } else {
+    if (!body) {
       empty.append(el('h3','','尚未取得正文'),el('p','','目前只有来源简介，不能生成全文摘要。'));
       if (typeof a.error === 'string' && a.error) empty.append(el('p','error-box',a.error));
     }
     summaryPane.append(empty);
+  }
+  if(body&&!detailedSummary(a)){
+    const upgrade=summaryReady(a),empty=el('div',`reading-empty${upgrade?' detail-upgrade':''}`);empty.id='summary-generation';
+    const title=el('h3'),note=el('p','summary-job-note'),error=el('p','error-box'),provider=el('p','generation-provider');title.id='summary-job-status';title.setAttribute('role','status');error.id='summary-job-error';error.setAttribute('role','alert');error.hidden=true;
+    const actions=el('div','generation-actions'),generate=button(upgrade?'生成详细解读':'安排摘要','generate-summary',()=>generateSummary(a.id,upgrade));generate.id=upgrade?'upgrade-summary':'generate-summary';actions.append(generate,button('阅读正文','read-original-button',()=>setView('original')));empty.append(title,note,error,actions,provider);active.generation={root:empty,title,note,error,generate,provider};summaryPane.append(empty);
+  }
+  if(array(a.summary_history).length){
+    const history=el('details','summary-history');history.id='summary-history';history.append(el('summary','','查看此前摘要 / 复核稿'));
+    array(a.summary_history).filter(record=>record&&typeof record==='object').forEach((record,index)=>{
+      const item=el('section','history-entry'),oldMap=new Map(array(record.segments).filter(seg=>seg&&typeof seg==='object').map(seg=>[String(seg.id),seg]));item.append(el('h4','',`此前版本 ${index+1} · ${date(record.archived_at||record.summarized_at)}`),el('p','history-status',record.quality_review?.status==='assistant_reviewed'?'此历史稿曾对照文字复核；复核状态仅属于该版本。':'历史模型初稿 · 未复核'));
+      if(record.summary?.overview)item.append(el('p','summary-overview',record.summary.overview));
+      function historicalPoint(point,index,impact=false){const part=el('section','detailed-point');part.append(el('h4','',point.title||`${impact?'历史影响分析':'此前要点'} ${index+1}`),el('p','detailed-point-text',point.text||''));const refs=el('details','point-evidence');refs.dataset.stateKey=`history:${record.archive_id||record.archived_at||index}:${impact?'impact':'point'}:${index}`;const cited=[...new Set(array(point.segment_ids).map(String))].map(id=>oldMap.get(id)).filter(Boolean);refs.append(el('summary','',cited.length?`查看 ${cited.length} 处历史原文依据`:'历史原文未保存或引用不可用'));cited.forEach(seg=>{const quote=el('blockquote','historical-evidence');quote.append(el('span','paragraph-id',`历史段落 ${seg.id}`),el('p','',seg.text||''));refs.append(quote);});part.append(refs);item.append(part);}
+      array(record.summary?.points).filter(point=>point&&typeof point==='object').forEach((point,i)=>historicalPoint(point,i));
+      if(array(record.summary?.impacts).length){item.append(el('p','impact-boundary','以下为历史版本的 AI 推断，原文依据不等于作者原话。'));array(record.summary.impacts).filter(impact=>impact&&typeof impact==='object').forEach((impact,i)=>historicalPoint(impact,i,true));}
+      if(array(record.quality_review?.issues).length){const issues=el('ul','review-issues');record.quality_review.issues.forEach(issue=>issues.append(el('li','',typeof issue==='string'?issue:issue?.description||'未提供问题说明')));item.append(issues);}
+      if(record.quality_review?.note)item.append(el('p','review-meta',record.quality_review.note));
+      if(record.model_draft_summary){const draft=el('details','history-model-draft');draft.dataset.stateKey=`history-draft:${record.archive_id||index}`;draft.append(el('summary','','此前复核前的模型草稿'));if(record.model_draft_summary.overview)draft.append(el('p','draft-overview',record.model_draft_summary.overview));array(record.model_draft_summary.points).filter(point=>point&&typeof point==='object').forEach(point=>draft.append(el('p','detailed-point-text',point.text)));item.append(draft);}
+      history.append(item);
+    });summaryPane.append(history);
   }
   const originalHeading = el('div','pane-heading'); originalHeading.append(el('h3','',body ? 'RSS 已获取正文' : '来源简介'),el('span','',body ? `${segments.length} 段` : '非全文')); originalPane.append(originalHeading);
   originalPane.append(el('p','original-intro',body ? '外部源文字，未独立核实是否删节。段落标记用于回查摘要出处。' : '只有简介或元信息，尚未取得可供总结的正文。'));
