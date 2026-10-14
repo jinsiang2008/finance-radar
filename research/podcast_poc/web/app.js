@@ -24,12 +24,16 @@ function hasTranscript(ep) { return ['full','sample','partial'].includes(ep.cove
 function thirdParty(ep) { return ep.source_kind === 'third_party_transcript'; }
 function summaryReady(ep) { return hasTranscript(ep)&&ep.status==='summarized'&&Boolean(ep.summary?.overview||array(ep.summary?.points).length); }
 function detailedSummary(ep) { return summaryReady(ep) && ep.summary?.schema_version==='detailed-v1'; }
-function jobFor(ep) { return array(automation?.jobs).find(j=>j.article_id===ep.id&&(!summaryReady(ep)||j.upgrade===true)) || (summaryReady(ep)?ep.detail_generation:null); }
+function jobFor(ep) { return array(automation?.jobs).find(j=>j.article_id===ep.id&&(!summaryReady(ep)||j.upgrade===true)) || (summaryReady(ep)&&ep.detail_generation?{type:'summary',...ep.detail_generation}:null); }
 function jobState(ep) { return submitting.has(ep.id)?'submitting':jobFor(ep)?.state||(ep.status==='summarizing'?'running':ep.status==='failed'?'failed':''); }
 function isReviewed(ep) { return summaryReady(ep) && ep.quality_review?.status === 'assistant_reviewed'; }
 function beijingDate(value) { const parsed = value && new Date(value);return parsed && !Number.isNaN(parsed.getTime()) ? parsed.toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}) : '时间待确认'; }
-function deferred(job) { return job?.state === 'queued' && (job.deferred_reason === 'off_peak_only' || automation?.off_peak_only === true && automation?.execution_allowed === false); }
-function deferredNote(job) { return `等待谷时处理，预计最早 ${beijingDate(job?.not_before || automation?.next_run_at)}（北京时间）。可以先阅读文字稿，后台恢复后依次处理。`; }
+function onDemandPolicy() { return automation?.manual_execution_policy==='immediate'; }
+function onDemandJob(job) { return onDemandPolicy()&&job?.type==='summary'&&job.on_demand===true; }
+function canPromote(item) { const job=jobFor(item);return onDemandPolicy()&&job?.state==='queued'&&!onDemandJob(job); }
+function generationBusy(item) { const state=jobState(item);return ['submitting','running'].includes(state)||state==='queued'&&!canPromote(item); }
+function deferred(job) { return job?.state === 'queued' && !onDemandJob(job) && (job.deferred_reason === 'off_peak_only' || automation?.off_peak_only === true && automation?.execution_allowed === false); }
+function deferredNote(job) { if(onDemandPolicy())return '自动任务安排在谷时，也可现在手动处理这一篇。';return `等待谷时处理，预计最早 ${beijingDate(job?.not_before || automation?.next_run_at)}（北京时间）。可以先阅读文字稿，后台恢复后依次处理。`; }
 function acquisitionInfo(ep) {
   if(hasTranscript(ep))return null;
   const acquisition=ep.transcript_acquisition,waiting=automation?.off_peak_only===true&&automation?.execution_allowed===false;
@@ -54,12 +58,12 @@ function updateSchedule() {
     const minutes=Number.isFinite(automation.off_peak_minutes)?automation.off_peak_minutes:60,limit=Number.isFinite(automation.podcast_daily_limit)?automation.podcast_daily_limit:3;
     const pause=automation.enabled===false?'自动处理未开启。':automation.provider_blocked?'自动分析暂停中。':automation.worker_alive===false?'后台暂未运行。':'';
     const policy=`自动取稿仅覆盖 ${supported}：谷时每 ${minutes} 分钟检查，每个来源只处理最新 1 集，每天最多新增 ${limit} 集；历史节目不自动回填。取得正文后，由 DeepSeek 生成中文要点与段落证据，仍需复核。其他来源暂未接入自动取稿，整集音频转写尚未启用。`;
-    if(node)node.textContent=`${pause}自动取稿：${supported}。谷时每 ${minutes} 分钟检查，每源最新 1 集，每天最多新增 ${limit} 集；其他来源及历史节目暂不自动取稿。${automation.execution_allowed===false?' 高峰先排队，具体取稿状态见各集。':''}`;
+    if(node)node.textContent=`${pause}自动取稿：${supported}。谷时每 ${minutes} 分钟检查，每源最新 1 集，每天最多新增 ${limit} 集；其他来源及历史节目暂不自动取稿。${automation.execution_allowed===false?' 自动取稿高峰先排队，具体状态见各集。':''}${onDemandPolicy()?' 已有文字稿可手动立即生成。':''}`;
     if(boundary)boundary.textContent=`${sourceBoundary}${pause}${policy}`;
     return;
   }
   if(boundary)boundary.textContent=sourceBoundary;
-  if(node)node.textContent=automation?.off_peak_only ? `阅读任务仅在谷时执行；谷时每 ${Number.isFinite(automation.off_peak_minutes)?automation.off_peak_minutes:60} 分钟检查，高峰先排队。${automation.execution_allowed===false?` 最早 ${beijingDate(automation.next_run_at)}（北京时间）恢复。`:''}` : '摘要按后台队列安排；音频仅在点击后加载。';
+  if(node)node.textContent=onDemandPolicy()?`自动阅读在谷时处理；谷时每 ${Number.isFinite(automation.off_peak_minutes)?automation.off_peak_minutes:60} 分钟检查。手动生成当前内容无需等待谷时。`:automation?.off_peak_only ? `阅读任务仅在谷时执行；谷时每 ${Number.isFinite(automation.off_peak_minutes)?automation.off_peak_minutes:60} 分钟检查，高峰先排队。${automation.execution_allowed===false?` 最早 ${beijingDate(automation.next_run_at)}（北京时间）恢复。`:''}` : '摘要按后台队列安排；音频仅在点击后加载。';
 }
 function updateGeneration() {
   const ep=currentEpisode;if(!ep)return;
@@ -67,18 +71,20 @@ function updateGeneration() {
   const acquisition=acquisitionInfo(ep),coverageState=reader.querySelector('.transcript-acquisition-status'),acquisitionNote=reader.querySelector('.transcript-acquisition-note');
   if(acquisition){if(coverageState)coverageState.textContent=acquisition.label;if(acquisitionNote)acquisitionNote.textContent=acquisition.note;}
   const box=reader.querySelector('#podcast-generation');if(!box)return;
-  const upgrade=summaryReady(ep),state=jobState(ep),job=jobFor(ep),waiting=deferred(job),busy=['submitting','queued','running'].includes(state),button=box.querySelector('button'),note=box.querySelector('.podcast-job-state'),error=box.querySelector('.error-box');
+  const upgrade=summaryReady(ep),state=jobState(ep),job=jobFor(ep),waiting=state!=='submitting'&&deferred(job),promotable=canPromote(ep),busy=generationBusy(ep),button=box.querySelector('button'),note=box.querySelector('.podcast-job-state'),error=box.querySelector('.error-box');
   const progress=ep.detail_generation;
   const chunks=progress&&Number.isFinite(progress.chunks_processed)&&Number.isFinite(progress.chunks_total)?`已整理 ${progress.chunks_processed} / ${progress.chunks_total} 块。`:'';
-  note.textContent=waiting?`${deferredNote(job)}${upgrade?'现有摘要继续保留，详细稿完成后再更新。':''}`:({submitting:'正在提交请求…',queued:upgrade?'详细解读已排队，现有摘要仍可阅读。':'摘要已排队，可继续阅读文字稿。',running:`正在整理${upgrade?'详细解读':'文字稿'}与出处。${chunks}${upgrade?'现有摘要仍可阅读。':'完成后自动更新。'}`,completed:'摘要已完成，正在等待最新结果。',failed:upgrade?'详细解读未能完成，现有摘要和复核记录仍然保留。':'摘要未能完成，可重试。'})[state]||(upgrade?`当前为此前的简版摘要。可生成分主题详解和 AI 影响分析，原摘要会保留在历史记录中。${automation?.off_peak_only?'高峰提交后等待谷时执行。':''}`:`只总结当前取得的文字稿，不会自动下载音频或开始转写。${automation?.off_peak_only?'高峰提交后等待谷时执行。':''}`);
-  button.textContent=waiting?'等待谷时':({submitting:'正在提交…',queued:'已排队',running:'正在生成…'})[state]||(state==='failed'||requestErrors.has(ep.id)?upgrade?'重试详细解读':'重新安排摘要':upgrade?'生成详细解读':'安排摘要');button.disabled=busy||(!session.isKol&&!csrfToken)||(upgrade&&automation?.provider!=='deepseek');button.hidden=state==='completed';
+  const immediate=onDemandPolicy(),manualQueued=onDemandJob(job)&&state==='queued';
+  note.textContent=waiting?`${deferredNote(job)}${upgrade?'现有摘要继续保留。':''}`:({submitting:'正在提交请求…',queued:manualQueued?`已提交，无需等待谷时；前方任务完成后开始处理。${upgrade?'现有摘要仍可阅读。':'可先阅读文字稿。'}`:upgrade?'详细解读已排队，现有摘要仍可阅读。':'摘要已排队，可继续阅读文字稿。',running:`正在整理${upgrade?'详细解读':'文字稿'}与出处。${chunks}${upgrade?'现有摘要仍可阅读。':'完成后自动更新。'}`,completed:'摘要已完成，正在等待最新结果。',failed:upgrade?'详细解读未能完成，现有摘要和复核记录仍然保留。':'摘要未能完成，可重试。'})[state]||(upgrade?`可生成分主题详解与 AI 影响分析，原摘要会保留。${!immediate&&automation?.off_peak_only?'高峰提交后等待谷时执行。':''}`:`根据已取得文字稿生成摘要与出处。${!immediate&&automation?.off_peak_only?'高峰提交后等待谷时执行。':''}`);
+  button.textContent=waiting&&!promotable?'等待谷时':busy?({submitting:'正在提交…',queued:'已排队',running:'正在生成…'})[state]:promotable?'立即生成':waiting?'等待谷时':state==='failed'||requestErrors.has(ep.id)?upgrade?'重试详细解读':'重新生成':upgrade?'生成详细解读':immediate?'立即生成':'安排摘要';button.disabled=busy||(!session.isKol&&!csrfToken)||(upgrade&&automation?.provider!=='deepseek');button.hidden=state==='completed';
+  const cost=box.querySelector('.manual-cost-note');if(cost){cost.hidden=!immediate||busy||state==='completed'||automation?.provider!=='deepseek';cost.textContent='手动生成按当前时段的 DeepSeek 价格计费。';}
   if(upgrade&&automation?.provider!=='deepseek'){note.textContent='当前摘要服务尚未接入 DeepSeek；详细解读需切换至 DeepSeek 后生成。现有摘要与出处仍可阅读。';button.textContent='详细解读需 DeepSeek';}
   box.setAttribute('aria-busy',String(busy));
   error.textContent=requestErrors.get(ep.id)||(state==='failed'?job?.error||ep.detail_generation?.error||ep.error||'':'');error.hidden=!error.textContent;
 }
 async function generateSummary(id,upgrade=false) {
   const generation=session.revision(),ep=episodes.find(e=>e.id===id);
-  if(!session.valid(generation)||!ep||!hasTranscript(ep)||detailedSummary(ep)||summaryReady(ep)!==upgrade||(upgrade&&automation?.provider!=='deepseek')||['submitting','queued','running','completed'].includes(jobState(ep)))return;
+  if(!session.valid(generation)||!ep||!hasTranscript(ep)||detailedSummary(ep)||summaryReady(ep)!==upgrade||(upgrade&&automation?.provider!=='deepseek')||generationBusy(ep)||jobState(ep)==='completed')return;
   submitting.add(id);requestErrors.delete(id);updateGeneration();
   try {const response=await session.request(session.api('summary'),{method:'POST',headers:session.summaryHeaders(csrfToken),body:JSON.stringify(upgrade?{id,upgrade:true}:{id})});const result=await response.json();if(!session.valid(generation))return;if(!response.ok)throw new Error(session.errorMessage(result,response.status));if(result.job?.article_id===id)automation={...automation,jobs:[...array(automation?.jobs).filter(j=>j.article_id!==id),result.job]};if(inFlight)await inFlight;await load();}
   catch(error){if(session.valid(generation)&&!error.authExpired)requestErrors.set(id,error.message||'请求失败，请稍后重试。');}
@@ -374,7 +380,7 @@ function select(ep,{preserve=false}={}) {
 
   }
   if(hasTranscript(ep)&&!detailedSummary(ep)){
-    const upgrade=summaryReady(ep),generation=el('div',`podcast-generation${upgrade?' detail-upgrade':''}`);generation.id='podcast-generation';const state=el('p','podcast-job-state');state.setAttribute('role','status');const error=el('p','error-box');error.setAttribute('role','alert');const button=el('button','',upgrade?'生成详细解读':'安排摘要');button.id=upgrade?'upgrade-podcast-summary':'generate-podcast-summary';button.type='button';button.addEventListener('click',()=>generateSummary(ep.id,upgrade));generation.append(state,error,button);summarySection.append(generation);
+    const upgrade=summaryReady(ep),generation=el('div',`podcast-generation${upgrade?' detail-upgrade':''}`);generation.id='podcast-generation';const state=el('p','podcast-job-state');state.setAttribute('role','status');const error=el('p','error-box');error.setAttribute('role','alert');const button=el('button','',upgrade?'生成详细解读':'安排摘要');button.id=upgrade?'upgrade-podcast-summary':'generate-podcast-summary';button.type='button';button.addEventListener('click',()=>generateSummary(ep.id,upgrade));generation.append(state,error,button,el('p','manual-cost-note'));summarySection.append(generation);
   }
   if(array(ep.summary_history).length){
     const history=el('details','summary-history');history.id='summary-history';history.append(el('summary','','查看此前摘要 / 复核稿'));

@@ -820,9 +820,12 @@ def serve(port, *, return_server=False, start_worker=True):
     def automation_state():
         settings = reader_settings()
         runtime = engine.runtime_snapshot()
+        config = summary_config()
         state = local_module("schedule_policy").snapshot(runtime.get("last_check_at"),
-            peak_minutes=settings.get("peak_minutes", 240), off_peak_minutes=settings.get("off_peak_minutes", 60))
+            peak_minutes=settings.get("peak_minutes", 240), off_peak_minutes=settings.get("off_peak_minutes", 60),
+            off_peak_only=config.get("provider") == "deepseek")
         state.update(runtime)
+        state.update(manual_execution_policy="immediate", manual_execution_scope="single_summary")
         config = summary_config()
         state.update({"enabled": bool(settings.get("enabled")), **config,
             "credentials_status": settings.get("credentials_status", "unknown"),
@@ -870,7 +873,7 @@ def serve(port, *, return_server=False, start_worker=True):
                     if (set(value) not in ({"id"}, {"id", "upgrade"}) or not isinstance(value["id"], str)
                             or ("upgrade" in value and type(value["upgrade"]) is not bool)):
                         raise ValueError("Invalid article request")
-                    job = engine.enqueue(value["id"], manual=True, upgrade=value.get("upgrade", False))
+                    job = engine.enqueue(value["id"], manual=True, upgrade=value.get("upgrade", False), on_demand=True)
                 elif path == "/api/wechat/check":
                     if set(value) - {"force"} or not isinstance(value.get("force", False), bool):
                         raise ValueError("Invalid check request")

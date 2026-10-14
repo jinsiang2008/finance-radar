@@ -38,6 +38,23 @@ class DeepSeekClientTests(unittest.TestCase):
         self.opener = self.build.return_value
         self.opener.open.return_value = response()
 
+    def test_local_queue_provider_checks_permission_before_every_paid_attempt(self):
+        policy = inference.schedule_policy
+        client = inference.Client()
+        selected = [False]
+        with patch.object(policy, "period_at", return_value="peak"), policy.summary_request_context(lambda: selected[0]):
+            with self.assertRaises(policy.OffPeakDeferred):
+                client.generate(MESSAGES, 1100)
+            self.assertEqual(client.stats()["paid_api_calls"], 0)
+            self.opener.open.assert_not_called()
+            selected[0] = True
+            self.assertEqual(client.generate(MESSAGES, 1100), '{"overview":"中文"}')
+            selected[0] = False
+            with self.assertRaises(policy.OffPeakDeferred):
+                client.generate(MESSAGES, 1100)
+        self.assertEqual(client.stats()["paid_api_calls"], 1)
+        self.assertEqual(self.opener.open.call_count, 1)
+
     def test_public_config_and_model_allowlist(self):
         self.assertEqual(inference.config(), {"provider": "deepseek", "model": "deepseek-v4-flash"})
         for model in ("deepseek-flash", "deepseek-v4-pro", "deepseek-v4-flash"):

@@ -41,13 +41,15 @@ def _text(value, name, maximum=6000):
 
 
 def _refs(value, allowed):
-    if (not isinstance(value, list) or not value or len(value) > 30
+    # Caption feeds contain many short cues; a supported topic can legitimately
+    # span more than 30 original IDs. Keep every citation, with a finite bound.
+    if (not isinstance(value, list) or not value or len(value) > 64
             or any(not isinstance(ref, str) or ref not in allowed for ref in value)):
         raise ValueError("Unknown or absent evidence ID")
     return list(dict.fromkeys(value))
 
 
-def validate(value, allowed, *, final=False, long_form=False):
+def validate(value, allowed, *, final=False, long_form=False, short_form=False):
     if not isinstance(value, dict):
         raise ValueError("Expected summary object")
     overview = _text(value.get("overview"), "overview", 1600)
@@ -90,6 +92,9 @@ def validate(value, allowed, *, final=False, long_form=False):
             chars = len(re.findall(r"[\u4e00-\u9fff]", overview + "".join(p["text"] for p in normalized)))
             if len(points) < 8 or chars < 1200:
                 raise ValueError("Long input requires 8–14 substantial points and detailed explanation")
+        if short_form and (len(points) > 3 or len(impacts) > 2
+                           or len(overview + "".join(p["text"] for p in normalized)) > 600):
+            raise ValueError("Short input requires 1–3 points, at most 2 impacts, and at most 600 summary characters")
     if len(json.dumps(result, ensure_ascii=False)) > (19000 if final else 12000):
         raise ValueError("Summary exceeds bounded merge size")
     return result
@@ -156,6 +161,7 @@ def summarize(poc, eid):
         episode.pop("error", None)
 
     def persist():
+        progress["on_demand"] = poc.local_module("schedule_policy").summary_is_on_demand()
         episode["detail_generation"] = progress
         if not has_old:
             episode["processing"] = deepcopy(progress["processing"])
@@ -173,21 +179,26 @@ def summarize(poc, eid):
         persist()
 
     def infer(prompt, ids, *, final=False):
+        correction = ""
         for attempt in range(2):
-            request = prompt + ("\n上次输出格式、引用或详细程度不合要求，请按上述要求重新生成完整JSON。" if attempt else "")
+            request = prompt + correction
             if poc.serialized_prompt_chars(request) > 28000:
                 raise ValueError("Detailed reading request is too large")
             try:
                 answer = client.generate([{"role": "system", "content": SYSTEM}, {"role": "user", "content": request}],
-                                         8500 if final else 5000)
+                                         12000 if final else 9000)
             finally:
                 usage()
             poc.write_json(poc.DATA / "diagnostics" / eid / f"detail-response-{time.time_ns()}.json", {"answer": answer, "attempt": attempt})
             try:
-                return validate(poc.parse_json(answer), ids, final=final, long_form=final and long_form)
+                return validate(poc.parse_json(answer), ids, final=final,
+                                long_form=final and long_form, short_form=final and short_form)
             except (ValueError, TypeError, KeyError):
                 if attempt:
                     raise
+                correction = ("\n上次输出格式、引用或详细程度不合要求；每条引用最多64个有效原始ID，不得捏造。"
+                              + ("短文仅1–3个主题、最多2条影响，概述与要点正文合计不超过600字符。" if final and short_form else "")
+                              + "请按上述要求重新生成完整JSON。")
 
     prefix = (f"内容：{episode.get('title', '')[:250]}；来源：{episode.get('account', episode.get('show', ''))[:150]}。"
               f"发表时间：{episode.get('published_at') or '未知'}。文中观点按发表时点理解，不自动代表当前市场或技术现状，影响推断需核验现况。"
@@ -210,6 +221,7 @@ def summarize(poc, eid):
 
     total_chars = sum(len(item["text"]) for item in episode["segments"])
     long_form = total_chars >= 10000
+    short_form = total_chars < 800
     chunks = poc.bounded_summary_chunks(episode["segments"], chunk_prompt, maximum=27000)
     progress["chunks_total"] = len(chunks)
     persist()
@@ -246,18 +258,21 @@ def summarize(poc, eid):
     ids = {ref for point in notes[0]["points"] for ref in point["segment_ids"]}
     final_prompt = (prefix + "根据详细证据笔记写最终中文阅读报告，事实摘要与AI推断严格分开。"
         + ("长访谈目标正文约1800–3000字，overview约200–350字，8–14个主题，每点多个完整句子展开论据、案例、前提和反例。" if long_form else
-           ("本文不足800字符，只提取1–3个主题，通常0–2条实质影响；字数不超过原文的必要信息量，不扩充猜测。" if total_chars < 800 else
+           ("本文不足800字符，只提取1–3个主题，概述和要点正文合计最多600字符，通常0–2条实质影响；保留全部有用日程和数字，不扩充猜测。" if short_form else
             "按文章或片段实际内容写详细报告，概述和1–8个主题要点，不要为了长度凑数；较短文本不强求投资相关性。"))
         + '严格JSON：{"schema_version":"detailed-v1","overview":"中文概述","scope":"材料边界与相关性说明",'
           '"points":[{"title":"主题","text":"详细内容","segment_ids":["原始ID"]}],'
           '"impacts":[{"domain":"investment|work|industry","title":"影响主题","text":"受影响对象、传导机制与可行动的研究方向",'
           '"uncertainty":"成立条件、反例、风险与未知","watch_items":["需要验证的指标或小实验"],"segment_ids":["原文依据ID"]}]}。'
-          "只输出有实质关联的影响，通常2–6条，不相关时impacts=[]并说明原因。"
+        + ("只输出有实质关联的影响，最多2条。" if short_form else "只输出有实质关联的影响，通常2–6条。")
+        + "不相关时impacts=[]并说明原因。不要仅因文章可被AI抽取就推导工作机会。"
+          "摘要聚焦实质内容，不把关注引导、平台介绍、免责声明单独扩写成主题；不要反复列举原文没提供的信息。"
+          "发布日期、标题日期与事件发生日可以不同，不能因此宣称原文矛盾；同一时刻的时区表达不算日期冲突。"
           "投资看行业/商业模式/股票ETF研究方向而非买卖建议；工作看AI产品、软件研发可验证的小实验。"
           "不要重复摘要充当影响分析；需说明为什么会传导以及何时可能不成立。\n"
         + json.dumps(notes[0], ensure_ascii=False))
     path = cache / ("detail-final-" + hashlib.sha256(final_prompt.encode()).hexdigest() + ".json")
-    result = (validate(json.loads(path.read_text()), ids, final=True, long_form=long_form) if path.exists()
+    result = (validate(json.loads(path.read_text()), ids, final=True, long_form=long_form, short_form=short_form) if path.exists()
               else infer(final_prompt, ids, final=True))
     if not path.exists():
         poc.write_json(path, result)

@@ -12,6 +12,10 @@ https://api-docs.deepseek.com/zh-cn/guides/json_mode/
 from __future__ import annotations
 
 from http.client import HTTPException
+try:
+    from research.podcast_poc import schedule_policy
+except ModuleNotFoundError:
+    import schedule_policy
 import json
 import math
 import os
@@ -188,6 +192,10 @@ class Client:
                           headers={"Authorization": "Bearer " + self._api_key,
                                    "Content-Type": "application/json", "Accept": "application/json"},
                           method="POST")
+        # Queue jobs share the production rule. Standalone CLI clients retain
+        # their explicit invocation behavior and are not a scheduler context.
+        if schedule_policy.summary_context_active():
+            schedule_policy.require_summary_window()
         self._attempts += 1
         self._usage_unreported_calls += 1
         try:

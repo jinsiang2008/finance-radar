@@ -92,6 +92,10 @@ class Engine:
                         connection.execute("ALTER TABLE jobs ADD COLUMN " + column + " TEXT")
                 if "upgrade" not in columns:
                     connection.execute("ALTER TABLE jobs ADD COLUMN upgrade INTEGER NOT NULL DEFAULT 0")
+                if "on_demand" not in columns:
+                    # Historical manual=1 can mean a bulk refresh; never infer
+                    # an immediate paid permission when migrating old rows.
+                    connection.execute("ALTER TABLE jobs ADD COLUMN on_demand INTEGER NOT NULL DEFAULT 0")
                 connection.commit()
             except BaseException:
                 connection.rollback()
@@ -99,7 +103,12 @@ class Engine:
 
     def _schedule(self):
         policy = getattr(self.poc, "reading_schedule", None)
-        return policy() if callable(policy) else {"execution_allowed": True}
+        if callable(policy):
+            return policy()
+        config = getattr(self.poc, "summary_config", None)
+        if callable(config) and config().get("provider") == "deepseek":
+            return schedule_policy.snapshot(off_peak_only=True)
+        return {"execution_allowed": True}
 
     @staticmethod
     def _deferral_values(policy):
@@ -109,7 +118,9 @@ class Engine:
         return value, "off_peak_only"
 
     def _apply_queue_schedule(self, connection, job_id, policy):
-        not_before, reason = self._deferral_values(policy)
+        job = connection.execute("SELECT type,on_demand FROM jobs WHERE id=?", (job_id,)).fetchone()
+        not_before, reason = ((None, None) if job and job["type"] == "summary" and job["on_demand"] == 1
+                              else self._deferral_values(policy))
         connection.execute("UPDATE jobs SET not_before=?,deferred_reason=? WHERE id=? AND state='queued'",
                            (not_before, reason, job_id))
 
@@ -140,6 +151,7 @@ class Engine:
         result["manual"] = bool(result["manual"])
         result["reused"] = bool(result["reused"])
         result["upgrade"] = bool(result.get("upgrade", False))
+        result["on_demand"] = result.get("on_demand") == 1
         result.pop("interruptions", None)
         return result
 
@@ -201,8 +213,10 @@ class Engine:
         return (not job.get("upgrade") or (article.get("summary", {}).get("schema_version") == "detailed-v1"
                 and article.get("summary_signature") == self._version(article, True)))
 
-    def enqueue(self, article_id, manual=True, upgrade=False):
+    def enqueue(self, article_id, manual=True, upgrade=False, on_demand=False):
         """Queue a validated body once; only an explicit manual request retries failure."""
+        if type(on_demand) is not bool or (on_demand and not manual):
+            raise ValueError("即时处理需要明确的单篇手动请求。")
         if type(upgrade) is not bool:
             raise ValueError("升级选项必须是布尔值。")
         if upgrade and not callable(getattr(self.poc, "summarize_detailed", None)):
@@ -242,12 +256,15 @@ class Engine:
             if row is None:
                 job_id = uuid.uuid4().hex
                 connection.execute("""INSERT INTO jobs
-                    (id,type,article_id,input_version,state,manual,created_at,updated_at,completed_at,reused,upgrade)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    (id,type,article_id,input_version,state,manual,created_at,updated_at,completed_at,reused,upgrade,on_demand)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (job_id, "summary", article_id, version, "completed" if ready else "queued", int(manual),
-                     moment, moment, moment if ready else None, int(ready), int(upgrade)))
+                     moment, moment, moment if ready else None, int(ready), int(upgrade), int(on_demand)))
             else:
                 job_id = row["id"]
+                if on_demand:
+                    # Includes running jobs: the next request re-reads this row.
+                    connection.execute("UPDATE jobs SET on_demand=1,manual=1,not_before=NULL,deferred_reason=NULL,updated_at=? WHERE id=?", (moment, job_id))
                 if upgrade and not row["upgrade"]:
                     connection.execute("UPDATE jobs SET upgrade=1 WHERE id=?", (job_id,))
                 if ready and row["state"] != "running":
@@ -256,7 +273,7 @@ class Engine:
                 elif not ready and (row["state"] in {"completed", "superseded"} or (manual and row["state"] == "failed")):
                     connection.execute("""UPDATE jobs SET state='queued', error=NULL, reused=0, manual=?,
                         interruptions=0, started_at=NULL, completed_at=NULL, updated_at=? WHERE id=?""",
-                        (int(manual), moment, job_id))
+                        (int(manual or row["manual"]), moment, job_id))
                 elif manual and row["state"] == "queued" and not row["manual"]:
                     connection.execute("UPDATE jobs SET manual=1, updated_at=? WHERE id=?", (moment, job_id))
             # Remember bodies explicitly selected for reading. A later edit of an
@@ -317,15 +334,28 @@ class Engine:
             connection.execute("UPDATE jobs SET state=?, error=?, reused=?, updated_at=?, completed_at=?,not_before=NULL,deferred_reason=NULL WHERE id=?",
                                (state, error, int(reused), moment, moment, job_id))
 
+    def _on_demand(self, job, *, running_only=False):
+        if job["type"] != "summary":
+            return False
+        with self._connection() as connection:
+            row = connection.execute("SELECT type,article_id,input_version,state,on_demand FROM jobs WHERE id=?", (job["id"],)).fetchone()
+        return bool(row and row["type"] == "summary" and row["article_id"] == job["article_id"]
+                    and row["input_version"] == job["input_version"] and row["on_demand"] == 1
+                    and (not running_only or row["state"] == "running"))
+
     def _defer(self, job, exception):
         with self._transaction() as connection:
-            connection.execute("""UPDATE jobs SET state='queued',error=NULL,not_before=?,deferred_reason='off_peak_only',
-                started_at=NULL,completed_at=NULL,updated_at=? WHERE id=?""", (exception.not_before, _now(), job["id"]))
+            # The user may have selected this item after its last peak check.
+            row = connection.execute("SELECT type,on_demand FROM jobs WHERE id=?", (job["id"],)).fetchone()
+            immediate = bool(row and row["type"] == "summary" and row["on_demand"] == 1)
+            not_before, reason = (None, None) if immediate else (exception.not_before, "off_peak_only")
+            connection.execute("""UPDATE jobs SET state='queued',error=NULL,not_before=?,deferred_reason=?,
+                started_at=NULL,completed_at=NULL,updated_at=? WHERE id=?""", (not_before, reason, _now(), job["id"]))
         if job["type"] == "summary":
             article = self.poc.load_episode(job["article_id"])
             if self._version(article, bool(job.get("upgrade"))) == job["input_version"] and not self._ready_for_job(article, job):
                 if article.get("detail_generation"):
-                    article["detail_generation"].update(state="queued", not_before=exception.not_before)
+                    article["detail_generation"].update(state="queued", not_before=not_before, on_demand=immediate)
                     article["detail_generation"].pop("error", None)
                 if not article.get("summary"):
                     article["status"] = "body_ready" if article.get("content_kind") == "wechat_article" else "transcribed"
@@ -449,7 +479,7 @@ class Engine:
                 eligible = (article["id"] in baseline["initial_article_ids"]
                             or bool(published and published > baseline["published_after"]) or known_changed)
                 if eligible and self._has_body(article) and not self._summary_ready(article):
-                    self.enqueue(article["id"], manual=manual)
+                    self.enqueue(article["id"], manual=False)
             except (ValueError, OSError, KeyError, TypeError):
                 continue
         values = {"last_refresh_state": "completed" if successful else "failed",
@@ -465,7 +495,7 @@ class Engine:
             raise RuntimeError(REFRESH_FAILURE)
 
     def run_one(self, allow_automatic=True):
-        """Run one job; manual priority never bypasses a reading cost window."""
+        """Run one item; only persisted single-item permission bypasses peak hours."""
         with self.lock_path.open("a") as worker_lock:
             try:
                 fcntl.flock(worker_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -474,18 +504,20 @@ class Engine:
             try:
                 self._recover()
                 policy = self._schedule()
-                if not policy.get("execution_allowed", True):
-                    not_before, reason = self._deferral_values(policy)
-                    with self._transaction() as connection:
-                        connection.execute("""UPDATE jobs SET not_before=?,deferred_reason=? WHERE state='queued'
-                            AND (not_before IS NOT ? OR deferred_reason IS NOT ?)""", (not_before, reason, not_before, reason))
-                    return False
+                execution_allowed = policy.get("execution_allowed", True)
                 with self._transaction() as connection:
-                    connection.execute("UPDATE jobs SET not_before=NULL,deferred_reason=NULL WHERE state='queued' AND deferred_reason='off_peak_only'")
+                    if not execution_allowed:
+                        not_before, reason = self._deferral_values(policy)
+                        connection.execute("""UPDATE jobs SET not_before=?,deferred_reason=? WHERE state='queued'
+                            AND NOT (type='summary' AND on_demand=1)
+                            AND (not_before IS NOT ? OR deferred_reason IS NOT ?)""", (not_before, reason, not_before, reason))
+                    connection.execute("""UPDATE jobs SET not_before=NULL,deferred_reason=NULL WHERE state='queued'
+                        AND (? OR (type='summary' AND on_demand=1))""", (int(execution_allowed),))
                     row = connection.execute("""SELECT * FROM jobs WHERE state='queued'
-                        AND (? OR manual=1)
-                        ORDER BY manual DESC, CASE type WHEN 'refresh' THEN 0 ELSE 1 END, created_at, id LIMIT 1""",
-                        (int(allow_automatic),)).fetchone()
+                        AND (? OR manual=1) AND (? OR (type='summary' AND on_demand=1))
+                        ORDER BY CASE WHEN type='summary' AND on_demand=1 THEN 0 ELSE 1 END,
+                        manual DESC, CASE type WHEN 'refresh' THEN 0 ELSE 1 END, created_at, id LIMIT 1""",
+                        (int(allow_automatic), int(execution_allowed))).fetchone()
                     if row is None:
                         return False
                     job = dict(row)
@@ -500,19 +532,20 @@ class Engine:
                         if not self._has_input(article) or self._version(article, bool(job.get("upgrade"))) != job["input_version"]:
                             self._finish(job["id"], "superseded")
                             if self._has_input(article):
-                                self.enqueue(article["id"], manual=bool(job["manual"]), upgrade=bool(job.get("upgrade")))
+                                self.enqueue(article["id"], manual=bool(job["manual"]) or self._on_demand(job), upgrade=bool(job.get("upgrade")), on_demand=self._on_demand(job))
                             return True
                         if self._ready_for_job(article, job):
                             self._finish(job["id"], "completed", reused=True)
                             return True
                         summarize = (self.poc.summarize_detailed if job.get("upgrade") or getattr(self.poc, "DETAILED_SUMMARIES", False)
                                      else self.poc.summarize)
-                        summarize(job["article_id"])
+                        with schedule_policy.summary_request_context(lambda: self._on_demand(job, running_only=True)):
+                            summarize(job["article_id"])
                         completed = self.poc.load_episode(job["article_id"])
                         if self._version(completed, bool(job.get("upgrade"))) != job["input_version"]:
                             self._finish(job["id"], "superseded")
                             if self._has_input(completed):
-                                self.enqueue(completed["id"], manual=bool(job["manual"]), upgrade=bool(job.get("upgrade")))
+                                self.enqueue(completed["id"], manual=bool(job["manual"]) or self._on_demand(job), upgrade=bool(job.get("upgrade")), on_demand=self._on_demand(job))
                             return True
                         if not self._ready_for_job(completed, job):
                             raise ValueError("Summary generation did not persist a complete result")

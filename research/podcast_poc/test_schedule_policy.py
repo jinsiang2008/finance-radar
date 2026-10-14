@@ -59,3 +59,33 @@ class ScheduleTests(unittest.TestCase):
         with self.assertRaises(policy.OffPeakDeferred) as caught:
             policy.require_off_peak(at=dt("2026-10-13T09:00"))
         self.assertEqual(datetime.fromisoformat(caught.exception.not_before), dt("2026-10-13T12:00"))
+
+
+    def test_explicit_summary_permission_is_live_and_does_not_relax_fetch_guard(self):
+        selected = [False]
+        peak = dt("2026-10-14T10:00")
+        with policy.summary_request_context(lambda: selected[0]):
+            with self.assertRaises(policy.OffPeakDeferred):
+                policy.require_summary_window(at=peak)
+            selected[0] = True
+            policy.require_summary_window(at=peak)
+            with self.assertRaises(policy.OffPeakDeferred):
+                policy.require_off_peak(at=peak)
+        self.assertFalse(policy.summary_context_active())
+        with self.assertRaises(policy.OffPeakDeferred):
+            policy.require_summary_window(at=peak)
+
+    def test_summary_permission_does_not_leak_after_failure_or_to_other_threads(self):
+        from concurrent.futures import ThreadPoolExecutor
+        with self.assertRaises(RuntimeError):
+            with policy.summary_request_context(lambda: True):
+                self.assertTrue(policy.summary_is_on_demand())
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    self.assertFalse(pool.submit(policy.summary_is_on_demand).result())
+                raise RuntimeError("simulated job failure")
+        self.assertFalse(policy.summary_is_on_demand())
+
+    def test_summary_permission_requires_true_not_truthy_data(self):
+        for value in (1, "true", {}, None):
+            with policy.summary_request_context(lambda: value):
+                self.assertFalse(policy.summary_is_on_demand())

@@ -245,7 +245,9 @@ class ReadingRuntime:
         state.update(worker_alive=False, scheduler="systemd_worker", jobs=self.engine.snapshot(),
                      transcript_policy="official_latest_only", automatic_transcript_sources=list(TRANSCRIPT_SOURCES),
                      podcast_daily_limit=PODCAST_DAILY_LIMIT, automatic_audio_transcription=False,
-                     deepseek_audio_transcription=False, paid_call_boundary="before_each_request")
+                     deepseek_audio_transcription=False, paid_call_boundary="before_each_request",
+                     manual_execution_policy="immediate", manual_execution_scope="single_summary",
+                     manual_refresh_execution_policy="off_peak_only")
         try:
             heartbeat = json.loads((self.data / "runtime" / "worker-heartbeat.json").read_text())
             stamp = datetime.fromisoformat(heartbeat["updated_at"])
@@ -287,7 +289,7 @@ class ReadingRuntime:
     def enqueue_summary(self, content_id, *, upgrade=False):
         if self.settings()["provider"] != "deepseek":
             raise ReadingUnavailable("阅读后台尚未配置完成，请稍后重试。")
-        return self.engine.enqueue(content_id, manual=True, upgrade=upgrade)
+        return self.engine.enqueue(content_id, manual=True, upgrade=upgrade, on_demand=True)
 
     def enqueue_check(self, manual=True):
         if self.settings()["provider"] != "deepseek":

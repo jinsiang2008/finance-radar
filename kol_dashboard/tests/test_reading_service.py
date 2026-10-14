@@ -116,14 +116,18 @@ class ReadingServiceTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.runtime.fetch_feed(url, limit=1000)
 
-    def test_peak_manual_requests_are_queued_and_rss_fetch_waits_too(self):
+    def test_peak_single_summary_is_immediate_but_rss_fetch_waits(self):
         self.runtime.clock = lambda: datetime.fromisoformat("2026-10-13T10:00:00+08:00")
         self.configured()
         self.runtime.poc.save_episode(article())
         job = self.runtime.enqueue_summary("wx-test")
         self.assertEqual(job["state"], "queued")
-        self.assertEqual(job["deferred_reason"], "off_peak_only")
+        self.assertIsNone(job["deferred_reason"])
+        self.assertIsNone(job["not_before"])
+        self.assertTrue(job["on_demand"])
         state = self.runtime.status()
+        self.assertEqual(state["manual_execution_policy"], "immediate")
+        self.assertEqual(state["manual_execution_scope"], "single_summary")
         self.assertTrue(state["off_peak_only"])
         self.assertFalse(state["execution_allowed"])
         self.assertFalse(state["due"])

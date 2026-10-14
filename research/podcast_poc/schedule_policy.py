@@ -1,4 +1,6 @@
 """Beijing peak/off-peak cadence; calendar data is explicit and auditable."""
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -46,6 +48,37 @@ def require_off_peak(*, at=None):
     moment = at or datetime.now(timezone.utc)
     if period_at(moment) != "off_peak":
         raise OffPeakDeferred(moment)
+
+
+# The executor installs a job-specific database predicate, never a global flag.
+# ContextVar keeps concurrent request handlers and later jobs from inheriting it.
+_SUMMARY_PERMISSION = ContextVar("reading_summary_permission", default=None)
+
+
+@contextmanager
+def summary_request_context(allow_immediate):
+    if not callable(allow_immediate):
+        raise TypeError("A persisted summary permission predicate is required")
+    token = _SUMMARY_PERMISSION.set(allow_immediate)
+    try:
+        yield
+    finally:
+        _SUMMARY_PERMISSION.reset(token)
+
+
+def summary_context_active():
+    return _SUMMARY_PERMISSION.get() is not None
+
+
+def summary_is_on_demand():
+    predicate = _SUMMARY_PERMISSION.get()
+    return predicate is not None and predicate() is True
+
+
+def require_summary_window(*, at=None):
+    """Check each paid request; only its current explicitly selected job bypasses."""
+    if not summary_is_on_demand():
+        require_off_peak(at=at)
 
 
 def snapshot(last_check_at=None, *, at=None, peak_minutes=240, off_peak_minutes=60, off_peak_only=False):

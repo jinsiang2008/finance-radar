@@ -85,7 +85,7 @@ _AI_ACTION_HEADER = "X-Finance-Radar-Action"
 _AI_ACTION_VALUE = "request-ai-enrichment"
 _OPTIONS_POLICY_ACTION_VALUE = "update-options-policy"
 _OPTIONS_POLICY_MAX_BODY_BYTES = 16 * 1024
-_READING_ASSET_VERSION = "45"
+_READING_ASSET_VERSION = "46"
 _READING_ASSETS = frozenset({"app.js", "style.css", "wechat.js", "wechat.css", "reader-auth.js", "reader-auth.css"})
 _READING_WEB = BASE.parent / "research" / "podcast_poc" / "web"
 # The atomic release flattens kol_dashboard alongside the shared research package.

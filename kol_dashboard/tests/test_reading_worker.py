@@ -65,7 +65,7 @@ class ReadingWorkerTests(unittest.TestCase):
         value = podcast("podcast-boundary")
         value["segments"].append({"id": "s0002", "text": "A second distinct topic in the interview.", "start_seconds": 20, "end_seconds": 40})
         worker.runtime.poc.save_episode(value)
-        job = worker.runtime.enqueue_summary(value["id"])
+        job = worker.runtime.engine.enqueue(value["id"], manual=False)
         calls = []
         def respond(**kwargs):
             refs = (["s0001"], ["s0002"], ["s0001", "s0002"], ["s0001", "s0002"])[len(calls)]

@@ -59,8 +59,8 @@ class SharedDeepSeekClient:
                 or len(user_prompt) > 32_000):
             raise llm_enrichment.EnrichmentError("invalid_request", retry_after_seconds=None)
         # Each chunk, retry and merge passes this boundary independently. An
-        # already in-flight call may finish, but no new paid call starts in peak.
-        schedule_policy.require_off_peak(at=self.clock())
+        # explicitly selected item may run in peak; other jobs recheck every call.
+        schedule_policy.require_summary_window(at=self.clock())
         self.calls += 1
         self.unknown += 1
         try:

@@ -50,3 +50,4 @@
 .podcast-generation button{min-height:44px}
 @media(max-width:700px){.section-heading{flex-wrap:wrap;gap:5px}.detailed-point-text,.impact-mechanism{font-size:14px;line-height:1.95}.detailed-point h4,.impact-item h4{font-size:15px}.detailed-point,.impact-item{padding:17px 0}.detail-section-title{font-size:15px}.segment-heading{flex-wrap:wrap}.jump-to-transcript{margin-left:0}.summary-scope,.impact-boundary{font-size:11px}}
 .summary-scope>summary{min-height:44px;padding:10px 0;color:var(--muted);cursor:pointer}.summary-scope>p{padding:1px 0 7px}.history-model-draft .detailed-point-text{margin-top:10px}
+#podcast-generation .manual-cost-note{margin-top:8px;color:var(--muted);font-size:11px}#podcast-generation .manual-cost-note[hidden]{display:none}

@@ -70,7 +70,7 @@ class ReadingApiTests(unittest.IsolatedAsyncioTestCase):
         await self.login()
         headers = {"X-Finance-Radar-Action": "request-reading-summary", "Content-Type": "application/json"}
         for raw in ('{"id":"wx-one","id":"wx-two"}', '{"id":"../../secrets"}',
-                    '{"id":"wx-demo","prompt":"override"}', '{"url":"https://evil.invalid"}', '[]'):
+                    '{"id":"wx-demo","prompt":"override"}', '{"id":"wx-demo","on_demand":true}', '{"url":"https://evil.invalid"}', '[]'):
             with patch.object(dashboard.reading_service, "enqueue_summary") as enqueue:
                 response = await self.client.post("/api/private/reading/summary", headers=headers, content=raw)
                 self.assertEqual(response.status_code, 422)
@@ -140,8 +140,8 @@ class ReadingApiTests(unittest.IsolatedAsyncioTestCase):
             response = await self.client.get("/wechat")
         self.assertEqual(response.status_code, 200)
         self.assertIn('data-kol-base="/kol"', response.text)
-        self.assertIn('/kol/reading-assets/wechat.js?v=45', response.text)
+        self.assertIn('/kol/reading-assets/wechat.js?v=46', response.text)
         self.assertNotIn('src="/wechat.js"', response.text)
         self.assertIn("frame-ancestors 'none'", response.headers["content-security-policy"])
-        self.assertEqual((await self.client.get("/reading-assets/wechat.js?v=45")).status_code, 200)
+        self.assertEqual((await self.client.get("/reading-assets/wechat.js?v=46")).status_code, 200)
         self.assertEqual((await self.client.get("/reading-assets/poc.py")).status_code, 404)

@@ -335,6 +335,45 @@ class DetailedTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "evidence"):
             detail.validate(value, {"s0001"}, final=True)
 
+    def test_dense_caption_evidence_retains_all_32_source_cues(self):
+        refs = [f"s{i:04d}" for i in range(32)]
+        allowed = set(refs)
+        note = answer(refs)
+        self.assertEqual(detail.validate(note, allowed)["points"][0]["segment_ids"], refs)
+        note["points"][0]["segment_ids"].append("unknown")
+        with self.assertRaisesRegex(ValueError, "evidence"):
+            detail.validate(note, allowed)
+
+    def test_short_final_rejects_metadata_padding_and_repairs_once(self):
+        value = self.save()
+        client = Client()
+        final_calls = []
+        def generate(messages, max_tokens):
+            prompt = messages[1]["content"]
+            client.calls.append(prompt)
+            final = '"schema_version":"detailed-v1"' in prompt
+            result = answer(["s0001"], final=final)
+            if final:
+                final_calls.append(prompt)
+                if len(final_calls) == 1:
+                    result["points"] *= 8
+            return json.dumps(result, ensure_ascii=False)
+        self.poc._RUNTIME["client_factory"] = lambda: client
+        client.generate = generate
+        self.engine.enqueue(value["id"])
+        self.assertTrue(self.engine.run_one())
+        generated = self.poc.load_episode(value["id"])
+        self.assertEqual(generated["status"], "summarized")
+        self.assertEqual(len(generated["summary"]["points"]), 1)
+        self.assertEqual(len(client.calls), 3)
+        self.assertIn("最多2条影响", final_calls[-1])
+
+    def test_short_summary_does_not_allow_one_overlong_point(self):
+        result = answer(["s0001"], final=True)
+        result["points"][0]["text"] *= 12
+        with self.assertRaisesRegex(ValueError, "600 summary"):
+            detail.validate(result, {"s0001"}, final=True, short_form=True)
+
     def test_long_final_rejects_eight_short_sentences(self):
         value = answer(["s0001"], final=True)
         value["points"] *= 8

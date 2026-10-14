@@ -334,14 +334,19 @@ class ReadingJobTests(unittest.TestCase):
         self.assertTrue(self.engine.run_one())
         self.assertEqual(self.job(job["id"])["state"], "completed")
 
-    def test_manual_refresh_and_its_summaries_can_run_while_automatic_work_is_paused(self):
+    def test_manual_refresh_does_not_authorize_its_discovered_summary_batch(self):
         first = self.engine.enqueue_refresh()
         promoted = self.engine.enqueue_refresh(manual=True)
         self.assertEqual(first["id"], promoted["id"])
         self.assertTrue(promoted["manual"])
         self.assertTrue(self.engine.run_one(allow_automatic=False))
         downstream = next(job for job in self.engine.snapshot() if job["type"] == "summary")
-        self.assertTrue(downstream["manual"])
+        self.assertFalse(downstream["manual"])
+        self.assertFalse(downstream["on_demand"])
+        self.assertFalse(self.engine.run_one(allow_automatic=False))
+        self.assertEqual(self.job(downstream["id"])["state"], "queued")
+        selected = self.engine.enqueue(downstream["article_id"], on_demand=True)
+        self.assertEqual(selected["id"], downstream["id"])
         self.assertTrue(self.engine.run_one(allow_automatic=False))
         self.assertEqual(self.job(downstream["id"])["state"], "completed")
 

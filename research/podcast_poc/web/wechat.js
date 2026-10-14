@@ -29,10 +29,14 @@ function hasBody(a) { return a.coverage?.scope === 'source_text' && a.source_kin
 function reviewed(a) { return hasBody(a) && a.status === 'summarized' && a.quality_review?.status === 'assistant_reviewed'; }
 function summaryReady(a) { return hasBody(a) && a.status === 'summarized' && Boolean(a.summary?.overview || array(a.summary?.points).length); }
 function detailedSummary(a) { return summaryReady(a) && a.summary?.schema_version==='detailed-v1'; }
-function jobFor(a) { return array(automation?.jobs).find(job=>job?.article_id === a.id&&(!summaryReady(a)||job.upgrade===true)) || (summaryReady(a)?a.detail_generation:null); }
+function jobFor(a) { return array(automation?.jobs).find(job=>job?.article_id === a.id&&(!summaryReady(a)||job.upgrade===true)) || (summaryReady(a)&&a.detail_generation?{type:'summary',...a.detail_generation}:null); }
 function jobState(a) { return submitting.has(a.id) ? 'submitting' : jobFor(a)?.state || (a.status === 'summarizing' ? 'running' : a.status === 'failed' && hasBody(a) ? 'failed' : ''); }
-function deferred(job) { return job?.state === 'queued' && (job.deferred_reason === 'off_peak_only' || automation?.off_peak_only === true && automation?.execution_allowed === false); }
-function deferredNote(job) { return `等待谷时处理，预计最早 ${beijingDate(job?.not_before || automation?.next_run_at)}（北京时间）。可以先阅读正文，后台恢复后依次处理。`; }
+function onDemandPolicy() { return automation?.manual_execution_policy==='immediate'; }
+function onDemandJob(job) { return onDemandPolicy()&&job?.type==='summary'&&job.on_demand===true; }
+function canPromote(item) { const job=jobFor(item);return onDemandPolicy()&&job?.state==='queued'&&!onDemandJob(job); }
+function generationBusy(item) { const state=jobState(item);return ['submitting','running'].includes(state)||state==='queued'&&!canPromote(item); }
+function deferred(job) { return job?.state === 'queued' && !onDemandJob(job) && (job.deferred_reason === 'off_peak_only' || automation?.off_peak_only === true && automation?.execution_allowed === false); }
+function deferredNote(job) { if(onDemandPolicy())return '自动任务安排在谷时，也可现在手动处理这一篇。';return `等待谷时处理，预计最早 ${beijingDate(job?.not_before || automation?.next_run_at)}（北京时间）。可以先阅读正文，后台恢复后依次处理。`; }
 function modelLabel() { return automation?.provider === 'local_mlx' ? '本地免费模型' : automation?.provider === 'deepseek' ? 'DeepSeek' : '摘要服务'; }
 function recordedModelLabel(a) {
   const inference = a.processing?.inference, model = a.processing?.summary_model;
@@ -130,11 +134,11 @@ function showAutomation() {
   const paused = Boolean(automation.provider_blocked || pausedReason);
   const waiting = automation.off_peak_only === true && automation.execution_allowed === false;
   label.textContent = paused ? '自动处理已暂停' : automation.enabled === true ? automation.worker_alive === true ? waiting ? '已开启 · 等待谷时' : '已开启' : '已开启 · 后台未运行' : '未开启';
-  box.append(el('p','automation-policy',automation.off_peak_only ? `配置频率（北京时间）：谷时每 ${Number.isFinite(automation.off_peak_minutes)?automation.off_peak_minutes:60} 分钟检查；高峰只排队，抓取和摘要等待谷时。` : `配置频率（北京时间）：空闲每 ${intervalLabel(automation.off_peak_minutes)}，高峰每 ${intervalLabel(automation.peak_minutes)} 检查一次。`));
+  box.append(el('p','automation-policy',automation.off_peak_only ? `配置频率（北京时间）：谷时每 ${Number.isFinite(automation.off_peak_minutes)?automation.off_peak_minutes:60} 分钟检查；自动抓取和摘要在高峰只排队，等待谷时。` : `配置频率（北京时间）：空闲每 ${intervalLabel(automation.off_peak_minutes)}，高峰每 ${intervalLabel(automation.peak_minutes)} 检查一次。`));
   const period = automation.period === 'peak' ? '高峰' : automation.period === 'off_peak' ? '空闲' : '时段待确认';
   box.append(el('p','',`当前：${period}。分时检查采用 DeepSeek 峰谷规则。`),el('p','automation-provider',`实际摘要服务：${modelLabel()}${typeof automation.model === 'string' && automation.model ? `（${automation.model}）` : ''}。`));
   box.append(el('p','',paused ? '已暂停安排新的自动检查与摘要任务。已有内容仍可阅读。' : automation.enabled === true ? '发现新文章后，由后台安排检查与摘要任务。' : '定时检查未开启；有正文的文章可以手动生成摘要。'));
-  if(waiting&&!paused)box.append(el('p','automation-deferred',`高峰期间仍可阅读已有内容、安排摘要；最早 ${beijingDate(automation.next_run_at)}（北京时间）恢复处理。`));
+  if(waiting&&!paused)box.append(el('p','automation-deferred',onDemandPolicy()?'自动任务等待谷时；单篇手动生成可立即进入处理队列。':`高峰期间仍可阅读已有内容、安排摘要；最早 ${beijingDate(automation.next_run_at)}（北京时间）恢复处理。`));
   if (paused) box.append(el('p','automation-warning automation-paused-reason',pausedReason || '摘要服务暂不可用，自动任务等待服务恢复。'));
   box.append(el('p','automation-worker',`后台进程：${automation.worker_alive === true ? '运行中' : automation.worker_alive === false ? '未运行' : '状态未提供'}`));
   box.append(el('p','',`最近检查：${beijingDate(automation.last_check_at)}`),el('p','',`最近成功：${beijingDate(automation.last_success_at)}`),el('p','automation-next-check',`下次检查：${paused ? '暂停中，当前不安排自动检查' : automation.enabled === true ? `${beijingDate(automation.next_check_at || automation.next_run_at)}（北京时间）` : '未安排'}`));
@@ -154,24 +158,25 @@ function updateJobUI() {
   if (badge) { setText(badge,label); badge.className=`status ${kind}`; }
   const controls = active.generation;
   if (!controls) return;
-  const upgrade=summaryReady(a),current = jobState(a), job = jobFor(a), waiting=deferred(job), busy = ['submitting','queued','running'].includes(current), complete = current === 'completed';
+  const upgrade=summaryReady(a),current = jobState(a), job = jobFor(a), waiting=current!=='submitting'&&deferred(job),promotable=canPromote(a), busy = generationBusy(a), complete = current === 'completed';
   const errors = requestErrors.get(a.id) || (current === 'failed' ? job?.error || a.detail_generation?.error || a.error || '摘要任务未能完成，可以稍后重试。' : '');
   const progress=a.detail_generation, chunks=progress&&Number.isFinite(progress.chunks_processed)&&Number.isFinite(progress.chunks_total)?`已整理 ${progress.chunks_processed} / ${progress.chunks_total} 块。`:'';
-  setText(controls.title,waiting?'等待谷时处理':({submitting:'正在提交摘要请求',queued:upgrade?'详细解读已排队':'摘要已排队',running:upgrade?'正在生成详细解读':'正在生成摘要',completed:'摘要已完成',failed:upgrade?'详细解读未能完成':'摘要生成失败'})[current] || (upgrade?'还可以读得更深入':'这篇文章还没有摘要'));
-  setText(controls.note,waiting?`${deferredNote(job)}${upgrade?'现有摘要继续保留，详细稿完成后再更新。':''}`:({submitting:'正在向后台提交，请稍候。',queued:upgrade?'现有摘要和复核记录继续保留，详细解读完成后自动更新。':'后台会依次处理。你可以继续阅读正文，完成后此处自动更新。',running:`正在整理正文与出处。${chunks}${upgrade?'现有摘要仍可阅读。':'完成后此处自动更新。'}`,completed:'后台已完成任务，正在等待最新摘要内容。',failed:upgrade?'现有摘要和复核记录仍然保留；可以重试详细解读。':'已获取的正文仍可阅读；重试只会提交这篇文章。'})[current] || (upgrade?`当前为此前的简版摘要。可生成分主题详解和 AI 影响分析，原摘要会保留在历史记录中。${automation?.off_peak_only?'高峰提交后等待谷时执行。':''}`:`可以按需安排要点与出处，也可以直接阅读已获取正文。${automation?.off_peak_only?'高峰提交后等待谷时执行。':''}`));
+  setText(controls.title,waiting?onDemandPolicy()?'正文已就绪':'等待谷时处理':({submitting:'正在提交摘要请求',queued:upgrade?'详细解读已排队':'摘要已排队',running:upgrade?'正在生成详细解读':'正在生成摘要',completed:'摘要已完成',failed:upgrade?'详细解读未能完成':'摘要生成失败'})[current] || (upgrade?'还可以读得更深入':'这篇文章还没有摘要'));
+  const immediate=onDemandPolicy(),manualQueued=onDemandJob(job)&&current==='queued';
+  setText(controls.note,waiting?`${deferredNote(job)}${upgrade?'现有摘要继续保留。':''}`:({submitting:'正在向后台提交，请稍候。',queued:manualQueued?`已提交，无需等待谷时；前方任务完成后开始处理。${upgrade?'现有摘要仍可阅读。':'可先阅读正文。'}`:upgrade?'现有摘要和复核记录继续保留，详细解读完成后自动更新。':'后台会依次处理，正文仍可阅读。',running:`正在整理正文与出处。${chunks}${upgrade?'现有摘要仍可阅读。':'完成后此处自动更新。'}`,completed:'后台已完成任务，正在等待最新摘要内容。',failed:upgrade?'现有摘要和复核记录仍然保留；可以重试详细解读。':'已获取的正文仍可阅读；重试只会提交这篇文章。'})[current] || (upgrade?`可生成分主题详解与 AI 影响分析，原摘要会保留。${!immediate&&automation?.off_peak_only?'高峰提交后等待谷时执行。':''}`:`可以生成要点与出处，也可以先阅读正文。${!immediate&&automation?.off_peak_only?'高峰提交后等待谷时执行。':''}`));
   setText(controls.error,typeof errors === 'string' ? errors : '摘要请求失败，请稍后重试。'); controls.error.hidden = !errors;
   controls.generate.hidden = complete;
   controls.generate.disabled = busy || (!session.isKol && !csrfToken) || (upgrade&&automation?.provider!=='deepseek');
-  setText(controls.generate,waiting?'等待谷时':({submitting:'正在提交…',queued:'已排队',running:'正在生成…'})[current] || (current === 'failed' || errors ? upgrade?'重试详细解读':'重新安排摘要' : upgrade?'生成详细解读':'安排摘要'));
+  setText(controls.generate,waiting&&!promotable?'等待谷时':busy?({submitting:'正在提交…',queued:'已排队',running:'正在生成…'})[current]:promotable?'立即生成':waiting?'等待谷时':current==='failed'||errors?upgrade?'重试详细解读':'重新生成':upgrade?'生成详细解读':immediate?'立即生成':'安排摘要');
   if(upgrade&&automation?.provider!=='deepseek'){setText(controls.note,'当前摘要服务尚未接入 DeepSeek；详细解读需切换至 DeepSeek 后生成。现有摘要与出处仍可阅读。');setText(controls.generate,'详细解读需 DeepSeek');}
-  setText(controls.provider,`${modelLabel()}${automation?.model ? ` · ${automation.model}` : ''}${!session.isKol && !csrfToken && !busy ? ' · 服务暂不可提交，请刷新列表后重试' : ''}`);
+  setText(controls.provider,immediate?`${modelLabel()}${automation?.provider==='deepseek'&&!busy?' · 手动生成按当前时段计费。':''}`:`${modelLabel()}${automation?.model ? ` · ${automation.model}` : ''}${!session.isKol && !csrfToken && !busy ? ' · 服务暂不可提交，请刷新列表后重试' : ''}`);
   controls.root.dataset.state = current || 'ready'; controls.root.setAttribute('aria-busy',String(busy));
 }
 async function generateSummary(articleId,upgrade=false) {
   const generation=session.revision();
   if (!session.valid(generation)) return;
   const a = articles.find(item=>item.id === articleId);
-  if (!a || !hasBody(a) || detailedSummary(a) || summaryReady(a)!==upgrade || (upgrade&&automation?.provider!=='deepseek') || ['submitting','queued','running','completed'].includes(jobState(a))) return;
+  if (!a || !hasBody(a) || detailedSummary(a) || summaryReady(a)!==upgrade || (upgrade&&automation?.provider!=='deepseek') || generationBusy(a) || jobState(a)==='completed') return;
   if (!session.isKol && !csrfToken) { requestErrors.set(articleId,'缺少本机请求凭据，请刷新列表后重试。'); updateJobUI(); return; }
   submitting.add(articleId); requestErrors.delete(articleId); updateJobUI(); showList();
   const controller = new AbortController(), timeout = setTimeout(()=>controller.abort(),20000);
@@ -377,7 +382,7 @@ function select(a,{focus=false,mobileOpen=false,preserve=false}={}) {
       empty.append(el('h3','','尚未取得正文'),el('p','','目前只有来源简介，不能生成全文摘要。'));
       if (typeof a.error === 'string' && a.error) empty.append(el('p','error-box',a.error));
     }
-    summaryPane.append(empty);
+    if(!body)summaryPane.append(empty);
   }
   if(body&&!detailedSummary(a)){
     const upgrade=summaryReady(a),empty=el('div',`reading-empty${upgrade?' detail-upgrade':''}`);empty.id='summary-generation';
