@@ -1,0 +1,434 @@
+{
+  "verified_at": "2026-10-14T06:05:57.153798+00:00",
+  "application_commit": "3ccb1297730a595929bb6423d5bfd3a4a8438d13",
+  "state": "deployed_with_three_official_transcripts_ready_and_automatic_summaries_deferred",
+  "runtime": {
+    "verified_at": "2026-10-14T06:04:33.448058+00:00",
+    "application_commit": "3ccb1297730a595929bb6423d5bfd3a4a8438d13",
+    "build_worktree_dirty": false,
+    "release": "/opt/kol-dashboard/releases/20261014T055832Z-53854-f070828d",
+    "manifest_sha256": "9bbca59e394c598870225d2d5a8662b2b8a63ff8dd72511b6521081f3e5603f3",
+    "runtime_files_verified": 58,
+    "runtime_file_mismatches": [],
+    "reading_asset_version": 47,
+    "health": {
+      "status": 200,
+      "healthy": true
+    },
+    "private_endpoints": {
+      "/api/private/reading/podcasts": {
+        "status": 401,
+        "cache_control": "no-store"
+      },
+      "/api/private/reading/wechat": {
+        "status": 401,
+        "cache_control": "no-store"
+      },
+      "/api/private/reading/status": {
+        "status": 401,
+        "cache_control": "no-store"
+      }
+    },
+    "reader_pages": {
+      "/podcasts": {
+        "status": 200,
+        "asset_47_reference": true
+      },
+      "/wechat": {
+        "status": 200,
+        "asset_47_reference": true
+      }
+    },
+    "reader_assets": {
+      "app.js": {
+        "status": 200,
+        "bytes": 52611,
+        "response_hash_matches_release": true
+      },
+      "wechat.js": {
+        "status": 200,
+        "bytes": 51027,
+        "response_hash_matches_release": true
+      },
+      "style.css": {
+        "status": 200,
+        "bytes": 18673,
+        "response_hash_matches_release": true
+      },
+      "wechat.css": {
+        "status": 200,
+        "bytes": 14697,
+        "response_hash_matches_release": true
+      },
+      "reader-auth.js": {
+        "status": 200,
+        "bytes": 8836,
+        "response_hash_matches_release": true
+      },
+      "reader-auth.css": {
+        "status": 200,
+        "bytes": 1683,
+        "response_hash_matches_release": true
+      }
+    },
+    "units": {
+      "kol-dashboard.service": "active",
+      "kol-reading-worker.service": "active",
+      "nginx.service": "active",
+      "kol-collect-kol.timer": "active",
+      "kol-collect-news.timer": "active",
+      "kol-enrich-news.timer": "active"
+    },
+    "acceptance": {
+      "passed": true,
+      "errors": []
+    }
+  },
+  "public_browser": {
+    "startedAt": "2026-10-14T06:04:40.039Z",
+    "expectedAssetVersion": "47",
+    "pages": [
+      {
+        "kind": "podcasts",
+        "layouts": [
+          {
+            "width": 1440,
+            "noHorizontalOverflow": true,
+            "unlockButtonHeight": 44
+          },
+          {
+            "width": 390,
+            "noHorizontalOverflow": true,
+            "unlockButtonHeight": 44
+          },
+          {
+            "width": 320,
+            "noHorizontalOverflow": true,
+            "unlockButtonHeight": 44
+          }
+        ],
+        "assets": [
+          "style.css",
+          "reader-auth.css",
+          "reader-auth.js",
+          "app.js"
+        ],
+        "status": 200,
+        "cacheControl": "no-store",
+        "anonymousPrivateContentHidden": true,
+        "passed": true
+      },
+      {
+        "kind": "wechat",
+        "layouts": [
+          {
+            "width": 1440,
+            "noHorizontalOverflow": true,
+            "unlockButtonHeight": 44
+          },
+          {
+            "width": 390,
+            "noHorizontalOverflow": true,
+            "unlockButtonHeight": 44
+          },
+          {
+            "width": 320,
+            "noHorizontalOverflow": true,
+            "unlockButtonHeight": 44
+          }
+        ],
+        "assets": [
+          "style.css",
+          "wechat.css",
+          "reader-auth.css",
+          "reader-auth.js",
+          "wechat.js"
+        ],
+        "status": 200,
+        "cacheControl": "no-store",
+        "anonymousPrivateContentHidden": true,
+        "passed": true
+      }
+    ],
+    "assets": [
+      {
+        "name": "style.css",
+        "status": 200,
+        "version": "47",
+        "sha256": "116205480c5a3f565bc3d6924fe75b27fc32ae15cd9416202653ebf7abb6f021",
+        "matchesLocal": true
+      },
+      {
+        "name": "reader-auth.css",
+        "status": 200,
+        "version": "47",
+        "sha256": "9b919d3f78431d1e6f1b22bb215a5cb22e2089bd020584d470145266fe1ff424",
+        "matchesLocal": true
+      },
+      {
+        "name": "reader-auth.js",
+        "status": 200,
+        "version": "47",
+        "sha256": "aa7610f3164580552d7ba1e2a9f1fd021f009a8420b7fae6bb44600451f366f1",
+        "matchesLocal": true
+      },
+      {
+        "name": "app.js",
+        "status": 200,
+        "version": "47",
+        "sha256": "e2b3a05429cc4e2acc34795dc7fb284c0b5ffbbe034a45f3ff4534381de49813",
+        "matchesLocal": true
+      },
+      {
+        "name": "wechat.css",
+        "status": 200,
+        "version": "47",
+        "sha256": "4d2559779819f71d040f24be8d4316e8824b2204e5764f9aba665b054bbee2eb",
+        "matchesLocal": true
+      },
+      {
+        "name": "wechat.js",
+        "status": 200,
+        "version": "47",
+        "sha256": "6436a15cbc50518cf034146e0b781c67f243aadd409851710bf0fd68901e2171",
+        "matchesLocal": true
+      }
+    ],
+    "privateAPIs": [],
+    "errors": [],
+    "requestFailures": [],
+    "blockedRequests": [],
+    "privateBrowserRequests": 0,
+    "postRequests": 0,
+    "passed": true,
+    "privateApiProbe": "not_run",
+    "finishedAt": "2026-10-14T06:04:45.674Z"
+  },
+  "content_import": {
+    "verified_at": "2026-10-14T06:05:57.153798+00:00",
+    "application_commit": "3ccb1297730a595929bb6423d5bfd3a4a8438d13",
+    "release": "/opt/kol-dashboard/releases/20261014T055832Z-53854-f070828d",
+    "scope": "one_time_import_of_three_user_requested_official_historical_transcripts",
+    "metadata_initialization": {
+      "created": 3,
+      "tagged": 0,
+      "episode_ids": [
+        "curated-ray-dalio-freakonomics-330",
+        "curated-elon-musk-lex-400",
+        "curated-jensen-huang-dwarkesh"
+      ]
+    },
+    "transcripts_imported": 3,
+    "repeat_initialization": {
+      "created": 0,
+      "tagged": 0,
+      "episode_ids": [
+        "curated-ray-dalio-freakonomics-330",
+        "curated-elon-musk-lex-400",
+        "curated-jensen-huang-dwarkesh"
+      ]
+    },
+    "existing_content_records_verified_unchanged": 229,
+    "daily_automatic_acquisition_ledger_unchanged": true,
+    "daily_automatic_acquisition_ledger": {
+      "date": "2026-10-14",
+      "ids": [
+        "dwarkesh-df8d7f12bc40",
+        "lex-3b2c67e29bd1",
+        "diary-471e3a03f8f2"
+      ]
+    },
+    "automatic_daily_limit": 3,
+    "new_network_fetches": 0,
+    "paid_calls_by_import": 0,
+    "curated_collection": {
+      "id": "influential_history",
+      "title": "历史精选",
+      "episode_count": 3,
+      "guests": [
+        {
+          "id": "ray-dalio",
+          "name": "瑞·达利欧"
+        },
+        {
+          "id": "elon-musk",
+          "name": "埃隆·马斯克"
+        },
+        {
+          "id": "jensen-huang",
+          "name": "黄仁勋"
+        }
+      ]
+    },
+    "rows": [
+      {
+        "id": "curated-ray-dalio-freakonomics-330",
+        "title": "Extra: Ray Dalio Full Interview",
+        "show": "Freakonomics Radio",
+        "guests": [
+          "瑞·达利欧"
+        ],
+        "published_at": "2018-04-08",
+        "published_precision": "date",
+        "source_url": "https://freakonomics.com/podcast/extra-ray-dalio-full-interview-ep-330/",
+        "transcript_source_url": "https://freakonomics.com/podcast/extra-ray-dalio-full-interview-ep-330/",
+        "source_kind": "official_edited_transcript",
+        "segments": 127,
+        "text_chars": 64834,
+        "timestamp_precisions": [
+          "none"
+        ],
+        "transcript_ready": true,
+        "summary_ready": false,
+        "paid_api_calls": 0,
+        "job": {
+          "id": "6ee2e06a115a41c099d9c4afddf0a10d",
+          "state": "queued",
+          "manual": false,
+          "on_demand": false,
+          "attempts": 0,
+          "not_before": "2026-10-14T10:00:00+00:00",
+          "deferred_reason": "off_peak_only"
+        },
+        "canonical_records": 1
+      },
+      {
+        "id": "curated-elon-musk-lex-400",
+        "title": "Elon Musk: War, AI, Aliens, Politics, Physics, Video Games, and Humanity",
+        "show": "Lex Fridman Podcast",
+        "guests": [
+          "埃隆·马斯克"
+        ],
+        "published_at": "2023-11-09T19:03:46+00:00",
+        "published_precision": "timestamp",
+        "source_url": "https://lexfridman.com/elon-musk-4/",
+        "transcript_source_url": "https://lexfridman.com/elon-musk-4-transcript/",
+        "source_kind": "official_edited_transcript",
+        "segments": 549,
+        "text_chars": 103018,
+        "timestamp_precisions": [
+          "speaker_turn"
+        ],
+        "transcript_ready": true,
+        "summary_ready": false,
+        "paid_api_calls": 0,
+        "job": {
+          "id": "fc31f6754e6c4eb383e385e7f9fe6e61",
+          "state": "queued",
+          "manual": false,
+          "on_demand": false,
+          "attempts": 0,
+          "not_before": "2026-10-14T10:00:00+00:00",
+          "deferred_reason": "off_peak_only"
+        },
+        "canonical_records": 1
+      },
+      {
+        "id": "curated-jensen-huang-dwarkesh",
+        "title": "Jensen Huang – TPU competition, why we should sell chips to China, & Nvidia’s supply chain moat",
+        "show": "Dwarkesh Podcast",
+        "guests": [
+          "黄仁勋"
+        ],
+        "published_at": "2026-04-15T15:45:23.854Z",
+        "published_precision": "timestamp",
+        "source_url": "https://www.dwarkesh.com/p/jensen-huang",
+        "transcript_source_url": "https://www.dwarkesh.com/p/jensen-huang",
+        "source_kind": "official_edited_transcript",
+        "segments": 181,
+        "text_chars": 84750,
+        "timestamp_precisions": [
+          "chapter"
+        ],
+        "transcript_ready": true,
+        "summary_ready": false,
+        "paid_api_calls": 0,
+        "job": {
+          "id": "a29271d0b34c4f859fd1b5ffcb36db72",
+          "state": "queued",
+          "manual": false,
+          "on_demand": false,
+          "attempts": 0,
+          "not_before": "2026-10-14T10:00:00+00:00",
+          "deferred_reason": "off_peak_only"
+        },
+        "canonical_records": 1
+      }
+    ],
+    "passed": true
+  },
+  "tests": {
+    "kol_full": 1037,
+    "reading_full": 193,
+    "official_adapter_tests_in_reading_suite": 22,
+    "clean_export_repository_tests": 3,
+    "clean_export_compile": true,
+    "browser_fixture_checks": 49,
+    "browser_fixture_passed": true,
+    "browser_fixture_checks_detail": [
+      "private gate",
+      "in-page login",
+      "production navigation",
+      "no token persistence",
+      "action header",
+      "no automatic audio",
+      "podcast metadata guard",
+      "partial third-party transcript",
+      "safe provenance and collapsed details",
+      "episode deep link",
+      "Beijing off-peak queue feedback",
+      "deferred 30s versus running 5s polling",
+      "explicit on-demand peak execution without automatic paid requests",
+      "legacy batch manual flag cannot bypass peak gate",
+      "same-job promotion and duplicate prevention",
+      "running disabled and queued-after-pause promotable",
+      "compact mobile controls retain original reading",
+      "English priority default and source filters",
+      "historical collection and three guest filters",
+      "original publication dates and independent safe rationale",
+      "curated-only source does not create an RSS subscription",
+      "historical deep links retain selection",
+      "null timestamps show paragraph positions without audio seek",
+      "historical filters create no paid requests",
+      "historical mobile layout at 320px and 390px",
+      "source health versus transcript availability",
+      "legacy fixture compatibility",
+      "Chinese deep link compatibility",
+      "empty source filter",
+      "six acquisition states and summary precedence",
+      "peak-to-valley updates without replacing transcript DOM",
+      "retry time is not completion promise",
+      "official transcript policy limits and safe provenance",
+      "detailed topics and three impact domains",
+      "AI inference boundary and safe text rendering",
+      "explicit idempotent detailed upgrade",
+      "old reviewed summary survives queued running failed upgrade",
+      "history citations use archived segments without current-text fallback",
+      "impact evidence return navigation",
+      "empty impacts do not invent relevance",
+      "long detailed payload at 320px and 390px",
+      "local POC upgrade uses CSRF and requires DeepSeek",
+      "subscription state cleared on lock",
+      "cross-tab logout",
+      "stale response discard",
+      "403 clears memory and DOM",
+      "BFCache recheck",
+      "visibility recheck",
+      "390px and 320px touch targets"
+    ]
+  },
+  "schedule": {
+    "timezone": "Asia/Shanghai",
+    "automatic_summary_earliest": "2026-10-14T18:00:00+08:00",
+    "manual_single_episode_immediate": true,
+    "automatic_daily_acquisition_limit": 3,
+    "reading_new_summaries_already_generated": false
+  },
+  "scope_notes": [
+    "Full text remains private; this file contains verification metadata only.",
+    "This import reused three official texts fetched during the earlier off-peak window; it did not reset the automatic daily acquisition ledger.",
+    "Full coverage means the retrieved official edited transcript, not an audio audit or verbatim ASR guarantee.",
+    "Freakonomics has paragraph evidence without timestamps; Dwarkesh has chapter-level timestamps; Lex retains source notes on inherited speaker labels.",
+    "No new paid inference was made for this historical-content import. Detailed summary quality for these three episodes is not yet verified."
+  ]
+}
