@@ -1,0 +1,602 @@
+{
+  "verification_stage": "deployed_and_peak_queue_verified",
+  "application": {
+    "verified_at": "2026-10-14T03:30:48.387970+00:00",
+    "application_commit": "48e12f16b507b9101ac24979c93c1c3cf9827c42",
+    "build_worktree_dirty": false,
+    "release": "/opt/kol-dashboard/releases/20261014T032459Z-23043-20870da5",
+    "manifest_sha256": "7707bf1d299e973bd103265a1b5df2b75b171ca849e042dbf47209557f9fe6b0",
+    "runtime_files_verified": 56,
+    "runtime_file_mismatches": [],
+    "reading_asset_version": 45,
+    "health": {
+      "status": 200,
+      "healthy": true
+    },
+    "private_endpoints": {
+      "/api/private/reading/podcasts": {
+        "status": 401,
+        "cache_control": "no-store"
+      },
+      "/api/private/reading/wechat": {
+        "status": 401,
+        "cache_control": "no-store"
+      },
+      "/api/private/reading/status": {
+        "status": 401,
+        "cache_control": "no-store"
+      }
+    },
+    "reader_pages": {
+      "/podcasts": {
+        "status": 200,
+        "asset_45_reference": true
+      },
+      "/wechat": {
+        "status": 200,
+        "asset_45_reference": true
+      }
+    },
+    "reader_assets": {
+      "app.js": {
+        "status": 200,
+        "bytes": 47599,
+        "response_hash_matches_release": true
+      },
+      "wechat.js": {
+        "status": 200,
+        "bytes": 49961,
+        "response_hash_matches_release": true
+      },
+      "style.css": {
+        "status": 200,
+        "bytes": 17407,
+        "response_hash_matches_release": true
+      },
+      "wechat.css": {
+        "status": 200,
+        "bytes": 14392,
+        "response_hash_matches_release": true
+      },
+      "reader-auth.js": {
+        "status": 200,
+        "bytes": 8836,
+        "response_hash_matches_release": true
+      },
+      "reader-auth.css": {
+        "status": 200,
+        "bytes": 1683,
+        "response_hash_matches_release": true
+      }
+    },
+    "units": {
+      "kol-dashboard.service": "active",
+      "kol-reading-worker.service": "active",
+      "nginx.service": "active",
+      "kol-collect-kol.timer": "active",
+      "kol-collect-news.timer": "active",
+      "kol-enrich-news.timer": "active"
+    },
+    "acceptance": {
+      "passed": true,
+      "errors": []
+    }
+  },
+  "content": {
+    "verified_at": "2026-10-14T03:32:08.359938+00:00",
+    "release": "/opt/kol-dashboard/releases/20261014T032459Z-23043-20870da5",
+    "stage": "peak_queued",
+    "schedule": {
+      "period": "peak",
+      "execution_allowed": false,
+      "next_run_at": "2026-10-14T04:00:00+00:00",
+      "next_check_at": "2026-10-14T04:00:00+00:00",
+      "worker_alive": true,
+      "enabled": true,
+      "counts": {
+        "completed": 231,
+        "queued": 4
+      }
+    },
+    "baseline_records": 229,
+    "nonselected_compared": 225,
+    "nonselected_changed_summary_ids": [],
+    "nonselected_missing_ids": [],
+    "selected": [
+      {
+        "id": "diary-471e3a03f8f2",
+        "title": "AI Extinction Risk Expert: If Your Job Is Repetitive, AI Will Do It Better Than You! | Eric Weinstein",
+        "stage": "peak_queued",
+        "status": "summarized",
+        "format": null,
+        "source_text_chars": 94986,
+        "source_segments": 1521,
+        "summary_chars": 448,
+        "summary_chinese_chars": 383,
+        "points": 8,
+        "impacts": 0,
+        "impact_domains": [],
+        "evidence_references": 24,
+        "all_references_resolve": true,
+        "detailed_schema_valid": false,
+        "summary_evidence_hash_matches": false,
+        "new_reviewed": false,
+        "historical_versions": 0,
+        "original_summary_preserved": false,
+        "historical_review_preserved": false,
+        "historical_original_segments": 0,
+        "historical_evidence_hash_and_refs_valid": false,
+        "historical_evidence_matches_current_original": false,
+        "readable_original_during_upgrade": true,
+        "detail_generation": {
+          "state": null,
+          "signature": null,
+          "chunks_processed": null,
+          "chunks_total": null,
+          "started_at": null,
+          "completed_at": null,
+          "not_before": null,
+          "error": null
+        },
+        "processing": {
+          "summary_model": null,
+          "prompt_version": null,
+          "inference": null,
+          "paid_api_calls": null,
+          "usage_unreported_calls": null,
+          "usage": null
+        },
+        "job": {
+          "id": "1ef1f9966cc34b519a18e9737d878897",
+          "state": "queued",
+          "upgrade": 1,
+          "attempts": 0,
+          "not_before": "2026-10-14T04:00:00+00:00",
+          "started_at": null,
+          "completed_at": null,
+          "error": null
+        },
+        "upgrade_complete": false,
+        "peak_queue_verified": true
+      },
+      {
+        "id": "dwarkesh-ilya-2",
+        "title": "Ilya Sutskever — We're moving from the age of scaling to the age of research",
+        "stage": "peak_queued",
+        "status": "summarized",
+        "format": null,
+        "source_text_chars": 72688,
+        "source_segments": 133,
+        "summary_chars": 519,
+        "summary_chinese_chars": 430,
+        "points": 6,
+        "impacts": 0,
+        "impact_domains": [],
+        "evidence_references": 10,
+        "all_references_resolve": true,
+        "detailed_schema_valid": false,
+        "summary_evidence_hash_matches": false,
+        "new_reviewed": true,
+        "historical_versions": 0,
+        "original_summary_preserved": false,
+        "historical_review_preserved": false,
+        "historical_original_segments": 0,
+        "historical_evidence_hash_and_refs_valid": false,
+        "historical_evidence_matches_current_original": false,
+        "readable_original_during_upgrade": true,
+        "detail_generation": {
+          "state": null,
+          "signature": null,
+          "chunks_processed": null,
+          "chunks_total": null,
+          "started_at": null,
+          "completed_at": null,
+          "not_before": null,
+          "error": null
+        },
+        "processing": {
+          "summary_model": null,
+          "prompt_version": null,
+          "inference": null,
+          "paid_api_calls": null,
+          "usage_unreported_calls": null,
+          "usage": null
+        },
+        "job": {
+          "id": "af0c43cd956643ac9d43351d6a623389",
+          "state": "queued",
+          "upgrade": 1,
+          "attempts": 0,
+          "not_before": "2026-10-14T04:00:00+00:00",
+          "started_at": null,
+          "completed_at": null,
+          "error": null
+        },
+        "upgrade_complete": false,
+        "peak_queue_verified": true
+      },
+      {
+        "id": "wx-35cf506b1da0cd4f0eb8",
+        "title": "Agent、MCP、Skill、Cli、Model 一次讲透：老系统接入 AI 的概念地图与三条路径",
+        "stage": "peak_queued",
+        "status": "summarized",
+        "format": null,
+        "source_text_chars": 4112,
+        "source_segments": 102,
+        "summary_chars": 368,
+        "summary_chinese_chars": 207,
+        "points": 5,
+        "impacts": 0,
+        "impact_domains": [],
+        "evidence_references": 14,
+        "all_references_resolve": true,
+        "detailed_schema_valid": false,
+        "summary_evidence_hash_matches": false,
+        "new_reviewed": false,
+        "historical_versions": 0,
+        "original_summary_preserved": false,
+        "historical_review_preserved": false,
+        "historical_original_segments": 0,
+        "historical_evidence_hash_and_refs_valid": false,
+        "historical_evidence_matches_current_original": false,
+        "readable_original_during_upgrade": true,
+        "detail_generation": {
+          "state": null,
+          "signature": null,
+          "chunks_processed": null,
+          "chunks_total": null,
+          "started_at": null,
+          "completed_at": null,
+          "not_before": null,
+          "error": null
+        },
+        "processing": {
+          "summary_model": null,
+          "prompt_version": null,
+          "inference": null,
+          "paid_api_calls": null,
+          "usage_unreported_calls": null,
+          "usage": null
+        },
+        "job": {
+          "id": "c77c34e4743a4d0bbc40e22f6c70d429",
+          "state": "queued",
+          "upgrade": 1,
+          "attempts": 0,
+          "not_before": "2026-10-14T04:00:00+00:00",
+          "started_at": null,
+          "completed_at": null,
+          "error": null
+        },
+        "upgrade_complete": false,
+        "peak_queue_verified": true
+      },
+      {
+        "id": "wx-ab378fe91086bb9dc8fb",
+        "title": "10月14日投资提示：中科转债发行",
+        "stage": "peak_queued",
+        "status": "summarized",
+        "format": null,
+        "source_text_chars": 267,
+        "source_segments": 13,
+        "summary_chars": 181,
+        "summary_chinese_chars": 131,
+        "points": 5,
+        "impacts": 0,
+        "impact_domains": [],
+        "evidence_references": 5,
+        "all_references_resolve": true,
+        "detailed_schema_valid": false,
+        "summary_evidence_hash_matches": false,
+        "new_reviewed": false,
+        "historical_versions": 0,
+        "original_summary_preserved": false,
+        "historical_review_preserved": false,
+        "historical_original_segments": 0,
+        "historical_evidence_hash_and_refs_valid": false,
+        "historical_evidence_matches_current_original": false,
+        "readable_original_during_upgrade": true,
+        "detail_generation": {
+          "state": null,
+          "signature": null,
+          "chunks_processed": null,
+          "chunks_total": null,
+          "started_at": null,
+          "completed_at": null,
+          "not_before": null,
+          "error": null
+        },
+        "processing": {
+          "summary_model": null,
+          "prompt_version": null,
+          "inference": null,
+          "paid_api_calls": null,
+          "usage_unreported_calls": null,
+          "usage": null
+        },
+        "job": {
+          "id": "4b5b9440f2934c7e88d64124b3a8cf78",
+          "state": "queued",
+          "upgrade": 1,
+          "attempts": 0,
+          "not_before": "2026-10-14T04:00:00+00:00",
+          "started_at": null,
+          "completed_at": null,
+          "error": null
+        },
+        "upgrade_complete": false,
+        "peak_queue_verified": true
+      }
+    ],
+    "acceptance": {
+      "complete": false,
+      "selected_complete": false,
+      "peak_queue_verified": true,
+      "nonselected_preserved": true,
+      "semantic_accuracy_manually_verified": false
+    }
+  },
+  "explicit_upgrade_queue": {
+    "verified_at": "2026-10-14T03:31:19.592649+00:00",
+    "schedule": {
+      "timezone": "Asia/Shanghai",
+      "period": "peak",
+      "peak_minutes": 240,
+      "off_peak_minutes": 60,
+      "due": false,
+      "next_check_at": "2026-10-14T04:00:00+00:00",
+      "off_peak_only": true,
+      "execution_allowed": false,
+      "next_run_at": "2026-10-14T04:00:00+00:00",
+      "deferred_reason": "off_peak_only",
+      "manual_execution_policy": "off_peak_only",
+      "calendar_status": "verified",
+      "calendar_years": [
+        2026
+      ],
+      "price_source": "https://api-docs.deepseek.com/zh-cn/quick_start/pricing/",
+      "calendar_source": "https://zwfw.gansu.gov.cn/chengguan/zwzx/zxtg/art/2025/art_2529408225b9478487a7bd156ff8c37b.html"
+    },
+    "items": [
+      {
+        "id": "diary-471e3a03f8f2",
+        "job_id": "1ef1f9966cc34b519a18e9737d878897",
+        "state": "queued",
+        "attempts": 0,
+        "not_before": "2026-10-14T04:00:00+00:00",
+        "deferred_reason": "off_peak_only",
+        "duplicate_request_same_job": true,
+        "old_summary_and_review_preserved": true
+      },
+      {
+        "id": "dwarkesh-ilya-2",
+        "job_id": "af0c43cd956643ac9d43351d6a623389",
+        "state": "queued",
+        "attempts": 0,
+        "not_before": "2026-10-14T04:00:00+00:00",
+        "deferred_reason": "off_peak_only",
+        "duplicate_request_same_job": true,
+        "old_summary_and_review_preserved": true
+      },
+      {
+        "id": "wx-35cf506b1da0cd4f0eb8",
+        "job_id": "c77c34e4743a4d0bbc40e22f6c70d429",
+        "state": "queued",
+        "attempts": 0,
+        "not_before": "2026-10-14T04:00:00+00:00",
+        "deferred_reason": "off_peak_only",
+        "duplicate_request_same_job": true,
+        "old_summary_and_review_preserved": true
+      },
+      {
+        "id": "wx-ab378fe91086bb9dc8fb",
+        "job_id": "4b5b9440f2934c7e88d64124b3a8cf78",
+        "state": "queued",
+        "attempts": 0,
+        "not_before": "2026-10-14T04:00:00+00:00",
+        "deferred_reason": "off_peak_only",
+        "duplicate_request_same_job": true,
+        "old_summary_and_review_preserved": true
+      }
+    ]
+  },
+  "public_browser": {
+    "startedAt": "2026-10-14T03:30:35.153Z",
+    "expectedAssetVersion": "45",
+    "pages": [
+      {
+        "kind": "podcasts",
+        "layouts": [
+          {
+            "width": 1440,
+            "noHorizontalOverflow": true,
+            "unlockButtonHeight": 44
+          },
+          {
+            "width": 390,
+            "noHorizontalOverflow": true,
+            "unlockButtonHeight": 44
+          },
+          {
+            "width": 320,
+            "noHorizontalOverflow": true,
+            "unlockButtonHeight": 44
+          }
+        ],
+        "assets": [
+          "style.css",
+          "reader-auth.css",
+          "reader-auth.js",
+          "app.js"
+        ],
+        "status": 200,
+        "cacheControl": "no-store",
+        "anonymousPrivateContentHidden": true,
+        "passed": true
+      },
+      {
+        "kind": "wechat",
+        "layouts": [
+          {
+            "width": 1440,
+            "noHorizontalOverflow": true,
+            "unlockButtonHeight": 44
+          },
+          {
+            "width": 390,
+            "noHorizontalOverflow": true,
+            "unlockButtonHeight": 44
+          },
+          {
+            "width": 320,
+            "noHorizontalOverflow": true,
+            "unlockButtonHeight": 44
+          }
+        ],
+        "assets": [
+          "style.css",
+          "wechat.css",
+          "reader-auth.css",
+          "reader-auth.js",
+          "wechat.js"
+        ],
+        "status": 200,
+        "cacheControl": "no-store",
+        "anonymousPrivateContentHidden": true,
+        "passed": true
+      }
+    ],
+    "assets": [
+      {
+        "name": "style.css",
+        "status": 200,
+        "version": "45",
+        "sha256": "c32f2d24975166d5879a7940acef5844c73d649dbfe9a565ef3589b79922a76e",
+        "matchesLocal": true
+      },
+      {
+        "name": "reader-auth.css",
+        "status": 200,
+        "version": "45",
+        "sha256": "9b919d3f78431d1e6f1b22bb215a5cb22e2089bd020584d470145266fe1ff424",
+        "matchesLocal": true
+      },
+      {
+        "name": "reader-auth.js",
+        "status": 200,
+        "version": "45",
+        "sha256": "aa7610f3164580552d7ba1e2a9f1fd021f009a8420b7fae6bb44600451f366f1",
+        "matchesLocal": true
+      },
+      {
+        "name": "app.js",
+        "status": 200,
+        "version": "45",
+        "sha256": "80233a8898f0bbe7c8804d0352be39ccb8a47f88bafd91a10c6f66de545afa87",
+        "matchesLocal": true
+      },
+      {
+        "name": "wechat.css",
+        "status": 200,
+        "version": "45",
+        "sha256": "5d55fcc619db3f3795afb22bd8a96e7e93bdf9b8cc17476c7975efeac056f87b",
+        "matchesLocal": true
+      },
+      {
+        "name": "wechat.js",
+        "status": 200,
+        "version": "45",
+        "sha256": "6c2e0f106493d72773f3bc5aa5a93e8567fee6551957e7fd6d132193f81e9c4e",
+        "matchesLocal": true
+      }
+    ],
+    "privateAPIs": [
+      {
+        "kind": "podcasts",
+        "status": 401,
+        "cacheControl": "no-store",
+        "privateContentAbsent": true,
+        "detail": "private_mode_required"
+      },
+      {
+        "kind": "wechat",
+        "status": 401,
+        "cacheControl": "no-store",
+        "privateContentAbsent": true,
+        "detail": "private_mode_required"
+      },
+      {
+        "kind": "status",
+        "status": 401,
+        "cacheControl": "no-store",
+        "privateContentAbsent": true,
+        "detail": "private_mode_required"
+      }
+    ],
+    "errors": [],
+    "requestFailures": [],
+    "blockedRequests": [],
+    "privateBrowserRequests": 0,
+    "postRequests": 0,
+    "passed": true,
+    "finishedAt": "2026-10-14T03:30:41.126Z"
+  },
+  "private_reader_fixture": {
+    "passed": true,
+    "checks": [
+      "private gate",
+      "in-page login",
+      "production navigation",
+      "no token persistence",
+      "action header",
+      "no automatic audio",
+      "podcast metadata guard",
+      "partial third-party transcript",
+      "safe provenance and collapsed details",
+      "episode deep link",
+      "Beijing off-peak queue feedback",
+      "deferred 30s versus running 5s polling",
+      "English priority default and source filters",
+      "source health versus transcript availability",
+      "legacy fixture compatibility",
+      "Chinese deep link compatibility",
+      "empty source filter",
+      "six acquisition states and summary precedence",
+      "peak-to-valley updates without replacing transcript DOM",
+      "retry time is not completion promise",
+      "official transcript policy limits and safe provenance",
+      "detailed topics and three impact domains",
+      "AI inference boundary and safe text rendering",
+      "explicit idempotent detailed upgrade",
+      "old reviewed summary survives queued running failed upgrade",
+      "history citations use archived segments without current-text fallback",
+      "impact evidence return navigation",
+      "empty impacts do not invent relevance",
+      "long detailed payload at 320px and 390px",
+      "local POC upgrade uses CSRF and requires DeepSeek",
+      "subscription state cleared on lock",
+      "cross-tab logout",
+      "stale response discard",
+      "403 clears memory and DOM",
+      "BFCache recheck",
+      "visibility recheck",
+      "390px and 320px touch targets"
+    ],
+    "privateGets": 50,
+    "summaryPosts": 5
+  },
+  "tests": {
+    "kol_suite_passed": 1012,
+    "reading_full_suite_passed_before_last_guard": 158,
+    "reading_final_guard_focused_suite_passed": 64,
+    "detailed_summary_contract_tests_passed": 20,
+    "repository_contract_tests_passed": 3,
+    "clean_staged_export_compileall": true
+  },
+  "limitations": [
+    "Real detailed DeepSeek output has not been generated or semantically reviewed in this verification; current selected summaries remain legacy drafts.",
+    "Four explicit upgrades are queued for the next allowed window at 2026-10-14 12:00 Asia/Shanghai; this is an earliest start, not a completion promise.",
+    "Structural evidence checks do not establish semantic accuracy. AI impact hypotheses have no live market or user portfolio inputs.",
+    "Other legacy summaries are preserved and only upgrade on explicit request; new eligible unsummarized content uses detailed-v1."
+  ]
+}
