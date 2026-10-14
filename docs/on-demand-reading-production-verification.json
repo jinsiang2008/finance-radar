@@ -1,0 +1,1018 @@
+{
+  "verified_at": "2026-10-14T05:25:38.442254+00:00",
+  "application_commit": "0af9c74e965049464eda0d1b467f2c32f48f19e1",
+  "release": "/opt/kol-dashboard/releases/20261014T051353Z-44223-f8164016",
+  "policy": {
+    "authenticated_single_summary": "immediate_priority_queue",
+    "automatic_reading": "off_peak_only",
+    "manual_source_refresh": "off_peak_only",
+    "preemption": false,
+    "old_manual_flag_grants_peak_bypass": false,
+    "deduplicated": true
+  },
+  "runtime": {
+    "verified_at": "2026-10-14T05:19:30.338244+00:00",
+    "application_commit": "0af9c74e965049464eda0d1b467f2c32f48f19e1",
+    "build_worktree_dirty": false,
+    "release": "/opt/kol-dashboard/releases/20261014T051353Z-44223-f8164016",
+    "manifest_sha256": "8036224ae28c4387b3d22eebdc14462572815bfa49d70bb722592b44067b7554",
+    "runtime_files_verified": 56,
+    "runtime_file_mismatches": [],
+    "reading_asset_version": 46,
+    "health": {
+      "status": 200,
+      "healthy": true
+    },
+    "private_endpoints": {
+      "/api/private/reading/podcasts": {
+        "status": 401,
+        "cache_control": "no-store"
+      },
+      "/api/private/reading/wechat": {
+        "status": 401,
+        "cache_control": "no-store"
+      },
+      "/api/private/reading/status": {
+        "status": 401,
+        "cache_control": "no-store"
+      }
+    },
+    "reader_pages": {
+      "/podcasts": {
+        "status": 200,
+        "asset_46_reference": true
+      },
+      "/wechat": {
+        "status": 200,
+        "asset_46_reference": true
+      }
+    },
+    "reader_assets": {
+      "app.js": {
+        "status": 200,
+        "bytes": 48960,
+        "response_hash_matches_release": true
+      },
+      "wechat.js": {
+        "status": 200,
+        "bytes": 51027,
+        "response_hash_matches_release": true
+      },
+      "style.css": {
+        "status": 200,
+        "bytes": 17554,
+        "response_hash_matches_release": true
+      },
+      "wechat.css": {
+        "status": 200,
+        "bytes": 14697,
+        "response_hash_matches_release": true
+      },
+      "reader-auth.js": {
+        "status": 200,
+        "bytes": 8836,
+        "response_hash_matches_release": true
+      },
+      "reader-auth.css": {
+        "status": 200,
+        "bytes": 1683,
+        "response_hash_matches_release": true
+      }
+    },
+    "units": {
+      "kol-dashboard.service": "active",
+      "kol-reading-worker.service": "active",
+      "nginx.service": "active",
+      "kol-collect-kol.timer": "active",
+      "kol-collect-news.timer": "active",
+      "kol-enrich-news.timer": "active"
+    },
+    "acceptance": {
+      "passed": true,
+      "errors": []
+    }
+  },
+  "public_browser": {
+    "startedAt": "2026-10-14T05:01:49.351Z",
+    "expectedAssetVersion": "46",
+    "pages": [
+      {
+        "kind": "podcasts",
+        "layouts": [
+          {
+            "width": 1440,
+            "noHorizontalOverflow": true,
+            "unlockButtonHeight": 44,
+            "screenshot": "/private/tmp/kol-on-demand-public-podcasts-1440.png"
+          },
+          {
+            "width": 390,
+            "noHorizontalOverflow": true,
+            "unlockButtonHeight": 44,
+            "screenshot": "/private/tmp/kol-on-demand-public-podcasts-390.png"
+          },
+          {
+            "width": 320,
+            "noHorizontalOverflow": true,
+            "unlockButtonHeight": 44,
+            "screenshot": "/private/tmp/kol-on-demand-public-podcasts-320.png"
+          }
+        ],
+        "assets": [
+          "style.css",
+          "reader-auth.css",
+          "reader-auth.js",
+          "app.js"
+        ],
+        "status": 200,
+        "cacheControl": "no-store",
+        "anonymousPrivateContentHidden": true,
+        "passed": true
+      },
+      {
+        "kind": "wechat",
+        "layouts": [
+          {
+            "width": 1440,
+            "noHorizontalOverflow": true,
+            "unlockButtonHeight": 44,
+            "screenshot": "/private/tmp/kol-on-demand-public-wechat-1440.png"
+          },
+          {
+            "width": 390,
+            "noHorizontalOverflow": true,
+            "unlockButtonHeight": 44,
+            "screenshot": "/private/tmp/kol-on-demand-public-wechat-390.png"
+          },
+          {
+            "width": 320,
+            "noHorizontalOverflow": true,
+            "unlockButtonHeight": 44,
+            "screenshot": "/private/tmp/kol-on-demand-public-wechat-320.png"
+          }
+        ],
+        "assets": [
+          "style.css",
+          "wechat.css",
+          "reader-auth.css",
+          "reader-auth.js",
+          "wechat.js"
+        ],
+        "status": 200,
+        "cacheControl": "no-store",
+        "anonymousPrivateContentHidden": true,
+        "passed": true
+      }
+    ],
+    "assets": [
+      {
+        "name": "style.css",
+        "status": 200,
+        "version": "46",
+        "sha256": "70e4dd6152999120891ca05d7b2bcb757ece68d4f3e7c77323e7b014c7324933",
+        "matchesLocal": true
+      },
+      {
+        "name": "reader-auth.css",
+        "status": 200,
+        "version": "46",
+        "sha256": "9b919d3f78431d1e6f1b22bb215a5cb22e2089bd020584d470145266fe1ff424",
+        "matchesLocal": true
+      },
+      {
+        "name": "reader-auth.js",
+        "status": 200,
+        "version": "46",
+        "sha256": "aa7610f3164580552d7ba1e2a9f1fd021f009a8420b7fae6bb44600451f366f1",
+        "matchesLocal": true
+      },
+      {
+        "name": "app.js",
+        "status": 200,
+        "version": "46",
+        "sha256": "be914660ca51ead088f1127d7e94bc8a2df5231c06cfa3e31aea4f5b594621e4",
+        "matchesLocal": true
+      },
+      {
+        "name": "wechat.css",
+        "status": 200,
+        "version": "46",
+        "sha256": "4d2559779819f71d040f24be8d4316e8824b2204e5764f9aba665b054bbee2eb",
+        "matchesLocal": true
+      },
+      {
+        "name": "wechat.js",
+        "status": 200,
+        "version": "46",
+        "sha256": "6436a15cbc50518cf034146e0b781c67f243aadd409851710bf0fd68901e2171",
+        "matchesLocal": true
+      }
+    ],
+    "privateAPIs": [
+      {
+        "kind": "podcasts",
+        "status": 401,
+        "cacheControl": "no-store",
+        "privateContentAbsent": true,
+        "detail": "private_mode_required"
+      },
+      {
+        "kind": "wechat",
+        "status": 401,
+        "cacheControl": "no-store",
+        "privateContentAbsent": true,
+        "detail": "private_mode_required"
+      },
+      {
+        "kind": "status",
+        "status": 401,
+        "cacheControl": "no-store",
+        "privateContentAbsent": true,
+        "detail": "private_mode_required"
+      }
+    ],
+    "errors": [],
+    "requestFailures": [],
+    "blockedRequests": [],
+    "privateBrowserRequests": 0,
+    "postRequests": 0,
+    "passed": true,
+    "finishedAt": "2026-10-14T05:01:54.800Z"
+  },
+  "validation": {
+    "kol_full_tests": 1025,
+    "kol_full_tests_application_commit": "648dcf5a3af573a09c54413a581090fe9bf96823",
+    "reading_full_tests": 187,
+    "detailed_summary_tests_in_reading_suite": 44,
+    "latest_backend_and_manual_worker_tests": 67,
+    "manual_boundary_tests": 12,
+    "clean_export_repository_tests": 3,
+    "compile_check": true,
+    "peak_behavior": "clock-controlled transport and worker tests; live selected retrials occurred off peak",
+    "sandbox_test_note": "Five localhost API tests initially could not bind inside the sandbox. The complete 187-test suite was then rerun with local listening permitted."
+  },
+  "selected_content": {
+    "verified_at": "2026-10-14T05:25:38.442254+00:00",
+    "release": "/opt/kol-dashboard/releases/20261014T051353Z-44223-f8164016",
+    "stage": "generated",
+    "schedule": {
+      "period": "off_peak",
+      "execution_allowed": true,
+      "next_run_at": "2026-10-14T05:25:38.442254+00:00",
+      "next_check_at": "2026-10-14T10:00:00+00:00",
+      "worker_alive": true,
+      "enabled": true,
+      "counts": {
+        "completed": 241,
+        "failed": 1
+      }
+    },
+    "baseline_records": 229,
+    "nonselected_compared": 225,
+    "nonselected_changed_summary_ids": [
+      "wx-1837505e0709fd1c436d",
+      "wx-30353cec87f199f2f956"
+    ],
+    "nonselected_missing_ids": [],
+    "selected": [
+      {
+        "id": "diary-471e3a03f8f2",
+        "title": "AI Extinction Risk Expert: If Your Job Is Repetitive, AI Will Do It Better Than You! | Eric Weinstein",
+        "stage": "generated",
+        "status": "summarized",
+        "format": "detailed-v1",
+        "source_text_chars": 94986,
+        "source_segments": 1521,
+        "summary_chars": 3594,
+        "summary_chinese_chars": 2695,
+        "points": 8,
+        "impacts": 5,
+        "impact_domains": [
+          "industry",
+          "investment",
+          "work"
+        ],
+        "evidence_references": 104,
+        "all_references_resolve": true,
+        "detailed_schema_valid": true,
+        "summary_evidence_hash_matches": true,
+        "new_reviewed": false,
+        "historical_versions": 1,
+        "original_summary_preserved": true,
+        "historical_review_preserved": true,
+        "historical_original_segments": 1521,
+        "historical_evidence_hash_and_refs_valid": true,
+        "historical_evidence_matches_current_original": true,
+        "readable_original_during_upgrade": false,
+        "detail_generation": {
+          "state": "completed",
+          "signature": "90b657ffc64740031c3d3b3d42f4a326d7b94b2ddcf968422a9b589c3a6922ff",
+          "chunks_processed": 9,
+          "chunks_total": 9,
+          "started_at": "2026-10-14T04:00:01.518373+00:00",
+          "completed_at": "2026-10-14T05:03:52.619991+00:00",
+          "not_before": null,
+          "error": null
+        },
+        "processing": {
+          "summary_model": "deepseek-v4-flash",
+          "prompt_version": "detailed-reading-v1",
+          "inference": "deepseek",
+          "paid_api_calls": 20,
+          "usage_unreported_calls": 0,
+          "usage": {
+            "prompt_tokens": 149898,
+            "completion_tokens": 74079,
+            "total_tokens": 223977
+          }
+        },
+        "job": {
+          "id": "1ef1f9966cc34b519a18e9737d878897",
+          "state": "completed",
+          "upgrade": 1,
+          "on_demand": 1,
+          "attempts": 4,
+          "not_before": null,
+          "started_at": "2026-10-14T05:02:02.416244+00:00",
+          "completed_at": "2026-10-14T05:05:11.814355+00:00",
+          "error": null
+        },
+        "upgrade_complete": true,
+        "peak_queue_verified": false
+      },
+      {
+        "id": "dwarkesh-ilya-2",
+        "title": "Ilya Sutskever — We're moving from the age of scaling to the age of research",
+        "stage": "generated",
+        "status": "summarized",
+        "format": "detailed-v1",
+        "source_text_chars": 72688,
+        "source_segments": 133,
+        "summary_chars": 4154,
+        "summary_chinese_chars": 3168,
+        "points": 8,
+        "impacts": 4,
+        "impact_domains": [
+          "industry",
+          "investment",
+          "work"
+        ],
+        "evidence_references": 70,
+        "all_references_resolve": true,
+        "detailed_schema_valid": true,
+        "summary_evidence_hash_matches": true,
+        "new_reviewed": false,
+        "historical_versions": 1,
+        "original_summary_preserved": true,
+        "historical_review_preserved": true,
+        "historical_original_segments": 133,
+        "historical_evidence_hash_and_refs_valid": true,
+        "historical_evidence_matches_current_original": true,
+        "readable_original_during_upgrade": false,
+        "detail_generation": {
+          "state": "completed",
+          "signature": "1fb472dffa5bd1317ae36483abe602364a4f53c275601663350b50e141a57d3e",
+          "chunks_processed": 7,
+          "chunks_total": 7,
+          "started_at": "2026-10-14T04:00:37.862299+00:00",
+          "completed_at": "2026-10-14T05:20:50.765753+00:00",
+          "not_before": null,
+          "error": null
+        },
+        "processing": {
+          "summary_model": "deepseek-v4-flash",
+          "prompt_version": "detailed-reading-v1",
+          "inference": "deepseek",
+          "paid_api_calls": 17,
+          "usage_unreported_calls": 0,
+          "usage": {
+            "prompt_tokens": 95525,
+            "completion_tokens": 59032,
+            "total_tokens": 154557
+          }
+        },
+        "job": {
+          "id": "af0c43cd956643ac9d43351d6a623389",
+          "state": "completed",
+          "upgrade": 1,
+          "on_demand": 1,
+          "attempts": 5,
+          "not_before": null,
+          "started_at": "2026-10-14T05:19:48.821481+00:00",
+          "completed_at": "2026-10-14T05:20:50.788519+00:00",
+          "error": null
+        },
+        "upgrade_complete": true,
+        "peak_queue_verified": false
+      },
+      {
+        "id": "wx-35cf506b1da0cd4f0eb8",
+        "title": "Agent、MCP、Skill、Cli、Model 一次讲透：老系统接入 AI 的概念地图与三条路径",
+        "stage": "generated",
+        "status": "summarized",
+        "format": "detailed-v1",
+        "source_text_chars": 4112,
+        "source_segments": 102,
+        "summary_chars": 2637,
+        "summary_chinese_chars": 1731,
+        "points": 8,
+        "impacts": 4,
+        "impact_domains": [
+          "industry",
+          "work"
+        ],
+        "evidence_references": 77,
+        "all_references_resolve": true,
+        "detailed_schema_valid": true,
+        "summary_evidence_hash_matches": true,
+        "new_reviewed": false,
+        "historical_versions": 1,
+        "original_summary_preserved": true,
+        "historical_review_preserved": true,
+        "historical_original_segments": 102,
+        "historical_evidence_hash_and_refs_valid": true,
+        "historical_evidence_matches_current_original": true,
+        "readable_original_during_upgrade": false,
+        "detail_generation": {
+          "state": "completed",
+          "signature": "8640040ec1be657ac789a302bb14796626bc2a6941c3fa1c51c01bdb49e7f631",
+          "chunks_processed": 1,
+          "chunks_total": 1,
+          "started_at": "2026-10-14T04:02:21.130748+00:00",
+          "completed_at": "2026-10-14T04:02:48.389822+00:00",
+          "not_before": null,
+          "error": null
+        },
+        "processing": {
+          "summary_model": "deepseek-v4-flash",
+          "prompt_version": "detailed-reading-v1",
+          "inference": "deepseek",
+          "paid_api_calls": 2,
+          "usage_unreported_calls": 0,
+          "usage": {
+            "prompt_tokens": 7656,
+            "completion_tokens": 5235,
+            "total_tokens": 12891
+          }
+        },
+        "job": {
+          "id": "c77c34e4743a4d0bbc40e22f6c70d429",
+          "state": "completed",
+          "upgrade": 1,
+          "on_demand": 1,
+          "attempts": 1,
+          "not_before": null,
+          "started_at": "2026-10-14T04:02:21.108684+00:00",
+          "completed_at": "2026-10-14T04:17:54.680699+00:00",
+          "error": null
+        },
+        "upgrade_complete": true,
+        "peak_queue_verified": false
+      },
+      {
+        "id": "wx-ab378fe91086bb9dc8fb",
+        "title": "10月14日投资提示：中科转债发行",
+        "stage": "generated",
+        "status": "summarized",
+        "format": "detailed-v1",
+        "source_text_chars": 267,
+        "source_segments": 13,
+        "summary_chars": 202,
+        "summary_chinese_chars": 169,
+        "points": 3,
+        "impacts": 1,
+        "impact_domains": [
+          "investment"
+        ],
+        "evidence_references": 8,
+        "all_references_resolve": true,
+        "detailed_schema_valid": true,
+        "summary_evidence_hash_matches": true,
+        "new_reviewed": true,
+        "historical_versions": 1,
+        "original_summary_preserved": true,
+        "historical_review_preserved": true,
+        "historical_original_segments": 13,
+        "historical_evidence_hash_and_refs_valid": true,
+        "historical_evidence_matches_current_original": true,
+        "readable_original_during_upgrade": false,
+        "detail_generation": {
+          "state": "completed",
+          "signature": "37030c3234207be5d86b5a5dbfae226c5a1a10cca877fd45b4a2b0755b9f80b6",
+          "chunks_processed": 1,
+          "chunks_total": 1,
+          "started_at": "2026-10-14T04:02:48.442595+00:00",
+          "completed_at": "2026-10-14T04:03:03.145211+00:00",
+          "not_before": null,
+          "error": null
+        },
+        "processing": {
+          "summary_model": "deepseek-v4-flash",
+          "prompt_version": "detailed-reading-v1",
+          "inference": "deepseek",
+          "paid_api_calls": 2,
+          "usage_unreported_calls": 0,
+          "usage": {
+            "prompt_tokens": 2666,
+            "completion_tokens": 2553,
+            "total_tokens": 5219
+          }
+        },
+        "job": {
+          "id": "4b5b9440f2934c7e88d64124b3a8cf78",
+          "state": "completed",
+          "upgrade": 1,
+          "on_demand": 1,
+          "attempts": 1,
+          "not_before": null,
+          "started_at": "2026-10-14T04:02:48.430958+00:00",
+          "completed_at": "2026-10-14T04:17:54.717218+00:00",
+          "error": null
+        },
+        "upgrade_complete": true,
+        "peak_queue_verified": false
+      }
+    ],
+    "acceptance": {
+      "complete": false,
+      "selected_complete": true,
+      "peak_queue_verified": false,
+      "nonselected_preserved": false,
+      "semantic_accuracy_manually_verified": false
+    }
+  },
+  "acceptance": {
+    "requested_manual_and_automatic_policy_deployed": true,
+    "selected_upgrades_completed": true,
+    "all_selected_original_summaries_preserved": true,
+    "unexpected_nonselected_changes": 0,
+    "complete_semantic_review": false
+  },
+  "nonselected_integrity": {
+    "compared": 225,
+    "unchanged": 223,
+    "missing": 0,
+    "accounted_changes": [
+      {
+        "id": "wx-1837505e0709fd1c436d",
+        "preexisting_explicit_upgrade": true,
+        "created_at": "2026-10-14T03:59:38.983831+00:00",
+        "completed_at": "2026-10-14T04:04:37.382247+00:00",
+        "original_summary_fingerprint_in_history": true
+      },
+      {
+        "id": "wx-30353cec87f199f2f956",
+        "preexisting_explicit_upgrade": true,
+        "created_at": "2026-10-14T03:52:24.388597+00:00",
+        "completed_at": "2026-10-14T04:04:07.899385+00:00",
+        "original_summary_fingerprint_in_history": true
+      }
+    ],
+    "unexpected_changes": [],
+    "note": "The generic comparison records two changes. Both are separate explicit upgrades queued before this release, and both preserve their original summaries in history."
+  },
+  "bounded_retry": {
+    "verified_at": "2026-10-14T05:02:02.238068+00:00",
+    "selected_jobs": [
+      {
+        "id": "dwarkesh-ilya-2",
+        "job_id": "af0c43cd956643ac9d43351d6a623389",
+        "state": "queued",
+        "on_demand": true,
+        "not_before": null,
+        "prior_paid_calls": 11,
+        "signature": "1fb472dffa5bd1317ae36483abe602364a4f53c275601663350b50e141a57d3e",
+        "cached_chunks_before_retry": 7,
+        "cached_chunk_hashes": {
+          "detail-000.json": "79512f936981b9755b1ff93f7973e9ca67fddb36be8fce17689349ab32c4d2dc",
+          "detail-001.json": "7ed3f299df96c2088ce87f06b811f2e31fdfeb1f6c4ef104e1894d672c188729",
+          "detail-002.json": "42d7437cb8ce6ef69b30ff8c6ba114278b68ce705e86034a12eee3f733932814",
+          "detail-003.json": "74f8a0a33571d9511b4c8b232cc434f088de2caf65ba21b5a9083e02041106e5",
+          "detail-004.json": "106fe5e971cbb918719bcac643a0019ef00084f4bfa8635a48004fca9a8062d3",
+          "detail-005.json": "47d9e0e73699271ea49030b252772e6e375f263d319fbfb043136a0af7a6e265",
+          "detail-006.json": "1f12d1b5199b11812e1d58753da91b4b3e322a562fc8a29556a2e87330bed5d4"
+        },
+        "repeat_request_same_job": true
+      },
+      {
+        "id": "diary-471e3a03f8f2",
+        "job_id": "1ef1f9966cc34b519a18e9737d878897",
+        "state": "queued",
+        "on_demand": true,
+        "not_before": null,
+        "prior_paid_calls": 14,
+        "signature": "90b657ffc64740031c3d3b3d42f4a326d7b94b2ddcf968422a9b589c3a6922ff",
+        "cached_chunks_before_retry": 9,
+        "cached_chunk_hashes": {
+          "detail-000.json": "76918f202ee5f72f2a5deaedce6f320f4494ffc27464b8ac7088b67309dd9af6",
+          "detail-001.json": "bd47a1cebca58db709ac11032635d642bc0116a93deffe7ec360dd7058152117",
+          "detail-002.json": "75bd2340b159207803f3c95901eb1a3c6929b8b886580c60450e823fd375da98",
+          "detail-003.json": "d2bb46ecde8131f1dbe50c41bbe595f024c2e43e07ecb81562af5694bb7eef23",
+          "detail-004.json": "95af7a2de24c103a1978de3cef50165b38486a216b5eb59a6c57d2e6a8a715f8",
+          "detail-005.json": "3676d506225ca6c83b92b597882c9e704c24bf81f120cfcab1148eaab86ba9f9",
+          "detail-006.json": "52d224b0a07c3469526d18e2d10c86d413fed4b8fbc21c05292a1657d153d7e8",
+          "detail-007.json": "09213cc6fd3b49f5837ad12efda1c92830eb2db0b150711ee5725b33de0376bf",
+          "detail-008.json": "d5464fe7763693358cfe56420d55917a12543f330e8f555fd048ed683634861d"
+        },
+        "repeat_request_same_job": true
+      }
+    ]
+  },
+  "shared_evidence_ilya_retry": {
+    "verified_at": "2026-10-14T05:19:48.736894+00:00",
+    "selected_jobs": [
+      {
+        "id": "dwarkesh-ilya-2",
+        "job_id": "af0c43cd956643ac9d43351d6a623389",
+        "state": "queued",
+        "on_demand": true,
+        "not_before": null,
+        "prior_paid_calls": 14,
+        "signature": "1fb472dffa5bd1317ae36483abe602364a4f53c275601663350b50e141a57d3e",
+        "cached_chunks_before_retry": 7,
+        "cached_chunk_hashes": {
+          "detail-000.json": "79512f936981b9755b1ff93f7973e9ca67fddb36be8fce17689349ab32c4d2dc",
+          "detail-001.json": "7ed3f299df96c2088ce87f06b811f2e31fdfeb1f6c4ef104e1894d672c188729",
+          "detail-002.json": "42d7437cb8ce6ef69b30ff8c6ba114278b68ce705e86034a12eee3f733932814",
+          "detail-003.json": "74f8a0a33571d9511b4c8b232cc434f088de2caf65ba21b5a9083e02041106e5",
+          "detail-004.json": "106fe5e971cbb918719bcac643a0019ef00084f4bfa8635a48004fca9a8062d3",
+          "detail-005.json": "47d9e0e73699271ea49030b252772e6e375f263d319fbfb043136a0af7a6e265",
+          "detail-006.json": "1f12d1b5199b11812e1d58753da91b4b3e322a562fc8a29556a2e87330bed5d4"
+        },
+        "repeat_request_same_job": true
+      }
+    ]
+  },
+  "cached_chunks": {
+    "verified_at": "2026-10-14T05:21:01.393971+00:00",
+    "all_cached_chunks_unchanged": true,
+    "items": [
+      {
+        "id": "dwarkesh-ilya-2",
+        "cached_chunks": 7,
+        "all_chunk_bytes_unchanged": true,
+        "paid_calls_before_retry": 11,
+        "paid_calls_after_retry": 17,
+        "new_paid_calls": 6
+      },
+      {
+        "id": "diary-471e3a03f8f2",
+        "cached_chunks": 9,
+        "all_chunk_bytes_unchanged": true,
+        "paid_calls_before_retry": 14,
+        "paid_calls_after_retry": 20,
+        "new_paid_calls": 6
+      }
+    ]
+  },
+  "isolated_merge_preflight": {
+    "verified_at": "2026-10-14T04:53:45.973180+00:00",
+    "episode_id": "diary-471e3a03f8f2",
+    "scope": "first three cached notes only; one real merge; production read-only",
+    "input_points": 24,
+    "input_notes": 3,
+    "source_episode_sha256": "9d1f614587e5f41ba03feafb883f12e083dca2c7be780f20cf65dde882ba41c9",
+    "candidate_files_sha256": {
+      "detailed_summary.py": "c09f312dd18acb4e8e8c1ba24b6171b4ea52e6523efec1803d03649eee47c080",
+      "reading_worker.py": "c0f31bba2fdb26c2d5542272e7b27afe0cb40303cf6def411a88fb14746cd86a"
+    },
+    "request_sha256": "354502ce061087484d954907ad13b5bd2995e716d5215772feb42afefc4bf729",
+    "serialized_chars": 6381,
+    "assigned_input_points": 24,
+    "points": 8,
+    "max_refs": 8,
+    "summary_chinese_chars": 2833,
+    "passed": true,
+    "provider": {
+      "paid_api_calls": 1,
+      "usage_unreported_calls": 0,
+      "usage": {
+        "prompt_tokens": 9254,
+        "completion_tokens": 3392,
+        "total_tokens": 12646
+      }
+    },
+    "production_episode_unchanged": true
+  },
+  "prior_isolated_merge_preflight_failed": {
+    "verified_at": "2026-10-14T04:44:52.120884+00:00",
+    "episode_id": "diary-471e3a03f8f2",
+    "scope": "first three cached notes only; one real merge; production read-only",
+    "input_points": 24,
+    "input_notes": 3,
+    "source_episode_sha256": "9d1f614587e5f41ba03feafb883f12e083dca2c7be780f20cf65dde882ba41c9",
+    "candidate_files_sha256": {
+      "detailed_summary.py": "1832d124f5a02e9a22120126a97fee990fb7dc472fa10de3b29bf977c351e64b",
+      "reading_worker.py": "c0f31bba2fdb26c2d5542272e7b27afe0cb40303cf6def411a88fb14746cd86a"
+    },
+    "request_sha256": "4863eabc007bd858482c5a4f539ef6cdaf779f139ddeddc70614d875c3569a41",
+    "points": 18,
+    "serialized_chars": 11419,
+    "max_refs": 48,
+    "passed": false,
+    "error_type": "ValueError",
+    "error_code": null,
+    "provider": {
+      "paid_api_calls": 1,
+      "usage_unreported_calls": 0,
+      "usage": {
+        "prompt_tokens": 8828,
+        "completion_tokens": 5783,
+        "total_tokens": 14611
+      }
+    },
+    "production_episode_unchanged": true
+  },
+  "saved_failed_output_offline_replay": {
+    "verified_at": "2026-10-14T05:13:15.155467+00:00",
+    "candidate_sha256": "3c1ef926158ce15064b1dcbeb088b11f57895fdc8a5c8cca66970607fbdb9437",
+    "paid_calls": 0,
+    "production_writes": 0,
+    "rows": [
+      {
+        "diagnostic": "detail-response-1791954270667452760.json",
+        "passed": true,
+        "themes": 8,
+        "all_input_points_assigned": true,
+        "all_refs_in_current_group": true
+      },
+      {
+        "diagnostic": "detail-response-1791954288731071579.json",
+        "passed": true,
+        "themes": 8,
+        "all_input_points_assigned": true,
+        "all_refs_in_current_group": true
+      }
+    ],
+    "passed": true
+  },
+  "semantic_review": {
+    "full_audio_or_all_text_verified": false,
+    "financial_short_item": {
+      "id": "wx-ab378fe91086bb9dc8fb",
+      "scope": "all 267 characters of retrieved external RSS text only",
+      "corrected_overexpansion_and_unsupported_date_conflicts": true,
+      "official_filings_or_prices_checked": false,
+      "original_model_draft_preserved": true
+    },
+    "technical_article": {
+      "id": "wx-35cf506b1da0cd4f0eb8",
+      "checked_points": 3,
+      "checked_impacts": 2,
+      "full_review_badge": false,
+      "corrections": [
+        "rollback is a separate design and verification task",
+        "limit legacy SSE wording to old HTTP plus SSE two-endpoint transport"
+      ]
+    },
+    "podcast_spotcheck": {
+      "eric": {
+        "id": "diary-471e3a03f8f2",
+        "partial_corrections_saved": true,
+        "full_review_badge": false,
+        "model_draft_preserved": true,
+        "checked_points": 3,
+        "checked_impacts": 2,
+        "paid_calls": 0,
+        "source_scope": "bounded official transcript passages only"
+      },
+      "ilya": {
+        "schema_version": "bounded-semantic-review-v1",
+        "created_at": "2026-10-14T05:24:20.439795+00:00",
+        "id": "dwarkesh-ilya-2",
+        "input_sample_sha256": "982abdf8bc4e4986f6332eb8db0c980e7b8cce8b059ce4f7ef5ab65c4ad5eef2",
+        "status": "limited_spotcheck_with_one_scoped_correction",
+        "scope": {
+          "points": [
+            0,
+            4,
+            7
+          ],
+          "impacts": [
+            0,
+            1
+          ],
+          "full_summary_reviewed": false,
+          "full_transcript_read": false,
+          "audio_reviewed": false,
+          "external_claims_verified": false,
+          "new_remote_reads": false,
+          "paid_calls": 0,
+          "production_modified": false,
+          "set_quality_review_badge": false
+        },
+        "overall": "已展示部分支持主要话题；因多段截断及总量上限，其余细节只记未核验，不推定错误。唯一建议修订是 point7 的含混明确归因及主题收敛。",
+        "samples": [
+          {
+            "kind": "point",
+            "index": 0,
+            "cited_ids": [
+              "s0004",
+              "s0005",
+              "s0008",
+              "s0009",
+              "s0011",
+              "s0012",
+              "s0013"
+            ],
+            "shown_ids": [
+              "s0004",
+              "s0005",
+              "s0008",
+              "s0009",
+              "s0011",
+              "s0012",
+              "s0013"
+            ],
+            "clipped_ids": [
+              "s0013"
+            ],
+            "not_shown_cited_ids": [],
+            "assessment": "partially_supported_with_truncated_evidence",
+            "supported_topics": [
+              "对巨额投入的适应与抽象感",
+              "主持人和受访者对未来经济影响的分歧",
+              "评测表现与经济影响之间的落差"
+            ],
+            "limitations": [
+              "bug 反复引入与回退的详细例子位于被截断部分，当前样本不能完成逐句核对。"
+            ],
+            "confirmed_error": false
+          },
+          {
+            "kind": "point",
+            "index": 4,
+            "cited_ids": [
+              "s0030",
+              "s0031",
+              "s0032",
+              "s0033"
+            ],
+            "shown_ids": [
+              "s0030",
+              "s0031",
+              "s0032",
+              "s0033"
+            ],
+            "clipped_ids": [
+              "s0031"
+            ],
+            "not_shown_cited_ids": [],
+            "assessment": "partially_supported_with_truncated_evidence",
+            "supported_topics": [
+              "先产出结果再评分的强化学习流程",
+              "中间轨迹价值映射的困难",
+              "Ilya 对价值函数的乐观预期和情绪调节假设"
+            ],
+            "limitations": [
+              "s0031 被截断，长任务、o1/R1 和具体示例的全部细节未展示。"
+            ],
+            "confirmed_error": false
+          },
+          {
+            "kind": "point",
+            "index": 7,
+            "cited_ids": [
+              "s0042",
+              "s0043",
+              "s0044",
+              "s0045",
+              "s0046",
+              "s0047",
+              "s0048",
+              "s0049"
+            ],
+            "shown_ids": [
+              "s0042",
+              "s0043",
+              "s0044",
+              "s0045",
+              "s0046",
+              "s0047"
+            ],
+            "clipped_ids": [
+              "s0042",
+              "s0043",
+              "s0047"
+            ],
+            "not_shown_cited_ids": [
+              "s0048",
+              "s0049"
+            ],
+            "assessment": "attribution_ambiguity_and_topic_scope_correction_recommended",
+            "supported_topics": [
+              "样本效率和可教性问题",
+              "进化先验对视觉听觉运动的可能作用",
+              "Ilya 随后强调人类善于学习或依赖更基础的机制"
+            ],
+            "limitations": [
+              "s0042、s0043、s0047 被截断，s0048、s0049 未展示。",
+              "不能据口语肯定词确定其在承认模型学习能力超过人类；后半句转向人类学习机制。",
+              "SSI 融资、实验预算等属于额外主题，且当前引用样本不足以核验其数字。"
+            ],
+            "confirmed_error": false,
+            "specific_risk": "现有中文作出了超出含混对话承接所能支持的明确归因。"
+          },
+          {
+            "kind": "impact",
+            "index": 0,
+            "cited_ids": [
+              "s0036",
+              "s0037",
+              "s0055",
+              "s0056",
+              "s0057",
+              "s0058"
+            ],
+            "shown_ids": [
+              "s0036",
+              "s0037",
+              "s0055",
+              "s0056"
+            ],
+            "clipped_ids": [
+              "s0037",
+              "s0055",
+              "s0056"
+            ],
+            "not_shown_cited_ids": [
+              "s0057",
+              "s0058"
+            ],
+            "assessment": "conditional_inference_with_limited_premise_check",
+            "supported_topics": [
+              "关于规模化与研究方法的讨论",
+              "公司数量与想法数量的对比"
+            ],
+            "limitations": [
+              "相关段落大幅截断，后续算力分配与规模边际收益论证未完整展示。",
+              "再定价、资本开支回报和产业需求变化是有条件推断，未验证当前市场或具体公司。"
+            ],
+            "confirmed_error": false
+          },
+          {
+            "kind": "impact",
+            "index": 1,
+            "cited_ids": [
+              "s0011",
+              "s0012",
+              "s0013",
+              "s0014",
+              "s0015",
+              "s0016",
+              "s0017"
+            ],
+            "shown_ids": [
+              "s0011",
+              "s0012",
+              "s0013",
+              "s0014"
+            ],
+            "clipped_ids": [
+              "s0013",
+              "s0014"
+            ],
+            "not_shown_cited_ids": [
+              "s0015",
+              "s0016",
+              "s0017"
+            ],
+            "assessment": "conditional_inference_with_limited_premise_check",
+            "supported_topics": [
+              "评测与现实经济影响落差",
+              "对研究者过度关注评测的讨论"
+            ],
+            "limitations": [
+              "s0013、s0014 被截断，s0015–s0017 未展示，不能完整核对 RL 环境选择的论证及发言归属。",
+              "收入与续约影响只是条件性传导分析；其不确定性文字已明确并非已证因果。"
+            ],
+            "confirmed_error": false
+          }
+        ],
+        "application_notes": [
+          "仅建议替换 point7，其余四个抽样条目不因截断而改写。",
+          "局部修订需保留原模型初稿，并记录 scoped correction，不能标记整篇已复核。",
+          "引用结构有效与语义完整性应分开记录；本次不提供整篇通过结论。"
+        ],
+        "applied": {
+          "id": "dwarkesh-ilya-2",
+          "partial_correction_saved": true,
+          "corrected_point": 7,
+          "full_review_badge": false,
+          "model_draft_preserved": true,
+          "checked_points": 3,
+          "checked_impacts": 2,
+          "paid_calls": 0,
+          "source_scope": "bounded official transcript passages with clipping limitations"
+        }
+      },
+      "full_episode_or_audio_reviewed": false,
+      "note": "Spotchecks test selected text claims and attribution only; they do not independently verify external facts or investment conclusions."
+    }
+  },
+  "limitations": [
+    "Immediate means no time-of-day deferral, not preemption of a running task.",
+    "Source acquisition remains off peak; unsupported episodes without text still need a transcript or future ASR integration.",
+    "Evidence ID validity is not proof of semantic correctness; most detailed outputs remain model drafts."
+  ]
+}
