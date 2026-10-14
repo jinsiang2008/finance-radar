@@ -11,6 +11,7 @@ SPEECH = "A synthetic explanation describes how an example system measures usefu
 DWARKESH = "https://www.dwarkesh.com/p/synthetic-interview"
 LEX = "https://lexfridman.com/synthetic-guest-transcript"
 DIARY = "https://rss.flightcast.com/transcripts/EXAMPLE123.vtt"
+FREAKONOMICS = "https://freakonomics.com/podcast/extra-ray-dalio-full-interview-ep-330/"
 
 
 def stamp(index):
@@ -43,6 +44,58 @@ def vtt(count=24):
 
 
 class OfficialTranscriptTests(unittest.TestCase):
+    def test_lex_blank_speaker_span_preserves_continuation_time_and_provenance(self):
+        html = lex().replace('<span class="ts-name">Speaker 1</span>', '<span class="ts-name"></span>', 1)
+        result = parse_transcript('lex', html, source_url=LEX)
+        self.assertEqual(result['segments'][1]['speaker'], 'Speaker 0')
+        self.assertEqual(result['segments'][1]['start_seconds'], 30)
+        self.assertTrue(result['segments'][1]['source_notes'])
+        self.assertNotIn('source_notes', result['segments'][2])
+
+    def test_lex_initial_blank_speaker_is_not_guessed(self):
+        html = lex().replace('<span class="ts-name">Speaker 0</span>', '<span class="ts-name"></span>', 1)
+        with self.assertRaises(TranscriptUnavailable):
+            parse_transcript('lex', html, source_url=LEX)
+
+    def full_untimed_interview(self):
+        dialogue = ''.join(f'<p>{"DUBNER" if i % 2 == 0 else "DALIO"}: {SPEECH}</p>' for i in range(24))
+        return '<section id="transcript"><div id="transcript_inner"><p>Editorial introduction.</p>' + dialogue + \
+            '<p>Continuation of the last answer.</p><p>DUBNER: Great. Be well, Ray. Bye.</p>' + \
+            '<p>Producer credits, not a speaker claim.</p></div></section>'
+
+    def test_freakonomics_untimed_dialogue_excludes_editorial_text(self):
+        result = parse_transcript('freakonomics', self.full_untimed_interview(), source_url=FREAKONOMICS)
+        self.assertEqual(len(result['segments']), 25)
+        self.assertEqual(result['segments'][-2]['speaker'], 'Ray Dalio')
+        self.assertIn('Continuation of the last answer.', result['segments'][-2]['text'])
+        self.assertTrue(all(s['start_seconds'] is None and s['end_seconds'] is None for s in result['segments']))
+        self.assertNotIn('Editorial introduction', str(result))
+        self.assertNotIn('Producer credits', str(result))
+        self.assertEqual(result['coverage']['scope'], 'full')
+        self.assertIn('不表示完整音频覆盖', result['coverage']['note'])
+        self.assertEqual(find_transcript_url('freakonomics', FREAKONOMICS, ''), FREAKONOMICS)
+
+    def test_freakonomics_rejects_truncated_short_or_wrong_container(self):
+        html = self.full_untimed_interview()
+        for invalid in [html.replace('Be well, Ray. Bye.', 'Cut off'),
+                        html.replace('id="transcript_inner"', 'id="description"'),
+                        html.replace(SPEECH, 'Short.')]:
+            with self.subTest(html=invalid[:80]), self.assertRaises(TranscriptUnavailable):
+                parse_transcript('freakonomics', invalid, source_url=FREAKONOMICS)
+
+    def test_freakonomics_only_pinned_episode_path_is_allowed(self):
+        for url in ['https://freakonomics.com/podcast/another-episode/',
+                    FREAKONOMICS.replace('https://', 'http://'),
+                    FREAKONOMICS.replace('freakonomics.com', 'user@freakonomics.com'),
+                    FREAKONOMICS.replace('freakonomics.com', 'freakonomics.com:443')]:
+            with self.subTest(url=url), self.assertRaises(TranscriptUnavailable):
+                validate_transcript_url('freakonomics', url)
+
+    def test_freakonomics_does_not_silently_reassign_unknown_speaker(self):
+        html = self.full_untimed_interview().replace('Continuation of the last answer.', 'UNKNOWN: Unexpected speech.')
+        with self.assertRaises(TranscriptUnavailable):
+            parse_transcript('freakonomics', html, source_url=FREAKONOMICS)
+
     def test_final_urls_are_fixed_official_paths(self):
         for source, url in [('dwarkesh', DWARKESH), ('lex', LEX), ('diary', DIARY)]:
             self.assertEqual(validate_transcript_url(source, url + '?utm_source=test#content'), url)

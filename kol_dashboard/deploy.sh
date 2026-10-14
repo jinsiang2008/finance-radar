@@ -89,7 +89,7 @@ cp "$LIB_DIR/serenity_tracker.py" "$WORK/pkg/lib/"
 # local setup helpers, virtualenvs, or a second HTTP server/automation launcher.
 READING_SOURCE="$REPO_DIR/research/podcast_poc"
 mkdir -p "$WORK/pkg/research/podcast_poc/web"
-cp "$READING_SOURCE"/{poc.py,wechat.py,reading_jobs.py,schedule_policy.py,inference.py,official_transcripts.py,detailed_summary.py,wechat_sources.json} \
+cp "$READING_SOURCE"/{poc.py,wechat.py,reading_jobs.py,schedule_policy.py,inference.py,official_transcripts.py,detailed_summary.py,curated_podcasts.py,curated_podcasts.json,wechat_sources.json} \
   "$WORK/pkg/research/podcast_poc/"
 cp "$READING_SOURCE/web"/{index.html,app.js,style.css,wechat.html,wechat.js,wechat.css,reader-auth.js,reader-auth.css} \
   "$WORK/pkg/research/podcast_poc/web/"

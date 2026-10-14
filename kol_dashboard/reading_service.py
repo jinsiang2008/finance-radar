@@ -19,7 +19,7 @@ import uuid
 from urllib.parse import urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
-from research.podcast_poc import poc as poc_template, reading_jobs, schedule_policy, official_transcripts
+from research.podcast_poc import poc as poc_template, reading_jobs, schedule_policy, official_transcripts, curated_podcasts
 
 
 SUPPORTED_MODELS = {"deepseek-v4-flash", "deepseek-v4-pro"}
@@ -104,17 +104,55 @@ class ReadingRuntime:
 
     def refresh_podcasts(self):
         schedule_policy.require_off_peak(at=self.clock())
+        self.ensure_curated_podcasts()
         results = self.poc.discover(list(self.poc.FEEDS), limit=3)
         self.engine._runtime_update(podcast_last_check_at=self.poc.now(),
                                     podcast_successful_sources=sum(bool(row.get("success")) for row in results),
                                     podcast_source_count=len(results))
         self.acquire_podcast_transcripts()
 
+    def ensure_curated_podcasts(self):
+        """Initialize fixed picks under the caller's worker/CLI mutation lock.
+
+        This is deliberately absent from GET and construction paths. Existing
+        text, summaries, review state, RSS identity and publication dates stay
+        byte-for-byte equivalent as values; only the fixed curation is added.
+        """
+        episodes = self.poc.payload()["episodes"]
+        result = {"created": 0, "tagged": 0, "episode_ids": []}
+        for entry in curated_podcasts.catalog():
+            existing = curated_podcasts.existing_episode(episodes, entry)
+            if existing is None:
+                if self.poc.episode_path(entry["id"]).exists():
+                    raise ValueError("Historical podcast identity conflicts with an existing record")
+                episode = curated_podcasts.metadata_episode(entry, self.poc.now())
+                self.poc.save_episode(episode)
+                episodes.append(episode)
+                result["created"] += 1
+            else:
+                # payload adds transient source display fields; use the saved
+                # record so catalog tagging cannot persist unrelated changes.
+                episode = self.poc.load_episode(existing["id"])
+                expected = curated_podcasts.curation(entry)
+                if episode.get("curation") != expected:
+                    episode["curation"] = expected
+                    self.poc.save_episode(episode)
+                    result["tagged"] += 1
+            result["episode_ids"].append(episode["id"])
+            if episode.get("segments") and not self.engine._summary_ready(episode):
+                self.engine.enqueue(episode["id"], manual=False, on_demand=False)
+        return result
+
     @staticmethod
     def _official_url(source_id, url, *, transcript=False):
         if not isinstance(url, str):
             raise ValueError("Missing official transcript URL")
         parsed = urlsplit(url)
+        if source_id == "freakonomics":
+            entry = curated_podcasts.entry_for_url(source_id, url)
+            if entry is None:
+                raise ValueError("Only the selected Freakonomics episode may be fetched")
+            return entry["source_url"]
         hosts = {"dwarkesh": "www.dwarkesh.com", "lex": "lexfridman.com", "diary": "rss.flightcast.com"}
         paths = {"dwarkesh": r"/p/[a-zA-Z0-9_-]+/?", "lex": r"/[a-zA-Z0-9-]+/?",
                  "diary": r"/transcripts/[a-zA-Z0-9_-]+\.vtt"}
@@ -158,6 +196,23 @@ class ReadingRuntime:
                 latest[key] = episode
         return latest
 
+    def _podcast_candidates(self, episodes):
+        """Curated history first, then one newest input per existing RSS source."""
+        candidates = []
+        for entry in sorted(curated_podcasts.catalog(), key=lambda item: item["priority"]):
+            episode = curated_podcasts.existing_episode(episodes, entry)
+            if episode is not None:
+                candidates.append((entry["source_id"], episode, entry))
+        latest = self._latest_podcasts(episodes)
+        seen = {episode["id"] for _, episode, _ in candidates}
+        for source_id in TRANSCRIPT_SOURCES:
+            episode = latest.get(source_id)
+            if (episode is not None and episode["id"] not in seen
+                    and curated_podcasts.match_episode(episode) is None):
+                candidates.append((source_id, episode, None))
+                seen.add(episode["id"])
+        return candidates
+
     def acquire_podcast_transcripts(self):
         """Called under the existing worker lock; at most three new inputs/day."""
         if not self.settings()["enabled"] or self.engine.runtime_snapshot().get("provider_blocked"):
@@ -166,13 +221,11 @@ class ReadingRuntime:
         # Recover every saved automatic input, even when a newer RSS episode
         # appeared after a crash between saving the text and enqueueing it.
         for episode in episodes:
-            if episode.get("segments") and episode.get("transcript_acquisition", {}).get("state") == "ready":
-                self.engine.enqueue(episode["id"], manual=False)
-        latest = self._latest_podcasts(episodes)
-        for key in TRANSCRIPT_SOURCES:
-            candidate = latest.get(key)
-            if candidate is None:
-                continue
+            if episode.get("segments") and (
+                    episode.get("transcript_acquisition", {}).get("state") == "ready"
+                    or (curated_podcasts.match_episode(episode) and not self.engine._summary_ready(episode))):
+                self.engine.enqueue(episode["id"], manual=False, on_demand=False)
+        for key, candidate, curated in self._podcast_candidates(episodes):
             episode = self.poc.load_episode(candidate["id"])
             acquisition = episode.get("transcript_acquisition", {})
             if episode.get("segments"):
@@ -199,9 +252,9 @@ class ReadingRuntime:
                     body = self.fetch_official_transcript(key, url, transcript=True)
                     parsed = official_transcripts.parse_webvtt(body, source_url=url)
                 else:
-                    url = self._official_url(key, episode.get("source_url"))
+                    url = self._official_url(key, curated["source_url"] if curated else episode.get("source_url"))
                     body = self.fetch_official_transcript(key, url)
-                    target = official_transcripts.find_transcript_url(key, url, body)
+                    target = url if key == "freakonomics" else official_transcripts.find_transcript_url(key, url, body)
                     target = self._official_url(key, target, transcript=True)
                     if target != url:
                         body = self.fetch_official_transcript(key, target, transcript=True)
@@ -228,7 +281,7 @@ class ReadingRuntime:
                 continue
             # A queue write failure must remain recoverable with the saved text;
             # it is not a failure to acquire the transcript.
-            self.engine.enqueue(episode["id"], manual=False)
+            self.engine.enqueue(episode["id"], manual=False, on_demand=False)
 
     def schedule_status(self):
         runtime = self.engine.runtime_snapshot()
@@ -243,7 +296,7 @@ class ReadingRuntime:
         if state.get("provider_blocked"):
             state["automatic_paused_reason"] = reading_jobs.PROVIDER_ERRORS.get(state["provider_blocked"], reading_jobs.PUBLIC_FAILURE)
         state.update(worker_alive=False, scheduler="systemd_worker", jobs=self.engine.snapshot(),
-                     transcript_policy="official_latest_only", automatic_transcript_sources=list(TRANSCRIPT_SOURCES),
+                     transcript_policy="official_latest_and_curated", automatic_transcript_sources=list(TRANSCRIPT_SOURCES),
                      podcast_daily_limit=PODCAST_DAILY_LIMIT, automatic_audio_transcription=False,
                      deepseek_audio_transcription=False, paid_call_boundary="before_each_request",
                      manual_execution_policy="immediate", manual_execution_scope="single_summary",
@@ -272,10 +325,19 @@ class ReadingRuntime:
         result = self.poc.payload()
         result.update(mode="server_deepseek", automation=self.status())
         latest_ids = {ep["id"] for ep in self._latest_podcasts(result["episodes"]).values()}
+        curated_count = 0
         for episode in result["episodes"]:
+            entry = curated_podcasts.match_episode(episode)
+            if entry:
+                episode["curation"] = curated_podcasts.curation(entry)
+                curated_count += 1
+            else:
+                episode.pop("curation", None)
             if episode.get("segments"):
                 continue
-            if episode.get("source_id") not in TRANSCRIPT_SOURCES:
+            if entry:
+                episode.setdefault("transcript_acquisition", {"state": "pending"})
+            elif episode.get("source_id") not in TRANSCRIPT_SOURCES:
                 episode["transcript_acquisition"] = {"state": "unsupported"}
             elif episode["id"] not in latest_ids:
                 episode["transcript_acquisition"] = {"state": "archive"}
@@ -283,7 +345,11 @@ class ReadingRuntime:
                 episode.setdefault("transcript_acquisition", {"state": "pending"})
         result["discovery"].update(automatic_transcript_fetch=True,
                                    automatic_transcript_sources=list(TRANSCRIPT_SOURCES),
-                                   automatic_scope="latest_one_per_source", podcast_daily_limit=PODCAST_DAILY_LIMIT)
+                                   automatic_scope="latest_one_per_source_and_curated", podcast_daily_limit=PODCAST_DAILY_LIMIT)
+        guests = {guest_id: guest for item in curated_podcasts.catalog()
+                  for guest_id, guest in zip(item["guest_ids"], item["guests"])}
+        result["curated_collection"] = {"id": curated_podcasts.COLLECTION, "title": "历史精选",
+            "episode_count": curated_count, "guests": [{"id": key, "name": value} for key, value in guests.items()]}
         return result
 
     def enqueue_summary(self, content_id, *, upgrade=False):

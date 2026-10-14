@@ -43,12 +43,14 @@ def validate_transcript_url(source_id: str, url: str) -> str:
         return _url(url, {"lexfridman.com", "www.lexfridman.com"}, r"/[a-zA-Z0-9-]+-transcript/?")
     if source_id == "diary":
         return _url(url, {"rss.flightcast.com"}, r"/transcripts/[a-zA-Z0-9_-]+\.vtt")
+    if source_id == "freakonomics":
+        return _url(url, {"freakonomics.com"}, r"/podcast/extra-ray-dalio-full-interview-ep-330/")
     raise TranscriptUnavailable("This publisher has no supported official transcript adapter")
 
 
 def find_transcript_url(source_id: str, source_url: str, html: str) -> str:
     """Find the actual episode transcript link; never invent a transcript URL."""
-    if source_id == "dwarkesh":
+    if source_id in {"dwarkesh", "freakonomics"}:
         return validate_transcript_url(source_id, source_url)
     if source_id != "lex":
         raise TranscriptUnavailable("This publisher requires an explicit transcript feed link")
@@ -225,16 +227,70 @@ def _lex(html: str, url: str) -> dict:
     if body is None:
         raise TranscriptUnavailable("Official transcript content was not found")
     segments = []
+    previous_speaker = None
     for turn in body.select(".ts-segment"):
         name, stamp, speech = (turn.select_one(selector) for selector in (".ts-name", ".ts-timestamp", ".ts-text"))
         if name is None or stamp is None or speech is None:
             raise TranscriptUnavailable("Incomplete official transcript speaker turn")
         for node in speech.select("script, style"):
             node.decompose()
-        segments.append({"speaker": _speaker(name.get_text(" ", strip=True)),
+        label = name.get_text(" ", strip=True)
+        # Older publisher pages leave the name span empty for continuation
+        # paragraphs. Keep their own clock and explicitly record inheritance.
+        speaker = _speaker(label) if label else previous_speaker
+        if speaker is None:
+            raise TranscriptUnavailable("Official continuation lacks a previous speaker")
+        previous_speaker = speaker
+        segment = {"speaker": speaker,
                          "start_seconds": _seconds(stamp.get_text(" ", strip=True).strip("()")),
-                         "timestamp_precision": "speaker_turn", "text": speech.get_text(" ", strip=True)})
+                         "timestamp_precision": "speaker_turn", "text": speech.get_text(" ", strip=True)}
+        if not label:
+            segment["source_notes"] = ["原站本段说话人标签为空，按相邻续段沿用上一标签。"]
+        segments.append(segment)
     return _result(segments, url, "完整处理所获取的公开官方整理稿；时间点沿用官方文字稿，未独立核对整段音频，不保证与音频逐字一致。")
+
+
+def _freakonomics(html: str, url: str) -> dict:
+    """Read the pinned full interview, retaining untimed dialogue paragraphs.
+
+    This publisher has no segment clocks. Do not weaken the timestamp checks
+    of the other adapters or manufacture a duration for these speech turns.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    body = soup.select_one("section#transcript #transcript_inner")
+    if body is None:
+        raise TranscriptUnavailable("Official full interview container was not found")
+    for node in body.select("script, style"):
+        node.decompose()
+    paragraphs = [p.get_text(" ", strip=True) for p in body.find_all("p")]
+    turn = re.compile(r"^(?P<speaker>(?:Stephen\s+)?DUBNER|(?:Ray\s+)?DALIO):\s*(?P<speech>.+)$")
+    labeled = [(index, turn.fullmatch(text)) for index, text in enumerate(paragraphs)
+               if turn.fullmatch(text)]
+    if not labeled or not labeled[-1][1]["speech"].endswith("Be well, Ray. Bye."):
+        raise TranscriptUnavailable("Pinned interview closing turn was not found")
+    first, last = labeled[0][0], labeled[-1][0]
+    segments = []
+    for text in paragraphs[first:last + 1]:
+        if not text:
+            continue
+        match = turn.fullmatch(text)
+        if match:
+            name = "Ray Dalio" if match["speaker"].endswith("DALIO") else "Stephen Dubner"
+            segments.append({"id": f"s{len(segments)+1:04d}", "speaker": name,
+                             "start_seconds": None, "end_seconds": None,
+                             "timestamp_precision": "none", "text": match["speech"]})
+        else:
+            if re.match(r"^[A-Z][A-Z .]{2,40}:", text):
+                raise TranscriptUnavailable("Unexpected full interview speaker label")
+            segments[-1]["text"] += "\n\n" + text
+    counts = Counter(segment["speaker"] for segment in segments)
+    if (len(segments) < MIN_SEGMENTS or sum(len(s["text"]) for s in segments) < MIN_TEXT_CHARS
+            or set(counts) != {"Ray Dalio", "Stephen Dubner"} or min(counts.values()) < 3):
+        raise TranscriptUnavailable("Not enough complete full interview dialogue")
+    return {"segments": segments, "source_kind": "official_edited_transcript", "transcript_url": url,
+            "coverage": {"scope": "full", "start_seconds": None, "end_seconds": None,
+                         "segments_total": len(segments), "segments_processed": 0,
+                         "note": "完整处理取得的官方对谈文字，排除编辑导语与制作说明；原站未提供段落时间戳，未逐秒核对音频，不表示完整音频覆盖。"}}
 
 
 def parse_transcript(source_id: str, html: str, *, source_url: str) -> dict:
@@ -244,6 +300,8 @@ def parse_transcript(source_id: str, html: str, *, source_url: str) -> dict:
         return _dwarkesh(html, url)
     if source_id == "lex":
         return _lex(html, url)
+    if source_id == "freakonomics":
+        return _freakonomics(html, url)
     raise TranscriptUnavailable("This publisher does not use the HTML transcript adapter")
 
 

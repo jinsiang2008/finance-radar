@@ -8,9 +8,9 @@ const states = { summarized: ['模型初稿 · 待复核', 'pending'], summarizi
 let episodes = [];
 let selectedId = new URL(location.href).searchParams.get('episode');
 let automation=null, csrfToken='', pollTimer=null, inFlight=null, selectedSignature='', currentEpisode=null, listSignature='';
-let sources=[], discovery=null, groupFilter='primary', sourceFilter='all', filtersInitialized=false, filterSignature='', sourceSignature='';
+let sources=[], discovery=null, groupFilter='primary', sourceFilter='all', guestFilter='all', filtersInitialized=false, filterSignature='', sourceSignature='';
 const readingStates=new Map(), submitting=new Set(), requestErrors=new Map();
-const groupLabels={all:'全部',primary:'英文重点',chinese:'中文',additional:'英文补充'};
+const groupLabels={all:'全部',primary:'英文重点',chinese:'中文',additional:'英文补充',history:'历史精选'};
 const sourceBoundary='订阅更新会发现新节目。读取节目列表不代表已有全文或摘要；取得文字稿后才能整理中文要点。';
 
 function el(tag, className, text) {
@@ -20,6 +20,8 @@ function el(tag, className, text) {
   return node;
 }
 function array(value) { return Array.isArray(value) ? value : []; }
+function historicalPick(ep) { return ep.curation?.collection==='influential_history'; }
+function curatedGuests(ep) { return historicalPick(ep)?array(ep.curation.guest_ids).flatMap((id,index)=>typeof id==='string'&&typeof ep.curation.guests?.[index]==='string'?[{id,name:ep.curation.guests[index]}]:[]):[]; }
 function hasTranscript(ep) { return ['full','sample','partial'].includes(ep.coverage?.scope) && array(ep.segments).some(s=>s&&typeof s.text==='string'&&s.text.trim()); }
 function thirdParty(ep) { return ep.source_kind === 'third_party_transcript'; }
 function summaryReady(ep) { return hasTranscript(ep)&&ep.status==='summarized'&&Boolean(ep.summary?.overview||array(ep.summary?.points).length); }
@@ -45,7 +47,7 @@ function acquisitionInfo(ep) {
     fetching:{label:'正在读取文字稿',kind:'pending',note:'正在读取官方文字稿或字幕。取得正文后才会安排中文要点与段落证据；尚未开始内容分析。'},
     unavailable:{label:'文字稿暂不可读',kind:'pending',note:`本次未能取得可读的官方文字稿或字幕。${retry}`},
     unsupported:{label:'待接入转写',kind:'pending',note:'这集暂无可自动读取的官方文字稿，整集音频转写尚未启用，当前不会自动生成摘要。可打开原节目收听。'},
-    archive:{label:'历史节目 · 未自动处理',kind:'',note:'这集属于历史节目。当前只自动处理支持来源的最新一集，历史内容不自动回填。可打开原节目收听。'},
+    archive:{label:'历史节目 · 未自动处理',kind:'',note:historicalPick(ep)?'这集已选入历史精选，等待后台检查可用文字稿；自动处理仍受谷时与每日额度限制。可先打开原节目。':'这集未入历史精选，不自动处理。支持来源的最新节目及已选入的历史节目，按谷时与每日额度依次处理。可打开原节目收听。'},
     ready:{label:'文字稿待就绪',kind:'pending',note:'来源已返回文字稿状态，当前还没有可读取的正文。请稍后刷新查看，尚不能生成内容摘要。'}
   })[acquisition.state]||null;
 }
@@ -53,12 +55,14 @@ function status(ep) { if(!hasTranscript(ep)){const acquisition=acquisitionInfo(e
 function schedulePoll() { clearTimeout(pollTimer);if(session.authenticated())pollTimer=setTimeout(load,array(automation?.jobs).some(j=>j.state==='running'||j.state==='queued'&&!deferred(j))||episodes.some(ep=>(!hasTranscript(ep)&&ep.transcript_acquisition?.state==='fetching')||ep.detail_generation?.state==='running')?5000:30000); }
 function updateSchedule() {
   const node=document.querySelector('#podcast-schedule'),boundary=document.querySelector('.podcast-source-boundary');
-  if(automation?.transcript_policy==='official_latest_only'){
+  document.querySelector('.podcast-history-note').textContent=`回看有影响力的历史对话，保留原发布日期。精选按谷时与每日额度依次处理；${onDemandPolicy()?'已有文字稿可手动立即生成。':'取得文字稿后可阅读原文或安排摘要。'}`;
+  if(['official_latest_only','official_latest_and_curated'].includes(automation?.transcript_policy)){
     const names={dwarkesh:'Dwarkesh',lex:'Lex Fridman',diary:'The Diary Of A CEO'},supported=array(automation.automatic_transcript_sources).map(id=>names[id]).filter(Boolean).join('、')||'已接入官方文字稿的来源';
     const minutes=Number.isFinite(automation.off_peak_minutes)?automation.off_peak_minutes:60,limit=Number.isFinite(automation.podcast_daily_limit)?automation.podcast_daily_limit:3;
     const pause=automation.enabled===false?'自动处理未开启。':automation.provider_blocked?'自动分析暂停中。':automation.worker_alive===false?'后台暂未运行。':'';
-    const policy=`自动取稿仅覆盖 ${supported}：谷时每 ${minutes} 分钟检查，每个来源只处理最新 1 集，每天最多新增 ${limit} 集；历史节目不自动回填。取得正文后，由 DeepSeek 生成中文要点与段落证据，仍需复核。其他来源暂未接入自动取稿，整集音频转写尚未启用。`;
-    if(node)node.textContent=`${pause}自动取稿：${supported}。谷时每 ${minutes} 分钟检查，每源最新 1 集，每天最多新增 ${limit} 集；其他来源及历史节目暂不自动取稿。${automation.execution_allowed===false?' 自动取稿高峰先排队，具体状态见各集。':''}${onDemandPolicy()?' 已有文字稿可手动立即生成。':''}`;
+    const historyPolicy='历史精选同样按谷时与每日额度依次处理；未入精选的历史节目不自动处理。';
+    const policy=`自动取稿覆盖 ${supported} 的最新 1 集及已接入文字来源的历史精选：谷时每 ${minutes} 分钟检查，每天最多新增 ${limit} 集。${historyPolicy}取得正文后，由 DeepSeek 生成中文要点与段落证据，仍需复核。其他来源暂未接入自动取稿，整集音频转写尚未启用。`;
+    if(node)node.textContent=`${pause}自动取稿：${supported}。谷时每 ${minutes} 分钟检查，每源最新 1 集，每天最多新增 ${limit} 集。${historyPolicy}${automation.execution_allowed===false?' 自动取稿高峰先排队，具体状态见各集。':''}${onDemandPolicy()?' 已有文字稿可手动立即生成。':''}`;
     if(boundary)boundary.textContent=`${sourceBoundary}${pause}${policy}`;
     return;
   }
@@ -137,26 +141,33 @@ function externalLink(url, label) {
 function sourceFor(ep) { return sources.find(source=>source.id===ep.source_id) || sources.find(source=>source.name===ep.show); }
 function inGroup(item, group) {
   if(group==='all')return true;
+  if(group==='history')return historicalPick(item);
   const source=sourceFor(item),language=item.language||source?.language||'',priority=item.source_priority||item.priority||source?.priority;
   if(group==='chinese')return language.startsWith('zh');
   return language==='en'&&(group==='primary'?priority==='primary':priority!=='primary');
 }
-function visibleEpisodes() { return episodes.filter(ep=>inGroup(ep,groupFilter)&&(sourceFilter==='all'||(ep.source_id||sourceFor(ep)?.id)===sourceFilter)); }
+function visibleEpisodes() { return episodes.filter(ep=>inGroup(ep,groupFilter)&&(sourceFilter==='all'||(ep.source_id||sourceFor(ep)?.id)===sourceFilter)&&(guestFilter==='all'||curatedGuests(ep).some(guest=>guest.id===guestFilter))); }
 function count(value) { return Number.isFinite(value)&&value>=0?Math.floor(value):0; }
 function renderFilters() {
-  const container=document.querySelector('#podcast-filters'),groups=document.querySelector('#podcast-groups'),selectSource=document.querySelector('#podcast-source');
+  const container=document.querySelector('#podcast-filters'),groups=document.querySelector('#podcast-groups'),selectSource=document.querySelector('#podcast-source'),historyFilters=document.querySelector('#podcast-history-filters'),guests=document.querySelector('#podcast-guests');
   container.hidden=false;
-  const available=sources.filter(source=>inGroup(source,groupFilter));
+  const curated=episodes.filter(historicalPick),historyMode=groupFilter==='history';
+  const curatedSources=[...new Map(curated.filter(ep=>ep.source_id).map(ep=>[ep.source_id,sourceFor(ep)||{id:ep.source_id,name:ep.show}])).values()];
+  const available=historyMode?curatedSources:sources.filter(source=>inGroup(source,groupFilter));
+  const guestChoices=[...new Map(curated.flatMap(curatedGuests).map(guest=>[guest.id,guest])).values()];
   if(sourceFilter!=='all'&&!available.some(source=>source.id===sourceFilter))sourceFilter='all';
-  const signature=JSON.stringify([sources.length>0,groupFilter,sourceFilter,available.map(source=>[source.id,source.name])]);
-  if(signature===filterSignature)return;filterSignature=signature;groups.replaceChildren();
-  for(const group of sources.length?Object.keys(groupLabels):['all']){
+  if(!historyMode||!guestChoices.some(guest=>guest.id===guestFilter))guestFilter='all';
+  const signature=JSON.stringify([sources.length>0,curated.length,groupFilter,sourceFilter,guestFilter,available.map(source=>[source.id,source.name]),guestChoices]);
+  if(signature===filterSignature)return;filterSignature=signature;groups.replaceChildren();guests.replaceChildren();historyFilters.hidden=!historyMode;
+  const ranges=sources.length?Object.keys(groupLabels).filter(group=>group!=='history'||curated.length):curated.length?['all','history']:['all'];
+  for(const group of ranges){
     const button=el('button','podcast-group',groupLabels[group]);button.type='button';button.dataset.group=group;button.setAttribute('aria-pressed',String(group===groupFilter));
-    button.addEventListener('click',()=>{if(groupFilter===group)return;groupFilter=group;sourceFilter='all';selectedId=null;renderCollection();});groups.append(button);
+    button.addEventListener('click',()=>{if(groupFilter===group)return;groupFilter=group;sourceFilter='all';guestFilter='all';selectedId=null;renderCollection();});groups.append(button);
   }
+  for(const guest of [{id:'all',name:'全部人物'},...guestChoices]){const button=el('button','podcast-guest',guest.name);button.type='button';button.dataset.guest=guest.id;button.setAttribute('aria-pressed',String(guest.id===guestFilter));button.addEventListener('click',()=>{if(guestFilter===guest.id)return;guestFilter=guest.id;sourceFilter='all';selectedId=null;renderCollection();});guests.append(button);}
   selectSource.replaceChildren();const all=el('option','','全部节目来源');all.value='all';selectSource.append(all);
   for(const source of available){const option=el('option','',source.name||'未命名来源');option.value=source.id;selectSource.append(option);}
-  selectSource.value=sourceFilter;selectSource.hidden=!sources.length;document.querySelector('.podcast-source-label').hidden=!sources.length;
+  selectSource.value=sourceFilter;selectSource.hidden=!available.length;document.querySelector('.podcast-source-label').hidden=!available.length;
 }
 function renderSources() {
   const panel=document.querySelector('#podcast-sources'),content=document.querySelector('#podcast-source-list');panel.hidden=!sources.length;
@@ -189,7 +200,7 @@ function renderCollection() {
 }
 function showList() {
   const items=visibleEpisodes();
-  const signature=JSON.stringify([selectedId,groupFilter,sourceFilter,episodes.length,items.map(ep=>[ep.id,ep.title,ep.show,ep.published_at,status(ep)])]);if(signature===listSignature)return;listSignature=signature;
+  const signature=JSON.stringify([selectedId,groupFilter,sourceFilter,guestFilter,episodes.length,items.map(ep=>[ep.id,ep.title,ep.show,ep.published_at,ep.curation,status(ep)])]);if(signature===listSignature)return;listSignature=signature;
   const scroll=list.scrollTop;
   list.replaceChildren();
   document.querySelector('#episode-count').textContent = `${items.length} / ${episodes.length} 集`;
@@ -197,9 +208,10 @@ function showList() {
     const button = el('button', 'episode');
     button.type = 'button'; button.dataset.episodeId=ep.id;button.setAttribute('aria-current', String(ep.id === selectedId));
     button.append(el('span', 'episode-show', ep.show || '未命名节目'), el('span', 'episode-title', ep.title || '未命名单集'));
+    if(historicalPick(ep))button.append(el('span','episode-curation',`历史精选${curatedGuests(ep).length?' · '+curatedGuests(ep).map(guest=>guest.name).join('、'):''}`));
     const meta = el('span', 'episode-meta');
     const [label, kind] = status(ep);
-    meta.append(el('span', '', date(ep.published_at)), el('span', `status ${kind}`, ep.coverage?.scope === 'sample' ? `${label} / 节选` : ep.coverage?.scope === 'partial' ? `${label} / 部分转写` : label));
+    meta.append(el('span', '', `${historicalPick(ep)?'原发布于 ':''}${date(ep.published_at)}`), el('span', `status ${kind}`, ep.coverage?.scope === 'sample' ? `${label} / 节选` : ep.coverage?.scope === 'partial' ? `${label} / 部分转写` : label));
     button.append(meta);
     button.addEventListener('click', () => select(episodes.find(item=>item.id===ep.id)||ep));
     list.append(button);
@@ -227,7 +239,8 @@ function select(ep,{preserve=false}={}) {
   const heading = el('header', 'reader-heading');
   heading.append(el('p', 'reader-show', ep.show || '播客'), el('h2', '', ep.title || '未命名单集'));
   const metadata = el('div', 'reader-meta');
-  metadata.append(el('span', '', date(ep.published_at)), el('span', '', ep.language === 'en' ? '英语原文' : ep.language?.startsWith('zh') ? '中文原文' : '语言待确认'));
+  metadata.append(el('span', '', `${historicalPick(ep)?'原发布于 ':''}${date(ep.published_at)}`), el('span', '', ep.language === 'en' ? '英语原文' : ep.language?.startsWith('zh') ? '中文原文' : '语言待确认'));
+  if(historicalPick(ep))metadata.append(el('span','history-badge','历史精选'));
   if (time(ep.duration_seconds)) metadata.append(el('span', '', `${thirdParty(ep)?'来源标注时长':'节目时长'} ${time(ep.duration_seconds)}`));
   const source = externalLink(ep.source_url, '打开原节目');
   if (source) metadata.append(source);
@@ -235,6 +248,12 @@ function select(ep,{preserve=false}={}) {
   metadata.append(el('span', `status ${stateClass}`, stateText));
   if(thirdParty(ep))metadata.append(el('span','transcript-source-kind','第三方自动转写'));
   heading.append(metadata); reader.append(heading);
+  if(historicalPick(ep)){
+    const selection=el('section','curation-context');selection.setAttribute('aria-label','历史精选说明');
+    selection.append(el('h3','','为什么选入'),el('p','curation-guests',curatedGuests(ep).map(guest=>guest.name).join('、')));
+    if(typeof ep.curation.reason==='string'&&ep.curation.reason.trim())selection.append(el('p','curation-reason',ep.curation.reason));
+    selection.append(el('p','curation-boundary','这是历史对话的选入说明，不是模型摘要。观点与数据属于节目发布时的语境，不代表当前情况。'));reader.append(selection);
+  }
 
   const coverage = ep.coverage || {};
   const box = el('div', `coverage ${['sample','partial'].includes(coverage.scope) ? 'sample' : ''} ${ep.status === 'failed' ? 'failed' : ''}`);
@@ -307,7 +326,7 @@ function select(ep,{preserve=false}={}) {
       const approximate=seg.timestamp_precision==='chapter';
       const seek = el('button', 'time-button', `▶ ${stamp}${approximate?' · 章节':''}`); seek.type = 'button'; seek.setAttribute('aria-label', `从${approximate?'章节起点 ':''}${stamp} 播放`);
       seek.addEventListener('click', () => loadAudio(seg.start_seconds, true)); meta.append(seek);
-    } else meta.append(el('span', '', stamp || '未提供时间戳'));
+    } else {const position=historical?-1:segments.indexOf(seg);meta.append(el('span', '', stamp || `${position>=0?`原文第 ${position+1} 段`:'历史原文段落'} · 未提供时间戳`));}
     if (seg.speaker) meta.append(el('span', '', seg.speaker));
     if(evidence&&!historical){const locate=el('button','jump-to-transcript','定位文字稿');locate.type='button';locate.addEventListener('click',()=>{const search=reader.querySelector('#segment-search');if(!search)return;search.dispatchEvent(new CustomEvent('locate-segment',{detail:String(seg.id)}));const target=[...reader.querySelectorAll('.transcript-segment')].find(node=>node.dataset.segmentId===String(seg.id));if(target){target.tabIndex=-1;target.focus({preventScroll:true});target.scrollIntoView({block:'center',behavior:'auto'});}});meta.append(locate);}
     node.dataset.segmentId=String(seg.id);node.append(meta, el('p', 'segment-text', seg.text || '此段没有正文。'));
@@ -440,8 +459,8 @@ async function fetchEpisodes() {
     sources=array(data.sources).filter(source=>source&&typeof source==='object'&&typeof source.id==='string');discovery=data.discovery||null;
     automation=data.automation||null;csrfToken=!session.isKol&&typeof data.csrf_token==='string'?data.csrf_token:'';
     updateSchedule();if(!selectedId)selectedId=new URL(location.href).searchParams.get('episode');
-    if(!sources.length)groupFilter='all';
-    if(!filtersInitialized){groupFilter=sources.length?'primary':'all';const linked=episodes.find(ep=>ep.id===selectedId);if(linked&&!inGroup(linked,groupFilter))groupFilter='all';filtersInitialized=true;}
+    if(!sources.length&&groupFilter!=='history')groupFilter='all';
+    if(!filtersInitialized){groupFilter=sources.length?'primary':'all';const linked=episodes.find(ep=>ep.id===selectedId);if(linked&&historicalPick(linked))groupFilter='history';else if(linked&&!inGroup(linked,groupFilter))groupFilter='all';filtersInitialized=true;}
     renderCollection();
   } catch (error) {
     if(!session.valid(generation)||error.authExpired)return;
@@ -457,5 +476,5 @@ refresh.addEventListener('click',()=>load());
 document.querySelector('#podcast-source').addEventListener('change',event=>{sourceFilter=event.target.value;selectedId=null;renderCollection();});
 session.on('lock',()=>{clearTimeout(pollTimer);inFlight=null;pollTimer=null;const audio=reader.querySelector('audio');if(audio){audio.pause();audio.removeAttribute('src');audio.load();}episodes=[];selectedId=null;currentEpisode=null;selectedSignature='';listSignature='';automation=null;csrfToken='';readingStates.clear();requestErrors.clear();submitting.clear();reader.replaceChildren();list.replaceChildren();document.querySelector('#episode-count').textContent='—';document.querySelector('#collection-status').textContent='请先解锁阅读';refresh.disabled=false;});
 session.on('lock',()=>{document.querySelector('#podcast-schedule').textContent='';document.querySelector('.podcast-source-boundary').textContent=sourceBoundary;});
-session.on('lock',()=>{sources=[];discovery=null;groupFilter='primary';sourceFilter='all';filtersInitialized=false;filterSignature='';sourceSignature='';document.querySelector('#podcast-filters').hidden=true;document.querySelector('#podcast-groups').replaceChildren();document.querySelector('#podcast-source').replaceChildren();const panel=document.querySelector('#podcast-sources');panel.hidden=true;panel.open=false;document.querySelector('#podcast-source-list').replaceChildren();document.querySelector('#podcast-sources-heading').textContent='订阅来源与更新';});
+session.on('lock',()=>{sources=[];discovery=null;groupFilter='primary';sourceFilter='all';guestFilter='all';filtersInitialized=false;filterSignature='';sourceSignature='';document.querySelector('#podcast-filters').hidden=true;document.querySelector('#podcast-groups').replaceChildren();document.querySelector('#podcast-source').replaceChildren();document.querySelector('#podcast-guests').replaceChildren();document.querySelector('#podcast-history-filters').hidden=true;const panel=document.querySelector('#podcast-sources');panel.hidden=true;panel.open=false;document.querySelector('#podcast-source-list').replaceChildren();document.querySelector('#podcast-sources-heading').textContent='订阅来源与更新';});
 session.on('unlock',()=>load());session.init().then(ready=>{if(ready)load();});

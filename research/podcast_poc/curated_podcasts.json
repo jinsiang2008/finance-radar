@@ -1,0 +1,45 @@
+{
+  "collection": "influential_history",
+  "episodes": [
+    {
+      "id": "curated-ray-dalio-freakonomics-330",
+      "source_id": "freakonomics",
+      "show": "Freakonomics Radio",
+      "title": "Extra: Ray Dalio Full Interview",
+      "language": "en",
+      "published_at": "2018-04-08",
+      "published_precision": "date",
+      "source_url": "https://freakonomics.com/podcast/extra-ray-dalio-full-interview-ep-330/",
+      "guest_ids": ["ray-dalio"],
+      "guests": ["瑞·达利欧"],
+      "priority": 1,
+      "reason": "理解达利欧的原则、决策方法与投资机构管理，作为宏观投资和工作决策的历史背景。"
+    },
+    {
+      "id": "curated-elon-musk-lex-400",
+      "source_id": "lex",
+      "show": "Lex Fridman Podcast",
+      "title": "Elon Musk: War, AI, Aliens, Politics, Physics, Video Games, and Humanity",
+      "language": "en",
+      "published_at": "2023-11-09T19:03:46+00:00",
+      "source_url": "https://lexfridman.com/elon-musk-4/",
+      "guest_ids": ["elon-musk"],
+      "guests": ["埃隆·马斯克"],
+      "priority": 2,
+      "reason": "回看马斯克关于 AI、技术与人类未来的长篇讨论，区分嘉宾观点、长期假设和后来需要验证的变化。"
+    },
+    {
+      "id": "curated-jensen-huang-dwarkesh",
+      "source_id": "dwarkesh",
+      "show": "Dwarkesh Podcast",
+      "title": "Jensen Huang – TPU competition, why we should sell chips to China, & Nvidia’s supply chain moat",
+      "language": "en",
+      "published_at": "2026-04-15T15:45:23.854Z",
+      "source_url": "https://www.dwarkesh.com/p/jensen-huang",
+      "guest_ids": ["jensen-huang"],
+      "guests": ["黄仁勋"],
+      "priority": 3,
+      "reason": "理解 NVIDIA 对 AI 算力、芯片和产业发展的判断，联系基础设施投资与技术工作的影响。"
+    }
+  ]
+}

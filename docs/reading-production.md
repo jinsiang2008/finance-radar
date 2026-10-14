@@ -24,7 +24,7 @@ worker 消费持久队列：自动抓取与摘要仅在谷时执行，谷时每 
 
 平铺应用包增加 `reading_service.py`、`reading_worker.py`、`reading_import.py`。共享代码保留 Python namespace 路径 `research/podcast_poc`，只复制：
 
-- 运行文件：`poc.py`、`wechat.py`、`reading_jobs.py`、`schedule_policy.py`、`inference.py`、`official_transcripts.py`、`detailed_summary.py`、`wechat_sources.json`。
+- 运行文件：`poc.py`、`wechat.py`、`reading_jobs.py`、`schedule_policy.py`、`inference.py`、`official_transcripts.py`、`detailed_summary.py`、`curated_podcasts.py`、`curated_podcasts.json`、`wechat_sources.json`。
 - 八个界面文件：`index.html`、`wechat.html`、`app.js`、`wechat.js`、`style.css`、`wechat.css`、`reader-auth.js`、`reader-auth.css`。
 
 不复制 tests、private、runtime、模型、虚拟环境、`configure_deepseek.py` 或本地服务控制脚本。文章、音频、队列与凭据都不进入代码 release。
@@ -189,3 +189,13 @@ worker 通过仅覆盖当前任务生命周期的上下文，在每次实际模�
 验证：187 项阅读测试（含 44 项详细契约）、67 项相关详细稿与单篇 worker 测试、3 项干净导出契约及编译通过。此前同版本 UI/API 的 1025 项 KOL 全套测试和真实浏览器桌面/手机检查通过，最终发布后再次核验资源 hash 和鉴权。峰时执行许可用可控时钟和每次请求的 transport 检查验证；本次真实生成发生在谷时，不伪称线上峰时付费请求验收。
 
 语义边界：Eric 和 Ilya 仅抽查各 3 个要点及 2 条影响，有限修订保留原模型初稿，不设置整篇已复核。财经短讯对照取得的全部 267 字 RSS 文字修正过度扩写；技术文作有限措辞校正。未独立核实节目中外部事实、实时行情或用户持仓。有效引用和结构校验不能替代语义核验。元信息验收见 [on-demand-reading-production-verification.json](on-demand-reading-production-verification.json)，正文和凭据不进入 Git。
+
+## 历史精选（2026-10-14）
+
+历史覆盖通过 `curated_podcasts.json` 显式选集，不扩大所有 RSS 的历史扫描。首批为瑞·达利欧 Freakonomics #330（2018-04-08）、马斯克 Lex #400（2023-11-09）和黄仁勋 Dwarkesh（2026-04-15），目录保留官方标题、原始发布日期和选入理由。页面增加“历史精选”与人物筛选，旧内容不按入库日伪装新消息；选择理由与模型摘要分开。原文和分析仍受私人阅读鉴权保护。
+
+初始化只在 worker/CLI 锁内执行，GET 不建记录、不抓取、不调用模型。规范原页 URL 匹配已有记录，RSS 再次发现相同节目时复用原 ID，已有正文、摘要和复核不重写。只有固定目录匹配才允许历史取稿，私有记录自带精选标签不能扩大抓取范围。精选优先于每源最新一期，两者共用原自动 3/day 额度、谷时及 24 小时失败退避；自动摘要仍为 `on_demand=false`。
+
+Freakonomics 仅接受该固定节目路径和官方全文容器，保留对谈连续段落并排除编辑导语/制作说明；原站没有时间戳，段落起止为 null，页面不提供虚构音频定位。Lex 历史稿的空说话人标签按续段继承前一标签并保留说明，首段无标签仍拒绝；各段时间戳继续严格校验。Dwarkesh 的章节时间只能代表章节起点。所有摘要继续携带原发表时间，历史观点不自动代表当前投资或技术事实。
+
+本次按用户要求只补录固定三份已在谷时取得并离线验证的官方全文，属于一次性显式内容导入；不重置自动取稿 ledger、不扩大以后每日额度、不重新抓取或付费推理。现有原稿保持；新内容只进入自动谷时队列，用户仍可对已有正文手动“立即生成”。实际上线和队列状态以随后生产验收记录为准。

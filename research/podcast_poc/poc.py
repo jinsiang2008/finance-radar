@@ -227,7 +227,12 @@ def published_timestamp(value):
         if stamp.tzinfo is None and re.search(r"\s-0000\s*$", value):
             stamp = stamp.replace(tzinfo=timezone.utc)
     if stamp.tzinfo is None:
-        return None
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            # A publisher may disclose only the calendar day. Use a stable
+            # sorting key without rewriting the saved value into a fake time.
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        else:
+            return None
     return stamp.timestamp()
 
 
@@ -266,6 +271,8 @@ def discover(names, limit):
     if any(key not in FEEDS for key in names):
         raise ValueError("Unknown podcast source")
     states = discovery_states()
+    curated = local_module("curated_podcasts")
+    existing_episodes = [json.loads(path.read_text()) for path in sorted((DATA / "episodes").glob("*.json"))]
     result = []
     for key in names:
         show, language, url = FEEDS[key]
@@ -285,20 +292,35 @@ def discover(names, limit):
             seen = set()
             for item, audio in candidates:
                 identity = item.findtext("guid") or audio.get("url")
-                if identity in seen:
+                selected = curated.match_episode({"source_id": key, "source_url": item.findtext("link"), "guid": identity})
+                dedup_key = ("curated", selected["id"]) if selected else ("guid", identity)
+                if dedup_key in seen:
                     continue
-                seen.add(identity)
+                seen.add(dedup_key)
                 eid = key + "-" + hashlib.sha256(identity.encode()).hexdigest()[:12]
+                curated_existing = curated.existing_episode(existing_episodes, selected) if selected else None
+                if curated_existing is not None:
+                    eid = curated_existing["id"]
                 if not episode_path(eid).exists():
                     secs = duration(item.findtext("{http://www.itunes.com/dtds/podcast-1.0.dtd}duration"))
-                    save_episode({"id": eid, "show": show, "language": language, "source_id": key,
+                    episode = {"id": eid, "show": show, "language": language, "source_id": key,
                         "title": item.findtext("title"), "published_at": item.findtext("pubDate"),
                         "source_url": item.findtext("link"), "audio_url": audio.get("url"),
                         "feed_url": url, "guid": identity, "duration_seconds": secs,
                         "status": "discovered", "source_kind": "rss_metadata", "segments": [],
                         "coverage": {"scope": "metadata_only", "segments_total": 0,
                                      "segments_processed": 0, "note": "仅发现新集，尚未取得正文或转写。"},
-                        "processing": {"paid_api_calls": 0}, "discovered_at": now()})
+                        "processing": {"paid_api_calls": 0}, "discovered_at": now()}
+                    if selected:
+                        episode["curation"] = curated.curation(selected)
+                    save_episode(episode)
+                    existing_episodes.append(episode)
+                elif selected:
+                    episode = load_episode(eid)
+                    expected = curated.curation(selected)
+                    if episode.get("curation") != expected:
+                        episode["curation"] = expected
+                        save_episode(episode)
                 # Podcasting 2.0 captions are a separate full-text candidate, not
                 # the description. Upgrade metadata only; never rewrite a read episode.
                 if key == "diary":

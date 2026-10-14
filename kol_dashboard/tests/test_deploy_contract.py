@@ -1004,7 +1004,7 @@ class DeploymentContractTests(unittest.TestCase):
         self.assertIsNotNone(assets)
         self.assertEqual(set(runtime.group(1).split(",")), {
             "poc.py", "wechat.py", "reading_jobs.py", "schedule_policy.py",
-            "inference.py", "official_transcripts.py", "detailed_summary.py", "wechat_sources.json",
+            "inference.py", "official_transcripts.py", "detailed_summary.py", "curated_podcasts.py", "curated_podcasts.json", "wechat_sources.json",
         })
         self.assertEqual(set(assets.group(1).split(",")), {
             "index.html", "wechat.html", "app.js", "wechat.js", "style.css",
